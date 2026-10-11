@@ -403,8 +403,9 @@ impl Instance {
         if pre.pinned_at != post.pinned_at {
             self.pinned_at = post.pinned_at;
         }
-        if pre.trashed_at != post.trashed_at {
+        if pre.trashed_at != post.trashed_at || pre.trash_lifecycle_id != post.trash_lifecycle_id {
             self.trashed_at = post.trashed_at;
+            self.trash_lifecycle_id = post.trash_lifecycle_id.clone();
             self.failed_purge = None;
         }
         if pre.pre_trash_project_path != post.pre_trash_project_path {
@@ -566,6 +567,36 @@ mod tests {
             let mut disk = pre.clone();
             disk.merge_user_action_diff(&pre, &post);
             assert!(!is_set(&disk), "{label} cleared");
+        }
+    }
+
+    #[test]
+    fn same_timestamp_retrash_splices_identity_and_invalidates_failed_purge() {
+        for profile_move in [false, true] {
+            let mut pre = inst();
+            pre.trash();
+            pre.record_failed_purge(true);
+            let mut post = pre.clone();
+            post.untrash();
+            post.trash();
+            post.trashed_at = pre.trashed_at;
+            let mut disk = pre.clone();
+            if profile_move {
+                disk.merge_profile_move_user_action_diff(&pre, &post);
+            } else {
+                disk.merge_user_action_diff(&pre, &post);
+            }
+            assert!(disk.same_trash_lifecycle(&post));
+            assert!(!disk.same_trash_lifecycle(&pre));
+            assert!(disk.failed_purge.is_none());
+
+            // An unrelated action must retain a peer's newer lifecycle and failure.
+            disk.record_failed_purge(false);
+            let mut renamed = pre.clone();
+            renamed.title = "renamed".into();
+            disk.merge_user_action_diff(&pre, &renamed);
+            assert!(disk.same_trash_lifecycle(&post));
+            assert_eq!(disk.failed_purge_forced(), Some(false));
         }
     }
 

@@ -170,7 +170,7 @@ impl Instance {
     /// Soft-delete the session into the trash bucket. Stops the live
     /// session (handled by the caller: ACP `shutdown`, optional tmux kill)
     /// but keeps every durable artifact so `untrash` can bring it back
-    /// intact. Intentionally additive: only `trashed_at` is set, the
+    /// intact. A new trash lifecycle receives its own UUID; the
     /// sibling triage flags (`archived_at`, `favorited_at`, `snoozed_until`,
     /// `pinned_at`) are left untouched so restore is faithful.
     /// `effective_bucket()` makes trash win regardless. Idempotent.
@@ -178,6 +178,7 @@ impl Instance {
         if self.trashed_at.is_none() {
             self.trashed_at = Some(Utc::now());
             self.failed_purge = None;
+            self.trash_lifecycle_id = Some(Uuid::new_v4().to_string());
         }
     }
 
@@ -186,6 +187,15 @@ impl Instance {
     pub fn untrash(&mut self) {
         self.trashed_at = None;
         self.failed_purge = None;
+        self.trash_lifecycle_id = None;
+    }
+
+    /// Match a durable trash lifecycle independently of clock resolution.
+    pub(crate) fn same_trash_lifecycle(&self, other: &Self) -> bool {
+        self.trashed_at.is_some()
+            && self.trashed_at == other.trashed_at
+            && self.trash_lifecycle_id.is_some()
+            && self.trash_lifecycle_id == other.trash_lifecycle_id
     }
 
     pub fn is_trashed(&self) -> bool {
@@ -720,10 +730,48 @@ mod tests {
         inst.trash();
         assert!(inst.is_trashed());
         assert_eq!(inst.effective_bucket(), SessionBucket::Trashed);
-
+        let back: Instance = serde_json::from_str(&serde_json::to_string(&inst).unwrap()).unwrap();
+        assert!(back.is_trashed());
+        assert!(inst.same_trash_lifecycle(&back));
+        inst.trash();
+        assert!(
+            inst.same_trash_lifecycle(&back),
+            "repeated trash is idempotent"
+        );
         inst.untrash();
+        assert!(inst.trash_lifecycle_id.is_none());
         assert!(!inst.is_trashed());
         assert_eq!(inst.effective_bucket(), SessionBucket::Active);
+        inst.trash();
+        inst.trashed_at = back.trashed_at;
+        assert!(!inst.same_trash_lifecycle(&back));
+
+        let mut archived = Instance::new("archived", "/tmp/x");
+        archived.archive();
+        assert_eq!(archived.effective_bucket(), SessionBucket::Archived);
+        archived.trash();
+        assert_eq!(archived.effective_bucket(), SessionBucket::Trashed);
+        archived.untrash();
+        assert_eq!(archived.effective_bucket(), SessionBucket::Archived);
+    }
+
+    #[test]
+    fn failed_purge_is_invalidated_by_same_timestamp_retrash() {
+        let mut row = Instance::new("failed", "/tmp/x");
+        row.trash();
+        row.record_failed_purge(true);
+        let failed = row.failed_purge.clone();
+        let stamp = row.trashed_at;
+        row.untrash();
+        assert!(row.failed_purge.is_none());
+        row.trash();
+        row.trashed_at = stamp;
+        row.failed_purge = failed;
+        assert_eq!(row.failed_purge_forced(), None);
+        row.record_failed_purge(false);
+        let loaded: Instance = serde_json::from_str(&serde_json::to_string(&row).unwrap()).unwrap();
+        assert_eq!(loaded.failed_purge_forced(), Some(false));
+        assert!(row.same_trash_lifecycle(&loaded));
     }
 
     #[test]

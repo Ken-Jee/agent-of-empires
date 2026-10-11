@@ -80,6 +80,7 @@ pub(crate) enum PurgeReservation<S: SessionStore + 'static> {
 
 pub(crate) struct TrashPurgeConsent {
     pub trashed_at: chrono::DateTime<Utc>,
+    pub trash_lifecycle_id: String,
     pub lifecycle_generation: u64,
     pub force_failed: bool,
 }
@@ -87,6 +88,7 @@ pub(crate) struct TrashPurgeConsent {
 impl TrashPurgeConsent {
     fn matches(&self, row: &Instance) -> bool {
         row.trashed_at == Some(self.trashed_at)
+            && row.trash_lifecycle_id.as_ref() == Some(&self.trash_lifecycle_id)
             && row.lifecycle_generation == self.lifecycle_generation
     }
 }
@@ -141,7 +143,6 @@ pub(crate) struct PurgeTransaction<S: SessionStore + 'static> {
     request: Option<DeletionRequest>,
     selection: Option<PurgeSelection>,
     capture: Option<super::purge_owners::PurgeCapture>,
-    was_trashed: bool,
     generation: u64,
     lifecycle_lock: Option<StorageFlock>,
     active: bool,
@@ -171,18 +172,18 @@ enum CompletionGate {
 impl CompletionGate {
     fn for_row(
         stored: &mut Instance,
-        was_trashed: bool,
+        selected: &Instance,
         generation: u64,
-        structured: bool,
         selection: Option<&PurgeSelection>,
         profile: &str,
     ) -> Self {
         let gate = if crate::session::claim::purge_restored_row_must_be_kept(
-            was_trashed,
+            selected.is_trashed(),
             stored.is_trashed(),
         ) {
             Self::KeptRestored
-        } else if stored.is_structured() != structured
+        } else if stored.is_structured() != selected.is_structured()
+            || (selected.is_trashed() && !stored.same_trash_lifecycle(selected))
             || !stored.lifecycle_reservation_is_owned(LifecycleOperation::Purge, generation)
             || selection.is_some_and(|selection| !selection.matches_location(stored, profile))
         {
@@ -273,7 +274,6 @@ impl<S: SessionStore + 'static> PurgeTransaction<S> {
         let store: &dyn SessionStore = &backend;
         let id = request.session_id.clone();
         let was_trashed = request.instance.is_trashed();
-        let expected_trashed_at = request.instance.trashed_at;
         let mut lifecycle_changed = false;
         let lifecycle_lock = store
             .storage()
@@ -389,7 +389,7 @@ impl<S: SessionStore + 'static> PurgeTransaction<S> {
                 .iter_mut()
                 .find(|instance| instance.id == id)
                 .expect("reserved purge row must still exist");
-            lifecycle_changed = was_trashed && stored.trashed_at != expected_trashed_at;
+            lifecycle_changed = was_trashed && !stored.same_trash_lifecycle(&request.instance);
             stored.failed_purge = None;
             stored.status = crate::session::Status::Deleting;
             let mut snapshot = stored.clone();
@@ -425,7 +425,6 @@ impl<S: SessionStore + 'static> PurgeTransaction<S> {
             request: Some(request),
             selection,
             capture: None,
-            was_trashed,
             generation,
             lifecycle_lock: Some(lifecycle_lock),
             active: true,
@@ -509,7 +508,7 @@ impl<S: SessionStore + 'static> PurgeTransaction<S> {
                     super::Status::Error,
                 ) {
                     stored.last_error = Some(errors.join("; "));
-                    if !errors.is_empty() {
+                    if !errors.is_empty() && stored.same_trash_lifecycle(&self.request().instance) {
                         stored.record_failed_purge(forced);
                     }
                 }
@@ -524,8 +523,6 @@ impl<S: SessionStore + 'static> PurgeTransaction<S> {
     fn gate(&mut self) -> Result<(CompletionGate, Option<Instance>)> {
         let id = self.request().session_id.clone();
         let generation = self.generation;
-        let was_trashed = self.was_trashed;
-        let structured = self.request().instance.is_structured();
         let mut outcome = None;
         self.store().update(|instances, _groups| {
             let Some(stored) = instances.iter_mut().find(|instance| instance.id == id) else {
@@ -534,9 +531,8 @@ impl<S: SessionStore + 'static> PurgeTransaction<S> {
             };
             let gate = CompletionGate::for_row(
                 stored,
-                was_trashed,
+                &self.request().instance,
                 generation,
-                structured,
                 self.selection.as_ref(),
                 self.store().storage().profile(),
             );
@@ -596,8 +592,6 @@ impl<S: SessionStore + 'static> PurgeTransaction<S> {
         };
         let id = self.request().session_id.clone();
         let generation = self.generation;
-        let was_trashed = self.was_trashed;
-        let structured = self.request().instance.is_structured();
         let mut commit = None;
         let mut owner = None;
         let mut capture = self.capture.take();
@@ -610,9 +604,8 @@ impl<S: SessionStore + 'static> PurgeTransaction<S> {
             };
             let gate = CompletionGate::for_row(
                 &mut instances[index],
-                was_trashed,
+                &self.request().instance,
                 generation,
-                structured,
                 self.selection.as_ref(),
                 self.store().storage().profile(),
             );
@@ -777,8 +770,6 @@ impl<S: SessionStore + 'static> PurgeTransaction<S> {
         }
 
         let generation = self.generation;
-        let was_trashed = self.was_trashed;
-        let structured = self.request().instance.is_structured();
         let mut commit = None;
         let commit_result = self.store().update(|instances, _groups| {
             let Some(index) = instances.iter().position(|instance| instance.id == id) else {
@@ -787,9 +778,8 @@ impl<S: SessionStore + 'static> PurgeTransaction<S> {
             };
             let gate = CompletionGate::for_row(
                 &mut instances[index],
-                was_trashed,
+                &self.request().instance,
                 generation,
-                structured,
                 self.selection.as_ref(),
                 self.store().storage().profile(),
             );
@@ -3634,16 +3624,24 @@ mod tests {
         let _guard = crate::session::test_support::isolate_app_dir();
         super::super::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
         let earlier = Utc::now() - chrono::Duration::minutes(5);
-        for (profile, same_lifecycle) in [("purge-stale-force", false), ("purge-same-force", true)]
-        {
+        for (profile, same_lifecycle, same_timestamp) in [
+            ("purge-stale-force", false, false),
+            ("purge-same-clock-force", false, true),
+            ("purge-same-force", true, true),
+        ] {
             let storage = Storage::new_unwatched(profile).unwrap();
             let mut requested = create_test_instance();
             requested.source_profile = profile.to_string();
+            requested.trash();
             let trashed_at = Utc::now();
-            requested.trashed_at = Some(if same_lifecycle { trashed_at } else { earlier });
+            requested.trashed_at = Some(if same_timestamp { trashed_at } else { earlier });
             storage
                 .update(|instances, _| {
                     let mut stored = requested.clone();
+                    if !same_lifecycle {
+                        stored.untrash();
+                        stored.trash();
+                    }
                     stored.trashed_at = Some(trashed_at);
                     instances.push(stored);
                     Ok(())
@@ -3761,6 +3759,54 @@ mod tests {
         );
         let result = committed.finish();
         assert_eq!(result.disposition, DeletionDisposition::Removed);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn same_timestamp_retrash_blocks_reserved_purge_before_irreversible_cleanup() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
+        let profile = "purge-same-clock-gate";
+        let storage = Storage::new_unwatched(profile).unwrap();
+        let mut selected = create_test_instance();
+        selected.source_profile = profile.into();
+        selected.trash();
+        storage
+            .update(|rows, _| {
+                rows.push(selected.clone());
+                Ok(())
+            })
+            .unwrap();
+        let transaction = match PurgeTransaction::reserve(
+            Storage::open_unwatched(profile).unwrap(),
+            test_request(selected.clone()),
+            None,
+        )
+        .unwrap()
+        {
+            PurgeReservation::Reserved(transaction) => transaction,
+            PurgeReservation::Rejected(_) => panic!("selected trash must reserve"),
+        };
+        let generation = transaction.generation;
+        storage
+            .update(|rows, _| {
+                rows[0].untrash();
+                rows[0].trash();
+                rows[0].trashed_at = selected.trashed_at;
+                assert_eq!(rows[0].lifecycle_generation, generation);
+                Ok(())
+            })
+            .unwrap();
+        let result = match transaction.begin_irreversible() {
+            Ok(_) => panic!("a superseded trash lifecycle crossed the irreversible boundary"),
+            Err(result) => result,
+        };
+        assert_eq!(result.disposition, DeletionDisposition::Busy);
+        assert!(!result.teardown_started);
+        let retained = storage.load().unwrap().remove(0);
+        assert!(!retained.same_trash_lifecycle(&selected));
+        assert!(!retained.has_fresh_lifecycle_reservation(Utc::now()));
+        assert_eq!(retained.failed_purge_forced(), None);
     }
 
     #[test]
@@ -5805,6 +5851,7 @@ mod tests {
             .unwrap();
         let consent = |generation| TrashPurgeConsent {
             trashed_at: row.trashed_at.unwrap(),
+            trash_lifecycle_id: row.trash_lifecycle_id.clone().unwrap(),
             lifecycle_generation: generation,
             force_failed: true,
         };
@@ -5821,9 +5868,18 @@ mod tests {
             detach_hooks: true,
             keep_scratch: true,
         };
-        for (generation, stamp) in [
-            (6, row.trashed_at.unwrap()),
-            (7, row.trashed_at.unwrap() - chrono::Duration::seconds(1)),
+        for (generation, stamp, identity) in [
+            (
+                6,
+                row.trashed_at.unwrap(),
+                row.trash_lifecycle_id.clone().unwrap(),
+            ),
+            (
+                7,
+                row.trashed_at.unwrap() - chrono::Duration::seconds(1),
+                row.trash_lifecycle_id.clone().unwrap(),
+            ),
+            (7, row.trashed_at.unwrap(), uuid::Uuid::new_v4().to_string()),
         ] {
             let rejected = PurgeTransaction::reserve_selected_trash(
                 Storage::open_unwatched(profile).unwrap(),
@@ -5831,6 +5887,7 @@ mod tests {
                 None,
                 TrashPurgeConsent {
                     trashed_at: stamp,
+                    trash_lifecycle_id: identity,
                     lifecycle_generation: generation,
                     force_failed: true,
                 },
@@ -5868,6 +5925,7 @@ mod tests {
         assert!(drop_failed_purge(&storage, &row.id, &consent(7)).is_err());
         let current = TrashPurgeConsent {
             trashed_at: loaded.trashed_at.unwrap(),
+            trash_lifecycle_id: loaded.trash_lifecycle_id.clone().unwrap(),
             lifecycle_generation: loaded.lifecycle_generation,
             force_failed: false,
         };

@@ -594,7 +594,7 @@ impl HomeView {
             self.update_selected();
         }
         if let Some(state) = self.live_send.clone() {
-            self.end_live_send_on_drift(&state);
+            self.end_live_send_on_projection_drift(&state);
         }
     }
 

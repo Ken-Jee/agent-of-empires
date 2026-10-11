@@ -6303,17 +6303,13 @@ impl HomeView {
         self.clear_preview_selection();
     }
 
-    /// `Some(reason)` when the live-send target drifted out from under us since entry:
-    /// the instance row was deleted, the title was renamed and the tmux session with it
-    /// (a retitle whose tmux rename did not land is not drift, since `resolve_name` still
-    /// resolves onto the worker's pane), or the tmux session is gone while our row says
-    /// otherwise. Presence is then probed on the target itself: an agent pane through
-    /// tmux, an auxiliary or tool pane through the snapshot's presence, so a target that
-    /// died without ever having opened a session is caught too.
-    ///
-    /// The caller shows the message verbatim, so phrase it as a user-facing sentence.
-    fn live_send_drift_reason(&self, state: &live_send::LiveSendState) -> Option<&'static str> {
-        let Some(inst) = self.get_instance(&state.session_id) else {
+    /// Drift established by row metadata alone; a presentation reload must not probe
+    /// pane liveness or retarget an otherwise unchanged live-send session.
+    fn live_send_projection_drift_reason(
+        instance: Option<&crate::session::Instance>,
+        state: &live_send::LiveSendState,
+    ) -> Option<&'static str> {
+        let Some(inst) = instance else {
             return Some("Session was deleted while live mode was active.");
         };
         let current_name = match &state.target {
@@ -6335,6 +6331,24 @@ impl HomeView {
         if current_name != state.tmux_name {
             return Some("Session was renamed while live mode was active.");
         }
+        None
+    }
+
+    /// `Some(reason)` when the live-send target drifted out from under us since entry:
+    /// the instance row was deleted, the title was renamed and the tmux session with it
+    /// (a retitle whose tmux rename did not land is not drift, since `resolve_name` still
+    /// resolves onto the worker's pane), or the tmux session is gone while our row says
+    /// otherwise. Presence is then probed on the target itself: an agent pane through
+    /// tmux, an auxiliary or tool pane through the snapshot's presence, so a target that
+    /// died without ever having opened a session is caught too.
+    ///
+    /// The caller shows the message verbatim, so phrase it as a user-facing sentence.
+    fn live_send_drift_reason(&self, state: &live_send::LiveSendState) -> Option<&'static str> {
+        let instance = self.get_instance(&state.session_id);
+        if let Some(reason) = Self::live_send_projection_drift_reason(instance, state) {
+            return Some(reason);
+        }
+        let inst = instance?;
         use crate::session::{AuxiliaryTarget, PanePresence};
         let gone = match &state.target {
             live_send::LiveSendTarget::Agent => {
@@ -6362,6 +6376,22 @@ impl HomeView {
             return Some("tmux pane went away while live mode was active.");
         }
         None
+    }
+
+    /// Reconcile deletion/rename after a metadata rebuild. Runtime callers retain the
+    /// full pane-presence check in end_live_send_on_drift.
+    pub(super) fn end_live_send_on_projection_drift(
+        &mut self,
+        state: &live_send::LiveSendState,
+    ) -> bool {
+        let Some(reason) =
+            Self::live_send_projection_drift_reason(self.get_instance(&state.session_id), state)
+        else {
+            return false;
+        };
+        self.exit_live_send_and_restore_sizing(state);
+        self.info_dialog = Some(InfoDialog::new("Live send ended", reason));
+        true
     }
 
     pub(super) fn end_live_send_on_drift(&mut self, state: &live_send::LiveSendState) -> bool {

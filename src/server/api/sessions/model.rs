@@ -108,6 +108,7 @@ impl SessionResponse {
                 None
             },
             trashed_at: inst.trashed_at.map(|t| t.to_rfc3339()),
+            trash_lifecycle_id: inst.trash_lifecycle_id.clone(),
             failed_purge_forced: inst.failed_purge_forced(),
             // Surface the marker; the web gates the visual on the
             // `session.unread_indicator` setting.

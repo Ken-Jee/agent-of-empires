@@ -50,11 +50,13 @@ pub(crate) mod v033_isolate_sandbox_content;
 mod v034_trash_retention_minutes;
 mod v035_serve_passphrase_policy;
 mod v036_session_creation_count;
+mod v037_trash_lifecycle_id;
 mod v038_canonical_sidebar;
 mod v039_custom_sort_order;
 mod v040_reconcile_serve_passphrase_policy;
 mod v041_pending_purge_owners;
 mod v042_reconcile_session_creation_count;
+mod v043_reconcile_trash_lifecycle_id;
 
 /// Fixtures shared by migrations that rewrite agent hook files.
 #[cfg(test)]
@@ -95,7 +97,7 @@ use anyhow::Result;
 use std::fs;
 use tracing::{debug, info};
 
-const CURRENT_VERSION: u32 = 42;
+const CURRENT_VERSION: u32 = 43;
 const VERSION_FILE: &str = ".schema_version";
 
 struct Migration {
@@ -286,6 +288,11 @@ const MIGRATIONS: &[Migration] = &[
         run: v036_session_creation_count::run,
     },
     Migration {
+        version: 37,
+        name: "trash_lifecycle_id",
+        run: v037_trash_lifecycle_id::run,
+    },
+    Migration {
         version: 38,
         name: "canonical_sidebar",
         run: v038_canonical_sidebar::run,
@@ -309,6 +316,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 42,
         name: "reconcile_session_creation_count",
         run: v042_reconcile_session_creation_count::run,
+    },
+    Migration {
+        version: 43,
+        name: "reconcile_trash_lifecycle_id",
+        run: v043_reconcile_trash_lifecycle_id::run,
     },
 ];
 

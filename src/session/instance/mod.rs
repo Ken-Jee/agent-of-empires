@@ -200,6 +200,7 @@ pub struct PendingInitialTurn {
 pub(crate) struct FailedPurge {
     lifecycle_generation: u64,
     trashed_at: DateTime<Utc>,
+    trash_lifecycle_id: String,
     forced: bool,
 }
 
@@ -344,6 +345,11 @@ pub struct Instance {
     /// absent in older `sessions.json` rows, so no migration is needed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trashed_at: Option<DateTime<Utc>>,
+    /// UUID of the current trash lifecycle. Unlike the timestamp, it cannot
+    /// collide across restore/retrash; v037 and v043 initialize older rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trash_lifecycle_id: Option<String>,
+    /// Failed cleanup scoped to this exact trash UUID and reservation generation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) failed_purge: Option<FailedPurge>,
 
@@ -776,11 +782,14 @@ pub struct Instance {
 
 impl Instance {
     pub(crate) fn record_failed_purge(&mut self, forced: bool) {
-        self.failed_purge = self.trashed_at.map(|trashed_at| FailedPurge {
-            lifecycle_generation: self.lifecycle_generation,
-            trashed_at,
-            forced,
-        });
+        self.failed_purge = self.trashed_at.zip(self.trash_lifecycle_id.as_ref()).map(
+            |(trashed_at, trash_lifecycle_id)| FailedPurge {
+                lifecycle_generation: self.lifecycle_generation,
+                trashed_at,
+                trash_lifecycle_id: trash_lifecycle_id.clone(),
+                forced,
+            },
+        );
     }
 
     pub(crate) fn failed_purge_forced(&self) -> Option<bool> {
@@ -789,6 +798,7 @@ impl Instance {
             .filter(|failed| {
                 failed.lifecycle_generation == self.lifecycle_generation
                     && Some(failed.trashed_at) == self.trashed_at
+                    && self.trash_lifecycle_id.as_ref() == Some(&failed.trash_lifecycle_id)
             })
             .map(|failed| failed.forced)
     }

@@ -832,6 +832,7 @@ async fn empty_trash_escalates_a_row_that_keeps_failing() {
                         .with_timezone(&chrono::Utc),
                 ),
                 expected_generation: Some(row.lifecycle_generation),
+                expected_trash_lifecycle_id: row.trash_lifecycle_id.clone(),
                 use_cleanup_defaults: true,
                 force_failed: round == 1,
                 drop_failed: round == 2,
@@ -922,9 +923,184 @@ async fn empty_trash_escalates_a_row_that_keeps_failing() {
     }
 }
 
-/// Shelf bulk actions: "Empty Trash" routes through a destructive confirm and marks every trashed
-/// row Deleting (an empty trash shows an info dialog instead), and "Restore All" un-trashes or
-/// unarchives every row of its section.
+/// Per-row permanent deletion uses the same canonical UUID guard and receipt admission
+/// as bulk purges, without changing the view or storage ahead of publication.
+#[tokio::test]
+#[serial]
+async fn selected_trash_purge_submits_exact_native_identity() {
+    use crate::daemon::{DeleteSessionBody, MutationReceipt};
+    use crate::tui::session_feed::{SessionCommandOutcome, SessionRequest};
+
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instance_at(0).id.clone();
+    let storage = Storage::new_unwatched("test").unwrap();
+    storage
+        .update(|rows, _| {
+            rows.iter_mut().find(|row| row.id == id).unwrap().trash();
+            Ok(())
+        })
+        .unwrap();
+    let state = native_state(&["test"]).await;
+    apply_published(&mut env.view, &state).await;
+    let requested = env.view.get_instance(&id).unwrap();
+    let body = DeleteSessionBody {
+        expected_trash: true,
+        expected_trashed_at: requested.trashed_at,
+        expected_generation: Some(requested.lifecycle_generation),
+        expected_trash_lifecycle_id: requested.trash_lifecycle_id.clone(),
+        ..Default::default()
+    };
+    assert!(body.expected_trash_lifecycle_id.is_some());
+    env.view.selected_session = Some(id.clone());
+    let mut respond = env.view.session_feed.request_driver_for_test();
+    let before = payload_bytes("test");
+    env.view
+        .delete_selected(&crate::tui::dialogs::DeleteOptions::default())
+        .unwrap();
+    assert_eq!(payload_bytes("test"), before);
+    let (status, headers, value) = request_with_headers(
+        &state,
+        "DELETE",
+        &format!("/api/sessions/{id}"),
+        serde_json::to_value(&body).unwrap(),
+    )
+    .await;
+    assert!(status.is_success(), "{status}: {value}");
+    let (submitted, request) = respond(Ok(SessionCommandOutcome::Purged(MutationReceipt {
+        cursor: super::pickers_groups_sort::receipt_cursor(&headers),
+        outcome: serde_json::from_value(value).unwrap(),
+    })))
+    .unwrap();
+    assert_eq!(submitted, id);
+    let SessionRequest::Purge(captured) = request else {
+        panic!("expected native purge");
+    };
+    assert_eq!(
+        serde_json::to_value(captured).unwrap(),
+        serde_json::to_value(body).unwrap()
+    );
+    env.view.apply_session_feed();
+    assert!(env.view.get_instance(&id).unwrap().is_trashed());
+    apply_published(&mut env.view, &state).await;
+    assert!(env.view.get_instance(&id).is_none());
+    assert!(!storage.load().unwrap().iter().any(|row| row.id == id));
+}
+
+/// Canonical failure history and stale removal consent are invalidated by a new UUID,
+/// even when a peer restore/re-trash reuses both the timestamp and generation.
+#[tokio::test]
+#[serial]
+async fn failed_purge_retry_identity_survives_storage_and_rejects_peer_retrash() {
+    use crate::daemon::DeleteSessionBody;
+    use crate::tui::session_feed::SessionRequest;
+
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instance_at(0).id.clone();
+    let storage = Storage::new_unwatched("test").unwrap();
+    storage
+        .update(|instances, _| {
+            let row = instances.iter_mut().find(|row| row.id == id).unwrap();
+            row.trash();
+            row.record_failed_purge(true);
+            Ok(())
+        })
+        .unwrap();
+    let state = native_state(&["test"]).await;
+    apply_published(&mut env.view, &state).await;
+    let mut respond = env.view.session_feed.request_driver_for_test();
+    let requested = env.view.get_instance(&id).unwrap().clone();
+    assert_eq!(
+        env.view
+            .session_feed
+            .applied_session(&id)
+            .unwrap()
+            .failed_purge_forced,
+        Some(true)
+    );
+    assert!(env.view.session_feed.can_submit(&id));
+    assert!(requested.trash_lifecycle_id.is_some());
+    assert_eq!(env.view.failed_delete_forced(&requested), Some(true));
+    let body = DeleteSessionBody {
+        expected_trash: true,
+        expected_trashed_at: requested.trashed_at,
+        expected_generation: Some(requested.lifecycle_generation),
+        expected_trash_lifecycle_id: requested.trash_lifecycle_id.clone(),
+        use_cleanup_defaults: true,
+        drop_failed: true,
+        ..Default::default()
+    };
+    env.view.empty_trash_all(false, true);
+    assert_eq!(env.view.failed_delete_forced(&requested), None);
+    storage
+        .update(|instances, _| {
+            let peer = instances.iter_mut().find(|row| row.id == id).unwrap();
+            peer.untrash();
+            peer.trash();
+            peer.trashed_at = requested.trashed_at;
+            peer.lifecycle_generation = requested.lifecycle_generation;
+            // A stale durable marker must not authorize this newly identified lifecycle.
+            peer.failed_purge = requested.failed_purge.clone();
+            Ok(())
+        })
+        .unwrap();
+    let peer_state = native_state(&["test"]).await;
+    let before = payload_bytes("test");
+    let (status, _, value) = request_with_headers(
+        &peer_state,
+        "DELETE",
+        &format!("/api/sessions/{id}"),
+        serde_json::to_value(&body).unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{value}");
+    assert_eq!(
+        payload_bytes("test"),
+        before,
+        "stale consent must not write storage"
+    );
+    let (submitted, request) = respond(Err(value.to_string())).unwrap();
+    assert_eq!(submitted, id);
+    let SessionRequest::Purge(captured) = request else {
+        panic!("expected native purge");
+    };
+    assert_eq!(
+        serde_json::to_value(captured).unwrap(),
+        serde_json::to_value(&body).unwrap()
+    );
+    env.view.apply_session_feed();
+    assert_eq!(
+        env.view.get_instance(&id).unwrap().trash_lifecycle_id,
+        requested.trash_lifecycle_id,
+        "a rejected ACK cannot project peer metadata before a snapshot"
+    );
+    apply_published(&mut env.view, &peer_state).await;
+    assert!(env.view.session_feed.can_submit(&id));
+    assert_eq!(
+        env.view
+            .session_feed
+            .applied_session(&id)
+            .unwrap()
+            .failed_purge_forced,
+        None
+    );
+    let current = env.view.get_instance(&id).unwrap();
+    assert_eq!(current.trashed_at, requested.trashed_at);
+    assert_eq!(current.lifecycle_generation, requested.lifecycle_generation);
+    assert_ne!(current.trash_lifecycle_id, requested.trash_lifecycle_id);
+    assert_eq!(env.view.failed_delete_forced(current), None);
+    env.view.prompt_empty_trash();
+    assert!(env
+        .view
+        .confirm_dialog
+        .as_ref()
+        .unwrap()
+        .checkbox_labels_for_test()
+        .is_empty());
+}
+
+/// Shelf bulk actions submit daemon mutations after confirmation. Receipts leave the
+/// displayed rows unchanged until publication; restore actions untrash or unarchive
+/// every row of their section.
 #[tokio::test]
 #[serial]
 async fn empty_trash_confirm_purges_every_trashed_row() {
@@ -990,6 +1166,12 @@ async fn empty_trash_confirm_purges_every_trashed_row() {
                                 .unwrap()
                                 .lifecycle_generation,
                         ),
+                        expected_trash_lifecycle_id: view
+                            .session_feed
+                            .applied_session(id)
+                            .unwrap()
+                            .trash_lifecycle_id
+                            .clone(),
                         ..Default::default()
                     })
                     .unwrap(),
@@ -1001,7 +1183,8 @@ async fn empty_trash_confirm_purges_every_trashed_row() {
                     serde_json::json!({}),
                 )
             };
-            let (status, headers, value) = request_with_headers(&state, method, &path, body).await;
+            let (status, headers, value) =
+                request_with_headers(&state, method, &path, body.clone()).await;
             assert!(status.is_success(), "{status}: {value}");
             let cursor = super::pickers_groups_sort::receipt_cursor(&headers);
             let outcome = if purge {
@@ -1017,11 +1200,14 @@ async fn empty_trash_confirm_purges_every_trashed_row() {
             };
             let (submitted, request) = respond(Ok(outcome)).unwrap();
             assert_eq!(&submitted, id);
-            assert!(if purge {
-                matches!(request, SessionRequest::Purge(_))
+            if purge {
+                let SessionRequest::Purge(captured) = request else {
+                    panic!("expected native purge");
+                };
+                assert_eq!(serde_json::to_value(captured).unwrap(), body);
             } else {
-                matches!(request, SessionRequest::Restore)
-            });
+                assert!(matches!(request, SessionRequest::Restore));
+            }
         }
         view.apply_session_feed();
         assert!(ids

@@ -28,12 +28,21 @@ pub(crate) async fn purge_session_artifacts(
     }
     let profile = instance.source_profile.clone();
     anyhow::ensure!(!profile.is_empty(), "Session has no source profile");
-    let consent = body.expected_trashed_at.zip(body.expected_generation).map(
-        |(trashed_at, lifecycle_generation)| crate::session::deletion::TrashPurgeConsent {
-            trashed_at,
-            lifecycle_generation,
-            force_failed: body.force_failed,
-        },
+    let consent = body
+        .expected_trashed_at
+        .zip(body.expected_generation)
+        .zip(body.expected_trash_lifecycle_id.as_ref())
+        .map(|((trashed_at, lifecycle_generation), trash_lifecycle_id)| {
+            crate::session::deletion::TrashPurgeConsent {
+                trashed_at,
+                trash_lifecycle_id: trash_lifecycle_id.clone(),
+                lifecycle_generation,
+                force_failed: body.force_failed,
+            }
+        });
+    anyhow::ensure!(
+        !body.expected_trash || consent.is_some(),
+        crate::session::LifecycleReservationError::Superseded
     );
     if body.drop_failed {
         let consent = consent.ok_or(crate::session::LifecycleReservationError::Superseded)?;
@@ -513,6 +522,9 @@ pub(crate) async fn purge_expired_trash(state: &Arc<AppState>) {
             force_delete: true,
             keep_scratch: false,
             expected_trash: true,
+            expected_trashed_at: instance.trashed_at,
+            expected_trash_lifecycle_id: instance.trash_lifecycle_id.clone(),
+            expected_generation: Some(instance.lifecycle_generation),
             use_cleanup_defaults: false,
             ..Default::default()
         };
@@ -558,14 +570,16 @@ pub async fn delete_session(
         return crate::server::api::read_only_response();
     }
     let body = body.map(|Json(body)| body).unwrap_or_default();
-    if body.expected_trashed_at.is_some() != body.expected_generation.is_some()
-        || ((body.force_failed || body.drop_failed)
-            && (!body.expected_trash || body.expected_trashed_at.is_none()))
+    let has_consent = body.expected_trashed_at.is_some();
+    if has_consent != body.expected_generation.is_some()
+        || has_consent != body.expected_trash_lifecycle_id.is_some()
+        || (body.expected_trash && !has_consent)
+        || ((body.force_failed || body.drop_failed) && (!body.expected_trash || !has_consent))
     {
         return api_error(
             StatusCode::BAD_REQUEST,
             "invalid_trash_consent",
-            "Trash escalation requires a selected trash timestamp and lifecycle generation",
+            "Trash consent requires a selected trash timestamp, UUID, and lifecycle generation",
         );
     }
     if body.use_cleanup_defaults

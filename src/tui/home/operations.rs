@@ -358,17 +358,32 @@ impl HomeView {
             ));
             return Ok(());
         }
-        self.session_feed.submit_request(
-            id,
-            crate::tui::session_feed::SessionRequest::Purge(crate::daemon::DeleteSessionBody {
-                delete_worktree: options.delete_worktree,
-                delete_branch: options.delete_branch,
-                delete_sandbox: options.delete_sandbox,
-                force_delete: options.force_delete,
-                keep_scratch: options.keep_scratch,
-                ..Default::default()
-            }),
-        )
+        let mut body = crate::daemon::DeleteSessionBody {
+            delete_worktree: options.delete_worktree,
+            delete_branch: options.delete_branch,
+            delete_sandbox: options.delete_sandbox,
+            force_delete: options.force_delete,
+            keep_scratch: options.keep_scratch,
+            ..Default::default()
+        };
+        if let Some(row) = self.session_feed.applied_session(&id) {
+            if let Some(stamp) = row.trashed_at.as_ref() {
+                body.expected_trash = true;
+                body.expected_trashed_at =
+                    Some(chrono::DateTime::parse_from_rfc3339(stamp)?.with_timezone(&chrono::Utc));
+                body.expected_generation = Some(row.lifecycle_generation);
+                body.expected_trash_lifecycle_id = Some(
+                    row.trash_lifecycle_id
+                        .as_ref()
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("Canonical trash identity is not available")
+                        })?
+                        .clone(),
+                );
+            }
+        }
+        self.session_feed
+            .submit_request(id, crate::tui::session_feed::SessionRequest::Purge(body))
     }
 
     pub(super) fn delete_selected_group(&mut self) -> anyhow::Result<()> {
@@ -881,6 +896,9 @@ impl HomeView {
             let Some(row) = self.session_feed.applied_session(&instance.id) else {
                 continue;
             };
+            let Some(trash_lifecycle_id) = row.trash_lifecycle_id.as_ref() else {
+                continue;
+            };
             let Some(stamp) = row
                 .trashed_at
                 .as_ref()
@@ -895,6 +913,7 @@ impl HomeView {
                     expected_trash: true,
                     expected_trashed_at: Some(stamp),
                     expected_generation: Some(row.lifecycle_generation),
+                    expected_trash_lifecycle_id: Some(trash_lifecycle_id.clone()),
                     use_cleanup_defaults: true,
                     force_failed,
                     drop_failed,

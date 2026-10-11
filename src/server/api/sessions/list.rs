@@ -640,6 +640,7 @@ mod workspace_ordering_tests {
                 delete_to_trash: true,
             },
             trashed_at: None,
+            trash_lifecycle_id: None,
             failed_purge_forced: None,
             remote_owner: None,
             remote_owner_key: None,

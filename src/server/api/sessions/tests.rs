@@ -7650,11 +7650,49 @@ async fn failed_forced_trash_drop_requires_selected_identity_and_returns_receipt
         crate::server::reload::load_all_profiles(&state.file_watch)
             .unwrap()
             .metadata;
-    for (marker, generation, trashed_at, status) in [
-        (None, Some(4), row.trashed_at, StatusCode::CONFLICT),
-        (Some(false), Some(4), row.trashed_at, StatusCode::CONFLICT),
-        (Some(true), None, row.trashed_at, StatusCode::BAD_REQUEST),
-        (Some(true), Some(4), None, StatusCode::BAD_REQUEST),
+    for (marker, generation, trashed_at, identity, status) in [
+        (
+            None,
+            Some(4),
+            row.trashed_at,
+            row.trash_lifecycle_id.clone(),
+            StatusCode::CONFLICT,
+        ),
+        (
+            Some(false),
+            Some(4),
+            row.trashed_at,
+            row.trash_lifecycle_id.clone(),
+            StatusCode::CONFLICT,
+        ),
+        (
+            Some(true),
+            None,
+            row.trashed_at,
+            row.trash_lifecycle_id.clone(),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            Some(true),
+            Some(4),
+            None,
+            row.trash_lifecycle_id.clone(),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            Some(true),
+            Some(4),
+            row.trashed_at,
+            None,
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            Some(true),
+            Some(4),
+            row.trashed_at,
+            Some(uuid::Uuid::new_v4().to_string()),
+            StatusCode::CONFLICT,
+        ),
     ] {
         let worker_state = state.clone();
         let id = row.id.clone();
@@ -7688,6 +7726,7 @@ async fn failed_forced_trash_drop_requires_selected_identity_and_returns_receipt
             Some(Json(DeleteSessionBody {
                 expected_trash: true,
                 expected_trashed_at: trashed_at,
+                expected_trash_lifecycle_id: identity.clone(),
                 expected_generation: generation,
                 drop_failed: true,
                 ..Default::default()
@@ -7733,6 +7772,7 @@ async fn failed_forced_trash_drop_requires_selected_identity_and_returns_receipt
             Some(Json(DeleteSessionBody {
                 expected_trash: true,
                 expected_trashed_at: row.trashed_at,
+                expected_trash_lifecycle_id: row.trash_lifecycle_id.clone(),
                 expected_generation: Some(generation),
                 drop_failed: true,
                 ..Default::default()
@@ -7777,4 +7817,79 @@ async fn failed_forced_trash_drop_requires_selected_identity_and_returns_receipt
             );
         }
     }
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn same_timestamp_retrash_rejects_stale_force_and_drop_consent() -> anyhow::Result<()> {
+    let _home = crate::session::test_support::isolate_app_dir();
+    crate::session::purge_owners::initialize(&crate::session::get_app_dir()?)?;
+    let profile = "same-clock-trash-consent";
+    let mut selected = Instance::new("selected trash", "");
+    let root = crate::session::scratch::provision_scratch_dir(&selected.id)?;
+    selected.project_path = root.to_string_lossy().into_owned();
+    selected.scratch = true;
+    selected.source_profile = profile.into();
+    selected.view = crate::session::View::Structured;
+    selected.trash();
+    selected.lifecycle_generation = 4;
+    selected.record_failed_purge(true);
+    let mut current = selected.clone();
+    current.untrash();
+    current.trash();
+    current.trashed_at = selected.trashed_at;
+    current.record_failed_purge(true);
+    assert_ne!(current.trash_lifecycle_id, selected.trash_lifecycle_id);
+    let payload = root.join("retained-files");
+    std::fs::write(&payload, b"same-clock retrash survives")?;
+    crate::server::test_support::seed_instances_on_disk_for_test(profile, vec![current.clone()]);
+    let state = crate::server::test_support::build_test_app_state(vec![current.clone()]);
+    *state.canonical_metadata.write().await =
+        crate::server::reload::load_all_profiles(&state.file_watch)?.metadata;
+    let storage = Storage::open_unwatched(profile)?;
+    let before = std::fs::read(storage.sessions_path())?;
+    for drop_failed in [false, true] {
+        let response = delete_session(
+            State(state.clone()),
+            Path(selected.id.clone()),
+            Some(Json(DeleteSessionBody {
+                expected_trash: true,
+                expected_trashed_at: selected.trashed_at,
+                expected_trash_lifecycle_id: selected.trash_lifecycle_id.clone(),
+                expected_generation: Some(selected.lifecycle_generation),
+                force_failed: !drop_failed,
+                drop_failed,
+                use_cleanup_defaults: true,
+                ..Default::default()
+            })),
+        )
+        .await
+        .into_response();
+        if drop_failed {
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+        } else {
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+            let outcome: crate::daemon::PurgeOutcome = serde_json::from_slice(&bytes)?;
+            assert!(matches!(
+                outcome,
+                crate::daemon::PurgeOutcome::Kept {
+                    teardown_started: false,
+                    ..
+                }
+            ));
+        }
+        assert_eq!(std::fs::read(storage.sessions_path())?, before);
+        assert_eq!(std::fs::read(&payload)?, b"same-clock retrash survives");
+        let snapshot = state.runtime.snapshot(&state).await?;
+        assert_eq!(
+            snapshot.value.contents.sessions[0].trash_lifecycle_id,
+            current.trash_lifecycle_id
+        );
+        assert_eq!(
+            snapshot.value.contents.sessions[0].failed_purge_forced,
+            Some(true)
+        );
+    }
+    Ok(())
 }

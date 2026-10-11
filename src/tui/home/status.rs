@@ -283,6 +283,7 @@ impl HomeView {
                 || instance.agent_session_id != row.agent_session_id
                 || instance.lifecycle_generation != row.lifecycle_generation
                 || instance.lifecycle_reservation != row.lifecycle_reservation
+                || instance.trash_lifecycle_id != row.trash_lifecycle_id
                 || instance.title != row.title
                 || instance.group_path != row.group_path
                 || instance.source_profile != row.profile
@@ -492,6 +493,9 @@ impl HomeView {
             instance
                 .lifecycle_reservation
                 .clone_from(&row.lifecycle_reservation);
+            instance
+                .trash_lifecycle_id
+                .clone_from(&row.trash_lifecycle_id);
             instance.agent_pane.clone_from(&row.agent_pane);
             instance.auxiliary.clone_from(&row.auxiliary);
             instance.unread = row.unread;

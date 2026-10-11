@@ -528,7 +528,9 @@ never falls back to editing the profile directory directly.
 Purge refuses unresolved runner ownership before committing deletion. The row
 and its resources remain available for repair and retry.
 
-Selected-trash actions include `expected_trashed_at` and `expected_generation`.
+Selected-trash actions include `expected_trashed_at`, `expected_generation` and
+`expected_trash_lifecycle_id`. The durable identity distinguishes restore/retrash
+even when timestamps coincide.
 `force_failed` permits escalation only after a recorded failure for that exact
 selection. `drop_failed` removes the row only after a forced failure for the same
 selection; it retains worktree files. Restore or a new lifecycle generation

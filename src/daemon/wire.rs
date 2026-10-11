@@ -520,6 +520,8 @@ pub struct DeleteSessionBody {
     #[serde(default)]
     pub expected_trashed_at: Option<chrono::DateTime<chrono::Utc>>,
     #[serde(default)]
+    pub expected_trash_lifecycle_id: Option<String>,
+    #[serde(default)]
     pub expected_generation: Option<u64>,
     /// Retry a recorded failed purge with force.
     #[serde(default)]
@@ -945,6 +947,9 @@ pub struct SessionResponse {
     /// and permanent-delete actions. See #2489.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trashed_at: Option<String>,
+    /// Durable UUID of this trash lifecycle, changed by every restore/retrash.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trash_lifecycle_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failed_purge_forced: Option<bool>,
     /// Unread marker, mirroring `Instance::unread`: `true` when the session

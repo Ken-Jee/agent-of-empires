@@ -1291,15 +1291,17 @@ async fn daemon_trash_restore_purge_preserves_collisions_and_allows_retry() {
         .json()
         .await
         .unwrap();
-    let holding = PathBuf::from(
-        &moved
-            .contents
-            .sessions
-            .iter()
-            .find(|row| row.id == id)
-            .unwrap()
-            .project_path,
-    );
+    let moved_row = moved
+        .contents
+        .sessions
+        .iter()
+        .find(|row| row.id == id)
+        .unwrap();
+    let first_trash_lifecycle_id = moved_row
+        .trash_lifecycle_id
+        .as_ref()
+        .expect("trash snapshot must expose its durable identity");
+    let holding = PathBuf::from(&moved_row.project_path);
     assert!(!worktree.exists());
     assert_eq!(
         std::fs::read_to_string(holding.join("payload.txt")).unwrap(),
@@ -1354,6 +1356,7 @@ async fn daemon_trash_restore_purge_preserves_collisions_and_allows_retry() {
         .find(|row| row.id == id)
         .unwrap();
     assert!(row.trashed_at.is_none());
+    assert!(row.trash_lifecycle_id.is_none());
     assert_eq!(row.status, Status::Stopped.wire_str());
     assert_eq!(std::path::Path::new(&row.project_path), worktree);
     assert!(!holding.exists());
@@ -1388,6 +1391,11 @@ async fn daemon_trash_restore_purge_preserves_collisions_and_allows_retry() {
         .find(|row| row.id == id)
         .unwrap();
     assert!(row.trashed_at.is_some());
+    assert!(row.trash_lifecycle_id.is_some());
+    assert_ne!(
+        row.trash_lifecycle_id.as_ref(),
+        Some(first_trash_lifecycle_id)
+    );
     assert_eq!(std::path::Path::new(&row.project_path), worktree);
     use agent_of_empires::daemon::{
         ApiErrorCode, DaemonClientError, DeleteSessionBody, PurgeOutcome, RuntimeFrame,
@@ -1406,6 +1414,14 @@ async fn daemon_trash_restore_purge_preserves_collisions_and_allows_retry() {
             &id,
             &DeleteSessionBody {
                 delete_worktree: true,
+                expected_trash: true,
+                expected_trashed_at: Some(
+                    chrono::DateTime::parse_from_rfc3339(row.trashed_at.as_ref().unwrap())
+                        .unwrap()
+                        .with_timezone(&chrono::Utc),
+                ),
+                expected_generation: Some(row.lifecycle_generation),
+                expected_trash_lifecycle_id: row.trash_lifecycle_id.clone(),
                 ..Default::default()
             },
             &epoch,
@@ -1445,13 +1461,22 @@ async fn daemon_trash_restore_purge_preserves_collisions_and_allows_retry() {
     assert_eq!(retained.status, Status::Error.wire_str());
     assert!(retained.lifecycle_reservation.is_none());
     assert_eq!(retained.failed_purge_forced, Some(false));
+    assert_eq!(retained.trash_lifecycle_id, row.trash_lifecycle_id);
     let receipt = sdk
         .purge_session(
             &id,
             &DeleteSessionBody {
                 delete_worktree: true,
                 delete_branch: true,
-                force_delete: true,
+                force_failed: true,
+                expected_trash: true,
+                expected_trashed_at: Some(
+                    chrono::DateTime::parse_from_rfc3339(retained.trashed_at.as_ref().unwrap())
+                        .unwrap()
+                        .with_timezone(&chrono::Utc),
+                ),
+                expected_generation: Some(retained.lifecycle_generation),
+                expected_trash_lifecycle_id: retained.trash_lifecycle_id.clone(),
                 ..Default::default()
             },
             &epoch,
