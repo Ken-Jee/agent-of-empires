@@ -1520,10 +1520,11 @@ async fn add_project_admission_refuses_second_attach_until_canonical_completion(
             .find(|row| row.id == id)
             .unwrap();
         if succeeds {
+            let incoming_path = incoming.path().canonicalize().unwrap();
             assert!(stored
                 .all_repos()
                 .iter()
-                .any(|repo| std::path::Path::new(&repo.main_repo_path) == incoming.path()));
+                .any(|repo| std::path::Path::new(&repo.main_repo_path) == incoming_path));
             for repo in stored.all_repos() {
                 assert!(std::path::Path::new(&repo.worktree_path)
                     .join(".git")
@@ -1599,10 +1600,11 @@ async fn attach_project_receipts_publish_real_git_and_release_admission() {
             .find(|row| row.id == id)
             .unwrap();
         if succeeds {
+            let incoming_path = incoming.path().canonicalize().unwrap();
             assert!(stored
                 .all_repos()
                 .iter()
-                .any(|repo| std::path::Path::new(&repo.main_repo_path) == incoming.path()));
+                .any(|repo| std::path::Path::new(&repo.main_repo_path) == incoming_path));
             for repo in stored.all_repos() {
                 assert!(std::path::Path::new(&repo.worktree_path)
                     .join(".git")

@@ -411,7 +411,7 @@ fn plan_conversion(
 }
 
 /// Validate an attachment without filesystem changes or persistence.
-/// Callers quiesce moving sessions before [`attach_planned`] revalidates the plan.
+/// Callers quiesce moving sessions before the plan is revalidated at commit.
 pub fn plan(
     instance: &super::Instance,
     profile: &str,
@@ -966,12 +966,10 @@ pub fn needs_restart(plan: &AttachPlan, is_sandboxed: bool) -> bool {
     plan.moves_session || is_sandboxed
 }
 
-/// What [`quiesce_for_conversion`] took down, so [`resume_after_conversion`]
-/// puts back exactly that and nothing else.
+/// Resources stopped by conversion and restored when it completes.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Quiesced {
-    /// A structured worker was signalled to stop. Its restart marker is
-    /// deliberately not written here; see [`quiesce_for_conversion`].
+    /// The structured worker was stopped; its restart marker is committed after the move.
     pub worker_was_running: bool,
     /// Generation of the stopped worker, so the restart marker written after
     /// the move authorizes only that runner's respawn.

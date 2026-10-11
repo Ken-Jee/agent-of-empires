@@ -294,6 +294,10 @@ impl Instance {
     pub(crate) fn uses_pi_session_sidecar(&self) -> bool {
         self.pi_sidecar_source().is_some_and(|source| {
             self.pi_extension_launched
+                || self
+                    .active_execution
+                    .as_ref()
+                    .is_some_and(|active| matches!(active.capture, Some(CaptureContext::Pi { .. })))
                 || source
                     .read_file(&self.id, "session_id", SESSION_SIDECAR_MAX_BYTES, None)
                     .is_some()
@@ -631,6 +635,91 @@ mod tests {
             Some("01a053b6-c470-78de-9d8f-bc00ef05332a"),
             "and the final flush must read it"
         );
+    }
+    #[test]
+    #[serial_test::serial]
+    fn reloaded_pi_stop_flushes_only_its_scoped_child_transcript() {
+        let (_hooks, _base, _hooks_tmp) = crate::hooks::test_support::BaseGuard::ready();
+        let home = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(home.path());
+        let root = home.path().canonicalize().unwrap();
+        let profile = "pi-scoped-stop";
+        let sid = "01a053b6-c470-78de-9d8f-bc00ef05332a";
+        let launch = "22222222-3333-4333-8444-555555555555";
+        let mut inst = tool_instance("pi", root.to_str().unwrap());
+        inst.source_profile = profile.into();
+        let source = SessionSidecarSource::host_hooks(&inst.id);
+        let binding = crate::session::ExecutionBinding {
+            agent: "pi".into(),
+            stores: vec![root.clone()],
+            configuration: Vec::new(),
+            cwd: root.clone(),
+            cwd_filesystem: "host".into(),
+            filesystem: "host".into(),
+            exported_default_store: None,
+        };
+        inst.active_execution = Some(ActiveExecution {
+            launch_id: launch.into(),
+            binding: binding.clone(),
+            capture: Some(CaptureContext::Pi {
+                source,
+                root: root.clone(),
+            }),
+            container: None,
+        });
+        inst.set_agent_conversation(
+            Some(sid.into()),
+            Some(crate::session::ConversationBinding {
+                session_id: sid.into(),
+                execution: Some(binding),
+                provenance: crate::session::ConversationProvenance::Preallocated,
+                transcript_path: None,
+            }),
+            None,
+        );
+        let storage = crate::session::storage::Storage::new_unwatched(profile).unwrap();
+        storage
+            .update(|rows, _| {
+                rows.push(inst.clone());
+                Ok(())
+            })
+            .unwrap();
+        let reloaded = storage.load().unwrap().remove(0);
+        assert!(!reloaded.pi_extension_launched);
+        assert!(reloaded.supports_session_poller());
+        assert!(reloaded.final_publication_observation().is_none());
+        let sidecar = crate::hooks::ensure_instance_dir_path(&inst.id).unwrap();
+        crate::hooks::write_session_id_via_guard(&inst.id, sid, Some(launch)).unwrap();
+        let id_only = reloaded.final_publication_observation().unwrap();
+        assert_eq!(id_only.sid, sid);
+        assert!(id_only.transcript_path.is_none());
+        let child = root.join(format!("child_{sid}.jsonl"));
+        std::fs::write(
+            &child,
+            format!("{{\"type\":\"session\",\"id\":\"{sid}\"}}\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            sidecar.join(format!("session_path.{launch}")),
+            child.to_str().unwrap(),
+        )
+        .unwrap();
+        let parent =
+            publish_host_pi_transcript(&inst.id, "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa", &root);
+        let parent_bytes = std::fs::read(&parent).unwrap();
+        reloaded.stop().unwrap();
+        let stopped = storage.load().unwrap().remove(0);
+        assert_eq!(stopped.status, Status::Stopped);
+        assert_eq!(stopped.agent_session_id.as_deref(), Some(sid));
+        let observed = stopped.agent_session_binding.unwrap();
+        assert_eq!(
+            observed.provenance,
+            crate::session::ConversationProvenance::Observed
+        );
+        assert_eq!(observed.transcript_path.as_ref(), Some(&child));
+        assert_eq!(stopped.pi_session_path.as_deref(), child.to_str());
+        assert_eq!(std::fs::read(parent).unwrap(), parent_bytes);
+        assert!(!sidecar.exists());
     }
 
     #[test]

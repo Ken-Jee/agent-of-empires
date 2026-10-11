@@ -725,9 +725,7 @@ pub struct Instance {
     pub(crate) capture_started_at: Option<std::time::SystemTime>,
 
     /// Set when this pane's launch line carried the Pi session-id extension.
-    /// Runtime only: after an AoE restart the pane is still running with it,
-    /// and the sidecar it wrote is what says so (see
-    /// `uses_pi_session_sidecar`).
+    /// After reload, the recorded Pi capture context admits its scoped publisher.
     #[serde(skip)]
     pi_extension_launched: bool,
     #[serde(skip)]

@@ -590,7 +590,7 @@ See [Tool Sessions](tool-sessions.md) for the full reference, hotkey rules, and 
 
 ## Profiles
 
-Profiles provide separate workspaces with their own sessions and groups. Each profile can override any of the settings above.
+Profiles provide separate workspaces with their own sessions and groups. Each profile can override any of the settings above. Press `P` in the TUI to choose from the last applied daemon profile list. Reopen the picker to see changes synchronized after it opened. If the selected profile disappears, its filter stays selected; choose `all` to display the remaining profiles.
 
 ```bash
 aoe                 # Uses "default" profile

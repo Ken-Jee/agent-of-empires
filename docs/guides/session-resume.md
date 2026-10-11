@@ -91,30 +91,6 @@ Automatic capture then takes over where supported. The abandoned conversation st
 
 Structured-view conversations remain managed by ACP. For a Claude terminal handoff, AoE records the native execution resolved for the current ACP ID. A handoff whose store cannot be resolved, or which the structured worker does not share, is refused before worker teardown with recovery guidance. Other structured resume-target changes are rejected.
 
-## Swapping the engine on a restart
-
-The restart dialog can change the tool a session runs. Session IDs live in
-per-agent namespaces, so swapping to a different agent parks the outgoing
-agent's conversation under its own tool name and starts a new one; swapping
-back restores what was parked.
-
-Two tool names can also point at the same agent on different accounts, through
-`[session.agent_config_dir]`. That swap changes the agent's config root, so the
-conversation is still on disk but under the account you swapped away from. AoE
-carries it across: it copies the transcript into the incoming account's config
-root so the agent resumes where it left off, and the row keeps its conversation
-ID, its model, and its effort setting, since none of those changed agent.
-
-The carry applies only when the new tool resolves to the same built-in agent,
-the session has a conversation to carry, and AoE knows the agent's transcript
-layout (Claude Code today). Anything else takes the parking swap above.
-
-The outgoing account keeps its own copy, so swapping accounts back and forth
-stays continuous: the account you swap away from is the one that was just
-running, so on the way back its transcript replaces the older copy the earlier
-swap left behind. A copy the incoming account wrote more recently than the
-outgoing one is left alone.
-
 ## Forking a session
 
 A fork starts a new, independent session from an existing session's conversation, so you can take the same history in a different direction. Only the fork is new: the original session and its transcript are untouched.
@@ -129,7 +105,7 @@ The child gets its own AoE ID and native conversation. The parent row and transc
 
 Forking needs an agent that can branch a conversation: claude, codex, opencode, and pi in the supported managed contexts, and the Claude adapter for structured sessions. Resume-only agents (gemini, vibe, copilot) and agents without resume in AoE (cursor, droid, kiro, qwen) hide or refuse the action.
 
-Pi terminal forks require the same working directory and an attested host `pi` on `PATH` that supports both `--fork` and `--session-id`. AoE assigns the child id before launch. A sandboxed Pi, an unattestable wrapper, or a Pi without either flag refuses the fork rather than creating an untracked conversation. The child copies the parent's saved transcript, starting from the last persisted message. Forking into a new worktree is not supported for Pi.
+Pi terminal forks require the same working directory and an attested host `pi` on `PATH` that supports both `--fork` and `--session-id`. AoE assigns the child id before launch. A sandboxed Pi, an unattestable wrapper, or a Pi without either flag refuses the fork rather than creating an untracked conversation. The child copies the parent's saved transcript, starting from the last persisted message. Stopping the child saves its launch-scoped transcript before clearing publication evidence; later starts resume that exact child rather than forking the parent again. Forking into a new worktree is not supported for Pi.
 
 ## Swapping the engine on a restart
 

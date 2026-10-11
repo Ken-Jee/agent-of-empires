@@ -1300,14 +1300,22 @@ mod tests {
                 .unwrap();
         assert!(result.unwrap().success());
         let pid: i32 = std::fs::read_to_string(pid_path).unwrap().parse().unwrap();
-        let output = Command::new("ps")
-            .args(["-o", "stat=", "-p", &pid.to_string()])
-            .output()
-            .unwrap();
-        let state = String::from_utf8_lossy(&output.stdout);
-        let running = output.status.success()
-            && !state.trim().is_empty()
-            && !state.trim_start().starts_with('Z');
+        // Signalling the group precedes the descendants' exit transition.
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let running = loop {
+            let output = Command::new("ps")
+                .args(["-o", "stat=", "-p", &pid.to_string()])
+                .output()
+                .unwrap();
+            let state = String::from_utf8_lossy(&output.stdout);
+            let running = output.status.success()
+                && !state.trim().is_empty()
+                && !state.trim_start().starts_with('Z');
+            if !running || Instant::now() >= deadline {
+                break running;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
         if running {
             let _ = nix::sys::signal::kill(
                 nix::unistd::Pid::from_raw(pid),
