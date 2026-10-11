@@ -24,6 +24,9 @@ fn saving_during_creation_never_persists_the_display_placeholder() {
     let stub = view.creating_stub_id.clone().unwrap();
     let storage = Storage::new_unwatched("default").unwrap();
     let before = payload_bytes("default");
+    let creations = crate::session::config::AppStateConfig::load()
+        .unwrap()
+        .sessions_created;
     view.reload().unwrap();
     assert!(!storage.load().unwrap().iter().any(|row| row.id == stub));
     assert!(
@@ -40,6 +43,13 @@ fn saving_during_creation_never_persists_the_display_placeholder() {
     assert_eq!(payload_bytes("default"), before);
     assert!(!storage.load().unwrap().iter().any(|row| row.id == stub));
     assert!(view.get_instance(&stub).is_none());
+    assert_eq!(
+        crate::session::config::AppStateConfig::load()
+            .unwrap()
+            .sessions_created,
+        creations,
+        "a cancelled display stub is not a committed creation"
+    );
 }
 
 #[test]
@@ -365,6 +375,11 @@ fn creation_receipt_waits_for_applied_snapshot_and_retries_profile_loading_witho
                 Ok(())
             })
             .unwrap();
+        // The daemon counted its commit before emitting the receipt; the consumer must not count it again.
+        crate::tips::record_session_creations(1);
+        let creations = crate::session::config::AppStateConfig::load()
+            .unwrap()
+            .sessions_created;
         let path = storage.sessions_path().to_path_buf();
         let valid = std::fs::read(&path).unwrap();
         assert_eq!(
@@ -419,6 +434,13 @@ fn creation_receipt_waits_for_applied_snapshot_and_retries_profile_loading_witho
         assert!(
             view.apply_creation_results().is_none(),
             "confirmation emits exactly one id"
+        );
+        assert_eq!(
+            crate::session::config::AppStateConfig::load()
+                .unwrap()
+                .sessions_created,
+            creations,
+            "receipt retries and repeat ticks never double-count the daemon commit"
         );
     }
 }

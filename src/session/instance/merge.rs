@@ -405,6 +405,7 @@ impl Instance {
         }
         if pre.trashed_at != post.trashed_at {
             self.trashed_at = post.trashed_at;
+            self.failed_purge = None;
         }
         if pre.pre_trash_project_path != post.pre_trash_project_path {
             self.pre_trash_project_path = post.pre_trash_project_path.clone();

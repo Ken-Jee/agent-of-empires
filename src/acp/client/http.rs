@@ -83,6 +83,12 @@ pub enum HttpError {
     ReadOnly,
     #[error("reviving the session is required to accept this prompt; retry without --no-revive")]
     RevivalRequired,
+    #[error("Auto-name skipped: the session changed or no title could be applied")]
+    SmartRenameSkipped,
+    #[error("The naming agent failed; check its availability and try again")]
+    SmartRenameFailed,
+    #[error("Auto-name timed out; other sessions may be naming. Try again shortly")]
+    SmartRenameTimeout,
     // A 401 can mean token, passphrase or device authentication failed.
     #[error("daemon rejected the request (401); restart `aoe serve` or check `--auth` mode")]
     Unauthorized,
@@ -434,17 +440,16 @@ impl HttpClient {
         Ok(())
     }
 
-    /// `POST /api/sessions/{id}/smart-rename`: on-demand "Auto-name now" for a
-    /// structured session. The daemon forces past the `smart_rename`-disabled
-    /// gate and runs the one-shot detached; a 2xx means "started", not
-    /// "renamed" (the new title arrives over the structured-view WS).
+    /// Wait for the one-shot and canonical title publication.
     pub async fn smart_rename(&self, session_id: &str) -> Result<(), HttpError> {
         let url = format!(
             "{}/api/sessions/{}/smart-rename",
             self.endpoint.base_url,
             path_segment(session_id)?
         );
-        let res = self.execute(self.http.post(&url)).await?;
+        let timeout =
+            crate::session::smart_rename::RENAME_DEADLINE + std::time::Duration::from_secs(15);
+        let res = self.execute(self.http.post(&url).timeout(timeout)).await?;
         check_status(res, session_id)?;
         Ok(())
     }
@@ -837,6 +842,9 @@ fn status_error(res: &reqwest::Response, session_id: Option<&str>, resolving: bo
         (_, Some(ApiErrorCode::ReadOnly)) => HttpError::ReadOnly,
         (_, Some(ApiErrorCode::NoRevive)) => HttpError::RevivalRequired,
         (_, Some(ApiErrorCode::PendingTargetGone)) => HttpError::ApprovalGone,
+        (_, Some(ApiErrorCode::SmartRenameSkipped)) => HttpError::SmartRenameSkipped,
+        (_, Some(ApiErrorCode::SmartRenameFailed)) => HttpError::SmartRenameFailed,
+        (_, Some(ApiErrorCode::SmartRenameTimeout)) => HttpError::SmartRenameTimeout,
         (StatusCode::NOT_FOUND, _) if session_id.is_some() && !resolving => {
             HttpError::SessionNotFound(session_id.unwrap().to_owned())
         }
@@ -1264,6 +1272,46 @@ mod tests {
         let result = tokio::time::timeout(Duration::from_secs(1), client.health_check()).await;
         server.abort();
         assert!(matches!(result.unwrap(), Err(HttpError::ReadOnly)));
+    }
+
+    #[tokio::test]
+    async fn smart_rename_reports_fixed_errors_without_reflecting_daemon_content() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for (status, code) in [
+            (409, "smart_rename_skipped"),
+            (502, "smart_rename_failed"),
+            (504, "smart_rename_timeout"),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = [0; 4096];
+                assert!(stream.read(&mut request).await.unwrap() > 0);
+                let headers = format!(
+                    "HTTP/1.1 {status} Error\r\nAoE-Error-Code: {code}\r\nContent-Length: 100\r\n\r\n"
+                );
+                stream.write_all(headers.as_bytes()).await.unwrap();
+                stream
+                    .write_all(b"secret-provider-credential")
+                    .await
+                    .unwrap();
+                std::future::pending::<()>().await;
+            });
+            let client =
+                HttpClient::new(endpoint(&format!("http://{address}"), Some("secret"))).unwrap();
+            let result =
+                tokio::time::timeout(Duration::from_secs(1), client.smart_rename("session")).await;
+            server.abort();
+            let error = result.unwrap().unwrap_err();
+            assert!(matches!(
+                (status, &error),
+                (409, HttpError::SmartRenameSkipped)
+                    | (502, HttpError::SmartRenameFailed)
+                    | (504, HttpError::SmartRenameTimeout)
+            ));
+            assert!(!error.to_string().contains("secret-provider-credential"));
+        }
     }
 
     /// The request `attach_credential` would put on the wire, headers and all.

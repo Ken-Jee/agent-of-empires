@@ -139,6 +139,8 @@ The rename waits for the first turn to finish and titles from the whole transcri
 
 To name with a different agent than the session's own (for example, a cheaper title model), set `session.smart_rename_agent` to any installed one-shot-capable agent; leave it empty to use the session's agent. The same setting also picks the agent for the conversation-summary one-shot. **Auto-name now** in the sidebar, or `v` or the command palette in the TUI, runs on demand even when `session.smart_rename` is off and regenerates over the current title. Automatic rename never overwrites a manually chosen title.
 
+Manual structured rename waits for the result and reports a skipped operation, provider failure, or deadline expiry without exposing provider output. An unsuccessful rename leaves the existing title intact.
+
 The sidebar shows where each session stands: an `Auto-name` chip (sparkle) marks a session that is still default-named and will be renamed on its first message, and a `Naming…` chip (pulsing dot) shows while the one-shot title call is in flight. The chips disappear once the session is renamed or if it is not eligible.
 
 Two chips flag a session that has parked itself but is still alive, so an agent waiting on background work does not read as a dead idle session. A `⏰` countdown shows when the agent scheduled a wakeup (a `ScheduleWakeup` call or a `/loop` run) and ticks down to the fire time. A `👁 monitoring` badge shows when the agent armed a `Monitor` (a background watch, for example waiting for a build or `cargo clippy` to finish); it has no fixed end time, so it stays put while the monitor keeps re-invoking the agent and clears once you send the session a new prompt.

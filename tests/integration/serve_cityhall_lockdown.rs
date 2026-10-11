@@ -236,8 +236,9 @@ async fn sensitive_routes_are_blocked() {
         (Method::GET, "/api/plugins/details?source=gh%3Ao%2Fr", ""),
         (Method::GET, "/api/plugins/jobs/job-1", ""),
         (Method::GET, "/api/plugins/x/update/preview", ""),
-        // The import picker enumerates the user's own `claude` runs on disk.
-        (Method::GET, "/api/claude-sessions", ""),
+        // Import discovery exposes native session titles and paths for every agent.
+        (Method::GET, "/api/importable-sessions?agent=claude", ""),
+        (Method::GET, "/api/importable-sessions?agent=codex", ""),
     ];
     for (method, uri, body) in cases {
         assert_cityhall_blocked(method.clone(), uri, Body::from(*body)).await;

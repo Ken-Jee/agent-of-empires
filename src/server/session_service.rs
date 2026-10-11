@@ -146,14 +146,12 @@ fn queue_drain_batch<'a>(
     if queue.is_empty() {
         return (&[], String::new());
     }
-    let batch_end = if profile.clear_aliases.is_empty() {
-        queue.len()
-    } else if profile.is_clear_command(&queue[0].text) {
+    let batch_end = if profile.is_solo_command(&queue[0].text) {
         1
     } else {
         queue
             .iter()
-            .position(|e| profile.is_clear_command(&e.text))
+            .position(|e| profile.is_solo_command(&e.text))
             .unwrap_or(queue.len())
     };
     let sub = &queue[..batch_end];
@@ -722,74 +720,91 @@ impl SessionService {
     /// (#4081 review: a client-side liveness check before this call would
     /// race a concurrent archive, snooze, or wake).
     pub(crate) async fn touch_and_wake_on_prompt(&self, id: &str, no_revive: bool) -> PromptTouch {
-        let inst_lock = self.instance_lock(id).await;
-        let _guard = inst_lock.lock().await;
-        let (profile, wake, woke_idle_dormant) = {
-            let mut instances = self.instances.write().await;
-            let Some(inst) = instances.iter_mut().find(|i| i.id == id) else {
-                return PromptTouch::Touched {
-                    idle_dormant: false,
-                };
-            };
-            if let Err(blocked) = inst.ensure_startable() {
-                return PromptTouch::Blocked(blocked);
-            }
-            if inst.is_structured() && !inst.launch_is_finalized() {
-                return PromptTouch::WorkerNotReady;
-            }
-            let was_idle_dormant = inst.is_idle_dormant();
-            let wake = inst.is_snoozed() || was_idle_dormant;
-            if no_revive && wake {
-                return PromptTouch::RevivalRefused;
-            }
-            inst.touch_last_accessed();
-            self.invalidate_disk_snapshots();
-            if was_idle_dormant {
-                tracing::info!(
-                    target: "acp.supervisor",
-                    session = %id,
-                    "waking idle-dormant structured view session on prompt; spawning a fresh worker"
-                );
-            }
-            (inst.source_profile.clone(), wake, was_idle_dormant)
+        let Ok(state) = self.native_state() else {
+            return PromptTouch::WorkerNotReady;
         };
-        if let Ok(storage) = crate::session::Storage::new(&profile, self.file_watch.clone()) {
-            let id_clone = id.to_string();
-            let outcome = tokio::task::spawn_blocking(move || {
-                storage.update(|instances, _groups| {
-                    let Some(inst) = instances.iter_mut().find(|i| i.id == id_clone) else {
-                        return Ok(None);
-                    };
-                    // A peer (e.g. the CLI) may have archived or trashed the row since the
-                    // memory check; waking it here would clear that.
-                    if let Err(blocked) = inst.ensure_startable() {
-                        return Ok(Some(PromptTouch::Blocked(blocked)));
+        let namespace = state.profile_namespace.clone().read_owned().await;
+        let guard = self.instance_lock(id).await.lock_owned().await;
+        let (worker_id, profile, title, generation, provider, view) = {
+            let instances = self.instances.read().await;
+            let Some(row) = instances.iter().find(|row| row.id == id) else {
+                return PromptTouch::WorkerNotReady;
+            };
+            (
+                row.id.clone(),
+                row.source_profile.clone(),
+                row.title.clone(),
+                row.lifecycle_generation,
+                row.agent_provider.clone(),
+                row.view,
+            )
+        };
+        let result = tokio::task::spawn_blocking(move || -> anyhow::Result<PromptTouch> {
+            // A dropped request must not release exclusion before commit and adoption finish.
+            let _exclusion = (namespace, guard);
+            let _identity = crate::session::acquire_session_identity_lock()?;
+            let _title = crate::session::acquire_session_title_lock(&worker_id)?;
+            let native = super::session_store::NativeSessionStore::open(
+                state, &profile, Some(worker_id.clone()),
+            )?;
+            let store: &dyn crate::session::SessionStore = &native;
+            let _lifecycle = store.storage().acquire_instance_lifecycle_lock(&worker_id)?;
+            let mut refused = None;
+            let committed = store.update(|rows, _| {
+                let row = rows.iter_mut().find(|row| row.id == worker_id)
+                    .ok_or(crate::session::SessionGone)?;
+                if let Err(blocked) = row.ensure_startable() {
+                    refused = Some(PromptTouch::Blocked(blocked));
+                    return Err(blocked.into());
+                }
+                anyhow::ensure!(
+                    row.lifecycle_generation == generation
+                        && row.title == title
+                        && row.agent_provider == provider
+                        && row.view == view,
+                    crate::session::LifecycleReservationError::Superseded
+                );
+                if row.is_structured() && !row.launch_is_finalized() {
+                    refused = Some(PromptTouch::WorkerNotReady);
+                    anyhow::bail!(crate::session::LifecycleReservationError::Superseded);
+                }
+                let idle_dormant = row.is_idle_dormant();
+                let wake = row.is_snoozed() || idle_dormant;
+                if no_revive && wake {
+                    refused = Some(PromptTouch::RevivalRefused);
+                    anyhow::bail!("prompt revival refused");
+                }
+                apply_prompt_persist_to_disk(row, wake);
+                Ok(idle_dormant)
+            });
+            match committed {
+                Ok(idle_dormant) => {
+                    if idle_dormant {
+                        tracing::info!(
+                            target: "acp.supervisor", session = %worker_id,
+                            "waking idle-dormant structured view session on prompt; spawning a fresh worker"
+                        );
                     }
-                    if inst.is_structured() && !inst.launch_is_finalized() {
-                        return Ok(Some(PromptTouch::WorkerNotReady));
-                    }
-                    apply_prompt_persist_to_disk(inst, wake);
-                    Ok(None)
-                })
-            })
-            .await;
-            match outcome {
-                Ok(Ok(None)) => {}
-                Ok(Ok(Some(refused))) => return refused,
-                Ok(Err(e)) => tracing::warn!(
-                    target: "server.session_service",
-                    session = %id,
-                    "failed to save after prompt touch and wake: {e}"
-                ),
-                Err(join_err) => tracing::warn!(
-                    target: "server.session_service",
-                    session = %id,
-                    "spawn_blocking join error during prompt touch save: {join_err}"
-                ),
+                    Ok(PromptTouch::Touched { idle_dormant })
+                }
+                Err(error) => match refused {
+                    Some(outcome) => Ok(outcome),
+                    None => Err(error),
+                },
             }
-        }
-        PromptTouch::Touched {
-            idle_dormant: woke_idle_dormant,
+        }).await;
+        match result {
+            Ok(Ok(outcome)) => outcome,
+            Ok(Err(error)) => {
+                tracing::warn!(target: "server.session_service", session = %id, %error,
+                    "canonical prompt touch and wake failed");
+                PromptTouch::WorkerNotReady
+            }
+            Err(error) => {
+                tracing::warn!(target: "server.session_service", session = %id, %error,
+                    "canonical prompt touch worker failed");
+                PromptTouch::WorkerNotReady
+            }
         }
     }
 
@@ -1544,7 +1559,7 @@ impl SessionService {
             return;
         }
 
-        // Leading batch up to a clear boundary (mirrors the client's split).
+        // Leading batch up to a clear or compact boundary.
         let profile = crate::acp::agent_profiles::resolve(&agent_key);
         let (sub, combined) = queue_drain_batch(&queue, profile);
         let sent_ids: Vec<String> = sub.iter().map(|e| e.id.clone()).collect();
@@ -1825,6 +1840,7 @@ impl SessionService {
     pub(crate) async fn prompt_dispatch_under_submission(
         &self,
         id: &str,
+        text: &str,
         idle_dormant: bool,
         no_revive: bool,
     ) -> crate::acp::dispatch::PromptDispatch {
@@ -1842,7 +1858,16 @@ impl SessionService {
             idle_dormant,
             rate_limit_parked,
         };
-        crate::acp::dispatch::decide(&self.fold_control_state(id).await, liveness)
+        let dispatch = crate::acp::dispatch::decide(&self.fold_control_state(id).await, liveness);
+        crate::acp::dispatch::hold_solo_command(dispatch, self.is_solo_command(id, text).await)
+    }
+
+    async fn is_solo_command(&self, id: &str, text: &str) -> bool {
+        let instances = self.instances.read().await;
+        instances.iter().find(|i| i.id == id).is_some_and(|inst| {
+            let agent_key = inst.agent_name.as_deref().unwrap_or(&inst.tool);
+            crate::acp::agent_profiles::resolve(agent_key).is_solo_command(text)
+        })
     }
 
     /// See [`crate::acp::dispatch::WorkerLiveness::rate_limit_parked`].
@@ -2211,6 +2236,9 @@ fn spec_payload_hash(spec: &StructuredSessionSpec) -> String {
         "import_acp_session_id",
         spec.import_acp_session_id.as_deref().unwrap_or_default(),
     );
+    if let Some(binding) = &spec.import_binding {
+        field("import_binding", &format!("{binding:?}"));
+    }
     use std::fmt::Write;
     let digest = hasher.finalize();
     let mut out = String::with_capacity(digest.len() * 2);
@@ -2220,15 +2248,8 @@ fn spec_payload_hash(spec: &StructuredSessionSpec) -> String {
     out
 }
 
-/// Disk-side half of [`SessionService::touch_and_wake_on_prompt`], mirroring onto disk
-/// whatever the memory side actually did. A waking prompt keeps touch semantics
-/// and lifts the sink; any other prompt advances recency monotonically and
-/// leaves sink state alone.
-///
-/// What the second tier buys, precisely: `wake` is computed from
-/// `state.instances`, so a daemon whose memory predates a peer's archive would
-/// otherwise clear a sink it has never observed. Tier 2 stops that, and only
-/// that.
+/// Apply an accepted prompt gesture to the authoritative row before native commit.
+/// A wake lifts snooze/dormancy; other prompts advance recency monotonically.
 ///
 /// Advancing `last_accessed_at` on disk is the signal `merge_user_action_diff`
 /// (`session/instance/merge.rs`) keys on to clear a park, which is right for a
@@ -2292,6 +2313,7 @@ mod tests {
             agent_model: None,
             agent_effort: None,
             import_acp_session_id: None,
+            import_binding: None,
             fork_seed: None,
             progress: None,
         }
@@ -2480,6 +2502,48 @@ mod tests {
         shifted_b.extra_args = "a".to_string();
         shifted_b.command_override = "bc".to_string();
         assert_ne!(spec_payload_hash(&shifted_a), spec_payload_hash(&shifted_b));
+        let mut imported = test_spec();
+        imported.import_acp_session_id = Some("opaque-session-id".into());
+        let mut binding = crate::session::ConversationBinding::unknown("opaque-session-id");
+        binding.provenance = crate::session::ConversationProvenance::Imported;
+        binding.execution = Some(crate::session::ExecutionBinding {
+            agent: "claude".into(),
+            stores: vec!["/store/a".into()],
+            configuration: Vec::new(),
+            cwd: "/project".into(),
+            cwd_filesystem: "host".into(),
+            filesystem: "host".into(),
+            exported_default_store: None,
+        });
+        imported.import_binding = Some(binding);
+        let original = spec_payload_hash(&imported);
+        let execution = imported
+            .import_binding
+            .as_mut()
+            .unwrap()
+            .execution
+            .as_mut()
+            .unwrap();
+        execution.stores[0] = "/store/b".into();
+        assert_ne!(
+            original,
+            spec_payload_hash(&imported),
+            "a different store cannot replay an imported identity"
+        );
+        let changed_store = spec_payload_hash(&imported);
+        imported
+            .import_binding
+            .as_mut()
+            .unwrap()
+            .execution
+            .as_mut()
+            .unwrap()
+            .cwd = "/other/project".into();
+        assert_ne!(
+            changed_store,
+            spec_payload_hash(&imported),
+            "a changed import cwd must change request identity"
+        );
     }
 
     #[tokio::test]
@@ -3305,6 +3369,7 @@ mod tests {
     async fn a_stale_disk_reload_keeps_in_memory_row_changes() {
         use crate::session::PendingInitialTurn;
         let _app_dir = crate::session::test_support::isolate_app_dir();
+        crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
         let pending = || PendingInitialTurn {
             text: "resume".into(),
             attachments: vec![],
@@ -3359,9 +3424,18 @@ mod tests {
             let mut inst = Instance::new("race", "/tmp/aoe-reload-race");
             inst.id = "s".to_string();
             inst.view = crate::session::View::Structured;
+            inst.source_profile = "default".into();
             inst.pending_initial_turn = pending_turn;
             inst.idle_dormant_since = dormant.then(chrono::Utc::now);
+            let storage = crate::session::Storage::new_unwatched("default").unwrap();
+            storage
+                .update(|rows, _| {
+                    *rows = vec![inst.clone()];
+                    Ok(())
+                })
+                .unwrap();
             let state = crate::server::test_support::build_test_app_state(vec![inst.clone()]);
+            crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
             let read_epoch = state
                 .mutation_epoch
                 .load(std::sync::atomic::Ordering::SeqCst);
@@ -3381,6 +3455,121 @@ mod tests {
 
             assert!(check(&state.instances.read().await[0]), "{name}");
         }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn prompt_touch_refuses_persisted_blocks_without_a_replica_wake() {
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
+        for reason in [
+            "archived",
+            "trashed",
+            "no_revive",
+            "unfinished",
+            "superseded",
+        ] {
+            let mut visible = Instance::new("prompt-wake", "/tmp/aoe-prompt-wake");
+            visible.source_profile = "default".into();
+            visible.view = crate::session::View::Structured;
+            visible.idle_dormant_since = Some(chrono::Utc::now());
+            let mut persisted = visible.clone();
+            match reason {
+                "archived" => persisted.archive(),
+                "trashed" => persisted.trash(),
+                "unfinished" => persisted.status = crate::session::Status::Creating,
+                "superseded" => persisted.lifecycle_generation += 1,
+                _ => {}
+            }
+            let storage = crate::session::Storage::new_unwatched("default").unwrap();
+            storage
+                .update(|rows, _| {
+                    *rows = vec![persisted];
+                    Ok(())
+                })
+                .unwrap();
+            let state = crate::server::test_support::build_test_app_state(vec![visible.clone()]);
+            crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+            let memory_before = serde_json::to_value(&visible).unwrap();
+            let disk_before = std::fs::read(storage.sessions_path()).unwrap();
+            let mut status_rx = state.status_tx.subscribe();
+            let outcome = state
+                .session_service
+                .touch_and_wake_on_prompt(&visible.id, reason == "no_revive")
+                .await;
+            match reason {
+                "archived" => assert!(matches!(
+                    outcome,
+                    PromptTouch::Blocked(crate::session::StartBlocked::Archived)
+                )),
+                "trashed" => assert!(matches!(
+                    outcome,
+                    PromptTouch::Blocked(crate::session::StartBlocked::Trashed)
+                )),
+                "no_revive" => assert!(matches!(outcome, PromptTouch::RevivalRefused)),
+                _ => assert!(matches!(outcome, PromptTouch::WorkerNotReady)),
+            }
+            assert_eq!(
+                serde_json::to_value(&state.instances.read().await[0]).unwrap(),
+                memory_before,
+                "{reason}"
+            );
+            assert_eq!(
+                std::fs::read(storage.sessions_path()).unwrap(),
+                disk_before,
+                "{reason}"
+            );
+            assert!(status_rx.try_recv().is_err(), "{reason}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_failed_prompt_touch_commit_does_not_wake_the_replica() {
+        use std::os::unix::fs::PermissionsExt;
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
+        let mut instance = Instance::new("failed-prompt-wake", "/tmp/aoe-failed-prompt-wake");
+        instance.source_profile = "default".into();
+        instance.view = crate::session::View::Structured;
+        instance.idle_dormant_since = Some(chrono::Utc::now());
+        let storage = crate::session::Storage::new_unwatched("default").unwrap();
+        storage
+            .update(|rows, _| {
+                *rows = vec![instance.clone()];
+                Ok(())
+            })
+            .unwrap();
+        let state = crate::server::test_support::build_test_app_state(vec![instance.clone()]);
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+        // Existing exclusion files remain accessible; replacing the row file must fail.
+        drop(crate::session::acquire_session_identity_lock().unwrap());
+        drop(crate::session::acquire_session_title_lock(&instance.id).unwrap());
+        drop(
+            storage
+                .acquire_instance_lifecycle_lock(&instance.id)
+                .unwrap(),
+        );
+        drop(storage.acquire_write_transition().unwrap());
+        let directory = storage.sessions_path().parent().unwrap();
+        let permissions = std::fs::metadata(directory).unwrap().permissions();
+        let memory_before = serde_json::to_value(&instance).unwrap();
+        let disk_before = std::fs::read(storage.sessions_path()).unwrap();
+        let mut status_rx = state.status_tx.subscribe();
+        std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let outcome = state
+            .session_service
+            .touch_and_wake_on_prompt(&instance.id, false)
+            .await;
+        std::fs::set_permissions(directory, permissions).unwrap();
+        assert!(matches!(outcome, PromptTouch::WorkerNotReady));
+        assert_eq!(
+            serde_json::to_value(&state.instances.read().await[0]).unwrap(),
+            memory_before
+        );
+        assert_eq!(std::fs::read(storage.sessions_path()).unwrap(), disk_before);
+        assert!(status_rx.try_recv().is_err());
     }
 
     #[tokio::test]
@@ -3503,6 +3692,15 @@ mod tests {
         let (sub, combined) = queue_drain_batch(&q, claude);
         assert_eq!(sub.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(), ["c"]);
         assert_eq!(combined, "/clear");
+
+        // A compact command splits the batch the same way.
+        let q = vec![entry("a", 0, "one"), entry("c", 1, "/compact focus")];
+        let (sub, combined) = queue_drain_batch(&q, claude);
+        assert_eq!(sub.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(), ["a"]);
+        assert_eq!(combined, "one");
+        let q = vec![entry("c", 0, "/compact"), entry("a", 1, "one")];
+        let (sub, _) = queue_drain_batch(&q, claude);
+        assert_eq!(sub.len(), 1);
 
         // No clear anywhere.
         let q = vec![

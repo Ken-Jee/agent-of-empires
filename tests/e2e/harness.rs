@@ -366,8 +366,9 @@ pub struct TuiTestHarness {
     /// FAKE_ACP_* and the runner-socket timeout into the daemon (and
     /// thus the daemon-spawned worker, which inherits this env).
     extra_env: Vec<(String, String)>,
-    /// Dirs prepended to PATH ahead of the `claude` stub. Acp tests
-    /// install the ACP shim here so it shadows the exit-0 stub.
+    /// Explicit removals override inherited and configured values.
+    extra_env_remove: Vec<String>,
+    /// Prepended to PATH ahead of the `claude` stub.
     extra_path_dirs: Vec<PathBuf>,
     /// When set, `Drop` stops the structured view workers and the serve daemon
     /// before killing the tmux session, so a panicking assertion can't
@@ -479,6 +480,7 @@ last_seen_version = "{}"
             cast_path: None,
             // aoe addresses tmux via `-S <socket>`, so pin it to the harness socket.
             extra_env: vec![("AOE_TMUX_SOCKET".to_string(), tmux_socket_env)],
+            extra_env_remove: Vec::new(),
             extra_path_dirs: Vec::new(),
             stop_daemon_on_drop: false,
             acp_fork_fail: false,
@@ -511,7 +513,15 @@ last_seen_version = "{}"
 
     /// Export an extra env var on every spawned process (tmux + `run_cli`).
     pub fn set_env(&mut self, key: &str, value: &str) {
+        self.extra_env_remove.retain(|removed| removed != key);
         self.extra_env.push((key.to_string(), value.to_string()));
+    }
+
+    pub fn remove_env(&mut self, key: &str) {
+        self.extra_env.retain(|(existing, _)| existing != key);
+        if !self.extra_env_remove.iter().any(|removed| removed == key) {
+            self.extra_env_remove.push(key.to_string());
+        }
     }
 
     /// Prepend `dir` to the PATH of every spawned process so a
@@ -1194,6 +1204,9 @@ last_seen_version = "{}"
             .env_remove("AGENT_OF_EMPIRES_DEBUG")
             .env_remove("AOE_LOG_LEVEL")
             .envs(self.extra_env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+        for key in &self.extra_env_remove {
+            command.env_remove(key);
+        }
         command
     }
 

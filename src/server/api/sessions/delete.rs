@@ -2,6 +2,10 @@
 
 use super::*;
 
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+struct PurgeCleanupFailed(String);
+
 /// Callers retain namespace, submission and instance exclusion through cleanup.
 pub(crate) async fn purge_session_artifacts(
     state: &Arc<AppState>,
@@ -24,6 +28,47 @@ pub(crate) async fn purge_session_artifacts(
     }
     let profile = instance.source_profile.clone();
     anyhow::ensure!(!profile.is_empty(), "Session has no source profile");
+    let consent = body.expected_trashed_at.zip(body.expected_generation).map(
+        |(trashed_at, lifecycle_generation)| crate::session::deletion::TrashPurgeConsent {
+            trashed_at,
+            lifecycle_generation,
+            force_failed: body.force_failed,
+        },
+    );
+    if body.drop_failed {
+        let consent = consent.ok_or(crate::session::LifecycleReservationError::Superseded)?;
+        let worker_state = state.clone();
+        let status_id = id.to_owned();
+        let instance = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+            let store = crate::server::session_store::NativeSessionStore::open(
+                worker_state,
+                &profile,
+                None,
+            )?;
+            crate::session::deletion::drop_failed_purge(&store, &status_id, &consent)?
+                .ok_or_else(|| crate::session::LifecycleReservationError::Superseded.into())
+        })
+        .await??;
+        let mut cleanup_errors = Vec::new();
+        if instance.is_structured() {
+            if let Err(error) = finish_structured_purge(state, id).await {
+                tracing::warn!(session = %id, %error, "dropped purge structured cleanup failed");
+                cleanup_errors.push("Structured worker cleanup remains unproven".into());
+            }
+        }
+        tokio::task::spawn_blocking(move || {
+            crate::session::deletion::cleanup_abandoned_session(instance)
+        })
+        .await?;
+        release_removed_session_locks(state, id).await;
+        return Ok(PurgeOutcome::Deleted {
+            messages: vec![
+                "Session record dropped after a forced purge failed; worktree files retained"
+                    .into(),
+            ],
+            cleanup_errors,
+        });
+    }
     let request = crate::session::deletion::DeletionRequest {
         session_id: id.to_owned(),
         instance,
@@ -42,7 +87,12 @@ pub(crate) async fn purge_session_artifacts(
             &profile,
             Some(status_id),
         )?;
-        PurgeTransaction::reserve(store, request, selection)
+        match consent {
+            Some(consent) => {
+                PurgeTransaction::reserve_selected_trash(store, request, selection, consent)
+            }
+            None => PurgeTransaction::reserve(store, request, selection),
+        }
     })
     .await??;
     let transaction = match reservation {
@@ -124,7 +174,16 @@ pub(crate) async fn purge_session_artifacts(
         DeletionDisposition::Busy => {
             anyhow::bail!(crate::session::LifecycleReservationError::Superseded)
         }
-        DeletionDisposition::Failed => anyhow::bail!(result.errors.join("; ")),
+        DeletionDisposition::Failed => {
+            if result
+                .retained_instance
+                .as_ref()
+                .is_some_and(|row| row.failed_purge_forced().is_some())
+            {
+                anyhow::bail!(PurgeCleanupFailed(result.errors.join("; ")));
+            }
+            anyhow::bail!(result.errors.join("; "));
+        }
         DeletionDisposition::Removed | DeletionDisposition::AlreadyGone => {}
     }
     let cleanup_errors = if result.disposition == DeletionDisposition::AlreadyGone {
@@ -455,6 +514,7 @@ pub(crate) async fn purge_expired_trash(state: &Arc<AppState>) {
             keep_scratch: false,
             expected_trash: true,
             use_cleanup_defaults: false,
+            ..Default::default()
         };
         match purge_session_artifacts(state, &id, instance, &body, recent_entry, None, None).await {
             Ok(outcome) => {
@@ -498,6 +558,16 @@ pub async fn delete_session(
         return crate::server::api::read_only_response();
     }
     let body = body.map(|Json(body)| body).unwrap_or_default();
+    if body.expected_trashed_at.is_some() != body.expected_generation.is_some()
+        || ((body.force_failed || body.drop_failed)
+            && (!body.expected_trash || body.expected_trashed_at.is_none()))
+    {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_trash_consent",
+            "Trash escalation requires a selected trash timestamp and lifecycle generation",
+        );
+    }
     if body.use_cleanup_defaults
         && (body.delete_worktree || body.delete_branch || body.delete_sandbox)
     {
@@ -573,6 +643,19 @@ pub async fn delete_session(
                 }
                 if *state.canonical_health.read().await != crate::daemon::RuntimeHealth::Healthy {
                     return StatusCode::SERVICE_UNAVAILABLE.into_response();
+                }
+                if error.is::<PurgeCleanupFailed>() {
+                    let snapshot = match state.runtime.publish(&state).await {
+                        Ok(snapshot) => snapshot,
+                        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+                    };
+                    return crate::server::runtime::mutation_response(
+                        &snapshot.value.cursor,
+                        crate::server::api::api_error_with_code_header(
+                            crate::daemon::ApiErrorCode::PurgeFailed,
+                            error.to_string(),
+                        ),
+                    );
                 }
                 tracing::error!(target: "http.api.sessions", session = %id, %error, "purge failed");
                 return (

@@ -15,11 +15,16 @@ pub enum ApiErrorCode {
     TlsRequired,
     RuntimeEpochMismatch,
     ResumeFailed,
+    StartFailed,
+    PurgeFailed,
     NoRevive,
     CreationTrustChanged,
     CreationCancelled,
     CreationNotPending,
     CreateHookFailed,
+    SmartRenameSkipped,
+    SmartRenameFailed,
+    SmartRenameTimeout,
 }
 
 impl ApiErrorCode {
@@ -31,6 +36,8 @@ impl ApiErrorCode {
             Self::CityhallMode => "cityhall_mode",
             Self::LifecycleLocked => "lifecycle_locked",
             Self::PendingTargetGone => "pending_target_gone",
+            Self::StartFailed => "start_failed",
+            Self::PurgeFailed => "purge_failed",
             Self::TlsRequired => "tls_required",
             Self::RuntimeEpochMismatch => "runtime_epoch_mismatch",
             Self::ResumeFailed => "resume_failed",
@@ -39,6 +46,9 @@ impl ApiErrorCode {
             Self::CreationCancelled => "creation_cancelled",
             Self::CreationNotPending => "creation_not_pending",
             Self::CreateHookFailed => "create_hook_failed",
+            Self::SmartRenameSkipped => "smart_rename_skipped",
+            Self::SmartRenameFailed => "smart_rename_failed",
+            Self::SmartRenameTimeout => "smart_rename_timeout",
         }
     }
 
@@ -51,6 +61,7 @@ impl ApiErrorCode {
             Self::LifecycleLocked
             | Self::RuntimeEpochMismatch
             | Self::ResumeFailed
+            | Self::PurgeFailed
             | Self::NoRevive
             | Self::CreationTrustChanged
             | Self::CreationCancelled
@@ -58,6 +69,10 @@ impl ApiErrorCode {
             Self::PendingTargetGone => StatusCode::NOT_FOUND,
             Self::TlsRequired => StatusCode::UPGRADE_REQUIRED,
             Self::CreateHookFailed => StatusCode::BAD_REQUEST,
+            Self::SmartRenameSkipped => StatusCode::CONFLICT,
+            Self::SmartRenameFailed => StatusCode::BAD_GATEWAY,
+            Self::SmartRenameTimeout => StatusCode::GATEWAY_TIMEOUT,
+            Self::StartFailed => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
 
@@ -89,8 +104,13 @@ impl ApiErrorCode {
             b"no_revive" => Self::NoRevive,
             b"creation_trust_changed" => Self::CreationTrustChanged,
             b"creation_cancelled" => Self::CreationCancelled,
+            b"start_failed" => Self::StartFailed,
+            b"purge_failed" => Self::PurgeFailed,
             b"creation_not_pending" => Self::CreationNotPending,
             b"create_hook_failed" => Self::CreateHookFailed,
+            b"smart_rename_skipped" => Self::SmartRenameSkipped,
+            b"smart_rename_failed" => Self::SmartRenameFailed,
+            b"smart_rename_timeout" => Self::SmartRenameTimeout,
             _ => return None,
         };
         (status == code.status()).then_some(code)

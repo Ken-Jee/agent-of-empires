@@ -735,6 +735,193 @@ fn right_click_trash_header_shows_bulk_menu() {
     }
 }
 
+/// `d` on the Trash header and the palette's "Empty trash" both open the empty-trash
+/// confirm, which ignores `session.confirm_delete` because the purge is irreversible.
+#[test]
+#[serial]
+fn trash_header_d_and_palette_open_empty_trash_confirm() {
+    for via_palette in [false, true] {
+        let mut env = create_test_env_with_sessions(2);
+        disable_confirm_delete();
+        env.view.trashed_section_collapsed = false;
+        let id = env.view.instance_at(0).id.clone();
+        super::pickers_groups_sort::fixture_trash(&mut env.view, &id);
+
+        if via_palette {
+            env.view.handle_key(
+                KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL),
+                None,
+            );
+            for ch in "empty trash".chars() {
+                env.view.handle_key(key(KeyCode::Char(ch)), None);
+            }
+            env.view.handle_key(key(KeyCode::Enter), None);
+        } else {
+            env.view.cursor = env
+                .view
+                .flat_items
+                .iter()
+                .position(|it| {
+                    matches!(it, Item::Group { path, .. }
+                        if crate::session::is_trash_section_path(path))
+                })
+                .expect("Trash header must render");
+            env.view.update_selected();
+            env.view.handle_key(key(KeyCode::Char('d')), None);
+        }
+
+        assert_eq!(
+            env.view.confirm_dialog.as_ref().map(|d| d.action()),
+            Some("empty_trash"),
+            "via_palette={via_palette}"
+        );
+        assert!(
+            env.view.get_instance(&id).unwrap().is_trashed(),
+            "nothing is purged before the confirm, via_palette={via_palette}"
+        );
+    }
+}
+
+/// Escalation comes from canonical failure markers and remains bound to the selected trash
+/// lifecycle. Peer restores and held lifecycle locks never become a local drop fallback.
+#[tokio::test]
+#[serial]
+async fn empty_trash_escalates_a_row_that_keeps_failing() {
+    use crate::daemon::{DeleteSessionBody, MutationReceipt};
+    use crate::tui::session_feed::{SessionCommandOutcome, SessionRequest};
+    for peer in ["idle", "restores", "holds_lock"] {
+        let mut env = create_test_env_with_sessions(2);
+        let id = env.view.instance_at(0).id.clone();
+        let storage = Storage::new_unwatched("test").unwrap();
+        storage
+            .update(|rows, _| {
+                let row = rows.iter_mut().find(|row| row.id == id).unwrap();
+                row.worktree_info = Some(crate::session::WorktreeInfo {
+                    branch: "gone".into(),
+                    main_repo_path: "/nonexistent/aoe-test-repo".into(),
+                    managed_by_aoe: true,
+                    created_at: chrono::Utc::now(),
+                    base_branch: None,
+                });
+                row.trash();
+                Ok(())
+            })
+            .unwrap();
+        let state = native_state(&["test"]).await;
+        apply_published(&mut env.view, &state).await;
+        let mut respond = env.view.session_feed.request_driver_for_test();
+        for round in 0..3 {
+            if round > 0 {
+                env.view.handle_key(key(KeyCode::Esc), None);
+                assert!(env.view.info_dialog.is_none());
+            }
+            let row = env.view.session_feed.applied_session(&id).unwrap();
+            assert_eq!(
+                row.failed_purge_forced,
+                match round {
+                    0 => None,
+                    1 => Some(false),
+                    _ => Some(true),
+                }
+            );
+            let body = DeleteSessionBody {
+                expected_trash: true,
+                expected_trashed_at: Some(
+                    chrono::DateTime::parse_from_rfc3339(row.trashed_at.as_ref().unwrap())
+                        .unwrap()
+                        .with_timezone(&chrono::Utc),
+                ),
+                expected_generation: Some(row.lifecycle_generation),
+                use_cleanup_defaults: true,
+                force_failed: round == 1,
+                drop_failed: round == 2,
+                ..Default::default()
+            };
+            env.view.prompt_empty_trash();
+            let dialog = env.view.confirm_dialog.as_mut().unwrap();
+            assert_eq!(
+                dialog.checkbox_labels_for_test().len(),
+                usize::from(round > 0)
+            );
+            if round > 0 {
+                dialog.handle_key(key(KeyCode::Down));
+                dialog.handle_key(key(KeyCode::Char(' ')));
+            }
+            let before = payload_bytes("test");
+            let lock = (round == 2 && peer == "holds_lock")
+                .then(|| storage.acquire_instance_lifecycle_lock(&id).unwrap());
+            if round == 2 && peer == "restores" {
+                let (status, _, _) = request_with_headers(
+                    &state,
+                    "POST",
+                    &format!("/api/sessions/{id}/restore"),
+                    serde_json::json!({}),
+                )
+                .await;
+                assert!(status.is_success());
+            }
+            env.view.handle_key(key(KeyCode::Char('y')), None);
+            assert!(env.view.get_instance(&id).unwrap().is_trashed());
+            if peer != "restores" || round != 2 {
+                assert_eq!(payload_bytes("test"), before);
+            }
+            env.view.prompt_empty_trash();
+            assert!(env
+                .view
+                .confirm_dialog
+                .as_ref()
+                .unwrap()
+                .checkbox_labels_for_test()
+                .is_empty());
+            env.view.confirm_dialog = None;
+            let request_state = state.clone();
+            let path = format!("/api/sessions/{id}");
+            let wire = serde_json::to_value(&body).unwrap();
+            let work = tokio::spawn(async move {
+                request_with_headers(&request_state, "DELETE", &path, wire).await
+            });
+            if lock.is_some() {
+                tokio::task::yield_now().await;
+                assert!(!work.is_finished(), "the held lock cannot complete a drop");
+                assert!(env.view.get_instance(&id).unwrap().is_trashed());
+            }
+            drop(lock);
+            let (status, headers, value) = work.await.unwrap();
+            let result = if status.is_success() {
+                Ok(SessionCommandOutcome::Purged(MutationReceipt {
+                    cursor: super::pickers_groups_sort::receipt_cursor(&headers),
+                    outcome: serde_json::from_value(value).unwrap(),
+                }))
+            } else {
+                assert!(status.is_client_error());
+                Err(value.to_string())
+            };
+            let (submitted, request) = respond(result).unwrap();
+            assert_eq!(submitted, id);
+            let SessionRequest::Purge(captured) = request else {
+                panic!("expected purge");
+            };
+            assert_eq!(
+                serde_json::to_value(captured).unwrap(),
+                serde_json::to_value(&body).unwrap()
+            );
+            env.view.apply_session_feed();
+            assert!(
+                env.view.get_instance(&id).is_some(),
+                "ACK does not remove a row before publication"
+            );
+            apply_published(&mut env.view, &state).await;
+            if round == 2 {
+                if peer == "restores" {
+                    assert!(!env.view.get_instance(&id).unwrap().is_trashed());
+                } else {
+                    assert!(env.view.get_instance(&id).is_none());
+                }
+            }
+        }
+    }
+}
+
 /// Shelf bulk actions: "Empty Trash" routes through a destructive confirm and marks every trashed
 /// row Deleting (an empty trash shows an info dialog instead), and "Restore All" un-trashes or
 /// unarchives every row of its section.
@@ -782,7 +969,30 @@ async fn empty_trash_confirm_purges_every_trashed_row() {
                 (
                     "DELETE",
                     format!("/api/sessions/{id}"),
-                    serde_json::json!({"expected_trash":true,"use_cleanup_defaults":true,"force_delete":true,"keep_scratch":false}),
+                    serde_json::to_value(crate::daemon::DeleteSessionBody {
+                        expected_trash: true,
+                        use_cleanup_defaults: true,
+                        expected_trashed_at: Some(
+                            chrono::DateTime::parse_from_rfc3339(
+                                view.session_feed
+                                    .applied_session(id)
+                                    .unwrap()
+                                    .trashed_at
+                                    .as_ref()
+                                    .unwrap(),
+                            )
+                            .unwrap()
+                            .with_timezone(&chrono::Utc),
+                        ),
+                        expected_generation: Some(
+                            view.session_feed
+                                .applied_session(id)
+                                .unwrap()
+                                .lifecycle_generation,
+                        ),
+                        ..Default::default()
+                    })
+                    .unwrap(),
                 )
             } else {
                 (
@@ -1379,7 +1589,8 @@ async fn confirm_delete_dont_ask_again_persists_the_opt_out() {
     let id = env.view.selected_session.clone().unwrap();
 
     env.view.handle_key(key(KeyCode::Char('d')), None);
-    // Space ticks the checkbox, the second `d` accepts.
+    // Down focuses the checkbox, Space ticks it, the second `d` accepts.
+    env.view.handle_key(key(KeyCode::Down), None);
     env.view.handle_key(key(KeyCode::Char(' ')), None);
     super::pickers_groups_sort::settle_row_command(
         &state,

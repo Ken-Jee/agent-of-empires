@@ -18,6 +18,7 @@ pub mod live_ws;
 pub mod login;
 mod pane;
 pub(crate) mod peer;
+pub mod plugin_status;
 pub mod push;
 pub mod push_send;
 pub mod rate_limit;

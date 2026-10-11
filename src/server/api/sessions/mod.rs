@@ -25,8 +25,8 @@ use crate::daemon::{
 use crate::git::error::GitError;
 use crate::session::config::SessionConfig;
 use crate::session::{
-    duplicate_session_error, is_duplicate_session, EnsureReadyError, EnsureReadyOutcome, Instance,
-    LifecycleOperation, Status, Storage, TerminalContextResume,
+    duplicate_session_error, is_duplicate_session, Instance, LifecycleOperation, Status, Storage,
+    TerminalContextResume,
 };
 
 use super::validate_no_shell_injection;
@@ -51,6 +51,7 @@ pub use create::*;
 pub use delete::*;
 pub use diff::*;
 pub use ensure::*;
+pub(crate) use lifecycle::recovery_restart;
 pub use lifecycle::*;
 pub use list::*;
 use model::*;

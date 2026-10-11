@@ -92,6 +92,7 @@ impl Instance {
             .checked_add(1)
             .ok_or(LifecycleReservationError::GenerationOverflow)?;
         self.lifecycle_generation = generation;
+        self.failed_purge = None;
         self.lifecycle_reservation = Some(LifecycleReservation {
             op: operation,
             generation,
@@ -308,6 +309,7 @@ impl Instance {
             anyhow::bail!("session {} no longer exists", self.id);
         };
         self.lifecycle_generation = generation;
+        self.failed_purge = None;
         self.lifecycle_reservation = reservation;
         if let Some(status) = status {
             self.status = status;

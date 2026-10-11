@@ -34,7 +34,7 @@ vi.mock("../../../lib/api", () => ({
   getHomePath: vi.fn().mockResolvedValue(null),
   browseFilesystem: vi.fn().mockResolvedValue({ entries: [], has_more: false, ok: false }),
   cloneRepo: vi.fn(),
-  listClaudeSessions: vi.fn().mockResolvedValue([]),
+  listImportableSessions: vi.fn().mockResolvedValue({ ok: true, sessions: [], truncated: false }),
   fetchProjects: (...args: unknown[]) => fetchProjects(...args),
   createSession: (...args: unknown[]) => createSession(...args),
 }));

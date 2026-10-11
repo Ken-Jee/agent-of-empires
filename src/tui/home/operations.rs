@@ -857,36 +857,53 @@ impl HomeView {
         }
     }
 
-    /// Purge the current view's trashed ids using each authoritative row's cleanup defaults.
-    /// Lifecycle claims, resource teardown and receipts are daemon-owned.
-    pub(super) fn empty_trash_all(&mut self) {
-        let mut ids: Vec<_> = self
-            .instances()
-            .filter(|row| {
-                row.is_trashed()
-                    && self
-                        .active_profile
-                        .as_ref()
-                        .is_none_or(|profile| *profile == row.source_profile)
-            })
-            .map(|row| row.id.clone())
-            .collect();
-        ids.sort();
-        if ids.is_empty() {
-            return;
+    /// Escalation is discovered from the daemon snapshot, never a local deletion worker.
+    pub(super) fn failed_delete_forced(&self, instance: &Instance) -> Option<bool> {
+        if !self.session_feed.can_submit(&instance.id) {
+            return None;
         }
-        let requests = ids.into_iter().map(|id| {
-            (
-                id,
+        self.session_feed
+            .applied_session(&instance.id)?
+            .failed_purge_forced
+    }
+
+    /// Purge authoritative trash rows with explicit, opt-in escalation and lifecycle guards.
+    pub(super) fn empty_trash_all(&mut self, force_failed: bool, drop_failed: bool) {
+        let mut requests = Vec::new();
+        for instance in self.instances().filter(|row| row.is_trashed()) {
+            if self
+                .active_profile
+                .as_ref()
+                .is_some_and(|profile| *profile != instance.source_profile)
+            {
+                continue;
+            }
+            let Some(row) = self.session_feed.applied_session(&instance.id) else {
+                continue;
+            };
+            let Some(stamp) = row
+                .trashed_at
+                .as_ref()
+                .and_then(|stamp| chrono::DateTime::parse_from_rfc3339(stamp).ok())
+                .map(|stamp| stamp.with_timezone(&chrono::Utc))
+            else {
+                continue;
+            };
+            requests.push((
+                instance.id.clone(),
                 crate::tui::session_feed::SessionRequest::Purge(crate::daemon::DeleteSessionBody {
                     expected_trash: true,
+                    expected_trashed_at: Some(stamp),
+                    expected_generation: Some(row.lifecycle_generation),
                     use_cleanup_defaults: true,
-                    force_delete: true,
+                    force_failed,
+                    drop_failed,
                     keep_scratch: false,
                     ..Default::default()
                 }),
-            )
-        });
+            ));
+        }
+        requests.sort_by(|a, b| a.0.cmp(&b.0));
         if let Err(error) = self.session_feed.submit_batch(requests) {
             self.info_dialog = Some(InfoDialog::new("Could Not Empty Trash", &error.to_string()));
         }

@@ -864,31 +864,12 @@ pub async fn create_session(
             return api_error(StatusCode::BAD_REQUEST, "validation_failed", msg);
         }
     }
-    if let Some(ref profile_name) = body.profile {
-        // Every profile is a real directory under profiles/. Distinguish an
-        // enumeration failure from a missing profile so the client does not see
-        // a 400 when the real problem is server-side.
-        let known = match crate::session::list_profiles() {
-            Ok(list) => list,
-            Err(e) => {
-                tracing::error!(
-                    target: "server.sessions",
-                    "failed to enumerate profiles while validating create_session: {e:#}"
-                );
-                return api_error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "internal_error",
-                    format!("Failed to enumerate profiles: {e}"),
-                );
-            }
-        };
-        if !known.contains(profile_name) {
-            return api_error(
-                StatusCode::BAD_REQUEST,
-                "profile_not_found",
-                format!("Profile '{}' does not exist", profile_name),
-            );
-        }
+    if let Some(resp) = body
+        .profile
+        .as_deref()
+        .and_then(crate::server::api::unknown_profile_response)
+    {
+        return resp;
     }
 
     let validation_profile = body.profile.as_deref().unwrap_or(&default_profile);
@@ -941,11 +922,11 @@ pub async fn create_session(
     }
 
     let worktree_enabled = create_body_uses_worktree(&body);
+    let mut import_binding = None;
 
-    // Importing a Claude session (#2276) is tightly scoped: it resumes one
-    // on-disk id in its original cwd via the claude structured agent. Reject an
-    // id paired with a different workspace shape, a non-claude agent, or a
-    // foreign cwd. Runs after tool-identity validation, ahead of the build.
+    // An import resumes one native id in its recorded cwd on the host. AoE
+    // enforces the cwd because pi-acp loads at any absolute path, and lists
+    // again so the id must still be one the picker could have shown.
     if let Some(import_id) = body
         .import_acp_session_id
         .as_deref()
@@ -953,31 +934,37 @@ pub async fn create_session(
         .filter(|s| !s.is_empty())
     {
         let bad = |msg: &str| api_error(StatusCode::BAD_REQUEST, "validation_failed", msg);
-        if body.tool != "claude"
-            || body
-                .agent_name
-                .as_deref()
-                .is_some_and(|n| !n.trim().is_empty())
+        if body
+            .agent_name
+            .as_deref()
+            .is_some_and(|n| !n.trim().is_empty())
         {
-            return bad("Importing a Claude session requires the built-in claude agent");
+            return bad("Importing a session requires a built-in ACP agent");
         }
-        if body.scratch || worktree_enabled || !body.extra_repo_paths.is_empty() {
+        if body.scratch || worktree_enabled || !body.extra_repo_paths.is_empty() || body.sandbox {
             return bad(
-                "Importing a Claude session cannot use scratch, a worktree, or extra repos",
+                "Importing a session cannot use scratch, a worktree, extra repos, or a sandbox",
             );
         }
-        let import_cwd = body.path.trim().to_string();
-        let import_id_owned = import_id.to_string();
-        let belongs = tokio::task::spawn_blocking(move || {
-            crate::session::claude_import::scan_sessions()
-                .into_iter()
-                .any(|s| s.session_id == import_id_owned && s.cwd == import_cwd)
-        })
+        let listed = match crate::server::api::acp::importable_sessions(
+            &state,
+            &body.tool,
+            validation_profile,
+        )
         .await
-        .unwrap_or(false);
-        if !belongs {
-            return bad("Unknown Claude session for this directory");
-        }
+        {
+            Ok(list) => list.sessions,
+            Err(e) => return crate::server::api::acp::list_error_response(e),
+        };
+        let import_cwd = body.path.trim();
+        let Some(imported) = listed
+            .into_iter()
+            .find(|session| session.session_id == import_id && session.cwd == import_cwd)
+        else {
+            return bad("Unknown session for this agent and directory");
+        };
+        import_binding = imported.conversation_binding;
+        body.import_acp_session_id = Some(imported.session_id);
     }
 
     // Forking an existing session: `fork_from` carries the source session's
@@ -1139,6 +1126,7 @@ pub async fn create_session(
         agent_model: body.agent_model,
         agent_effort: body.agent_effort,
         import_acp_session_id: body.import_acp_session_id,
+        import_binding,
         fork_seed,
         progress: progress.as_ref().map(|p| Arc::clone(&p.progress)),
     };
@@ -1356,90 +1344,4 @@ pub(super) fn public_create_session_error(e: &anyhow::Error) -> String {
         }
     }
     "Failed to create session".to_string()
-}
-
-// --- Ensure agent session ---
-
-/// Copy fields the start path mutated on the working `Instance` clone back
-/// onto the in-memory `state.instances` entry after a successful restart.
-///
-/// `agent_session_id` is the load-bearing one: Claude's `acquire_session_id`
-/// generates a fresh UUID at launch time and `persist_session_id` writes it
-/// to disk, but the in-memory state lives in a separate Vec that the 2s
-/// status poller refreshes from disk on its own cadence. Without this sync,
-/// a rapid second restart inside that window would see a stale
-/// `agent_session_id = None` and generate (and persist) a new UUID,
-/// silently orphaning the previous Claude conversation.
-pub(super) fn apply_post_restart_identity_sync(
-    live: &mut Instance,
-    before: &Instance,
-    started: &Instance,
-) {
-    if started.lifecycle_generation < live.lifecycle_generation {
-        return;
-    }
-    // The snapshot describes the agent it launched, and a swap moves neither the lifecycle counter
-    // nor the capture generation: applying it would resolve this row's capture from another agent.
-    if started.tool != live.tool {
-        return;
-    }
-    // Treat the pre-restart snapshot as a CAS baseline for peer-writable identity
-    // fields. A same-SID publication can still replace the native store or transcript.
-    let generation_can_merge = live.omp_capture_generation == before.omp_capture_generation
-        || live.omp_capture_generation == started.omp_capture_generation;
-    let conversation_unchanged = before.conversation_state().matches(live);
-    let marker_unchanged = live.resume_probe_failed_sid == before.resume_probe_failed_sid;
-    if generation_can_merge {
-        live.omp_capture_generation = started.omp_capture_generation.clone();
-        if conversation_unchanged {
-            live.adopt_conversation_state(started.conversation_state());
-        } else {
-            live.adopt_active_execution(started);
-        }
-    }
-    live.adopt_relaunch_poller_state(before, started);
-    if generation_can_merge && marker_unchanged && live.agent_session_id == started.agent_session_id
-    {
-        live.resume_probe_failed_sid = started.resume_probe_failed_sid.clone();
-    }
-    live.lifecycle_generation = started.lifecycle_generation;
-}
-
-pub(super) fn apply_post_restart_sync(
-    live: &mut Instance,
-    before: &Instance,
-    started: &Instance,
-) -> bool {
-    if started.lifecycle_generation < live.lifecycle_generation {
-        return false;
-    }
-    live.merge_post_restart_with_baseline(before, started);
-    live.last_error = if started.status == Status::Error {
-        started.last_error.clone()
-    } else {
-        None
-    };
-    live.last_error_check = started.last_error_check;
-    live.last_start_time = started.last_start_time;
-    live.retroactive_capture_excludes = started.retroactive_capture_excludes.clone();
-    true
-}
-
-/// Narrow sibling of [`apply_post_restart_sync`] that propagates only the
-/// fields the resume path is responsible for: the post-probe
-/// `agent_session_id`, the `resume_probe_failed_sid` marker, and the updated
-/// `retroactive_capture_excludes`.
-///
-/// Intended for error paths where the cascade may have run but the caller
-/// does not want to touch user-visible status fields. `NotRunning` is the
-/// canonical use case: a recoverable transient state where overwriting
-/// `live.status` with `started.status` (typically `Starting` from the
-/// post-cascade `finalize_launch`) would briefly mis-paint a broken pane
-/// as `Starting` until the 2s status poll loop reconciles.
-pub(super) fn apply_cascade_state_sync(live: &mut Instance, before: &Instance, started: &Instance) {
-    if started.lifecycle_generation < live.lifecycle_generation {
-        return;
-    }
-    apply_post_restart_identity_sync(live, before, started);
-    live.retroactive_capture_excludes = started.retroactive_capture_excludes.clone();
 }

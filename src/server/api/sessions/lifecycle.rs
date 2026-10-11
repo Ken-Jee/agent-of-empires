@@ -657,10 +657,11 @@ pub async fn restore_session(
     crate::server::runtime::session_mutation_response(&state, &id, Some(outcome)).await
 }
 
-/// `POST /api/sessions/:id/smart-rename`. Regenerates a structured session's
-/// title from its first prompt, including over a title already chosen. The rename
-/// runs detached and best-effort; a `202` means the attempt started, not that
-/// the title changed.
+/// `POST /api/sessions/:id/smart-rename`. Manual "Auto-name now" for a
+/// structured session: clears the per-session attempted gate and regenerates the
+/// title from the first prompt, even over one already chosen. Waits for the
+/// rename: `200` once the title is saved, `409` when nothing could be applied,
+/// `502` with the agent's reason on failure, `504` past the rename deadline.
 pub async fn force_smart_rename(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -744,11 +745,17 @@ pub async fn force_smart_rename(
             crate::session::smart_rename::try_terminal_smart_rename(
                 state.clone(),
                 profile,
-                id,
+                id.clone(),
                 true,
             ),
         );
-        return StatusCode::ACCEPTED.into_response();
+        return match state.runtime.publish(&state).await {
+            Ok(snapshot) => crate::server::runtime::mutation_response(
+                &snapshot.value.cursor,
+                StatusCode::ACCEPTED,
+            ),
+            Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        };
     }
 
     let Some((first_user_prompt, agent_prose)) = state
@@ -773,20 +780,34 @@ pub async fn force_smart_rename(
         attempted.remove(&id);
     }
 
-    state.runtime.work.spawn(
-        "server.smart_rename",
-        crate::session::smart_rename::try_smart_rename(
-            state.clone(),
-            id,
-            crate::session::smart_rename::SmartRenameInput {
-                first_user_prompt,
-                context,
-            },
-            // Manual requests bypass the automatic setting.
-            true,
+    use crate::session::smart_rename::SmartRenameError;
+    let Err(err) = crate::session::smart_rename::try_smart_rename(
+        state.clone(),
+        id.clone(),
+        crate::session::smart_rename::SmartRenameInput {
+            first_user_prompt,
+            context,
+        },
+        // Manual action forces past the smart_rename-disabled gate (#3039).
+        true,
+    )
+    .await
+    else {
+        return crate::server::runtime::session_mutation_response(&state, &id, None::<()>).await;
+    };
+    use crate::daemon::ApiErrorCode;
+    let (code, message) = match err {
+        SmartRenameError::Skipped(_) => (
+            ApiErrorCode::SmartRenameSkipped,
+            "No session title could be applied",
         ),
-    );
-    StatusCode::ACCEPTED.into_response()
+        SmartRenameError::Failed(_) => (ApiErrorCode::SmartRenameFailed, "The naming agent failed"),
+        SmartRenameError::TimedOut => (
+            ApiErrorCode::SmartRenameTimeout,
+            "The naming agent timed out",
+        ),
+    };
+    crate::server::api::api_error_with_code_header(code, message)
 }
 
 /// On-demand "summarize the conversation so far" for a structured-view
@@ -1321,6 +1342,7 @@ fn admit_restart(
 fn reserve_structured_restart(
     state: Arc<AppState>,
     instance: &Instance,
+    expected_generation: Option<u64>,
     body: &crate::daemon::RestartSessionBody,
 ) -> anyhow::Result<(crate::server::session_store::NativeSessionStore, Instance)> {
     use crate::session::SessionStore;
@@ -1340,6 +1362,10 @@ fn reserve_structured_restart(
         .into_iter()
         .find(|row| row.id == instance.id)
         .ok_or(crate::session::SessionGone)?;
+    anyhow::ensure!(
+        expected_generation.is_none_or(|expected| expected == probe.lifecycle_generation),
+        crate::session::LifecycleReservationError::Superseded
+    );
     admit_restart(&mut probe, body, false)?;
     if let Some(target) = body
         .profile
@@ -1540,7 +1566,7 @@ async fn finish_structured_restart(
                     });
                     let dispatch = state
                         .session_service
-                        .prompt_dispatch_under_submission(&id, false, true)
+                        .prompt_dispatch_under_submission(&id, &wake, false, true)
                         .await;
                     if matches
                         && !matches!(
@@ -1615,6 +1641,39 @@ pub(super) async fn prepare_agent_session(
     >,
     preparation: AgentPreparation,
     restart: Option<Arc<crate::daemon::RestartSessionBody>>,
+) -> axum::response::Response {
+    prepare_agent_session_inner(state, id, body, preparation, restart, None).await
+}
+
+pub(crate) async fn recovery_restart(
+    state: Arc<AppState>,
+    id: String,
+    expected_generation: u64,
+) -> axum::response::Response {
+    prepare_agent_session_inner(
+        state,
+        id,
+        Ok(None),
+        AgentPreparation::Restart,
+        Some(Arc::new(crate::daemon::RestartSessionBody {
+            bound_hooks: true,
+            ..Default::default()
+        })),
+        Some(expected_generation),
+    )
+    .await
+}
+
+async fn prepare_agent_session_inner(
+    state: Arc<AppState>,
+    id: String,
+    body: Result<
+        Option<Json<crate::daemon::StartSessionBody>>,
+        axum::extract::rejection::JsonRejection,
+    >,
+    preparation: AgentPreparation,
+    restart: Option<Arc<crate::daemon::RestartSessionBody>>,
+    expected_generation: Option<u64>,
 ) -> axum::response::Response {
     if preparation == AgentPreparation::Ensure && state.cityhall_mode {
         return crate::server::api::cityhall_response();
@@ -1693,7 +1752,7 @@ pub(super) async fn prepare_agent_session(
         let candidate = instance.clone();
         let restart_body = restart.clone().expect("restart body");
         let reserved = tokio::task::spawn_blocking(move || {
-            reserve_structured_restart(worker_state, &candidate, &restart_body)
+            reserve_structured_restart(worker_state, &candidate, expected_generation, &restart_body)
         })
         .await;
         let (native, reserved) = match reserved {
@@ -1744,8 +1803,9 @@ pub(super) async fn prepare_agent_session(
         .and_then(|body| body.size.as_ref())
         .or(body.size.as_ref())
         .map(|size| (size.cols.get(), size.rows.get()));
-    let expected_restart_generation =
-        (instance.is_structured() && restart.is_some()).then_some(instance.lifecycle_generation);
+    let expected_restart_generation = (instance.is_structured() && restart.is_some())
+        .then_some(instance.lifecycle_generation)
+        .or(expected_generation);
     let worker_restart = restart.clone();
     let worker_state = state.clone();
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
@@ -2105,23 +2165,44 @@ pub(super) async fn prepare_agent_session(
     };
     let outcome = match outcome {
         Err(error) => {
-            if let Some(response) = lifecycle_rejection(&state, &error) {
-                return response;
+            let response = if let Some(response) = lifecycle_rejection(&state, &error) {
+                response
+            } else if error.is::<crate::session::NativeStoreUnavailable>() {
+                StatusCode::SERVICE_UNAVAILABLE.into_response()
+            } else {
+                tracing::warn!(target: "http.api.sessions", session = %id, %error, "session start failed");
+                api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "start_failed",
+                    "Session start failed",
+                )
+            };
+            if restart_identity.is_some() {
+                drop(guard);
+                drop(submission);
+                drop(namespace);
+                return match state.runtime.publish(&state).await {
+                    Ok(snapshot) => {
+                        crate::server::runtime::mutation_response(&snapshot.value.cursor, response)
+                    }
+                    Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+                };
             }
-            tracing::warn!(target: "http.api.sessions", session = %id, %error, "session start failed");
-            if error.is::<crate::session::NativeStoreUnavailable>() {
-                return StatusCode::SERVICE_UNAVAILABLE.into_response();
-            }
-            return api_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "start_failed",
-                "Session start failed",
-            );
+            return response;
         }
         Ok(Some(crate::session::StartOutcome::ResumeFailed { sid })) => {
-            return (StatusCode::CONFLICT, crate::daemon::ApiErrorCode::ResumeFailed.header(), Json(serde_json::json!({
+            let response = (StatusCode::CONFLICT, crate::daemon::ApiErrorCode::ResumeFailed.header(), Json(serde_json::json!({
                 "error": "resume_failed", "message": "Resume failed; preserved for explicit retry", "resume_session_id": sid,
             }))).into_response();
+            drop(guard);
+            drop(submission);
+            drop(namespace);
+            return match state.runtime.publish(&state).await {
+                Ok(snapshot) => {
+                    crate::server::runtime::mutation_response(&snapshot.value.cursor, response)
+                }
+                Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+            };
         }
         Ok(outcome) => outcome,
     };
@@ -2194,7 +2275,17 @@ pub(super) async fn prepare_agent_session(
         .await;
     }
     if preparation == AgentPreparation::Ensure {
-        super::ensure::agent_target_response(&state, &id, outcome).await
+        let response = super::ensure::agent_target_response(&state, &id, outcome).await;
+        if !response.status().is_success() && restart_identity.is_some() {
+            match state.runtime.publish(&state).await {
+                Ok(snapshot) => {
+                    crate::server::runtime::mutation_response(&snapshot.value.cursor, response)
+                }
+                Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+            }
+        } else {
+            response
+        }
     } else {
         crate::server::runtime::session_mutation_response(&state, &id, None::<()>).await
     }

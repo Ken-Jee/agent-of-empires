@@ -3720,7 +3720,7 @@ Final prose line.\n";
 │ up/down navigate  enter select  esc cancel               │
 │                                                          │
 ╰──────────────────────────────────────────────────────────╯";
-        let cases: &[(&str, String, Status)] = &[
+        let cases = [
             // US1: rate limit / provider errors -> Error (banner anchor).
             (
                 "banner 429",
@@ -4109,6 +4109,16 @@ Final prose line.\n";
                 Status::Waiting,
             ),
             (
+                "terminal line below approval without composer",
+                format!("{approval_panel}\nError: Retry budget exhausted after 10 retries"),
+                Status::Error,
+            ),
+            (
+                "retry label below approval without composer",
+                format!("{approval_panel}\nretrying 2/3 now: 429 Too Many Requests"),
+                Status::Running,
+            ),
+            (
                 "answered approval above banner border",
                 format!(
                     "{approval_panel}\n ✖ 429 Too Many Requests (rate limited).\n Dismissed when you send your next message.\n{br}\n{prompt_box}"
@@ -4150,7 +4160,102 @@ Final prose line.\n";
                 Status::Idle,
             ),
         ];
-        for (name, pane, expected) in cases {
+        let mut cases: Vec<_> = cases
+            .into_iter()
+            .map(|(name, pane, expected)| (name.to_string(), pane, expected))
+            .collect();
+        let dismissed = "Dismissed when you send your next message.";
+        for (name, prose) in [
+            ("unicode esc prose", "The interrupt key is ⟦esc⟧"),
+            ("indented idle recap prefix", " ※ Working… ⟦esc⟧"),
+        ] {
+            cases.push((
+                name.to_string(),
+                format!("{prose}\n{prompt_box}"),
+                Status::Idle,
+            ));
+        }
+
+        let terminal = "Error: Retry budget exhausted after 10 retries";
+        let hint = "Processing… ⟦esc⟧";
+        let prompt_footer = "│ Enter submit · ↑/↓ scroll · Esc              │\n╰──────────────────────────────────────────────╯";
+        let loader = "⠹ Reading audit fixtures ⟨esc⟩";
+        for (name, pane, expected) in [
+            (
+                "newer prompt after loader",
+                format!("{loader}\n{prompt_footer}"),
+                Status::Waiting,
+            ),
+            (
+                "newer loader after prompt",
+                format!("{prompt_footer}\n{loader}"),
+                Status::Running,
+            ),
+            (
+                "newer prompt after error",
+                format!("{terminal}\n{prompt_footer}"),
+                Status::Waiting,
+            ),
+            (
+                "newer error after prompt",
+                format!("{prompt_footer}\n{terminal}"),
+                Status::Error,
+            ),
+        ] {
+            cases.push((name.to_string(), pane, expected));
+        }
+        for (name, pane, expected) in [
+            (
+                "newer interrupt after error",
+                format!("{terminal}\n{hint}"),
+                Status::Running,
+            ),
+            (
+                "newer error after interrupt",
+                format!("{hint}\n{terminal}"),
+                Status::Error,
+            ),
+            (
+                "newer interrupt after dismissal",
+                format!("{dismissed}\n{hint}"),
+                Status::Running,
+            ),
+            (
+                "newer dismissal after interrupt",
+                format!("{hint}\n{dismissed}"),
+                Status::Error,
+            ),
+        ] {
+            cases.push((name.to_string(), pane, expected));
+        }
+
+        cases.push((
+            "newer braille loader after error".to_string(),
+            format!("{terminal}\n⠹ Reading audit fixtures ⟨esc⟩\n╭── π ─╮\n╰─ ─╯"),
+            Status::Running,
+        ));
+        for (layout, live) in [
+            ("braille", "⠹ Reading audit fixtures ⟨esc⟩"),
+            ("symbolic", "◐ Locating audit config files ⟦esc⟧"),
+            ("ascii", "/ Running requested echo probe [esc]"),
+            ("wrapped", "⠹ Locating audit config files\n ⟦esc⟧"),
+            ("standalone", "⎋ Working…"),
+        ] {
+            for (terminal_name, terminal_line) in [("error", terminal), ("dismissal", dismissed)] {
+                cases.push((
+                    format!("newer {layout} after {terminal_name}"),
+                    format!("{terminal_line}\n{live}"),
+                    Status::Running,
+                ));
+                cases.push((
+                    format!("newer {terminal_name} after {layout}"),
+                    format!("{live}\n{terminal_line}"),
+                    Status::Error,
+                ));
+            }
+        }
+
+        for (name, pane, expected) in &cases {
             assert_eq!(detect_omp_status(pane), *expected, "case: {name}");
         }
     }
@@ -4178,6 +4283,16 @@ Final prose line.\n";
         // details: option rows and the footer stay fixed near the bottom.
         let cases = [
             OMP_LIVE_APPROVAL_PANEL,
+            "\
+╭─ Tool approval required ─────────────────────────────────╮
+│ Tool: custom_tool                                        │
+│                                                          │
+│  ❯ Allow this request                                    │
+│    Always allow                                          │
+│    Cancel                                                │
+│                                                          │
+│ ↑/↓ navigate · Enter select · Esc cancel                │
+╰──────────────────────────────────────────────────────────╯",
             "\
 ╭─ Allow tool: bash ───────────────────────────────────────╮
 │                                                          │
@@ -4284,7 +4399,8 @@ Final prose line.\n";
 │                                                          │
 ╰──────────────────────────────────────────────────────────╯";
         let cases = [
-            ("unicode default", format!("⠋ Working… ⟦esc⟧\n{box_unicode}")),
+("unicode default", format!("⠋ Working… ⟦esc⟧\n{box_unicode}")),
+("interrupt hint without spinner", format!("Processing… ⟦esc⟧\n{box_unicode}")),
             (
                 "unicode intent",
                 format!("⠴ Set permissions on audit bait path ⟦esc⟧\n{box_unicode}"),
@@ -4724,6 +4840,9 @@ Final prose line.\n";
     fn test_detect_omp_status_active_brand_uses_lowest_marker() {
         let band = "⎋ Working…\n⠸ 1s > model status";
         let approval = "│ ❯ Approve │\n│ Deny │\n│ up/down navigate  enter select  esc cancel │";
+        let statusline = "⎋ Working…\n⠏ 1s · 🖥 host";
+        let error = "Error: Retry budget exhausted after 10 retries";
+        let dismissed = "Dismissed when you send your next message.";
         let cases = [
             (
                 "lower approval wins",
@@ -4732,12 +4851,42 @@ Final prose line.\n";
             ),
             (
                 "lower terminal error wins",
-                format!("{band}\nError: Retry budget exhausted after 10 retries"),
+                format!("{band}\n{error}"),
+                Status::Error,
+            ),
+            (
+                "newer active band wins over older terminal error",
+                format!("{error}\n{band}\n╰─"),
+                Status::Running,
+            ),
+            (
+                "newer statusline wins over older terminal error",
+                format!("{error}\n{statusline}\n❯\n╰─"),
+                Status::Running,
+            ),
+            (
+                "newer terminal error wins over older statusline",
+                format!("{statusline}\n╰─\n{error}"),
+                Status::Error,
+            ),
+            (
+                "newer active band wins over older dismissal",
+                format!("{dismissed}\n{band}\n╰─"),
+                Status::Running,
+            ),
+            (
+                "newer dismissal wins over older active band",
+                format!("{band}\n{dismissed}"),
                 Status::Error,
             ),
             (
                 "lower active band wins",
                 format!("{approval}\n{band}\n╰─"),
+                Status::Running,
+            ),
+            (
+                "newer non-Working activity below an older selector",
+                format!("{approval}\n⎋ Running tests\n❯\n───────────────────────────────────\n ⠏ 28s · 🖥 host"),
                 Status::Running,
             ),
             (
@@ -4852,9 +5001,7 @@ Final prose line.\n";
 
     #[test]
     fn test_detect_omp_status_selector_hint_without_approval() {
-        // The panel help row alone must not pin Waiting: generic selectors
-        // render it without Approve/Deny options, and prose naming the plan
-        // options must not trip the overlay arm either.
+        // A footer without selected option rows, or quoted UI text, is not a live selector.
         let box_ = "╭── π ─╮\n╰─ ─╯";
         let cases = [
             // Quoted Plan Review labels/footer are not a live overlay.

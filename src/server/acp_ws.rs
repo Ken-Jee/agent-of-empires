@@ -845,6 +845,7 @@ mod tests {
                 id,
                 5,
                 &Event::SessionNotice {
+                    key: None,
                     severity: "warning".into(),
                     title: "Model fallback".into(),
                     description: None,

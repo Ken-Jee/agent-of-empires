@@ -55,6 +55,7 @@ pub(crate) enum SessionRequest {
         size: Option<TerminalSize>,
     },
     CancelCreation,
+    SmartRename,
 }
 
 pub(crate) enum SessionCommandOutcome {
@@ -76,10 +77,11 @@ enum CommandReply {
     Purge(MutationReceipt<crate::daemon::PurgeOutcome>),
     Restore(MutationReceipt<crate::daemon::RestoreOutcome>),
     Rename(MutationReceipt<crate::daemon::RenameOutcome>),
+    SmartRename(MutationReceipt<()>),
     WorktreeName(MutationReceipt<crate::daemon::WorktreeEditOutcome>),
     AttachProject(MutationReceipt<crate::daemon::AttachProjectOutcome>),
     Namespace(MutationReceipt<crate::daemon::NamespaceOutcome>),
-    PreparationFailed {
+    CommittedFailure {
         cursor: RuntimeCursor,
         failure: CommandFailure,
     },
@@ -96,10 +98,11 @@ impl CommandReply {
             Self::Purge(receipt) => &receipt.cursor,
             Self::Restore(receipt) => &receipt.cursor,
             Self::Rename(receipt) => &receipt.cursor,
+            Self::SmartRename(receipt) => &receipt.cursor,
             Self::WorktreeName(receipt) => &receipt.cursor,
             Self::AttachProject(receipt) => &receipt.cursor,
             Self::Namespace(receipt) => &receipt.cursor,
-            Self::PreparationFailed { cursor, .. } => cursor,
+            Self::CommittedFailure { cursor, .. } => cursor,
         }
     }
 }
@@ -142,7 +145,8 @@ impl CommandFailure {
             | DaemonClientError::ResponseTooLarge { .. }
             | DaemonClientError::Decode(_)
             | DaemonClientError::AuthenticatedDecode
-            | DaemonClientError::InvalidMutationReceipt => false,
+            | DaemonClientError::InvalidMutationReceipt
+            | DaemonClientError::Committed { .. } => false,
             DaemonClientError::UnixTransport | DaemonClientError::PeerIdentity => false,
         };
         if rejected {
@@ -384,6 +388,15 @@ async fn run_command_writer(
                     .await
                     .map(CommandReply::Namespace),
                 CommandRequest::Session { id, request } => match request {
+                    SessionRequest::SmartRename => client
+                        .smart_rename_session(&id, &epoch)
+                        .await
+                        .map(|receipt| {
+                            CommandReply::SmartRename(MutationReceipt {
+                                cursor: receipt.cursor,
+                                outcome: (),
+                            })
+                        }),
                     SessionRequest::Trash(body) => client
                         .trash_session(&id, &body, &epoch)
                         .await
@@ -475,6 +488,14 @@ async fn run_command_writer(
                                 Ok(CommandReply::Terminal(receipt))
                             }
                             Err(error) => {
+                                let mut cursor = cursor;
+                                if let crate::daemon::DaemonClientError::Committed {
+                                    cursor: committed,
+                                    ..
+                                } = &error
+                                {
+                                    cursor.revision = cursor.revision.max(committed.revision);
+                                }
                                 let mut failure = CommandFailure::submitted(error);
                                 match &mut failure {
                                     CommandFailure::Rejected(message)
@@ -485,7 +506,7 @@ async fn run_command_writer(
                                         );
                                     }
                                 }
-                                Ok(CommandReply::PreparationFailed { cursor, failure })
+                                Ok(CommandReply::CommittedFailure { cursor, failure })
                             }
                         },
                         Err(error) => Err(error),
@@ -496,14 +517,20 @@ async fn run_command_writer(
                         .map(CommandReply::Mutation),
                 },
             }
-            .map_err(|error| match error {
-                crate::daemon::DaemonClientError::Status {
-                    code: Some(crate::daemon::ApiErrorCode::ResumeFailed),
-                    ..
-                } => CommandFailure::Rejected(
-                    "Resume failed; the conversation is preserved for explicit retry".into(),
-                ),
-                error => CommandFailure::submitted(error),
+            .or_else(|error| match error {
+                error @ crate::daemon::DaemonClientError::Committed { .. } => {
+                    let message = error.to_string();
+                    let crate::daemon::DaemonClientError::Committed { cursor, code } = error else {
+                        unreachable!();
+                    };
+                    let failure = if code == crate::daemon::ApiErrorCode::PurgeFailed {
+                        CommandFailure::Rejected(message)
+                    } else {
+                        CommandFailure::Unknown(message)
+                    };
+                    Ok(CommandReply::CommittedFailure { cursor, failure })
+                }
+                error => Err(CommandFailure::submitted(error)),
             })
         };
         let _ = request.result.send(result);
@@ -1259,6 +1286,12 @@ impl SessionFeed {
             .find(|row| row.id == id)
     }
 
+    pub(crate) fn applied_epoch(&self) -> Option<&str> {
+        self.applied
+            .as_ref()
+            .map(|snapshot| snapshot.cursor.epoch.as_str())
+    }
+
     pub(crate) fn applied_snapshot(&self) -> Option<Arc<RuntimeSnapshot>> {
         self.applied.clone()
     }
@@ -1314,8 +1347,8 @@ impl SessionFeed {
                 if cursor.epoch == snapshot.cursor.epoch
                     && cursor.revision <= snapshot.cursor.revision
                 {
-                    if matches!(reply, CommandReply::PreparationFailed { .. }) {
-                        let Some(CommandReply::PreparationFailed { failure, .. }) = pending.reply.take() else {
+                    if matches!(reply, CommandReply::CommittedFailure { .. }) {
+                        let Some(CommandReply::CommittedFailure { failure, .. }) = pending.reply.take() else {
                             unreachable!();
                         };
                         if matches!(&failure, CommandFailure::Unknown(_)) {
@@ -1380,8 +1413,10 @@ impl SessionFeed {
                                             pane.state == crate::session::PanePresence::Alive
                                                 && pane.legacy_tool.is_none()
                                                 && matches!(reply, CommandReply::Terminal(receipt)
-                                                    if pane.tmux_session.as_deref()
-                                                        == Some(receipt.outcome.tmux_session.as_str()))
+                                                    if row.lifecycle_generation == receipt.outcome.lifecycle_generation
+                                                        && row.profile == receipt.outcome.profile
+                                                        && pane.tmux_session.as_deref()
+                                                            == Some(receipt.outcome.tmux_session.as_str()))
                                         }),
                                 }
                             });
@@ -1876,6 +1911,144 @@ mod tests {
         .expect("mutation submitted after explicit resolution");
         assert_eq!(id, "unknown");
         assert!(matches!(mutation, SessionMutation::Stop));
+    }
+
+    #[tokio::test]
+    async fn committed_failure_fences_until_publication_and_only_unknown_outcomes_quarantine() {
+        for (request, known) in [
+            (
+                SessionRequest::Mutation(SessionMutation::Start(StartSessionBody::default())),
+                false,
+            ),
+            (
+                SessionRequest::Purge(crate::daemon::DeleteSessionBody::default()),
+                true,
+            ),
+        ] {
+            let (mut feed, mut requests) = feed_with_native_lane();
+            feed.submit_request("partial".into(), request).unwrap();
+            let failure = if known {
+                CommandFailure::Rejected("Purge failed after commit".into())
+            } else {
+                CommandFailure::Unknown("Start committed but preparation failed".into())
+            };
+            requests
+                .try_recv()
+                .unwrap()
+                .result
+                .send(Ok(CommandReply::CommittedFailure {
+                    cursor: RuntimeCursor {
+                        epoch: "test".into(),
+                        revision: 2,
+                    },
+                    failure,
+                }))
+                .unwrap();
+            assert!(feed.drain_command_errors().is_empty());
+            assert!(!feed.can_submit("partial"));
+            let next = snapshot("test", 2);
+            feed.publish_for_test(SessionFeedResult::Snapshot(next.clone()));
+            feed.mark_snapshot_applied(next);
+            let errors = feed.drain_command_errors();
+            assert_eq!(errors.len(), 1);
+            assert_eq!(errors[0].outcome_unknown, !known);
+            assert_eq!(feed.can_submit("partial"), known);
+            if !known {
+                feed.resolve_indeterminate("partial").unwrap();
+                assert!(feed.can_submit("partial"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn auto_name_ack_only_settles_after_its_canonical_revision() {
+        let (mut feed, requests) = feed_with_native_lane();
+        let mut instance = crate::session::Instance::new("original-title", "/tmp/rename");
+        instance.id = "rename".into();
+        instance.source_profile = "test".into();
+        let row = crate::daemon::SessionResponse::from_instance(&instance, false);
+        let mut original = snapshot("test", 1);
+        Arc::make_mut(&mut original)
+            .contents
+            .sessions
+            .push(row.clone());
+        feed.publish_for_test(SessionFeedResult::Snapshot(original.clone()));
+        feed.mark_snapshot_applied(original);
+
+        let mut response_row = row.clone();
+        response_row.title = "receipt-only-title".into();
+        let app = axum::Router::new().route(
+            "/api/sessions/{id}/smart-rename",
+            axum::routing::post(move |request: axum::extract::Request| {
+                let response_row = response_row.clone();
+                async move {
+                    assert_eq!(
+                        request.headers()[crate::daemon::RUNTIME_EPOCH_HEADER],
+                        "test"
+                    );
+                    (
+                        [
+                            (crate::daemon::RUNTIME_EPOCH_HEADER, "test"),
+                            (crate::daemon::RUNTIME_REVISION_HEADER, "2"),
+                        ],
+                        axum::Json(response_row),
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = crate::daemon::DaemonClient::new(&format!("http://{address}"), None).unwrap();
+        let writer = tokio::spawn(run_command_writer(
+            client,
+            "test".into(),
+            feed.grant.clone(),
+            requests,
+            None,
+        ));
+        feed.submit_request("rename".into(), SessionRequest::SmartRename)
+            .unwrap();
+        assert!(!feed.can_submit("rename"));
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                assert!(feed.drain_command_errors().is_empty());
+                if feed.pending["rename"].reply.is_some() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the native writer receives the HTTP acknowledgment");
+        assert!(
+            !feed.can_submit("rename"),
+            "an ACK alone cannot release the row fence"
+        );
+        assert_eq!(
+            feed.applied_session("rename").unwrap().title,
+            "original-title"
+        );
+
+        let mut canonical_row = row;
+        canonical_row.title = "canonical-title".into();
+        let mut next = snapshot("test", 2);
+        Arc::make_mut(&mut next)
+            .contents
+            .sessions
+            .push(canonical_row);
+        feed.publish_for_test(SessionFeedResult::Snapshot(next.clone()));
+        feed.mark_snapshot_applied(next);
+        assert!(feed.drain_command_errors().is_empty());
+        assert!(feed.can_submit("rename"));
+        assert_eq!(
+            feed.applied_session("rename").unwrap().title,
+            "canonical-title"
+        );
+        drop(feed.commands.take());
+        writer.await.unwrap();
+        server.abort();
+        let _ = server.await;
     }
 
     /// A feed with a live command lane, both grants open, and one revision
@@ -2865,6 +3038,8 @@ mod tests {
             Cancel,
             Permission,
             Deleted,
+            Profile,
+            Generation,
             Presence(PanePresence),
             TargetName(Option<&'static str>),
         }
@@ -2873,6 +3048,8 @@ mod tests {
             Invalidation::Cancel,
             Invalidation::Permission,
             Invalidation::Deleted,
+            Invalidation::Profile,
+            Invalidation::Generation,
             Invalidation::Presence(PanePresence::Absent),
             Invalidation::Presence(PanePresence::Dead),
             Invalidation::Presence(PanePresence::Unknown),
@@ -2884,7 +3061,7 @@ mod tests {
             };
             let mut initial = snapshot("test", 1);
             let row: crate::daemon::SessionResponse = serde_json::from_value(serde_json::json!({
-                "id": "session", "profile": "test",
+                "id": "session", "profile": "test", "lifecycle_generation": 4,
                 "auxiliary": [{
                     "target": target, "state": "alive",
                     "tmux_session": "daemon-owned-target"
@@ -2915,6 +3092,12 @@ mod tests {
                     set_grant(&feed.native_grant, true);
                 }
                 Invalidation::Deleted => Arc::make_mut(&mut next).contents.sessions.clear(),
+                Invalidation::Profile => {
+                    Arc::make_mut(&mut next).contents.sessions[0].profile = "other".into();
+                }
+                Invalidation::Generation => {
+                    Arc::make_mut(&mut next).contents.sessions[0].lifecycle_generation += 1;
+                }
                 Invalidation::TargetName(name) => {
                     let row = &mut Arc::make_mut(&mut next).contents.sessions[0];
                     let mut value = serde_json::to_value(&*row).unwrap();
@@ -2940,8 +3123,8 @@ mod tests {
                 outcome: TerminalTarget {
                     tmux_session: "daemon-owned-target".into(),
                     status: crate::daemon::TerminalTargetStatus::Exists,
-                    lifecycle_generation: 0,
-                    profile: String::new(),
+                    lifecycle_generation: 4,
+                    profile: "test".into(),
                 },
             }));
             feed.publish_for_test(SessionFeedResult::Snapshot(next.clone()));

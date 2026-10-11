@@ -615,6 +615,19 @@ impl Session {
     }
 
     pub fn kill(&self) -> Result<()> {
+        // Retain the exact agent pane until kill-session removes it. Otherwise process-tree
+        // teardown can delete the last pane/server before the kill command reaches tmux.
+        if let Some(pane) = super::first_pane_id(&self.name) {
+            let output = crate::tmux::tmux_query_command()
+                .args(["set-option", "-p", "-t", &pane, "remain-on-exit", "on"])
+                .output()?;
+            if !output.status.success() {
+                bail!(
+                    "Failed to retain tmux pane for teardown: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+        }
         // Descendants may survive the SIGHUP sent by tmux.
         if let Some(pane_pid) = self.get_pane_pid() {
             process::kill_process_tree(pane_pid);
@@ -655,41 +668,35 @@ impl Session {
         }
         let target = format!("={}:", self.name);
 
-        if crate::tmux::utils::inside_tmux() {
-            let status = crate::tmux::tmux_command()
-                .args(["switch-client", "-t", &target])
-                .status()?;
-
-            if !status.success() {
-                // TMUX may be inherited without a connected client.
-                let status = crate::tmux::tmux_command()
-                    .args(["attach-session", "-t", &target])
-                    .status()?;
-
-                if !status.success() {
-                    let diag = self.diagnose_attach_failure();
-                    bail!(
-                        "Failed to attach to tmux session '{}' (exit {}): {}",
-                        self.name,
-                        status.code().unwrap_or(-1),
-                        diag
-                    );
-                }
+        let switch_existing = if crate::tmux::utils::inside_tmux() {
+            match crate::tmux::current_session_for_current_pane()? {
+                Some(current) => Session::from_name(&current.name)
+                    .is_attached()
+                    .ok_or_else(|| anyhow::anyhow!("Caller tmux client state is unavailable"))?,
+                None => false,
             }
         } else {
-            let status = crate::tmux::tmux_command()
+            false
+        };
+        let mut command = crate::tmux::tmux_command();
+        if switch_existing {
+            command.args(["switch-client", "-t", &target]);
+        } else {
+            // An inherited TMUX without a caller client must not block a fresh client.
+            command
                 .args(["attach-session", "-t", &target])
-                .status()?;
-
-            if !status.success() {
-                let diag = self.diagnose_attach_failure();
-                bail!(
-                    "Failed to attach to tmux session '{}' (exit {}): {}",
-                    self.name,
-                    status.code().unwrap_or(-1),
-                    diag
-                );
-            }
+                .env_remove("TMUX")
+                .env_remove("TMUX_PANE");
+        }
+        let status = command.status()?;
+        if !status.success() {
+            let diag = self.diagnose_attach_failure();
+            bail!(
+                "Failed to attach to tmux session '{}' (exit {}): {}",
+                self.name,
+                status.code().unwrap_or(-1),
+                diag
+            );
         }
 
         Ok(())
@@ -1187,6 +1194,34 @@ impl Session {
     #[cfg(test)]
     fn capture_window_composited(&self, lines: usize) -> Result<String> {
         Ok(self.capture_window_composited_with_cursor(lines)?.0)
+    }
+
+    /// Plain capture of the last `lines` rows: wrapped lines joined (`-J`) and no
+    /// escapes (unlike `capture_pane`, which passes `-e`), so callers match on the
+    /// text rather than on embedded SGR sequences. Used to scrape the pane.
+    pub fn capture_plain(&self, lines: usize) -> Result<String> {
+        // The existence probe and capture share one deadline.
+        let deadline = crate::tmux::TmuxCommandDeadline::new();
+        if !self.exists_with_deadline(&deadline) {
+            return Ok(String::new());
+        }
+        let target = format!("={}:^", self.name);
+        let mut command = crate::tmux::tmux_command();
+        command.args([
+            "capture-pane",
+            "-t",
+            &target,
+            "-p",
+            "-J",
+            "-S",
+            &format!("-{}", lines),
+        ]);
+        match deadline.run(&mut command) {
+            Ok(output) if output.status.success() => {
+                Ok(String::from_utf8_lossy(&output.stdout).to_string())
+            }
+            _ => Ok(String::new()),
+        }
     }
 
     /// Capture the pane's full scrollback (from session start) with wrapped
@@ -4365,6 +4400,11 @@ mod tests {
             content.contains("AOE_FIRST_WINDOW"),
             "capture_pane must read the first window's pane: {content:?}"
         );
+        let plain = session.capture_plain(10).expect("plain capture");
+        assert!(
+            plain.contains("AOE_FIRST_WINDOW"),
+            "plain capture must target the first window: {plain:?}"
+        );
 
         // The command in the first window is 'sleep', not a shell.
         // is_pane_running_shell must return false even though the active
@@ -5613,6 +5653,71 @@ mod tests {
         assert!(
             !respawned_again,
             "respawn_dead_pane should report no-op on live pane"
+        );
+    }
+
+    #[test]
+    fn kill_retains_the_last_pane_until_exact_session_removal() {
+        if std::env::var_os("AOE_TEST_KILL_LAST_PANE_CHILD").is_some() {
+            let name = "aoe_test_last_pane_teardown";
+            let created = crate::tmux::tmux_query_command()
+                .args([
+                    "-f",
+                    "/dev/null",
+                    "new-session",
+                    "-d",
+                    "-s",
+                    name,
+                    "exec sleep 120",
+                    ";",
+                    "set-option",
+                    "-p",
+                    "-t",
+                    &format!("={name}:^"),
+                    "remain-on-exit",
+                    "off",
+                ])
+                .output()
+                .unwrap();
+            assert!(
+                created.status.success(),
+                "{}",
+                String::from_utf8_lossy(&created.stderr)
+            );
+            let session = Session::from_name(name);
+            session
+                .kill()
+                .expect("last ordinary pane teardown must acknowledge exact removal");
+            let remaining = crate::tmux::tmux_query_command()
+                .args(["list-sessions", "-F", "#{session_name}"])
+                .output()
+                .unwrap();
+            assert!(
+                crate::tmux::tmux_no_server_running(&remaining.stderr),
+                "the isolated server should have exited only after kill-session: {}",
+                String::from_utf8_lossy(&remaining.stderr)
+            );
+            return;
+        }
+        if !tmux_available() {
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tmux::session::tests::kill_retains_the_last_pane_until_exact_session_removal",
+                "--nocapture",
+            ])
+            .env("AOE_TEST_KILL_LAST_PANE_CHILD", "1")
+            .env("AOE_TMUX_SOCKET", directory.path().join("tmux.sock"))
+            .output()
+            .unwrap();
+        assert!(
+            child.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&child.stdout),
+            String::from_utf8_lossy(&child.stderr)
         );
     }
 

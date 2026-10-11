@@ -28,13 +28,19 @@ function attachOk(worker: string, extra: Record<string, unknown> = {}) {
 }
 
 let fetchSpy: ReturnType<typeof stubFetch>;
-/** Answers the registry fetch, and every attach POST with `attach()`. */
-function mockAttach(attach: () => Response | Promise<Response>) {
-  fetchSpy.mockImplementation(async (input) =>
-    String(input).includes("/api/projects")
-      ? jsonResponse([{ name: "frontend", path: "/src/frontend", pinned: false, scope: "global" }])
-      : attach(),
-  );
+/** Answers the picker's fetches, and every attach POST with `attach()`. */
+function mockAttach(attach: () => Response | Promise<Response>, recent: { path: string; display_name: string }[] = []) {
+  fetchSpy.mockImplementation(async (input) => {
+    const url = String(input);
+    if (url.includes(ATTACH_URL)) return attach();
+    if (url.includes("/api/projects"))
+      return jsonResponse([{ name: "frontend", path: "/src/frontend", pinned: false, scope: "global" }]);
+    return jsonResponse(
+      url.includes("/api/recent-projects")
+        ? { projects: recent.map((r) => ({ ...r, tool: "claude", last_used_at: "2025-01-02T00:00:00Z" })) }
+        : { sessions: [] },
+    );
+  });
 }
 const attachCalls = () => fetchSpy.mock.calls.filter(([url]) => String(url).includes(ATTACH_URL));
 
@@ -87,12 +93,70 @@ describe("AddProjectModal", () => {
   it.each([
     ["frontend", false],
     ["/src/frontend", true],
+    ["/tmp/unlisted-project", false],
   ])("posts %j with attach_existing_branch=%s", async (project, reuseBranch) => {
     await submit(project, { reuseBranch });
     await waitFor(() => expect(attachCalls()).toHaveLength(1));
     const init = attachCalls()[0]![1] as RequestInit;
     expect(init.method).toBe("POST");
     expect(JSON.parse(init.body as string)).toEqual({ project, attach_existing_branch: reuseBranch });
+  });
+
+  it("lists saved projects in the picker instead of a native datalist", async () => {
+    await submit(null);
+    await waitFor(() => expect(screen.queryByTitle("/src/frontend")).not.toBeNull());
+    expect(screen.getByTestId("add-project-modal").querySelector("datalist")).toBeNull();
+  });
+
+  it("reads saved projects in the session profile, not the machine default", async () => {
+    openRowMenu(ws({ profile: "work" }));
+    fireEvent.click(screen.getByTestId("sidebar-context-menu-add-project"));
+    await screen.findByTitle("/src/frontend");
+    const reads = fetchSpy.mock.calls.filter(([url]) => String(url).includes("/api/projects"));
+    expect(reads.map(([url]) => String(url))).toEqual(["/api/projects?profile=work"]);
+  });
+
+  it("retries a failed saved-project read without discarding the typed path", async () => {
+    const answer = fetchSpy.getMockImplementation()!;
+    let fail = true;
+    fetchSpy.mockImplementation(async (input, init) => {
+      if (String(input).includes("/api/projects") && fail) return jsonResponse({ message: "unavailable" }, 503);
+      return answer(input, init);
+    });
+    openRowMenu(ws());
+    fireEvent.click(screen.getByTestId("sidebar-context-menu-add-project"));
+    fireEvent.change(screen.getByTestId("add-project-modal-input"), { target: { value: "/typed/repo" } });
+    await screen.findByRole("alert");
+    fail = false;
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    await screen.findByTitle("/src/frontend");
+    expect((screen.getByTestId("add-project-modal-input") as HTMLInputElement).value).toBe("/typed/repo");
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("posts the path of a clicked picker row", async () => {
+    openRowMenu(ws());
+    fireEvent.click(screen.getByTestId("sidebar-context-menu-add-project"));
+    fireEvent.click(await waitFor(() => screen.getByTitle("/src/frontend")));
+    fireEvent.click(screen.getByTestId("add-project-modal-submit"));
+    await waitFor(() => expect(attachCalls()).toHaveLength(1));
+    expect(JSON.parse((attachCalls()[0]![1] as RequestInit).body as string)).toEqual({
+      project: "/src/frontend",
+      attach_existing_branch: false,
+    });
+  });
+
+  it("lists a recent-only project and posts its path when clicked", async () => {
+    mockAttach(() => jsonResponse(attachOk("restarted")), [{ path: "/src/recent-only", display_name: "recent-only" }]);
+    openRowMenu(ws());
+    fireEvent.click(screen.getByTestId("sidebar-context-menu-add-project"));
+    fireEvent.click(await waitFor(() => screen.getByTitle("/src/recent-only")));
+    fireEvent.click(screen.getByTestId("add-project-modal-submit"));
+    await waitFor(() => expect(attachCalls()).toHaveLength(1));
+    expect(JSON.parse((attachCalls()[0]![1] as RequestInit).body as string)).toEqual({
+      project: "/src/recent-only",
+      attach_existing_branch: false,
+    });
   });
 
   it("does not post an empty project", async () => {

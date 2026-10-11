@@ -117,7 +117,11 @@ pub(crate) async fn execute(
             .await
             .map_err(|_| DaemonClientError::Transport);
     };
-    tokio::time::timeout(Duration::from_secs(15), async {
+    let timeout = request
+        .timeout()
+        .copied()
+        .unwrap_or(Duration::from_secs(15));
+    tokio::time::timeout(timeout, async {
         let stream = connect_unix(path).await?;
         let (mut sender, connection) =
             hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(stream))
@@ -150,6 +154,61 @@ pub(crate) async fn execute(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn unix_requests_honor_their_operation_deadline() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        for (deadline, elapsed, should_timeout) in [(30, 16, false), (1, 2, true)] {
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join("api.sock");
+            let listener = tokio::net::UnixListener::bind(&path).unwrap();
+            let (arrived, observed) = tokio::sync::oneshot::channel();
+            let (release, released) = tokio::sync::oneshot::channel();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut header = [0; 4096];
+                let mut used = 0;
+                while !header[..used].windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                    let read = stream.read(&mut header[used..]).await.unwrap();
+                    assert!(read > 0);
+                    used += read;
+                }
+                arrived.send(()).unwrap();
+                released.await.unwrap();
+                let _ = stream
+                    .write_all(
+                        b"HTTP/1.1 201 Created\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .await;
+            });
+            let http = reqwest::Client::new();
+            let request = http
+                .get("http://localhost/operation")
+                .timeout(Duration::from_secs(deadline))
+                .build()
+                .unwrap();
+            let client = tokio::spawn(async move { execute(&http, Some(&path), request).await });
+            observed.await.unwrap();
+            tokio::time::pause();
+            tokio::time::advance(Duration::from_secs(elapsed)).await;
+            tokio::time::resume();
+            if should_timeout {
+                assert!(matches!(
+                    client.await.unwrap(),
+                    Err(DaemonClientError::Timeout)
+                ));
+                release.send(()).unwrap();
+            } else {
+                release.send(()).unwrap();
+                assert_eq!(
+                    client.await.unwrap().unwrap().status(),
+                    reqwest::StatusCode::CREATED
+                );
+            }
+            server.await.unwrap();
+        }
+    }
 
     #[test]
     fn ancestor_trust_allows_only_owner_private_or_sticky_writes() {

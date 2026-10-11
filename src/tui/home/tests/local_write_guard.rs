@@ -182,7 +182,7 @@ async fn readonly_trash_restore_bulk_purge_and_force_remove_leave_persisted_owne
     view.selected_session = Some(row.id.clone());
     let before = payload_bytes("test");
     view.restore_selected_from_trash();
-    view.empty_trash_all();
+    view.empty_trash_all(false, false);
     assert!(view
         .force_remove_session(&row.id, std::num::NonZeroU64::new(9).unwrap())
         .is_err());

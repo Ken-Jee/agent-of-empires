@@ -78,6 +78,48 @@ pub(crate) enum PurgeReservation<S: SessionStore + 'static> {
     Rejected(DeletionResult),
 }
 
+pub(crate) struct TrashPurgeConsent {
+    pub trashed_at: chrono::DateTime<Utc>,
+    pub lifecycle_generation: u64,
+    pub force_failed: bool,
+}
+
+impl TrashPurgeConsent {
+    fn matches(&self, row: &Instance) -> bool {
+        row.trashed_at == Some(self.trashed_at)
+            && row.lifecycle_generation == self.lifecycle_generation
+    }
+}
+
+pub(crate) fn drop_failed_purge(
+    store: &dyn SessionStore,
+    id: &str,
+    consent: &TrashPurgeConsent,
+) -> Result<Option<Instance>> {
+    let _identity = crate::session::acquire_session_identity_lock()?;
+    let _title = crate::session::acquire_session_title_lock(id)?;
+    let _lifecycle = store.storage().acquire_instance_lifecycle_lock(id)?;
+    store.update(|rows, _| {
+        let index = rows
+            .iter()
+            .position(|row| row.id == id)
+            .ok_or(crate::session::SessionGone)?;
+        let row = &rows[index];
+        anyhow::ensure!(
+            consent.matches(row),
+            crate::session::LifecycleReservationError::Superseded
+        );
+        anyhow::ensure!(
+            !row.has_fresh_lifecycle_reservation(Utc::now()),
+            crate::session::LifecycleReservationError::Superseded
+        );
+        if row.failed_purge_forced() != Some(true) {
+            return Ok(None);
+        }
+        Ok(Some(rows.remove(index)))
+    })
+}
+
 /// Membership captured by a successful group-ungroup commit, before claiming purge.
 pub(crate) struct PurgeSelection {
     pub profile: String,
@@ -191,12 +233,21 @@ impl<S: SessionStore + 'static> PurgeTransaction<S> {
         request.instance = row;
     }
 
+    pub(crate) fn reserve_selected_trash(
+        backend: S,
+        request: DeletionRequest,
+        selection: Option<PurgeSelection>,
+        consent: TrashPurgeConsent,
+    ) -> Result<PurgeReservation<S>> {
+        Self::reserve_inner(backend, request, selection, None, Some(consent))
+    }
+
     pub fn reserve(
         backend: S,
         request: DeletionRequest,
         selection: Option<PurgeSelection>,
     ) -> Result<PurgeReservation<S>> {
-        Self::reserve_inner(backend, request, selection, None)
+        Self::reserve_inner(backend, request, selection, None, None)
     }
 
     /// Transfer only this creation's launch reservation into rollback ownership.
@@ -205,7 +256,7 @@ impl<S: SessionStore + 'static> PurgeTransaction<S> {
         request: DeletionRequest,
         generation: u64,
     ) -> Result<PurgeReservation<S>> {
-        Self::reserve_inner(backend, request, None, Some(generation))
+        Self::reserve_inner(backend, request, None, Some(generation), None)
     }
 
     fn reserve_inner(
@@ -213,6 +264,7 @@ impl<S: SessionStore + 'static> PurgeTransaction<S> {
         mut request: DeletionRequest,
         selection: Option<PurgeSelection>,
         creation_generation: Option<u64>,
+        consent: Option<TrashPurgeConsent>,
     ) -> Result<PurgeReservation<S>> {
         anyhow::ensure!(
             request.session_id == request.instance.id,
@@ -221,6 +273,8 @@ impl<S: SessionStore + 'static> PurgeTransaction<S> {
         let store: &dyn SessionStore = &backend;
         let id = request.session_id.clone();
         let was_trashed = request.instance.is_trashed();
+        let expected_trashed_at = request.instance.trashed_at;
+        let mut lifecycle_changed = false;
         let lifecycle_lock = store
             .storage()
             .acquire_instance_lifecycle_lock(&id)
@@ -230,6 +284,19 @@ impl<S: SessionStore + 'static> PurgeTransaction<S> {
         let mut rejected = None;
         store.update(|instances, _groups| {
             if let Some(stored) = instances.iter().find(|instance| instance.id == id) {
+                if let Some(consent) = &consent {
+                    if !consent.matches(stored) {
+                        rejected = Some((
+                            DeletionDisposition::KeptRestored,
+                            "Selected trash lifecycle changed before purge".into(),
+                            Some(stored.clone()),
+                        ));
+                        return Ok(());
+                    }
+                    if consent.force_failed && stored.failed_purge_forced().is_some() {
+                        request.force_delete = true;
+                    }
+                }
                 if stored.is_structured() != request.instance.is_structured()
                     || selection.as_ref().is_some_and(|selection| {
                         !selection.matches_location(stored, store.storage().profile())
@@ -322,6 +389,9 @@ impl<S: SessionStore + 'static> PurgeTransaction<S> {
                 .iter_mut()
                 .find(|instance| instance.id == id)
                 .expect("reserved purge row must still exist");
+            lifecycle_changed = was_trashed && stored.trashed_at != expected_trashed_at;
+            stored.failed_purge = None;
+            stored.status = crate::session::Status::Deleting;
             let mut snapshot = stored.clone();
             snapshot.source_profile = store.storage().profile().to_string();
             reserved = Some((generation, snapshot));
@@ -345,6 +415,10 @@ impl<S: SessionStore + 'static> PurgeTransaction<S> {
             request.instance.source_profile = snapshot.source_profile;
         } else {
             request.instance = snapshot;
+        }
+        // Force consent belongs to the selected trash lifecycle.
+        if lifecycle_changed {
+            request.force_delete = false;
         }
         let mut transaction = Self {
             store: Some(backend),
@@ -426,6 +500,7 @@ impl<S: SessionStore + 'static> PurgeTransaction<S> {
         let id = self.request().session_id.clone();
         let generation = self.generation;
         let mut retained = None;
+        let forced = self.request().force_delete;
         self.store().update(|instances, _groups| {
             if let Some(stored) = instances.iter_mut().find(|instance| instance.id == id) {
                 if stored.finish_lifecycle_status(
@@ -434,6 +509,9 @@ impl<S: SessionStore + 'static> PurgeTransaction<S> {
                     super::Status::Error,
                 ) {
                     stored.last_error = Some(errors.join("; "));
+                    if !errors.is_empty() {
+                        stored.record_failed_purge(forced);
+                    }
                 }
                 retained = Some(stored.clone());
             }
@@ -3552,6 +3630,54 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
+    fn purge_claim_drops_force_from_a_stale_trash_lifecycle() {
+        let _guard = crate::session::test_support::isolate_app_dir();
+        super::super::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
+        let earlier = Utc::now() - chrono::Duration::minutes(5);
+        for (profile, same_lifecycle) in [("purge-stale-force", false), ("purge-same-force", true)]
+        {
+            let storage = Storage::new_unwatched(profile).unwrap();
+            let mut requested = create_test_instance();
+            requested.source_profile = profile.to_string();
+            let trashed_at = Utc::now();
+            requested.trashed_at = Some(if same_lifecycle { trashed_at } else { earlier });
+            storage
+                .update(|instances, _| {
+                    let mut stored = requested.clone();
+                    stored.trashed_at = Some(trashed_at);
+                    instances.push(stored);
+                    Ok(())
+                })
+                .unwrap();
+            let transaction = match PurgeTransaction::reserve(
+                storage,
+                DeletionRequest {
+                    session_id: requested.id.clone(),
+                    instance: requested,
+                    delete_worktree: false,
+                    delete_branch: false,
+                    delete_sandbox: false,
+                    force_delete: true,
+                    detach_hooks: true,
+                    keep_scratch: false,
+                },
+                None,
+            )
+            .unwrap()
+            {
+                PurgeReservation::Reserved(transaction) => transaction,
+                PurgeReservation::Rejected(_) => panic!("purge reservation was refused"),
+            };
+            assert_eq!(
+                transaction.request().force_delete,
+                same_lifecycle,
+                "{profile}"
+            );
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn purge_transaction_generation_gate_and_durable_commit() {
         let _guard = crate::session::test_support::isolate_app_dir();
         super::super::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
@@ -5658,5 +5784,99 @@ mod tests {
                 );
             }
         }
+    }
+    #[test]
+    #[serial_test::serial]
+    fn selected_trash_escalation_is_durable_and_generation_bound() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
+        let profile = "selected-trash-escalation";
+        let storage = Storage::new_unwatched(profile).unwrap();
+        let mut row = Instance::new("failed purge", "/tmp/selected-trash");
+        row.source_profile = profile.into();
+        row.trash();
+        row.lifecycle_generation = 7;
+        row.record_failed_purge(false);
+        storage
+            .update(|rows, _| {
+                rows.push(row.clone());
+                Ok(())
+            })
+            .unwrap();
+        let consent = |generation| TrashPurgeConsent {
+            trashed_at: row.trashed_at.unwrap(),
+            lifecycle_generation: generation,
+            force_failed: true,
+        };
+        assert!(drop_failed_purge(&storage, &row.id, &consent(7))
+            .unwrap()
+            .is_none());
+        let request = DeletionRequest {
+            session_id: row.id.clone(),
+            instance: row.clone(),
+            delete_worktree: false,
+            delete_branch: false,
+            delete_sandbox: false,
+            force_delete: false,
+            detach_hooks: true,
+            keep_scratch: true,
+        };
+        for (generation, stamp) in [
+            (6, row.trashed_at.unwrap()),
+            (7, row.trashed_at.unwrap() - chrono::Duration::seconds(1)),
+        ] {
+            let rejected = PurgeTransaction::reserve_selected_trash(
+                Storage::open_unwatched(profile).unwrap(),
+                request.clone(),
+                None,
+                TrashPurgeConsent {
+                    trashed_at: stamp,
+                    lifecycle_generation: generation,
+                    force_failed: true,
+                },
+            )
+            .unwrap();
+            assert!(matches!(
+                rejected,
+                PurgeReservation::Rejected(DeletionResult {
+                    disposition: DeletionDisposition::KeptRestored,
+                    ..
+                })
+            ));
+            assert_eq!(storage.load().unwrap()[0].lifecycle_generation, 7);
+        }
+        let mut transaction = match PurgeTransaction::reserve_selected_trash(
+            Storage::open_unwatched(profile).unwrap(),
+            request,
+            None,
+            consent(7),
+        )
+        .unwrap()
+        {
+            PurgeReservation::Reserved(transaction) => transaction,
+            PurgeReservation::Rejected(_) => panic!("matching failed purge is retriable"),
+        };
+        assert!(transaction.request().force_delete);
+        let retained = transaction
+            .release_reservation(&["forced cleanup failed".into()])
+            .unwrap()
+            .unwrap();
+        drop(transaction);
+        assert_eq!(retained.failed_purge_forced(), Some(true));
+        let loaded = storage.load().unwrap().remove(0);
+        assert_eq!(loaded.failed_purge_forced(), Some(true));
+        assert!(drop_failed_purge(&storage, &row.id, &consent(7)).is_err());
+        let current = TrashPurgeConsent {
+            trashed_at: loaded.trashed_at.unwrap(),
+            lifecycle_generation: loaded.lifecycle_generation,
+            force_failed: false,
+        };
+        let removed = drop_failed_purge(&storage, &row.id, &current)
+            .unwrap()
+            .unwrap();
+        assert_eq!(removed.id, row.id);
+        assert!(storage.load().unwrap().is_empty());
+        row.untrash();
+        assert_eq!(row.failed_purge_forced(), None);
     }
 }

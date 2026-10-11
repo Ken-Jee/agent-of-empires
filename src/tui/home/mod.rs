@@ -9,6 +9,7 @@ mod file_watch_tests;
 pub(crate) use icons::get_indent;
 mod icons;
 mod input;
+mod last_prompt;
 mod layout;
 mod lifecycle;
 mod live_send;
@@ -221,6 +222,16 @@ pub struct HomeView {
     /// Which profile the selected group belongs to (for scoped group operations)
     pub(super) selected_group_profile: Option<String>,
     pub(super) view_mode: ViewMode,
+    /// Whether the terminal-view last-prompt footer (toggled with `Ctrl+L`) is on.
+    pub(super) show_last_prompt: bool,
+    /// Latest last-prompt scrape adopted for rendering. Module-private: only the
+    /// `home` submodules touch it.
+    last_prompt_cache: Option<last_prompt::LastPromptCache>,
+    /// Drop-box a background scrape thread writes into, keeping `capture-pane` off
+    /// the render/input path.
+    last_prompt_slot: last_prompt::LastPromptSlot,
+    /// Whether a background last-prompt scrape is currently running.
+    last_prompt_in_flight: bool,
     pub(super) sort_order: SortOrder,
     pub(super) group_by: GroupByMode,
     /// Per-row tag config; what to show next to each session title.
@@ -512,6 +523,8 @@ pub struct HomeView {
     /// is accepted. Carries the image through the generic `ConfirmDialog`,
     /// which only knows its action string.
     pub(super) pending_image_pull: Option<String>,
+    /// Checkbox keys the last submitted confirm dialog had checked.
+    pub(super) confirm_checked: Vec<&'static str>,
     /// Session whose persisted view flips (structured ↔ terminal) after the
     /// switch-view confirm dialog is accepted.
     pub(super) pending_switch_view_session: Option<String>,
@@ -560,6 +573,7 @@ pub struct HomeView {
     // The poller samples host resources and agent counts off the UI thread;
     // `metrics` holds the latest sample for the strip and detail view.
     pub(super) show_diagnostics: bool,
+    pub(super) show_shortcut_bar: bool,
     pub(super) metrics_poller: super::metrics_poller::MetricsPoller,
     pub(super) pending_metrics_refresh: bool,
     pub(super) metrics: crate::process::metrics::MetricsSnapshot,
@@ -847,6 +861,12 @@ pub struct HomeView {
     /// bottom until the user opts to see them. Persisted to
     /// `app_state.archived_section_collapsed`.
     pub(super) archived_section_collapsed: bool,
+
+    /// Stopped sessions inside groups are left out of the sidebar, for this run only.
+    pub(super) hide_stopped_in_groups: bool,
+    /// While stopped sessions are hidden, each group header's full count, keyed by path and
+    /// profile, so the header can show `visible/total`.
+    pub(super) group_totals: HashMap<(String, Option<String>), usize>,
 
     /// Collapsed state of the synthetic "Trash" sidebar section. Defaults to
     /// `true` (collapsed): trash is a recovery shelf, kept out of the way

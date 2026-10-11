@@ -110,6 +110,8 @@ impl HomeView {
             || self.info_dialog.is_some()
             || self.snooze_duration_dialog.is_some()
             || self.profile_picker_dialog.is_some()
+            || self.group_picker_dialog.is_some()
+            || self.sort_picker_dialog.is_some()
             || self.project_session_picker_dialog.is_some()
             || self.projects_dialog.is_some()
             || self.attach_project_dialog.is_some()
@@ -181,43 +183,7 @@ impl HomeView {
     }
 
     pub fn has_dialog(&self) -> bool {
-        let serve_open = self.serve_view.is_some();
-
-        self.live_send.is_some()
-            || self.show_help
-            || self.search_active
-            || self.new_dialog.is_some()
-            || self.confirm_dialog.is_some()
-            || self.unified_delete_dialog.is_some()
-            || self.group_delete_options_dialog.is_some()
-            || self.rename_dialog.is_some()
-            || self.worktree_name_dialog.is_some()
-            || self.restart_dialog.is_some()
-            || self.context_menu.is_some()
-            || self.repo_trust_dialog.is_some()
-            || self.hooks_install_dialog.is_some()
-            || self.volume_ignores_glob_dialog.is_some()
-            || self.intro_dialog.is_some()
-            || self.no_agents_dialog.is_some()
-            || self.changelog_dialog.is_some()
-            || self.info_dialog.is_some()
-            || self.snooze_duration_dialog.is_some()
-            || self.profile_picker_dialog.is_some()
-            || self.project_session_picker_dialog.is_some()
-            || self.projects_dialog.is_some()
-            || self.attach_project_dialog.is_some()
-            || self.plugin_manager_dialog.is_some()
-            || self.skills_manager_dialog.is_some()
-            || self.command_palette.is_some()
-            || self.tool_picker_dialog.is_some()
-            || self.send_message_dialog.is_some()
-            || self.permission_response_dialog.is_some()
-            || self.update_confirm_dialog.is_some()
-            || self.telemetry_consent_dialog.is_some()
-            || self.tips_dialog.is_some()
-            || serve_open
-            || self.settings_view.is_some()
-            || self.diff_view.is_some()
+        self.live_send.is_some() || self.has_non_live_send_overlay()
     }
 
     /// Whether the paste-burst detector should fire for incoming key events.

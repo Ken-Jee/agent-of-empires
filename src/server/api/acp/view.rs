@@ -87,6 +87,7 @@ pub async fn acp_enable(
     if !instance_exists(&state, &id).await {
         return session_not_found();
     }
+    let namespace = state.profile_namespace.clone().read_owned().await;
     // Serializes the transition with disable and with the deferred spawn.
     let inst_lock = state.instance_lock(&id).await;
     let transition_guard = inst_lock.lock().await;
@@ -139,7 +140,7 @@ pub async fn acp_enable(
 
     let agent_name = pick_agent(&state, &instance, instance.agent_name.as_deref()).await;
     if let Err(resp) =
-        commit_structured_view(&state, &mut instance, selected_binding.as_ref()).await
+        commit_structured_view(&state, &mut instance, selected_binding.as_ref(), namespace).await
     {
         return resp;
     }
@@ -148,20 +149,24 @@ pub async fn acp_enable(
     view_response(id, View::Structured)
 }
 
-/// Kill the tmux side and persist the structured view, then mirror it into
-/// memory unless a newer lifecycle generation already landed.
+/// Commit the structured view and publish its authoritative status once.
 async fn commit_structured_view(
-    state: &AppState,
+    state: &Arc<AppState>,
     instance: &mut Instance,
     selected_binding: Option<&crate::session::ConversationBinding>,
+    namespace: tokio::sync::OwnedRwLockReadGuard<()>,
 ) -> Result<(), Response> {
     let inst_for_transition = instance.clone();
     let profile = instance.source_profile.clone();
-    let file_watch = state.file_watch.clone();
+    let commit_state = state.clone();
     let binding_for_transition = selected_binding.cloned();
     let transition = tokio::task::spawn_blocking(move || -> anyhow::Result<u64> {
-        let storage = crate::session::Storage::new(&profile, file_watch)?;
-        let _lifecycle_lock = storage
+        let _namespace = namespace;
+        use crate::session::SessionStore;
+        let storage = crate::server::session_store::NativeSessionStore::open(
+            commit_state, &profile, Some(inst_for_transition.id.clone()),
+        )?;
+        let _lifecycle_lock = storage.storage()
             .acquire_instance_lifecycle_lock(&inst_for_transition.id)
             .map_err(|error| {
                 anyhow::anyhow!("failed to acquire terminal-to-ACP lifecycle lock: {error}")
@@ -172,7 +177,7 @@ async fn commit_structured_view(
         if let Err(error) = inst_for_transition.kill_ancillary_tmux_sessions_locked() {
             tracing::warn!(target: "acp.switch", session = %inst_for_transition.id, "kill ancillary tmux sessions failed: {error}");
         }
-        storage.update(|all, _groups| {
+        (&storage as &dyn crate::session::SessionStore).update(|all, _groups| {
             let Some(slot) = all
                 .iter_mut()
                 .find(|candidate| candidate.id == inst_for_transition.id)
@@ -189,6 +194,7 @@ async fn commit_structured_view(
             // structured rows, so a Running/Waiting status would never settle.
             slot.status = Status::Idle;
             slot.lifecycle_generation = slot.lifecycle_generation.saturating_add(1);
+            slot.acp_load_session_capable = None;
             Ok(slot.lifecycle_generation)
         })
     })
@@ -209,27 +215,15 @@ async fn commit_structured_view(
             ));
         }
     };
-    let apply = |inst: &mut Instance| {
-        inst.view = View::Structured;
-        inst.resume_intent = ResumeIntent::Default;
-        if let Some(binding) = selected_binding {
-            inst.agent_session_id = Some(binding.session_id.clone());
-            inst.agent_session_binding = Some(binding.clone());
-        }
-        inst.status = Status::Idle;
-        inst.lifecycle_generation = lifecycle_generation;
-        inst.acp_load_session_capable = None;
-    };
-    apply(instance);
-    let mut instances = state.instances.write().await;
-    if let Some(slot) = instances.iter_mut().find(|candidate| candidate.id == id) {
-        if lifecycle_generation >= slot.lifecycle_generation {
-            apply(slot);
-            state
-                .mutation_epoch
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    if let Some(committed) = find_instance(state, &id).await {
+        if lifecycle_generation >= instance.lifecycle_generation {
+            *instance = committed;
         }
     }
+    state.runtime.publish(state).await.map_err(|error| {
+        tracing::error!(target: "acp.switch", session = %id, %error, "view publication failed");
+        internal_error("failed to publish structured view")
+    })?;
     Ok(())
 }
 
@@ -243,7 +237,8 @@ fn spawn_enabled_worker(
     selected_conversation: Option<(String, crate::session::ExecutionBinding)>,
 ) {
     let session_id = expected.id.clone();
-    tokio::spawn(async move {
+    let work = state.runtime.work.clone();
+    work.spawn("server.acp_enable", async move {
         let exclusion =
             match crate::acp::sandbox::LaunchExclusion::acquire(state.clone(), &session_id, false)
                 .await
@@ -653,6 +648,56 @@ mod tests {
         assert!(
             routing.contains(&("CLAUDE_CODE_USE_VERTEX".to_string(), "1".to_string())),
             "{routing:?}"
+        );
+    }
+
+    /// The terminal-to-ACP switch settles the live slot to Idle itself. A plugin that last heard
+    /// Running would never learn the session went Idle unless the switch publishes the move.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn switching_to_structured_view_publishes_the_idle_it_settles_to() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let mut inst = Instance::new("switch-notify", "/tmp/aoe-switch-notify");
+        inst.source_profile = "default".to_string();
+        inst.status = Status::Running;
+        crate::server::test_support::seed_instances_on_disk_for_test("default", vec![inst.clone()]);
+        let state = crate::server::test_support::build_test_app_state(vec![inst.clone()]);
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+        let mut rx = state.status_tx.subscribe();
+        let mut working = inst.clone();
+
+        let namespace = state.profile_namespace.clone().read_owned().await;
+        assert!(
+            commit_structured_view(&state, &mut working, None, namespace)
+                .await
+                .is_ok()
+        );
+
+        let change = rx.try_recv().expect("the live slot's move is published");
+        assert_eq!(change.instance_id, inst.id);
+        assert_eq!((change.old, change.new), (Status::Running, Status::Idle));
+        assert_eq!(change.effective_profile, "default");
+        assert!(
+            rx.try_recv().is_err(),
+            "the transition is published only once"
+        );
+        let snapshot = state.runtime.snapshot(&state).await.unwrap();
+        let row = snapshot
+            .value
+            .contents
+            .sessions
+            .iter()
+            .find(|row| row.id == inst.id)
+            .unwrap();
+        assert_eq!(Status::from_api_str(&row.status), Some(Status::Idle));
+        assert_eq!(row.view, View::Structured);
+        let persisted = crate::session::Storage::open_unwatched("default")
+            .unwrap()
+            .load()
+            .unwrap();
+        assert_eq!(
+            (persisted[0].status, persisted[0].view),
+            (Status::Idle, View::Structured)
         );
     }
 

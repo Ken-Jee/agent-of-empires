@@ -6,10 +6,9 @@ working directory. By default each tool runs in its own persistent tmux
 session, so re-attaching is instant and state (cursor position, staged
 hunks, browsed path) survives across detaches.
 
-The UX mirrors the built-in terminal preview: press a hotkey to preview
-the tool in the home view, `Enter` to attach to it full-screen, and
-`Esc` to come back to the home view with the tool still running in the
-background.
+Press a hotkey to preview the tool in the home view. `Enter` follows your
+default attach mode, including [live mode](live-mode.md); `Tab` opens a
+full tmux client. Leaving the preview does not stop the tool.
 
 ## Configuring tools
 
@@ -80,8 +79,9 @@ so they shadow any built-in binding using the same combination.
 Three ways to open or run a tool, in roughly the order you'll grow into them:
 
 1. **Hotkey**. Select an agent session, press the configured hotkey
-   (e.g. `Alt+g`). The home view switches to a live preview of that
-   tool's tmux pane. Press `Enter` to attach.
+   (e.g. `Alt+g`). The daemon prepares its pane, then the home view shows
+   its output. Rendering alone never launches a tool. Pressing `Enter`
+   during preparation continues that same request instead of launching twice.
 2. **Picker**. Press `;` on the home view. A modal lists every
    configured tool with its command and hotkey. Pick one with arrow
    keys (or `j`/`k`) and `Enter`. `;` or `Esc` closes the picker.
@@ -96,7 +96,7 @@ the debug log, not shown as an interactive dialog.
 
 Once you're in tool preview mode:
 
-- `Enter` attaches you to the tool full-screen.
+- `Enter` uses your default attach mode; `Tab` attaches full-screen.
 - The hotkey **toggles** preview off and back to the structured view.
 - `Esc`, `;`, or `t` returns to the structured view.
 - `x` opens the Stop confirmation for the visible tool, not its agent.

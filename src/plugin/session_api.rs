@@ -17,7 +17,10 @@ use aoe_plugin_api::acp::{
     AcpAgentCapability, AcpCapabilitiesResponse, AcpModeCapability, AcpModelCapability,
     AcpThinkingCapability, ApprovalClass, CatalogStatus,
 };
-use aoe_plugin_api::session::{SessionsCreateRequest, SessionsCreateResponse, TurnSendRequest};
+use aoe_plugin_api::session::{
+    MessageDisposition, MessageSendRequest, MessageSendResponse, SessionsCreateRequest,
+    SessionsCreateResponse, TurnSendRequest,
+};
 
 use crate::acp::option_catalog::{AgentOptionEntry, OptionCatalog};
 use crate::acp::state::ConfigOptionCategory;
@@ -26,6 +29,7 @@ use crate::plugin::automation_policy::{
 };
 use crate::plugin::host_api::{DispatchError, PluginRpcContext};
 use crate::plugin::protocol::codes;
+use crate::server::api::sessions::{send_terminal_message, SendKeysError};
 use crate::server::session_service::{
     CreateIdempotencyProbe, IdempotencyConflict, PromptTouch, SendTurnError, SendTurnRequest,
     SessionCaller, SessionService,
@@ -41,6 +45,13 @@ const CAP_ACP_CAPABILITIES_PROBE: &str = "acp.capabilities.probe";
 const CAP_SESSION_CREATE: &str = "session.create";
 const CAP_SESSION_PROMPT: &str = "session.prompt";
 const CAP_SESSION_UNATTENDED: &str = "session.unattended";
+const CAP_SESSION_MESSAGE: &str = "session.message";
+
+const MAX_MESSAGE_BYTES: usize = 64 * 1024;
+/// Whole-call bound for `sessions.message.send`: the structured worker wait plus a terminal
+/// resume and its pane-ready wait.
+const MESSAGE_DEADLINE: std::time::Duration =
+    crate::acp::supervisor::WORKER_READY_TIMEOUT.saturating_add(std::time::Duration::from_secs(15));
 
 /// Everything the session RPCs need, injected into the plugin host at
 /// construction (before any worker launches).
@@ -49,6 +60,8 @@ pub struct SessionRpcDeps {
     pub policy: Arc<AutomationPolicy>,
     /// The serving profile new sessions are created under.
     pub profile: String,
+    /// Terminal keystroke injection is closed in CityHall mode, so plugins may not reach it either.
+    pub cityhall_mode: bool,
 }
 
 async fn clear_revival_pending(session_service: &SessionService, id: &str) {
@@ -63,6 +76,7 @@ pub(crate) fn handles(method: &str) -> bool {
     matches!(
         method,
         "acp.capabilities.get"
+            | "sessions.message.send"
             | "acp.capabilities.probe"
             | "sessions.create"
             | "sessions.turn.send"
@@ -78,6 +92,7 @@ pub(crate) fn required_capability(method: &str) -> Option<&'static str> {
         "acp.capabilities.probe" => Some(CAP_ACP_CAPABILITIES_PROBE),
         "sessions.create" => Some(CAP_SESSION_CREATE),
         "sessions.turn.send" => Some(CAP_SESSION_PROMPT),
+        "sessions.message.send" => Some(CAP_SESSION_MESSAGE),
         _ => None,
     }
 }
@@ -104,6 +119,10 @@ pub(crate) async fn dispatch(
         "sessions.turn.send" => {
             ctx.require(CAP_SESSION_PROMPT)?;
             sessions_turn_send(deps, ctx, params).await
+        }
+        "sessions.message.send" => {
+            ctx.require(CAP_SESSION_MESSAGE)?;
+            sessions_message_send(deps, ctx, params).await
         }
         other => Err(DispatchError::internal(format!(
             "session_api routed unknown method {other:?}"
@@ -518,6 +537,7 @@ async fn admit_and_create(
         agent_model: req.model_id.clone(),
         agent_effort: None,
         import_acp_session_id: None,
+        import_binding: None,
         fork_seed: None,
         progress: None,
     };
@@ -709,7 +729,7 @@ async fn sessions_turn_send(
         };
         let dispatch = deps
             .session_service
-            .prompt_dispatch_under_submission(&req.session_id, woke_idle_dormant, false)
+            .prompt_dispatch_under_submission(&req.session_id, &req.text, woke_idle_dormant, false)
             .await;
         // A cold worker is not a refusal on this path: `send_turn` resumes it
         // and waits, which is how a scheduler wakes a session it created. The
@@ -767,6 +787,236 @@ async fn sessions_turn_send(
     );
     result?;
     Ok(serde_json::json!({}))
+}
+
+/// Deliver a short text message to any session, as if the user had typed it. Unlike
+/// `sessions.turn.send` there is no ownership check: the `session.message` grant is the gate.
+async fn sessions_message_send(
+    deps: &Arc<SessionRpcDeps>,
+    ctx: &PluginRpcContext,
+    params: &Value,
+) -> Result<Value, DispatchError> {
+    let req: MessageSendRequest = serde_json::from_value(params.clone())
+        .map_err(|e| DispatchError::invalid_params(format!("sessions.message.send params: {e}")))?;
+    if req.message.trim().is_empty() {
+        return Err(DispatchError::with_kind(
+            codes::INVALID_PARAMS,
+            "message_empty",
+            "message must not be empty",
+        ));
+    }
+    if req.message.len() > MAX_MESSAGE_BYTES {
+        return Err(DispatchError::with_kind(
+            codes::INVALID_PARAMS,
+            "message_too_long",
+            format!("message exceeds {} KiB", MAX_MESSAGE_BYTES / 1024),
+        ));
+    }
+    let plugin_id = ctx.plugin_id.clone();
+
+    let result = async {
+        deps.policy.admit_message(&plugin_id)?;
+        let (task_deps, task_req) = (Arc::clone(deps), req.clone());
+        within_deadline(MESSAGE_DEADLINE, async move {
+            deliver_message(&task_deps, &task_req).await
+        })
+        .await
+    }
+    .await;
+
+    deps.policy.audit(
+        &plugin_id,
+        serde_json::json!({
+            "op": "sessions.message.send",
+            "session": req.session_id,
+            "decision": if result.is_ok() { "ok" } else { "denied" },
+            "kind": result.as_ref().err().and_then(|e| {
+                e.data.as_ref().and_then(|d| d.get("kind")).cloned()
+            }),
+        }),
+    );
+    serde_json::to_value(result?)
+        .map_err(|e| DispatchError::internal(format!("message response encode failed: {e}")))
+}
+
+/// Bounds how long the caller waits, not the delivery: a dropped future could stop between
+/// clearing the pending turn and enqueueing the message, or before the live row is synced.
+async fn within_deadline<T: Send + 'static>(
+    deadline: std::time::Duration,
+    delivery: impl std::future::Future<Output = Result<T, DispatchError>> + Send + 'static,
+) -> Result<T, DispatchError> {
+    match tokio::time::timeout(deadline, tokio::spawn(delivery)).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(e)) => Err(DispatchError::internal(format!(
+            "delivery task failed: {e}"
+        ))),
+        Err(_) => Err(DispatchError::with_kind(
+            codes::SERVICE_UNAVAILABLE,
+            "delivery_timeout",
+            "delivery did not finish in time; the message may still have been delivered",
+        )),
+    }
+}
+
+fn blocked_error(blocked: crate::session::StartBlocked) -> DispatchError {
+    DispatchError::with_kind(
+        codes::FAILED_PRECONDITION,
+        blocked.code(),
+        blocked.to_string(),
+    )
+}
+
+fn session_not_found() -> DispatchError {
+    map_send_error(SendTurnError::SessionNotFound)
+}
+
+async fn deliver_message(
+    deps: &Arc<SessionRpcDeps>,
+    req: &MessageSendRequest,
+) -> Result<MessageSendResponse, DispatchError> {
+    let is_structured = {
+        let instances = deps.session_service.instances.read().await;
+        let inst = instances
+            .iter()
+            .find(|i| i.id == req.session_id)
+            .ok_or_else(session_not_found)?;
+        inst.ensure_startable().map_err(blocked_error)?;
+        inst.is_structured()
+    };
+    if is_structured {
+        return deliver_structured(&deps.session_service, req).await;
+    }
+    if deps.cityhall_mode {
+        return Err(DispatchError::with_kind(
+            codes::FAILED_PRECONDITION,
+            "terminal_unavailable",
+            "terminal sessions take no plugin input in CityHall mode",
+        ));
+    }
+    let revived = send_terminal_message(
+        &deps.session_service,
+        &req.session_id,
+        req.message.clone(),
+        true,
+    )
+    .await
+    .map_err(|error| map_terminal_error(error.error))?;
+    Ok(MessageSendResponse {
+        disposition: MessageDisposition::Sent,
+        revived,
+    })
+}
+
+/// The user-prompt path: a busy agent steers or queues the message instead of refusing it.
+async fn deliver_structured(
+    service: &Arc<SessionService>,
+    req: &MessageSendRequest,
+) -> Result<MessageSendResponse, DispatchError> {
+    use crate::acp::dispatch::{PromptDispatch, QueueReason};
+
+    let id = req.session_id.as_str();
+    let caller = SessionCaller::User;
+    let _submission = service
+        .admit_prompt_submission(&caller, id)
+        .await
+        .map_err(|e| map_send_error(e.into()))?;
+    let woke_idle_dormant = match service.touch_and_wake_on_prompt(id, false).await {
+        PromptTouch::Touched { idle_dormant } => idle_dormant,
+        PromptTouch::RevivalRefused => return Err(map_send_error(SendTurnError::RevivalRefused)),
+        PromptTouch::WorkerNotReady => return Err(map_send_error(SendTurnError::WorkerNotReady)),
+        PromptTouch::Blocked(blocked) => return Err(blocked_error(blocked)),
+    };
+    let was_running = service.acp_supervisor.is_running(id).await;
+    let dispatch = service
+        .prompt_dispatch_under_submission(id, &req.message, woke_idle_dormant, false)
+        .await;
+    // A stopped worker is resumed by `send_turn` below, not queued behind a drain nothing starts.
+    if let PromptDispatch::Queued { reason } = dispatch {
+        if reason != QueueReason::WorkerDown {
+            service.clear_pending_initial_turn(id).await;
+            service
+                .enqueue_prompt(
+                    id,
+                    uuid::Uuid::new_v4().to_string(),
+                    req.message.clone(),
+                    Vec::new(),
+                    None,
+                )
+                .await
+                .ok_or_else(session_not_found)?;
+            return Ok(MessageSendResponse {
+                disposition: MessageDisposition::Queued,
+                revived: woke_idle_dormant,
+            });
+        }
+    }
+    let sent = service
+        .send_turn(
+            &caller,
+            id,
+            SendTurnRequest {
+                text: &req.message,
+                attachments: &[],
+                woke_idle_dormant,
+                prompt_id: None,
+                synthesized: false,
+                no_revive: false,
+            },
+        )
+        .await;
+    service.clear_pending_initial_turn(id).await;
+    sent.map_err(map_send_error)?;
+    Ok(MessageSendResponse {
+        disposition: if dispatch == PromptDispatch::Steered {
+            MessageDisposition::Steered
+        } else {
+            MessageDisposition::Sent
+        },
+        revived: woke_idle_dormant || !was_running,
+    })
+}
+
+fn map_terminal_error(e: SendKeysError) -> DispatchError {
+    match e {
+        SendKeysError::NotFound | SendKeysError::Gone => session_not_found(),
+        SendKeysError::Blocked(blocked) => blocked_error(blocked),
+        SendKeysError::NotRunning => DispatchError::with_kind(
+            codes::FAILED_PRECONDITION,
+            "session_not_running",
+            "the session's terminal is not running",
+        ),
+        SendKeysError::Preparation { response, detail } => {
+            let code = if response.status() == axum::http::StatusCode::FORBIDDEN {
+                codes::FORBIDDEN
+            } else if response.status().is_server_error() {
+                codes::SERVICE_UNAVAILABLE
+            } else {
+                codes::FAILED_PRECONDITION
+            };
+            let kind = detail
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("start_failed");
+            let mut error = DispatchError::with_kind(code, kind, "Terminal preparation failed");
+            if let Some(sid) = detail.get("resume_session_id").and_then(Value::as_str) {
+                error.data.as_mut().expect("typed error data")["resume_session_id"] = sid.into();
+            }
+            error
+        }
+        SendKeysError::Transient(status) => DispatchError::with_kind(
+            codes::FAILED_PRECONDITION,
+            "session_transient",
+            format!("session is {status:?}; retry when it settles"),
+        ),
+        SendKeysError::StructuredView => {
+            DispatchError::internal("terminal send reached a structured session")
+        }
+        SendKeysError::Tmux(error) => {
+            tracing::warn!(%error, "plugin terminal send failed");
+            DispatchError::internal("terminal send failed")
+        }
+        SendKeysError::Internal => DispatchError::internal("terminal send failed"),
+    }
 }
 
 fn map_send_error(e: SendTurnError) -> DispatchError {
@@ -837,10 +1087,30 @@ mod tests {
                 session_service: state.session_service.clone(),
                 policy,
                 profile: "test".to_string(),
+                cityhall_mode: false,
             }),
             state,
             dir,
         )
+    }
+
+    async fn seed_native_rows(state: &Arc<crate::server::AppState>) {
+        crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
+        let mut profiles = std::collections::BTreeMap::<String, Vec<Instance>>::new();
+        {
+            let mut rows = state.instances.write().await;
+            for row in rows.iter_mut() {
+                row.source_profile = crate::session::config::effective_profile(&row.source_profile);
+                profiles
+                    .entry(row.source_profile.clone())
+                    .or_default()
+                    .push(row.clone());
+            }
+        }
+        for (profile, rows) in profiles {
+            crate::server::test_support::seed_instances_on_disk_for_test(&profile, rows);
+        }
+        crate::server::test_support::refresh_canonical_metadata_for_test(state).await;
     }
 
     fn kind(e: &DispatchError) -> String {
@@ -863,6 +1133,7 @@ mod tests {
             "acp.capabilities.probe",
             "sessions.create",
             "sessions.turn.send",
+            "sessions.message.send",
         ] {
             let err = dispatch(&deps, &none, method, &serde_json::json!({}))
                 .await
@@ -1149,6 +1420,385 @@ mod tests {
         .expect("idle, unarchived history must not occupy a concurrency slot");
     }
 
+    fn message_params(session: &str, message: &str) -> Value {
+        serde_json::json!({ "session_id": session, "message": message })
+    }
+
+    /// A live structured session no plugin created, with a recording fake worker.
+    async fn foreign_live_session(
+        id: &str,
+    ) -> (
+        Arc<SessionRpcDeps>,
+        Arc<crate::server::AppState>,
+        tempfile::TempDir,
+        Arc<std::sync::Mutex<Vec<&'static str>>>,
+    ) {
+        let mut foreign = Instance::new("foreign", "/tmp/aoe-msg-project");
+        foreign.id = id.to_string();
+        foreign.view = crate::session::View::Structured;
+        foreign.agent_name = Some("claude".to_string());
+        let (deps, state, dir) = test_deps(vec![foreign]);
+        seed_native_rows(&state).await;
+        let cmds = deps
+            .session_service
+            .acp_supervisor
+            .test_insert_worker_cmd_recording(id)
+            .await;
+        (deps, state, dir, cmds)
+    }
+
+    #[tokio::test]
+    async fn message_send_needs_its_own_capability() {
+        let (deps, _state, _dir) = test_deps(Vec::new());
+        let err = dispatch(
+            &deps,
+            &ctx_with(&["session.prompt", "session.create"]),
+            "sessions.message.send",
+            &message_params("s", "hi"),
+        )
+        .await
+        .expect_err("session.prompt must not grant sessions.message.send");
+        assert_eq!(err.code, codes::FORBIDDEN);
+        assert_eq!(kind(&err), "capability_missing");
+        let err = dispatch(
+            &deps,
+            &ctx_with(&["session.message"]),
+            "sessions.turn.send",
+            &serde_json::json!({ "session_id": "s", "text": "hi" }),
+        )
+        .await
+        .expect_err("session.message must not grant sessions.turn.send");
+        assert_eq!(err.code, codes::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn message_send_validates_the_message_before_admitting_it() {
+        let (deps, _state, _dir) = test_deps(Vec::new());
+        let ctx = ctx_with(&["session.message"]);
+        let oversize = "x".repeat(MAX_MESSAGE_BYTES + 1);
+        let at_limit = "x".repeat(MAX_MESSAGE_BYTES);
+        for (label, message, want) in [
+            ("empty", "", Some("message_empty")),
+            ("whitespace", " \n\t ", Some("message_empty")),
+            ("oversize", oversize.as_str(), Some("message_too_long")),
+            // Passes validation and only then reports the missing session.
+            ("at the limit", at_limit.as_str(), None),
+        ] {
+            let err = dispatch(
+                &deps,
+                &ctx,
+                "sessions.message.send",
+                &message_params("s", message),
+            )
+            .await
+            .expect_err(label);
+            match want {
+                Some(want) => {
+                    assert_eq!(err.code, codes::INVALID_PARAMS, "{label}");
+                    assert_eq!(kind(&err), want, "{label}");
+                }
+                None => assert_eq!(kind(&err), "session_not_found", "{label}"),
+            }
+        }
+        let err = dispatch(
+            &deps,
+            &ctx,
+            "sessions.message.send",
+            &serde_json::json!({ "session_id": "s", "message": "hi", "text": "x" }),
+        )
+        .await
+        .expect_err("unknown fields are rejected");
+        assert_eq!(err.code, codes::INVALID_PARAMS);
+    }
+
+    #[tokio::test]
+    async fn message_send_rate_limits_per_plugin_in_its_own_bucket() {
+        use crate::plugin::automation_policy::{
+            MAX_PLUGIN_MESSAGES_PER_HOUR, MAX_PLUGIN_TURNS_PER_HOUR,
+        };
+        let (deps, _state, _dir) = test_deps(Vec::new());
+        for _ in 0..MAX_PLUGIN_MESSAGES_PER_HOUR {
+            deps.policy.admit_message("cron").expect("under the rate");
+        }
+        let err = dispatch(
+            &deps,
+            &ctx_with(&["session.message"]),
+            "sessions.message.send",
+            &message_params("s", "hi"),
+        )
+        .await
+        .expect_err("bucket exhausted");
+        assert_eq!(err.code, codes::RATE_LIMITED);
+        assert_eq!(kind(&err), "rate_limited");
+        const { assert!(MAX_PLUGIN_MESSAGES_PER_HOUR > MAX_PLUGIN_TURNS_PER_HOUR) };
+        deps.policy
+            .admit_turn("cron")
+            .expect("messages do not drain the turn bucket");
+    }
+
+    #[tokio::test]
+    async fn message_send_reports_missing_and_shelved_sessions_with_stable_kinds() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        type Shelve = (&'static str, fn(&mut Instance));
+        let shelves: [Shelve; 2] = [
+            ("session_archived", Instance::archive),
+            ("session_trashed", Instance::trash),
+        ];
+        let mut prior = Vec::new();
+        for (want, shelve) in shelves {
+            for structured in [false, true] {
+                let mut inst = Instance::new("shelved", "/tmp/aoe-msg-project");
+                inst.id = format!("{want}-{structured}");
+                if structured {
+                    inst.view = crate::session::View::Structured;
+                    inst.agent_name = Some("aoe-no-such-agent-msg".to_string());
+                }
+                shelve(&mut inst);
+                prior.push(inst);
+            }
+        }
+        let (deps, state, _dir) = test_deps(prior.clone());
+        let ctx = ctx_with(&["session.message"]);
+        for inst in &prior {
+            let want = if inst.is_archived() {
+                "session_archived"
+            } else {
+                "session_trashed"
+            };
+            let err = dispatch(
+                &deps,
+                &ctx,
+                "sessions.message.send",
+                &message_params(&inst.id, "ping"),
+            )
+            .await
+            .expect_err("a shelved session is never woken");
+            assert_eq!(kind(&err), want, "{}", inst.id);
+            assert_eq!(err.code, codes::FAILED_PRECONDITION, "{}", inst.id);
+            let instances = state.instances.read().await;
+            let after = instances.iter().find(|i| i.id == inst.id).unwrap();
+            assert_eq!(after.archived_at, inst.archived_at, "{}", inst.id);
+            assert_eq!(after.trashed_at, inst.trashed_at, "{}", inst.id);
+            assert_eq!(after.last_accessed_at, inst.last_accessed_at, "{}", inst.id);
+        }
+        let err = dispatch(
+            &deps,
+            &ctx,
+            "sessions.message.send",
+            &message_params("sess-gone", "ping"),
+        )
+        .await
+        .expect_err("a missing session is an error");
+        assert_eq!(kind(&err), "session_not_found");
+        assert_eq!(err.code, codes::INVALID_PARAMS);
+    }
+
+    #[tokio::test]
+    async fn message_send_delivers_to_a_session_the_plugin_did_not_create() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let (deps, _state, _dir, cmds) = foreign_live_session("sess-msg-idle").await;
+        let out = dispatch(
+            &deps,
+            &ctx_with(&["session.message"]),
+            "sessions.message.send",
+            &message_params("sess-msg-idle", "PR #7 was merged"),
+        )
+        .await
+        .expect("any session is a valid target");
+        assert_eq!(
+            out,
+            serde_json::json!({ "disposition": "sent", "revived": false })
+        );
+        // The fake worker records on its own task, so wait for the observable result.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while *cmds.lock().unwrap() != ["prompt"] {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the prompt must reach the worker, saw {:?}",
+                cmds.lock().unwrap()
+            );
+            tokio::task::yield_now().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn message_send_queues_behind_a_busy_agent_instead_of_refusing() {
+        use crate::acp::state::Event;
+        use crate::acp::supervisor::BroadcastSink;
+        let _home = crate::session::test_support::isolate_app_dir();
+        let (deps, state, _dir, _cmds) = foreign_live_session("sess-msg-busy").await;
+        let sink = crate::acp::supervisor::ChannelSink {
+            tx: state.acp_events_tx.clone(),
+            event_store: Arc::clone(&state.acp_event_store),
+            control_cache: Arc::clone(&state.acp_control_cache),
+        };
+        assert!(sink.publish_persisted(
+            "sess-msg-busy",
+            1,
+            &Event::UserPromptSent {
+                text: "the user's turn".into(),
+                attachments: Vec::new(),
+                prompt_id: None,
+                synthesized: false,
+            },
+        ));
+        let out = dispatch(
+            &deps,
+            &ctx_with(&["session.message"]),
+            "sessions.message.send",
+            &message_params("sess-msg-busy", "PR #7 was merged"),
+        )
+        .await
+        .expect("a busy agent queues the message");
+        assert_eq!(out["disposition"], "queued");
+        let queue = deps
+            .session_service
+            .queued_prompts_snapshot("sess-msg-busy")
+            .await;
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue[0].text, "PR #7 was merged");
+    }
+
+    #[tokio::test]
+    async fn message_send_wakes_a_parked_structured_session() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        type Park = (&'static str, fn(&mut Instance));
+        let parks: Vec<Park> = vec![
+            ("idle-dormant", |i| i.mark_idle_dormant()),
+            ("snoozed", |i| {
+                i.snoozed_until = Some(chrono::Utc::now() + chrono::Duration::hours(1))
+            }),
+            ("stopped, nothing to clear", |_| {}),
+        ];
+        for (label, park) in parks {
+            let mut parked = Instance::new("parked", "/tmp/aoe-msg-project");
+            parked.id = "sess-msg-parked".to_string();
+            parked.view = crate::session::View::Structured;
+            parked.agent_name = Some("aoe-no-such-agent-msg".to_string());
+            park(&mut parked);
+            let (deps, state, _dir) = test_deps(vec![parked]);
+            seed_native_rows(&state).await;
+            let result = dispatch(
+                &deps,
+                &ctx_with(&["session.message"]),
+                "sessions.message.send",
+                &message_params("sess-msg-parked", "wake up"),
+            )
+            .await;
+            // The fake agent cannot start, so the resume itself may fail; what matters is that
+            // the wake was attempted and not mistaken for a missing or busy session.
+            if let Err(err) = &result {
+                assert!(
+                    ["worker_not_ready", "internal"].contains(&kind(err).as_str())
+                        || err.code == codes::INTERNAL_ERROR,
+                    "{label}: {err:?}"
+                );
+            }
+            let instances = state.instances.read().await;
+            let inst = instances
+                .iter()
+                .find(|i| i.id == "sess-msg-parked")
+                .unwrap();
+            assert!(
+                !inst.is_idle_dormant() && !inst.is_snoozed(),
+                "{label}: the message clears the park"
+            );
+            assert!(inst.last_accessed_at.is_some(), "{label}");
+        }
+    }
+
+    #[tokio::test]
+    async fn message_send_refuses_terminal_sessions_in_cityhall_mode() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let mut terminal = Instance::new("terminal", "/tmp/aoe-msg-project");
+        terminal.id = "sess-msg-terminal".to_string();
+        let (deps, _state, _dir) = test_deps(vec![terminal]);
+        let cityhall = Arc::new(SessionRpcDeps {
+            session_service: deps.session_service.clone(),
+            policy: deps.policy.clone(),
+            profile: deps.profile.clone(),
+            cityhall_mode: true,
+        });
+        let err = dispatch(
+            &cityhall,
+            &ctx_with(&["session.message"]),
+            "sessions.message.send",
+            &message_params("sess-msg-terminal", "ping"),
+        )
+        .await
+        .expect_err("terminal input is closed in CityHall mode");
+        assert_eq!(kind(&err), "terminal_unavailable");
+        assert_eq!(err.code, codes::FAILED_PRECONDITION);
+    }
+
+    #[tokio::test]
+    async fn a_missed_deadline_does_not_cancel_the_delivery() {
+        let (release, released) = tokio::sync::oneshot::channel::<()>();
+        let (done, finished) = tokio::sync::oneshot::channel::<()>();
+        let err = within_deadline(std::time::Duration::from_millis(10), async move {
+            released.await.expect("released");
+            done.send(()).expect("test still waiting");
+            Ok(())
+        })
+        .await
+        .expect_err("the delivery is still blocked past the deadline");
+        assert_eq!(kind(&err), "delivery_timeout");
+        assert_eq!(err.code, codes::SERVICE_UNAVAILABLE);
+
+        release.send(()).expect("delivery task still alive");
+        tokio::time::timeout(std::time::Duration::from_secs(10), finished)
+            .await
+            .expect("the delivery must run to completion after the caller gave up")
+            .expect("delivery completed");
+    }
+
+    #[test]
+    fn terminal_send_errors_map_to_documented_kinds() {
+        use axum::response::IntoResponse;
+        let cases: Vec<(SendKeysError, &str)> = vec![
+            (SendKeysError::NotFound, "session_not_found"),
+            (SendKeysError::Gone, "session_not_found"),
+            (
+                SendKeysError::Blocked(crate::session::StartBlocked::Archived),
+                "session_archived",
+            ),
+            (
+                SendKeysError::Blocked(crate::session::StartBlocked::Trashed),
+                "session_trashed",
+            ),
+            (SendKeysError::NotRunning, "session_not_running"),
+            (
+                SendKeysError::Transient(Status::Starting),
+                "session_transient",
+            ),
+            (
+                SendKeysError::Preparation {
+                    response: Box::new(axum::http::StatusCode::CONFLICT.into_response()),
+                    detail: serde_json::json!({"error": "resume_failed", "resume_session_id": "sid-1"}),
+                },
+                "resume_failed",
+            ),
+        ];
+        for (err, want) in cases {
+            assert_eq!(kind(&map_terminal_error(err)), want);
+        }
+        let resume = map_terminal_error(SendKeysError::Preparation {
+            response: Box::new(axum::http::StatusCode::CONFLICT.into_response()),
+            detail: serde_json::json!({"error": "resume_failed", "resume_session_id": "sid-1"}),
+        });
+        assert_eq!(resume.data.unwrap()["resume_session_id"], "sid-1");
+        let forbidden = map_terminal_error(SendKeysError::Preparation {
+            response: Box::new(axum::http::StatusCode::FORBIDDEN.into_response()),
+            detail: serde_json::json!({"error": "read_only"}),
+        });
+        assert_eq!(forbidden.code, codes::FORBIDDEN);
+        assert_eq!(kind(&forbidden), "read_only");
+        let secret = map_terminal_error(SendKeysError::Tmux(anyhow::anyhow!(
+            "credential=private-value"
+        )));
+        assert!(!secret.message.contains("private-value"));
+    }
+
     #[tokio::test]
     async fn turn_send_maps_ownership_and_missing_session_without_leaking_locks() {
         let mut user_session = Instance::new("user-owned", "/tmp/aoe-2897-project");
@@ -1198,7 +1848,8 @@ mod tests {
         inst.view = crate::session::View::Structured;
         inst.status = crate::session::Status::Idle;
         inst.created_by_plugin = Some("cron".to_string());
-        let (deps, _state, _dir) = test_deps(vec![inst]);
+        let (deps, state, _dir) = test_deps(vec![inst]);
+        seed_native_rows(&state).await;
         let cmds = deps
             .session_service
             .acp_supervisor
@@ -1371,6 +2022,7 @@ mod tests {
             parked.created_by_plugin = Some("cron".to_string());
             park(&mut parked);
             let (deps, state, _dir) = test_deps(vec![parked]);
+            seed_native_rows(&state).await;
             let ctx = ctx_with(&["session.prompt"]);
 
             let result = dispatch(
@@ -1497,6 +2149,7 @@ mod tests {
             prior.push(shelved.clone());
 
             let (deps, state, _dir) = test_deps(prior);
+            seed_native_rows(&state).await;
             let err = dispatch(
                 &deps,
                 &ctx_with(&["session.prompt"]),
@@ -1537,6 +2190,8 @@ mod tests {
             })
             .unwrap();
         let (deps, state, _dir) = test_deps(vec![resting]);
+        crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
 
         let err = dispatch(
             &deps,
@@ -1623,6 +2278,7 @@ mod tests {
         resting.created_by_plugin = Some("cron".to_string());
         resting.status = Status::Idle;
         let (deps, state, _dir) = test_deps(vec![resting]);
+        seed_native_rows(&state).await;
         let ctx = ctx_with(&["session.prompt"]);
 
         let result = dispatch(

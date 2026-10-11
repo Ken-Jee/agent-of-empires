@@ -324,6 +324,35 @@ hotkey = "Alt+t"
     h.send_keys("M-t");
 
     h.wait_for("Tool: echotool");
+    // Tool activation itself prepares the daemon-owned preview pane. A header
+    // alone says nothing about canonical readiness or whether a pane exists.
+    h.wait_for(MARKER);
+    let owned = h
+        .tmux()
+        .args([
+            "list-sessions",
+            "-F",
+            "#{session_name}|#{@aoe_kind}|#{@aoe_tool_owner}",
+        ])
+        .output()
+        .expect("inspect prepared tool ownership");
+    assert!(
+        owned.status.success(),
+        "tool ownership scan failed: {}",
+        String::from_utf8_lossy(&owned.stderr)
+    );
+    let owner = serde_json::to_string(&(&session_id, "echotool")).unwrap();
+    let owned = String::from_utf8(owned.stdout).unwrap();
+    let targets: Vec<_> = owned
+        .lines()
+        .filter_map(|line| {
+            let (name, metadata) = line.split_once('|')?;
+            let (kind, observed_owner) = metadata.split_once('|')?;
+            (kind == "tool" && observed_owner == owner).then_some(name)
+        })
+        .collect();
+    assert_eq!(targets.len(), 1, "expected one exact owned tool: {owned}");
+    let tool_target = targets[0];
 
     let resume = h.terminal_resume_sequence();
     h.send_keys("Enter");
@@ -337,13 +366,13 @@ hotkey = "Alt+t"
             return Err(String::from_utf8_lossy(&output.stderr).into_owned());
         }
         let clients = String::from_utf8(output.stdout).map_err(|error| error.to_string())?;
-        if clients
-            .lines()
-            .any(|name| name.starts_with("aoe_dev_tool_") && name.contains(id_suffix))
-        {
+        if clients.lines().any(|name| name == tool_target) {
             Ok(())
         } else {
-            Err(format!("Tool client is not attached: {clients}"))
+            Err(format!(
+                "Tool client is not attached to {tool_target}: {clients}\n{}",
+                h.capture_screen()
+            ))
         }
     });
     h.wait_for(MARKER);
@@ -433,8 +462,18 @@ async fn native_auxiliary_ensure_uses_fresh_context_and_refuses_purge() {
     row.status = Status::Stopped;
     row.terminal_info = Some(agent_of_empires::session::TerminalInfo { created: true });
     let rows_path = app.join("profiles/default/sessions.json");
-    let persist =
-        |row: &Instance| fs::write(&rows_path, serde_json::to_vec(&[row]).unwrap()).unwrap();
+    let session_id = row.id.clone();
+    let load_committed = || {
+        let rows: Vec<Instance> = serde_json::from_slice(&fs::read(&rows_path).unwrap()).unwrap();
+        rows.into_iter()
+            .find(|value| value.id == session_id)
+            .unwrap()
+    };
+    let persist = |row: &Instance| {
+        let mut pending = tempfile::NamedTempFile::new_in(rows_path.parent().unwrap()).unwrap();
+        std::io::Write::write_all(&mut pending, &serde_json::to_vec(&[row]).unwrap()).unwrap();
+        pending.persist(&rows_path).unwrap();
+    };
     persist(&row);
     let started = h.run_cli(&["serve", "--core-only", "--daemon"]);
     assert!(
@@ -491,6 +530,8 @@ async fn native_auxiliary_ensure_uses_fresh_context_and_refuses_purge() {
     let original_host = inspect_pane(host_name);
     assert_eq!(original_host.split('\t').nth(1), Some("71"));
     assert_eq!(original_host.split('\t').nth(2), Some("29"));
+    // Inject only the stale cache flag, never roll back an authoritative generation.
+    row = load_committed();
     row.terminal_info = None;
     persist(&row);
     let ensured_host = sdk
@@ -513,7 +554,10 @@ async fn native_auxiliary_ensure_uses_fresh_context_and_refuses_purge() {
         durable[0].has_terminal(),
         "terminal creation was not committed"
     );
-    row.terminal_info = durable[0].terminal_info.clone();
+    row = durable
+        .into_iter()
+        .find(|value| value.id == session_id)
+        .unwrap();
     let url = format!("http://localhost/api/sessions/{}/tools/ensure", row.id);
     let ensure = || {
         http.post(&url)
@@ -552,6 +596,7 @@ async fn native_auxiliary_ensure_uses_fresh_context_and_refuses_purge() {
         "target {name}: {original_pane:?}"
     );
     assert_eq!(original_pane.split('\t').nth(2), Some("27"));
+    row = load_committed();
     let generation = row
         .try_acquire_lifecycle_reservation(
             LifecycleOperation::Purge,
@@ -603,6 +648,7 @@ async fn native_auxiliary_ensure_uses_fresh_context_and_refuses_purge() {
     assert_eq!(response.status(), reqwest::StatusCode::CONFLICT);
     assert_eq!(inspect_pane(host_name), original_host);
     assert_eq!(pane(), original_pane);
+    row = load_committed();
     row.release_lifecycle_reservation_if_owned(LifecycleOperation::Purge, generation);
     persist(&row);
     wait_for_lifecycle_published(&http, &row.id, generation, Duration::from_secs(10)).await;
@@ -714,6 +760,7 @@ async fn native_auxiliary_ensure_uses_fresh_context_and_refuses_purge() {
     assert!(killed.status.success());
     let fresh = h.project_path().join("fresh-tool-cwd");
     fs::create_dir(&fresh).unwrap();
+    row = load_committed();
     row.project_path = fresh.to_string_lossy().into_owned();
     persist(&row);
     let recreated = sdk
@@ -774,6 +821,7 @@ async fn native_auxiliary_ensure_uses_fresh_context_and_refuses_purge() {
         );
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
+    row = load_committed();
     row.terminal_info = None;
     persist(&row);
     let snapshot = || async {

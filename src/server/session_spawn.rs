@@ -4,6 +4,7 @@
 use std::sync::Arc;
 
 use crate::session::Instance;
+use anyhow::Context;
 
 use super::session_service::SessionService;
 
@@ -59,6 +60,7 @@ pub(crate) struct StructuredSessionSpec {
     pub agent_model: Option<String>,
     pub agent_effort: Option<String>,
     pub import_acp_session_id: Option<String>,
+    pub import_binding: Option<crate::session::ConversationBinding>,
     pub fork_seed: Option<crate::session::ForkSeed>,
     /// Where the web wizard polls this create's stage and hook output.
     pub progress: Option<Arc<crate::server::create_progress::CreateProgress>>,
@@ -144,6 +146,7 @@ pub(crate) async fn spawn_structured_session(
             agent_model,
             agent_effort,
             import_acp_session_id,
+            import_binding,
             fork_seed,
             progress,
         } = spec;
@@ -222,6 +225,15 @@ pub(crate) async fn spawn_structured_session(
         let identity = crate::session::acquire_session_identity_lock()?;
         let (existing_titles, existing_branches): (Vec<String>, Vec<String>) = {
             let rows = worker_state.instances.blocking_read();
+            if let Some(import_id) = import_acp_session_id.as_deref().filter(|id| !id.trim().is_empty()) {
+                anyhow::ensure!(
+                    !rows.iter().any(|row| {
+                        row.acp_session_id.as_deref() == Some(import_id)
+                            || row.agent_session_id.as_deref() == Some(import_id)
+                    }),
+                    "import source is already owned by an AoE session"
+                );
+            }
             (rows.iter().map(|row| row.title.clone()).collect(),
              rows.iter().filter_map(|row| row.worktree_info.as_ref().map(|worktree| worktree.branch.clone())).collect())
         };
@@ -253,6 +265,23 @@ pub(crate) async fn spawn_structured_session(
         instance.view = view;
         // Imports resume the existing structured conversation.
         if let Some(import_id) = import_acp_session_id.filter(|id| !id.trim().is_empty()) {
+            if matches!(instance.tool.as_str(), "claude" | "claude-code") {
+                let binding = import_binding.context("Claude import needs its confirmed source store")?;
+                let execution = binding.execution.as_ref().context("Claude import source is unqualified")?;
+                anyhow::ensure!(
+                    binding.session_id == import_id
+                        && binding.provenance == crate::session::ConversationProvenance::Imported
+                        && execution.agent == "claude"
+                        && execution.filesystem == "host"
+                        && execution.cwd_filesystem == "host"
+                        && execution.cwd == crate::session::capture::canonicalize_or_raw(&instance.project_path)
+                        && execution.stores.len() == 1
+                        && execution.stores[0].is_absolute()
+                        && agent_name.as_deref().is_none_or(|agent| matches!(agent, "claude" | "claude-code")),
+                    "Claude import source identity does not match this launch"
+                );
+                instance.set_agent_conversation(Some(import_id.clone()), Some(binding), None);
+            }
             instance.view = crate::session::View::Structured;
             instance.acp_session_id = Some(import_id);
             instance.import_pending = Some(true);
@@ -626,6 +655,7 @@ pub(crate) async fn spawn_structured_session(
             }
         }
 
+        crate::tips::record_session_creations(1);
         Ok::<_, anyhow::Error>((
             instance,
             build_warnings,
@@ -710,6 +740,7 @@ pub(crate) async fn spawn_structured_session(
                 let sandbox_info = response_instance.sandbox_info.clone();
                 let generation = response_instance.lifecycle_generation;
                 let spawn_state = state.clone();
+                let claude_store_pin = response_instance.selected_claude_store_pin();
                 service.work.spawn("acp.create_spawn", async move {
                     let namespace = spawn_state.profile_namespace.read().await;
                     let submission = service_for_check.prompt_submission(&id).await;
@@ -794,7 +825,7 @@ pub(crate) async fn spawn_structured_session(
                                     acp_mode_id,
                                     agent_command_override: command_override,
                                     seed_history_replay,
-                                    claude_store_pin: None,
+                                    claude_store_pin,
                                 },
                                 reservation,
                             )
@@ -944,6 +975,7 @@ mod tests {
             agent_model: None,
             agent_effort: None,
             import_acp_session_id: None,
+            import_binding: None,
             fork_seed: None,
             progress: None,
         };
@@ -962,6 +994,12 @@ mod tests {
             serde_json::from_slice(&std::fs::read(app.join("pending-purge-owners.json")).unwrap())
                 .unwrap();
         assert!(owners["owners"].as_array().unwrap().is_empty());
+        assert_eq!(
+            crate::session::config::AppStateConfig::load()
+                .unwrap()
+                .sessions_created,
+            0
+        );
     }
 
     #[tokio::test]
@@ -1007,6 +1045,12 @@ mod tests {
         let response = create.await.unwrap();
         assert!(archived, "before_session hook did not run");
         assert_eq!(response.status(), axum::http::StatusCode::CREATED);
+        assert_eq!(
+            crate::session::config::AppStateConfig::load()
+                .unwrap()
+                .sessions_created,
+            1
+        );
         let stored = support::load_instances_from_disk_for_test("test")
             .into_iter()
             .find(|inst| inst.title == "created-4116")

@@ -1010,7 +1010,8 @@ fn test_quit_confirm_dont_ask_again_persists_opt_out() {
     env.view.show_quit_confirm();
     assert!(env.view.confirm_dialog.is_some());
 
-    // Tick "don't warn me again", then confirm.
+    // Focus and tick "don't warn me again", then confirm.
+    env.view.handle_key(key(KeyCode::Down), None);
     env.view.handle_key(key(KeyCode::Char(' ')), None);
     let action = env.view.handle_key(key(KeyCode::Char('y')), None);
 
@@ -1208,4 +1209,186 @@ fn test_g_key_opens_group_picker() {
     env.view.handle_key(key(KeyCode::Enter), None);
     assert!(env.view.group_picker_dialog.is_none());
     assert_eq!(env.view.group_by, GroupByMode::Org);
+}
+
+#[test]
+#[serial]
+fn hiding_last_prompt_retains_capture_ownership_until_completion() {
+    use crate::tui::home::live_send::{parse_chord_list, LiveSendState, LiveSendTarget};
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    let mut env = create_test_env_with_sessions(1);
+    let inst = env.view.instance_at(0).clone();
+    let pane = "pending-capture".to_string();
+    env.view.live_send = Some(LiveSendState {
+        session_id: inst.id,
+        title: inst.title,
+        tmux_name: pane.clone(),
+        target: LiveSendTarget::Agent,
+        exit_chords: parse_chord_list("C-q"),
+        leader: None,
+    });
+    env.view.last_prompt_in_flight = true;
+    let slot = env.view.last_prompt_slot.clone();
+    let now = Instant::now();
+    let (epoch, session_id, lifecycle_generation) = env.view.last_prompt_identity().unwrap();
+    let epoch = epoch.to_owned();
+    let session_id = session_id.to_owned();
+    std::thread::scope(|scope| {
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let worker = scope.spawn(move || {
+            started_tx.send(()).unwrap();
+            if release_rx.recv_timeout(Duration::from_secs(5)).is_ok() {
+                *slot.lock().unwrap() = Some(super::super::last_prompt::LastPromptCache {
+                    pane,
+                    epoch,
+                    session_id,
+                    lifecycle_generation,
+                    text: Some("submitted".to_string()),
+                    at: now,
+                });
+            }
+        });
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        env.view.show_last_prompt = false;
+        env.view.refresh_last_prompt_at(now);
+        assert!(env.view.last_prompt_in_flight);
+        assert!(env.view.last_prompt_footer_line().is_none());
+        env.view.show_last_prompt = true;
+        env.view.refresh_last_prompt_at(now);
+        assert!(env.view.last_prompt_in_flight);
+        assert!(env.view.last_prompt_slot.lock().unwrap().is_none());
+
+        release_tx.send(()).unwrap();
+        worker.join().unwrap();
+        env.view.refresh_last_prompt_at(now);
+        assert!(!env.view.last_prompt_in_flight);
+        assert_eq!(
+            env.view.last_prompt_footer_line().as_deref(),
+            Some("submitted")
+        );
+        let mut replacement = env
+            .view
+            .session_feed
+            .applied_snapshot()
+            .unwrap()
+            .as_ref()
+            .clone();
+        replacement.cursor.revision += 1;
+        replacement
+            .contents
+            .sessions
+            .iter_mut()
+            .find(|row| row.id == env.view.live_send.as_ref().unwrap().session_id)
+            .unwrap()
+            .lifecycle_generation += 1;
+        env.view.session_feed.publish_for_test(
+            crate::tui::session_feed::SessionFeedResult::Snapshot(std::sync::Arc::new(replacement)),
+        );
+        env.view.apply_session_feed();
+        assert_ne!(
+            env.view.last_prompt_footer_line().as_deref(),
+            Some("submitted"),
+            "the same pane name cannot reuse a prior lifecycle prompt"
+        );
+    });
+}
+
+/// #4324: a configured `C-l` live-send exit chord must still exit, not toggle the
+/// last-prompt footer, because the toggle is routed after the live-send relay.
+#[test]
+#[serial]
+fn ctrl_l_configured_as_live_send_exit_still_exits() {
+    use crate::tui::home::live_send::{parse_chord_list, LiveSendState, LiveSendTarget};
+
+    let mut env = create_test_env_with_sessions(1);
+    let _native_driver = env.view.session_feed.terminal_driver_for_test();
+    let inst = env.view.instance_at(0).clone();
+    let tmux_name = crate::tmux::Session::generate_name(&inst.id, &inst.title);
+    env.view.select_session_by_id(&inst.id);
+    env.view.live_send = Some(LiveSendState {
+        session_id: inst.id.clone(),
+        title: inst.title.clone(),
+        tmux_name,
+        target: LiveSendTarget::Agent,
+        exit_chords: parse_chord_list("C-l"),
+        leader: None,
+    });
+
+    let action = env.view.handle_key(
+        KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL),
+        None,
+    );
+    assert!(action.is_none());
+    assert!(
+        env.view.live_send.is_none(),
+        "a C-l exit chord must exit live mode, not toggle the footer"
+    );
+    assert!(
+        !env.view.show_last_prompt,
+        "the footer must not toggle when C-l is the configured exit chord"
+    );
+}
+
+/// A configured `C-l` leader arms the prefix menu instead of toggling the footer.
+#[test]
+#[serial]
+fn ctrl_l_configured_as_live_send_leader_arms_prefix() {
+    use crate::tui::home::live_send::{parse_chord, LiveSendState, LiveSendTarget};
+
+    let mut env = create_test_env_with_sessions(1);
+    let _native_driver = env.view.session_feed.terminal_driver_for_test();
+    let inst = env.view.instance_at(0).clone();
+    let tmux_name = crate::tmux::Session::generate_name(&inst.id, &inst.title);
+    env.view.select_session_by_id(&inst.id);
+    env.view.live_send = Some(LiveSendState {
+        session_id: inst.id.clone(),
+        title: inst.title.clone(),
+        tmux_name,
+        target: LiveSendTarget::Agent,
+        exit_chords: Vec::new(),
+        leader: parse_chord("C-l"),
+    });
+
+    env.view.handle_key(
+        KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL),
+        None,
+    );
+    assert!(
+        env.view.live_send_pending_leader,
+        "a C-l leader must arm the prefix menu"
+    );
+    assert!(
+        !env.view.show_last_prompt,
+        "the footer must not toggle when C-l is the configured leader"
+    );
+}
+
+/// Outside live-send capture, Ctrl+L toggles the footer on and off.
+#[test]
+#[serial]
+fn ctrl_l_toggles_footer_when_not_in_live_send() {
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instance_at(0).id.clone();
+    env.view.select_session_by_id(&id);
+
+    assert!(!env.view.show_last_prompt);
+    env.view.handle_key(
+        KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL),
+        None,
+    );
+    assert!(
+        env.view.show_last_prompt,
+        "Ctrl+L turns the footer on outside live mode"
+    );
+    env.view.handle_key(
+        KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL),
+        None,
+    );
+    assert!(
+        !env.view.show_last_prompt,
+        "Ctrl+L turns the footer back off"
+    );
 }

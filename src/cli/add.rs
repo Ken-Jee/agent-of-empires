@@ -61,7 +61,7 @@ pub struct AddArgs {
     /// Fork an existing session: resume its conversation context in a new,
     /// independent session that then diverges. Give the source session's id or
     /// title. Terminal fork; available for agents that support forking
-    /// (claude, codex, opencode).
+    /// (claude, codex, opencode, pi).
     #[arg(long = "fork-from")]
     fork_from: Option<String>,
 
@@ -921,7 +921,7 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         Ok(true)
     });
     match persist_result {
-        Ok(true) => {}
+        Ok(true) => crate::tips::record_session_creations(1),
         Ok(false) => {
             cleanup_partial_session(
                 &path,

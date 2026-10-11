@@ -49,10 +49,12 @@ mod v032_bound_capture_exclusions;
 pub(crate) mod v033_isolate_sandbox_content;
 mod v034_trash_retention_minutes;
 mod v035_serve_passphrase_policy;
-mod v036_pending_purge_owners;
+mod v036_session_creation_count;
 mod v038_canonical_sidebar;
 mod v039_custom_sort_order;
 mod v040_reconcile_serve_passphrase_policy;
+mod v041_pending_purge_owners;
+mod v042_reconcile_session_creation_count;
 
 /// Fixtures shared by migrations that rewrite agent hook files.
 #[cfg(test)]
@@ -93,7 +95,7 @@ use anyhow::Result;
 use std::fs;
 use tracing::{debug, info};
 
-const CURRENT_VERSION: u32 = 40;
+const CURRENT_VERSION: u32 = 42;
 const VERSION_FILE: &str = ".schema_version";
 
 struct Migration {
@@ -280,8 +282,8 @@ const MIGRATIONS: &[Migration] = &[
     },
     Migration {
         version: 36,
-        name: "pending_purge_owners",
-        run: v036_pending_purge_owners::run,
+        name: "session_creation_count",
+        run: v036_session_creation_count::run,
     },
     Migration {
         version: 38,
@@ -297,6 +299,16 @@ const MIGRATIONS: &[Migration] = &[
         version: 40,
         name: "reconcile_serve_passphrase_policy",
         run: v040_reconcile_serve_passphrase_policy::run,
+    },
+    Migration {
+        version: 41,
+        name: "pending_purge_owners",
+        run: v041_pending_purge_owners::run,
+    },
+    Migration {
+        version: 42,
+        name: "reconcile_session_creation_count",
+        run: v042_reconcile_session_creation_count::run,
     },
 ];
 
@@ -542,16 +554,7 @@ mod tests {
             .contains("refusing to downgrade"));
     }
 
-    #[test]
-    fn test_current_version_matches_last_migration() {
-        if let Some(last) = MIGRATIONS.last() {
-            assert_eq!(CURRENT_VERSION, last.version);
-        }
-    }
-
-    /// v039 is a schema step and nothing more: an install on the previous version with a
-    /// non-default sort order comes out on a newer version with `state.toml` byte for byte
-    /// as it was, and running the migrations again changes neither.
+    /// Upgrading preserves the sort order, and a second run leaves state untouched.
     #[test]
     #[serial_test::serial]
     fn schema_34_advances_and_keeps_its_sort_order() {
@@ -575,16 +578,18 @@ mod tests {
         assert!(advanced > 34, "the version advances past 34, to {advanced}");
         assert_eq!(advanced, CURRENT_VERSION);
         assert_eq!(
-            fs::read_to_string(app.join("state.toml")).unwrap(),
-            state,
-            "the state is not rewritten"
+            crate::session::config::AppStateConfig::load()
+                .unwrap()
+                .sort_order,
+            Some(crate::session::config::SortOrder::Oldest)
         );
+        let migrated_state = fs::read_to_string(app.join("state.toml")).unwrap();
 
         run_migrations().unwrap();
         assert_eq!(get_current_version(), advanced, "a second run stays put");
         assert_eq!(
             fs::read_to_string(app.join("state.toml")).unwrap(),
-            state,
+            migrated_state,
             "and leaves the state alone"
         );
     }

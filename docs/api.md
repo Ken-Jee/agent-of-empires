@@ -507,6 +507,19 @@ A confirmed mutation still settles behind its receipt, but no cancelled input or
 attachment is delivered. Genuine authority loss or an unknown outcome remains
 blocked until reconciled.
 
+A failed launch can still commit a lifecycle generation. The finite
+`aoe-error-code` values `start_failed` and `resume_failed`, with valid same-epoch
+runtime receipt headers, acknowledge that preparation commit, not a successful
+launch. Clients must apply its snapshot before retrying. A later send or target
+probe failure can likewise retain a preparation cursor; it does not acknowledge
+message delivery. Transport loss or malformed mutation receipts remain unknown;
+effect-free daemon refusals do not acknowledge a commit.
+
+A failed purge can commit a retained-row failure marker. `409 purge_failed`
+includes the finite code header and its canonical receipt; clients wait for that
+snapshot before retrying or escalating. Unlike an unknown outcome, this committed
+cleanup failure does not require an operator to resolve mutation authority.
+
 With an active local daemon, CLI profile renames and deletions go through its
 namespace epoch. Deleting its served profile returns `409 served_profile` and
 preserves the profile; renaming it retargets the live identity. A daemon refusal
@@ -514,6 +527,12 @@ never falls back to editing the profile directory directly.
 
 Purge refuses unresolved runner ownership before committing deletion. The row
 and its resources remain available for repair and retry.
+
+Selected-trash actions include `expected_trashed_at` and `expected_generation`.
+`force_failed` permits escalation only after a recorded failure for that exact
+selection. `drop_failed` removes the row only after a forced failure for the same
+selection; it retains worktree files. Restore or a new lifecycle generation
+invalidates the failure marker.
 
 ## Driving a session as a subagent
 

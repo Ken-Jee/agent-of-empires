@@ -516,6 +516,17 @@ pub struct DeleteSessionBody {
     /// Resolve resource cleanup policy on the daemon from the reserved row.
     #[serde(default)]
     pub use_cleanup_defaults: bool,
+    /// Consent is bound to the trash lifecycle selected by the client.
+    #[serde(default)]
+    pub expected_trashed_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default)]
+    pub expected_generation: Option<u64>,
+    /// Retry a recorded failed purge with force.
+    #[serde(default)]
+    pub force_failed: bool,
+    /// Forget a row only after a recorded forced purge failed.
+    #[serde(default)]
+    pub drop_failed: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -934,6 +945,8 @@ pub struct SessionResponse {
     /// and permanent-delete actions. See #2489.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trashed_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failed_purge_forced: Option<bool>,
     /// Unread marker, mirroring `Instance::unread`: `true` when the session
     /// needs attention (a finished turn the user hasn't engaged with, or a
     /// manual flag), omitted when read. The web sidebar paints an unread

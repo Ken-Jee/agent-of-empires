@@ -11,10 +11,11 @@ pub(in crate::tui) enum NativePane {
     Auxiliary(crate::session::AuxiliaryTarget),
 }
 
-/// What to do once the daemon confirms the prepared pane is ready. Attaching,
-/// entering live send and delivering a message share one preparation, so the
+/// What to do once the daemon confirms the prepared pane is ready. Previewing,
+/// attaching, entering live send and delivering a message share one preparation, so the
 /// continuation travels with it instead of blocking the UI thread.
 pub(in crate::tui) enum PaneIntent {
+    Preview,
     Attach,
     LiveSend(crate::tui::home::live_send::LiveSendTarget),
     Send {
@@ -57,6 +58,7 @@ pub(super) struct PendingLegacyToolPreparation {
 
 pub(super) struct PendingNativeAttachment {
     id: String,
+    pane: NativePane,
     profile_filter: Option<String>,
     source_profile: String,
     view_mode: ViewMode,
@@ -73,6 +75,18 @@ impl HomeView {
         size: Option<(u16, u16)>,
         intent: PaneIntent,
     ) -> anyhow::Result<()> {
+        self.reconcile_native_attachment();
+        if let Some(pending) = self.pending_native_attachment.as_mut() {
+            if pending.id == id
+                && pending.pane == pane
+                && matches!(pending.intent, PaneIntent::Preview)
+            {
+                // Enter upgrades the same daemon preparation rather than cancelling its
+                // lease and trying to submit a second command into the row fence.
+                pending.intent = intent;
+                return Ok(());
+            }
+        }
         self.cancel_native_attachment();
         anyhow::ensure!(
             self.selected_session.as_deref() == Some(id),
@@ -82,10 +96,11 @@ impl HomeView {
             let row = self
                 .get_instance(id)
                 .ok_or_else(|| anyhow::anyhow!("Session is unknown to this view"))?;
-            let observation = row.auxiliary.iter().find(|observation|
-                matches!(&observation.target, crate::session::AuxiliaryTarget::Tool { tool_name: name } if name == tool_name))
-                .ok_or_else(|| anyhow::anyhow!("Tool ownership has not been observed yet. Wait for the runtime snapshot."))?;
-            {
+            // A newly configured tool may not have been sampled in this projection yet.
+            // The daemon must determine ownership from its fresh fenced metadata; a
+            // missing observation is not presumed absence or permission to adopt.
+            if let Some(observation) = row.auxiliary.iter().find(|observation|
+                matches!(&observation.target, crate::session::AuxiliaryTarget::Tool { tool_name: name } if name == tool_name)) {
                 if let Some(identity) = &observation.pane.legacy_tool {
                     let adoption = crate::session::LegacyToolAdoption {
                         tmux_session: observation
@@ -178,15 +193,16 @@ impl HomeView {
                     .map(|inst| inst.source_profile.clone())
             })
             .ok_or_else(|| anyhow::anyhow!("Session is unknown to this view"))?;
-        let preparation = match pane {
+        let preparation = match &pane {
             NativePane::Agent => self.session_feed.ensure_agent(id.into(), size)?,
             NativePane::Auxiliary(target) => {
                 self.session_feed
-                    .ensure_auxiliary(id.into(), target, size, adoption)?
+                    .ensure_auxiliary(id.into(), target.clone(), size, adoption)?
             }
         };
         self.pending_native_attachment = Some(PendingNativeAttachment {
             id: id.into(),
+            pane,
             profile_filter: self.active_profile.clone(),
             source_profile,
             view_mode: self.view_mode.clone(),
@@ -277,6 +293,7 @@ impl HomeView {
         };
         pending.preparation.lease.cancel_continuation();
         let title = match &pending.intent {
+            PaneIntent::Preview => "Tool preview failed",
             PaneIntent::Attach => "Attachment failed",
             PaneIntent::LiveSend(_) => "Live send failed",
             PaneIntent::Send { .. } => "Send Failed",
@@ -337,6 +354,7 @@ impl HomeView {
                     source_profile,
                     view_mode: self.view_mode.clone(),
                     terminal_mode: self.get_terminal_mode(id),
+                    pane: NativePane::Agent,
                     intent: PaneIntent::Attach,
                     preparation,
                 });

@@ -30,9 +30,11 @@ A plain New session opens on the project you launched last; pick another from Re
 
 ## Command palette
 
-The command palette (top-bar button or keyboard shortcut) is a fuzzy launcher for global actions: jump to a session, open settings, start a new session, toggle the right panel.
+The palette (top-bar button or keyboard shortcut) is a fuzzy launcher for global actions: jump to a session, open settings, start a session, toggle the right panel.
 
-Individual settings also appear in the palette under `Settings`. A writable toggle flips inline from the palette (a toast confirms, and the subtitle shows its current state and scope); every other setting opens the settings view on its tab. Read-only servers and settings that need elevation jump to the settings view instead of writing. The Settings header also has its own search box (and the TUI settings screen the `/` key) that filters settings across every tab and jumps to the one you pick.
+When an embedded agent or paired terminal, or the structured-session composer, has keyboard focus, press `Ctrl+Q` to return focus to the active session in the sidebar. Then press `a` to move to the next session needing attention; `a` works when a terminal or text field is not focused.
+
+Individual settings appear under `Settings`: a writable toggle flips inline with a toast, while read-only servers and settings needing elevation open the settings view instead. The Settings header has its own search box (the TUI settings screen uses `/`) that filters across every tab.
 
 ## First-run onboarding
 

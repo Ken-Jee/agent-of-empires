@@ -63,9 +63,7 @@ pub fn perform_restart(request: RestartRequest) -> RestartResult {
     let tool = instance.tool.clone();
     let before = instance.clone();
 
-    // With `bound_hooks`, honor the on_launch / before_start hook timeout the startup-recovery
-    // worker installs (`run_recovery_for_instance`), so a hanging hook (e.g. a `mint` script
-    // waiting on the network) cannot wedge this serial worker.
+    // Recovery bounds hooks so a hanging command cannot wedge its worker.
     let outcome = {
         let _scope = bound_hooks.then(|| {
             crate::session::recovery::HookTimeoutScope::new(

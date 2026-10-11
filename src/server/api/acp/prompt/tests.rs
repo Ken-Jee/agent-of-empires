@@ -14,8 +14,21 @@ fn structured_instance(id: &str, idle: bool) -> crate::session::Instance {
     inst
 }
 
-fn structured_state(id: &str, idle: bool) -> Arc<AppState> {
-    crate::server::test_support::build_test_app_state(vec![structured_instance(id, idle)])
+async fn seed_native_row(state: &Arc<AppState>) {
+    crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
+    let row = state.instances.read().await[0].clone();
+    crate::server::test_support::seed_instances_on_disk_for_test(
+        &row.source_profile,
+        vec![row.clone()],
+    );
+    crate::server::test_support::refresh_canonical_metadata_for_test(state).await;
+}
+
+async fn structured_state(id: &str, idle: bool) -> Arc<AppState> {
+    let state =
+        crate::server::test_support::build_test_app_state(vec![structured_instance(id, idle)]);
+    seed_native_row(&state).await;
+    state
 }
 
 fn prompt_req(text: &str) -> Result<Json<PromptRequest>, axum::extract::rejection::JsonRejection> {
@@ -109,7 +122,7 @@ const PARKS: [(&str, fn(&AppState, &str)); 2] = [
 /// A structured session whose worker starts fail: on the provider limit when
 /// `rate_limited`, otherwise as a generic launch failure. The count proves a
 /// case reached the start it forced.
-fn failing_start_state(
+async fn failing_start_state(
     id: &str,
     rate_limited: bool,
 ) -> (Arc<AppState>, Arc<std::sync::atomic::AtomicUsize>) {
@@ -130,16 +143,9 @@ fn failing_start_state(
         })
     });
     let inst = structured_instance(id, false);
-    // The launch admission rereads the stored row, as it exists in production.
-    crate::session::Storage::new_unwatched(&inst.source_profile)
-        .unwrap()
-        .update(|rows, _| {
-            rows.push(inst.clone());
-            Ok(())
-        })
-        .unwrap();
     let state =
         crate::server::test_support::build_test_app_state_with_launcher(vec![inst], launcher);
+    seed_native_row(&state).await;
     (state, launches)
 }
 
@@ -152,7 +158,7 @@ async fn wake_prompt_frees_instance_lock_and_publishes_nothing_without_a_worker(
     use crate::acp::supervisor::{ResumeKind, ResumeReservationOutcome};
 
     let id = "sess-3172".to_string();
-    let state = structured_state(&id, false);
+    let state = structured_state(&id, false).await;
     let reservation = match state
         .acp_supervisor
         .begin_resume(&id, ResumeKind::Spawn)
@@ -205,8 +211,9 @@ async fn wake_prompt_frees_instance_lock_and_publishes_nothing_without_a_worker(
 /// than reach the agent before the prompt it names.
 #[tokio::test]
 async fn cancel_waits_for_an_in_flight_prompt_submission() {
+    let _app_dir = crate::session::test_support::isolate_app_dir();
     let id = "sess-stop-order".to_string();
-    let state = structured_state(&id, false);
+    let state = structured_state(&id, false).await;
     let submission = state
         .session_service
         .prompt_submission_for_session(&id)
@@ -237,7 +244,7 @@ async fn prompt_handlers_claim_the_submission_guard_before_they_wake() {
     for diff_comments in [false, true] {
         let _app_dir = crate::session::test_support::isolate_app_dir();
         let id = "sess-3859".to_string();
-        let state = structured_state(&id, false);
+        let state = structured_state(&id, false).await;
         assert!(state.instances.read().await[0].last_accessed_at.is_none());
 
         let held = state
@@ -291,7 +298,7 @@ async fn rate_limit_park_is_sendable_at_the_shared_decision_point() {
     for (park, seed) in PARKS {
         let _app_dir = crate::session::test_support::isolate_app_dir();
         let id = format!("sess-{park}-park-shared");
-        let state = structured_state(&id, false);
+        let state = structured_state(&id, false).await;
         let service = &state.session_service;
         let id_ref = id.as_str();
         let decide = move || async move {
@@ -300,7 +307,7 @@ async fn rate_limit_park_is_sendable_at_the_shared_decision_point() {
                 .await
                 .expect("session exists");
             service
-                .prompt_dispatch_under_submission(id_ref, false, false)
+                .prompt_dispatch_under_submission(id_ref, "", false, false)
                 .await
         };
         assert_eq!(
@@ -323,8 +330,9 @@ async fn rate_limit_park_is_sendable_at_the_shared_decision_point() {
 #[tokio::test]
 async fn no_revive_refuses_a_stopped_or_dormant_worker_without_side_effects() {
     for dormant in [false, true] {
+        let _app_dir = crate::session::test_support::isolate_app_dir();
         let id = format!("sess-no-revive-dormant-{dormant}");
-        let state = structured_state(&id, false);
+        let state = structured_state(&id, false).await;
         {
             let mut instances = state.instances.write().await;
             if dormant {
@@ -336,6 +344,7 @@ async fn no_revive_refuses_a_stopped_or_dormant_worker_without_side_effects() {
                 synthesized: true,
             });
         }
+        seed_native_row(&state).await;
 
         let response = acp_prompt(
             State(Arc::clone(&state)),
@@ -393,7 +402,7 @@ async fn turn_on_a_park_resumes_instead_of_queueing() {
                 );
                 let _app_dir = crate::session::test_support::isolate_app_dir();
                 let id = format!("sess-{park}-park-{rate_limited}-{diff_comments}");
-                let (state, launches) = failing_start_state(&id, rate_limited);
+                let (state, launches) = failing_start_state(&id, rate_limited).await;
                 seed(&state, &id);
                 // The detached start holds a `SessionService` clone until it ends.
                 let refs_at_rest = Arc::strong_count(&state.session_service);
@@ -470,7 +479,7 @@ async fn no_revive_refuses_a_prompt_on_a_rate_limit_park() {
     for (park, seed) in PARKS {
         let _app_dir = crate::session::test_support::isolate_app_dir();
         let id = format!("sess-no-revive-{park}-park");
-        let (state, launches) = failing_start_state(&id, true);
+        let (state, launches) = failing_start_state(&id, true).await;
         seed(&state, &id);
         state.instances.write().await[0].pending_initial_turn =
             Some(crate::session::PendingInitialTurn {
@@ -478,6 +487,7 @@ async fn no_revive_refuses_a_prompt_on_a_rate_limit_park() {
                 attachments: Vec::new(),
                 synthesized: true,
             });
+        seed_native_row(&state).await;
 
         let response = acp_prompt(
             State(Arc::clone(&state)),
@@ -528,7 +538,7 @@ async fn no_revive_refuses_a_prompt_on_a_rate_limit_park() {
 async fn no_revive_refuses_a_workerless_rate_limit_park_with_a_stale_turn() {
     let _app_dir = crate::session::test_support::isolate_app_dir();
     let id = "sess-no-revive-stale-rate-limit".to_string();
-    let (state, launches) = failing_start_state(&id, true);
+    let (state, launches) = failing_start_state(&id, true).await;
     seed_elapsed_rate_limit_park(&state, &id, true);
     state.instances.write().await[0].pending_initial_turn =
         Some(crate::session::PendingInitialTurn {
@@ -536,6 +546,7 @@ async fn no_revive_refuses_a_workerless_rate_limit_park_with_a_stale_turn() {
             attachments: Vec::new(),
             synthesized: true,
         });
+    seed_native_row(&state).await;
 
     assert!(!state.acp_supervisor.is_running(&id).await);
     assert!(
@@ -587,7 +598,7 @@ async fn no_revive_refuses_a_workerless_rate_limit_park_with_a_stale_turn() {
 async fn a_direct_prompt_and_the_queue_drain_cannot_both_own_the_same_turn() {
     let _app_dir = crate::session::test_support::isolate_app_dir();
     let id = "sess-3621-race".to_string();
-    let state = structured_state(&id, true);
+    let state = structured_state(&id, true).await;
     let cmds = state
         .acp_supervisor
         .test_insert_worker_cmd_recording(&id)
@@ -638,7 +649,7 @@ async fn a_direct_prompt_and_the_queue_drain_cannot_both_own_the_same_turn() {
 async fn diff_comments_refuse_to_open_a_turn_another_submission_started() {
     let _app_dir = crate::session::test_support::isolate_app_dir();
     let id = "sess-3649-diff".to_string();
-    let state = structured_state(&id, true);
+    let state = structured_state(&id, true).await;
     let cmds = state
         .acp_supervisor
         .test_insert_worker_cmd_recording(&id)
@@ -759,13 +770,8 @@ async fn a_manual_prompt_cannot_overtake_a_continuation_install() {
         let label = if queued { "queued" } else { "direct" };
         let id = format!("sess-4092-{label}");
         let inst = structured_instance(&id, false);
-        // An empty profile resolves the same way for the seeder, the writer and
-        // the reader, so all three land on one sessions.json.
-        crate::server::test_support::seed_instances_on_disk_for_test(
-            &inst.source_profile,
-            vec![inst.clone()],
-        );
         let state = crate::server::test_support::build_test_app_state(vec![inst]);
+        seed_native_row(&state).await;
         state
             .acp_supervisor
             .test_insert_worker_cmd_recording(&id)

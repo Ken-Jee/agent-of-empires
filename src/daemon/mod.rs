@@ -98,12 +98,18 @@ pub enum DaemonClientError {
     Transport,
     /// The daemon returned a non-successful HTTP status. Authenticated
     /// responses omit the body so transformed credentials cannot be reflected.
-    #[error("daemon returned HTTP {status}: {body}")]
+    #[error("{}", daemon_status_message(*status, *code, body))]
     Status {
         status: StatusCode,
         code: Option<ApiErrorCode>,
         body: String,
         truncated: bool,
+    },
+    /// Preparation failed after a mutation committed; retain this acknowledgment fence.
+    #[error("{}", committed_failure_message(*code))]
+    Committed {
+        cursor: RuntimeCursor,
+        code: ApiErrorCode,
     },
     /// A successful response exceeded the bounded sessions-envelope limit.
     #[error("daemon response exceeded the {limit}-byte limit")]
@@ -116,6 +122,37 @@ pub enum DaemonClientError {
     AuthenticatedDecode,
     #[error("daemon mutation acknowledgment does not match this runtime")]
     InvalidMutationReceipt,
+}
+
+fn committed_failure_message(code: ApiErrorCode) -> &'static str {
+    match code {
+        ApiErrorCode::PurgeFailed => "Purge failed; apply its committed state before retrying",
+        ApiErrorCode::ResumeFailed => {
+            "Resume failed after start committed; the conversation is preserved for explicit retry"
+        }
+        _ => "Start committed but pane preparation failed; apply canonical state before retrying",
+    }
+}
+
+fn daemon_status_message(status: StatusCode, code: Option<ApiErrorCode>, body: &str) -> String {
+    match code {
+        Some(ApiErrorCode::SmartRenameSkipped) => {
+            "Auto-name is unavailable for this session; check its repository and tool configuration"
+                .into()
+        }
+        Some(ApiErrorCode::SmartRenameFailed) => {
+            "Auto-name failed; the daemon could not obtain a title from the agent".into()
+        }
+        Some(ApiErrorCode::SmartRenameTimeout) => {
+            "Auto-name timed out waiting for the agent".into()
+        }
+        Some(ApiErrorCode::ResumeFailed) => {
+            "Resume failed; the conversation is preserved for explicit retry".into()
+        }
+        Some(ApiErrorCode::StartFailed) => "Session start failed".into(),
+        Some(ApiErrorCode::PurgeFailed) => "Session purge failed".into(),
+        _ => format!("daemon returned HTTP {status}: {body}"),
+    }
 }
 
 impl DaemonClient {
@@ -452,6 +489,26 @@ impl DaemonClient {
         })
     }
 
+    /// Request daemon-owned naming; apply the receipt snapshot before using changed titles.
+    pub async fn smart_rename_session(
+        &self,
+        session_id: &str,
+        epoch: &str,
+    ) -> Result<MutationReceipt<SessionResponse>, DaemonClientError> {
+        let url = format!(
+            "{}/{}/smart-rename",
+            self.sessions_url,
+            transport::path_segment(session_id)?
+        );
+        self.request_mutation_with_outcome(
+            self.http
+                .post(url)
+                .timeout(crate::session::smart_rename::RENAME_DEADLINE + DEFAULT_TIMEOUT),
+            epoch,
+        )
+        .await
+    }
+
     pub async fn purge_session(
         &self,
         session_id: &str,
@@ -659,16 +716,53 @@ impl DaemonClient {
         &self,
         mut request: reqwest::RequestBuilder,
     ) -> Result<reqwest::Response, DaemonClientError> {
-        request = request.timeout(DEFAULT_TIMEOUT);
         if let Some(authorization) = &self.authorization {
             request = request.header(AUTHORIZATION, authorization.clone());
         }
-        let request = request.build().map_err(|_| DaemonClientError::Transport)?;
+        let mut request = request.build().map_err(|_| DaemonClientError::Transport)?;
+        if request.timeout().is_none() {
+            *request.timeout_mut() = Some(DEFAULT_TIMEOUT);
+        }
+        let expected_epoch = {
+            let mut values = request.headers().get_all(RUNTIME_EPOCH_HEADER).iter();
+            let value = values.next();
+            if values.next().is_none() {
+                value.cloned()
+            } else {
+                None
+            }
+        };
         let mut response =
             transport::execute(&self.http, self.unix_path.as_deref(), request).await?;
         let status = response.status();
         if !status.is_success() {
             let code = ApiErrorCode::from_headers(status, response.headers(), false);
+            if matches!(
+                code,
+                Some(
+                    ApiErrorCode::StartFailed
+                        | ApiErrorCode::ResumeFailed
+                        | ApiErrorCode::PurgeFailed
+                )
+            ) {
+                if let Some(epoch) = expected_epoch
+                    .as_ref()
+                    .and_then(|value| value.to_str().ok())
+                {
+                    if code == Some(ApiErrorCode::PurgeFailed)
+                        || response.headers().contains_key(RUNTIME_EPOCH_HEADER)
+                        || response.headers().contains_key(RUNTIME_REVISION_HEADER)
+                    {
+                        let cursor = mutation_cursor(response.headers(), epoch)?;
+                        return Err(DaemonClientError::Committed {
+                            cursor,
+                            code: code.unwrap(),
+                        });
+                    }
+                } else if code == Some(ApiErrorCode::PurgeFailed) {
+                    return Err(DaemonClientError::InvalidMutationReceipt);
+                }
+            }
             // D1: 409 lifecycle_locked maps from status plus the single finite
             // server-owned header without reading the body. 401 maps from status
             // alone; neither retains a body or token in the error.
@@ -1020,7 +1114,7 @@ mod tests {
         let tx = std::sync::Arc::new(std::sync::Mutex::new(Some(tx)));
         let app = axum::Router::new().route(
             route,
-            axum::routing::post(move |req: axum::extract::Request| {
+            axum::routing::any(move |req: axum::extract::Request| {
                 let headers = headers.clone();
                 let body = body.clone();
                 let tx = tx.clone();
@@ -1237,6 +1331,159 @@ mod tests {
         );
         let captured = next_request(rx).await;
         assert_eq!(captured.path, "/api/sessions/sess-1/stop");
+    }
+
+    #[tokio::test]
+    async fn smart_rename_accepts_completed_and_supervised_receipts() {
+        for status in [200, 202] {
+            let row = SessionResponse::from_instance(
+                &crate::session::Instance::new("named", "/tmp/named"),
+                false,
+            );
+            let app = axum::Router::new().route(
+                "/api/sessions/{id}/smart-rename",
+                axum::routing::post(move |req: axum::extract::Request| {
+                    let row = row.clone();
+                    async move {
+                        assert_eq!(req.headers()[RUNTIME_EPOCH_HEADER], "epoch-1");
+                        (
+                            axum::http::StatusCode::from_u16(status).unwrap(),
+                            [
+                                (RUNTIME_EPOCH_HEADER, "epoch-1"),
+                                (RUNTIME_REVISION_HEADER, "3"),
+                            ],
+                            axum::Json(row),
+                        )
+                    }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            let client = DaemonClient::new(&format!("http://{address}"), None).unwrap();
+            let receipt = client
+                .smart_rename_session("sess-1", "epoch-1")
+                .await
+                .unwrap();
+            assert_eq!(receipt.cursor.epoch, "epoch-1");
+            assert_eq!(receipt.cursor.revision, 3);
+            assert_eq!(receipt.outcome.title, "named");
+            server.abort();
+            let _ = server.await;
+        }
+    }
+
+    #[tokio::test]
+    async fn committed_mutation_errors_require_finite_code_and_matching_cursor() {
+        for (status, code, epoch, revision, committed, invalid) in [
+            (500, "start_failed", "epoch-1", "3", true, false),
+            (409, "resume_failed", "epoch-1", "3", true, false),
+            (409, "purge_failed", "epoch-1", "3", true, false),
+            (409, "purge_failed", "foreign", "3", false, true),
+            (409, "purge_failed", "epoch-1", "0", false, true),
+            (409, "purge_failed", "absent", "absent", false, true),
+            (500, "purge_failed", "epoch-1", "3", false, false),
+            (409, "resume_failed", "foreign", "3", false, true),
+            (409, "resume_failed", "epoch-1", "0", false, true),
+            (409, "resume_failed", "epoch-1", "3, 4", false, true),
+            (409, "unknown", "epoch-1", "3", false, false),
+            (403, "resume_failed", "epoch-1", "3", false, false),
+        ] {
+            let purge = code == "purge_failed";
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let base = serve_mutation_once(
+                if purge {
+                    "/api/sessions/{id}"
+                } else {
+                    "/api/sessions/{id}/start"
+                },
+                status,
+                if epoch == "absent" {
+                    vec![(ERROR_CODE_HEADER, code)]
+                } else {
+                    vec![
+                        (ERROR_CODE_HEADER, code),
+                        (RUNTIME_EPOCH_HEADER, epoch),
+                        (RUNTIME_REVISION_HEADER, revision),
+                    ]
+                },
+                "secret-body",
+                tx,
+            )
+            .await;
+            let client = DaemonClient::new(&base, Some("secret-token")).unwrap();
+            let error = if purge {
+                client
+                    .purge_session("sess-1", &DeleteSessionBody::default(), "epoch-1")
+                    .await
+                    .unwrap_err()
+            } else {
+                client
+                    .mutate_session(
+                        "sess-1",
+                        &SessionMutation::Start(StartSessionBody::default()),
+                        "epoch-1",
+                    )
+                    .await
+                    .unwrap_err()
+            };
+            assert!(!error.to_string().contains("secret"));
+            if committed {
+                assert!(
+                    matches!(error, DaemonClientError::Committed { cursor, .. } if cursor.epoch == "epoch-1" && cursor.revision == 3)
+                );
+            } else if invalid {
+                assert!(matches!(error, DaemonClientError::InvalidMutationReceipt));
+            } else {
+                assert!(matches!(error, DaemonClientError::Status { .. }));
+            }
+            assert_eq!(next_request(rx).await.epoch.as_deref(), Some("epoch-1"));
+        }
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        let base = serve_mutation_once(
+            "/api/sessions/{id}/start",
+            409,
+            vec![
+                (ERROR_CODE_HEADER, "resume_failed"),
+                (RUNTIME_EPOCH_HEADER, "epoch-1"),
+                (RUNTIME_REVISION_HEADER, "3"),
+            ],
+            "secret-body",
+            tx,
+        )
+        .await;
+        let client = DaemonClient::new(&base, Some("secret-token")).unwrap();
+        let error = client
+            .request_response(
+                client
+                    .http
+                    .post(format!("{base}/api/sessions/sess-1/start")),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, DaemonClientError::Status { .. }),
+            "a non-mutation request cannot adopt an error ACK"
+        );
+    }
+
+    #[test]
+    fn smart_rename_errors_do_not_reflect_agent_output() {
+        for code in [
+            ApiErrorCode::SmartRenameSkipped,
+            ApiErrorCode::SmartRenameFailed,
+            ApiErrorCode::SmartRenameTimeout,
+        ] {
+            let error = DaemonClientError::Status {
+                status: code.status(),
+                code: Some(code),
+                body: "secret-agent-output".into(),
+                truncated: false,
+            };
+            assert!(!error.to_string().contains("secret"));
+        }
     }
 
     #[tokio::test]

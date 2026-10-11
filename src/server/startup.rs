@@ -33,7 +33,7 @@ use super::token::{
     load_or_generate_token, test_token_grace_override, test_token_lifetime_override,
     write_secret_file, TokenManager, DEFAULT_TOKEN_GRACE,
 };
-use crate::server::{api, callback, login, push, session_service, tunnel};
+use crate::server::{api, callback, login, plugin_status, push, session_service, tunnel};
 
 /// Build the owner-only `serve.url` contents for a remotely exposed daemon.
 /// The public tunnel stays first for backwards-compatible display/QR consumers,
@@ -431,6 +431,8 @@ pub(crate) async fn start_server(
         supervisor.hydrate_seqs(acp_event_store.all_session_seqs());
         supervisor
     };
+    let cityhall_mode = std::env::var_os("AOE_CITYHALL_MODE").is_some();
+    let status_tx = broadcast::channel(STATUS_CHANNEL_CAPACITY).0;
     // The Tier 1 plugin worker host.
     let instances = Arc::new(RwLock::new(instances));
     let instance_locks = Arc::new(RwLock::new(std::collections::HashMap::new()));
@@ -469,6 +471,7 @@ pub(crate) async fn start_server(
                         session_service: Arc::clone(&session_service),
                         policy: Arc::new(policy),
                         profile: profile.to_string(),
+                        cityhall_mode,
                     })),
                     Err(e) => {
                         tracing::warn!(
@@ -744,7 +747,7 @@ pub(crate) async fn start_server(
         .into(),
         core_only,
         read_only,
-        cityhall_mode: std::env::var_os("AOE_CITYHALL_MODE").is_some(),
+        cityhall_mode,
         instances,
         profile_namespace: Arc::new(RwLock::new(())),
         publication: Arc::new(RwLock::new(())),
@@ -790,7 +793,7 @@ pub(crate) async fn start_server(
         }),
         remote_owner_cache: RwLock::new(std::collections::HashMap::new()),
         changed_files_cache: std::sync::RwLock::new(std::collections::HashMap::new()),
-        status_tx: broadcast::channel(STATUS_CHANNEL_CAPACITY).0,
+        status_tx,
         acp_events_tx: acp_events_tx.clone(),
         acp_event_store: acp_event_store.clone(),
         acp_control_cache: acp_control_cache.clone(),
@@ -996,6 +999,9 @@ pub(crate) async fn start_server(
     // Non-blocking: each worker runs in its own supervised task. A daemon with
     // no community plugin workers (the common case) does nothing here.
     if let Some(host) = state.plugin_host.clone() {
+        // Subscribe before any worker can register, or a transition published meanwhile has no
+        // forwarder to carry it.
+        plugin_status::spawn_forwarder(state.clone(), host.clone());
         host.start(&crate::plugin::registry()).await;
     }
 

@@ -88,6 +88,8 @@ fn second_shift_x_confirms_tool_kill_in_strict_mode() {
 
     h.send_keys("M-t");
     h.wait_for("Tool: idletool");
+    h.wait_for("Adopt Legacy Tool");
+    h.send_keys("Escape");
     let probe = h
         .tmux()
         .args(["display-message", "-t", &tool, "-p", "#{@aoe_tool_owner}"])

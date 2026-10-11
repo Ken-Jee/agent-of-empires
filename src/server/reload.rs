@@ -7,6 +7,7 @@ use crate::session::Status;
 use crate::session::Storage;
 use std::sync::Arc;
 
+use super::push::publish_status_change;
 use super::state::{AppState, StatusSource};
 use super::structured_repair::{
     persist_structured_row_repairs, repair_structured_rows_from_live_workers,
@@ -269,6 +270,11 @@ pub(crate) async fn adopt_committed_profiles<const N: usize>(
 ) -> Result<(), ReloadFailure> {
     let mut metadata = state.canonical_metadata.write().await;
     let mut current = state.instances.write().await;
+    let prior_statuses: Vec<_> = current
+        .iter()
+        .filter(|row| committed_status(&row.id))
+        .map(|row| (row.id.clone(), row.status))
+        .collect();
     replace_committed_profiles(&mut current, &mut metadata, committed, |id| {
         committed_status(id).then_some(StatusCommit::Lifecycle)
     })?;
@@ -276,6 +282,11 @@ pub(crate) async fn adopt_committed_profiles<const N: usize>(
         .mutation_epoch
         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     state.runtime.request_publish();
+    for (id, old) in prior_statuses {
+        if let Some(row) = current.iter().find(|row| row.id == id) {
+            publish_status_change(&state.status_tx, row, old);
+        }
+    }
     Ok(())
 }
 
@@ -758,6 +769,9 @@ pub(super) async fn reload_state_instances_from_disk(
     *state.canonical_metadata.write().await = metadata;
     *state.canonical_health.write().await = crate::daemon::RuntimeHealth::Healthy;
     state.runtime.request_publish();
+    for change in &changes {
+        let _ = state.status_tx.send(change.clone());
+    }
     changes
 }
 
@@ -812,6 +826,7 @@ pub(super) fn merge_loaded_rows(
                 changes.push(super::push::StatusChange {
                     instance_id: row.id.clone(),
                     instance_title: row.title.clone(),
+                    effective_profile: row.effective_profile(),
                     old: prior.status,
                     new: row.status,
                     at: now,
@@ -819,6 +834,7 @@ pub(super) fn merge_loaded_rows(
             }
         }
     }
+
     *current = merged;
     changes
 }
@@ -1010,6 +1026,204 @@ mod tests {
             .collect();
         profiles.sort_unstable();
         assert_eq!(profiles, ["first", "second"]);
+    }
+
+    fn terminal_row(status: Status) -> Instance {
+        let mut row = Instance::new("reload-publish", "/tmp/aoe-reload-publish");
+        row.source_profile = "default".to_string();
+        row.tool = "claude".to_string();
+        row.status = status;
+        row
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn native_status_commits_publish_once_and_rejections_publish_nothing() {
+        use crate::session::SessionStore;
+        let _home = crate::session::test_support::isolate_app_dir();
+        let row = terminal_row(Status::Running);
+        crate::server::test_support::seed_instances_on_disk_for_test("default", vec![row.clone()]);
+        let state = crate::server::test_support::build_test_app_state(vec![row.clone()]);
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+        let mut rx = state.status_tx.subscribe();
+        let id = row.id.clone();
+        let worker_state = state.clone();
+        tokio::task::spawn_blocking(move || {
+            let native = crate::server::session_store::NativeSessionStore::open(
+                worker_state,
+                "default",
+                Some(id.clone()),
+            )
+            .unwrap();
+            let store: &dyn SessionStore = &native;
+            for status in [Status::Starting, Status::Error, Status::Error] {
+                store
+                    .update(|rows, _| {
+                        rows.iter_mut().find(|row| row.id == id).unwrap().status = status;
+                        Ok(())
+                    })
+                    .unwrap();
+            }
+            let rejected: anyhow::Result<()> = store.update(|rows, _| {
+                rows.iter_mut().find(|row| row.id == id).unwrap().status = Status::Idle;
+                anyhow::bail!("reject before commit")
+            });
+            assert!(rejected.is_err());
+        })
+        .await
+        .unwrap();
+        for edge in [
+            (Status::Running, Status::Starting),
+            (Status::Starting, Status::Error),
+        ] {
+            let change = rx.try_recv().expect("each committed edge is published");
+            assert_eq!((change.old, change.new), edge);
+            assert_eq!(change.effective_profile, "default");
+        }
+        assert!(rx.try_recv().is_err(), "no-op and rejection emit nothing");
+        assert_eq!(state.instances.read().await[0].status, Status::Error);
+        assert_eq!(
+            crate::server::test_support::load_instances_from_disk_for_test("default")[0].status,
+            Status::Error
+        );
+    }
+
+    /// A reload that applies a different status than the live row holds is the one place that
+    /// moves it, so it publishes the move: from the live status at that instant, not from the
+    /// stale tick snapshot the caller diffed against.
+    #[tokio::test]
+    async fn a_reload_publishes_the_status_move_it_applies() {
+        // (live status, status in the snapshot, source, expected move)
+        let cases = [
+            (
+                Status::Running,
+                Status::Error,
+                StatusSource::TmuxApplied,
+                Some((Status::Running, Status::Error)),
+            ),
+            (
+                Status::Starting,
+                Status::Error,
+                StatusSource::TmuxApplied,
+                Some((Status::Starting, Status::Error)),
+            ),
+            (Status::Idle, Status::Idle, StatusSource::TmuxApplied, None),
+            // A disk-only reload never decides a status, so it moves nothing.
+            (
+                Status::Running,
+                Status::Stopped,
+                StatusSource::DiskOnly,
+                None,
+            ),
+        ];
+        for (live, snapshot, source, want) in cases {
+            let row = terminal_row(live);
+            let state = crate::server::test_support::build_test_app_state(vec![row.clone()]);
+            let mut rx = state.status_tx.subscribe();
+            let mut fresh = row.clone();
+            fresh.status = snapshot;
+            let read_epoch = state
+                .mutation_epoch
+                .load(std::sync::atomic::Ordering::SeqCst);
+
+            let metadata = state.canonical_metadata.read().await.clone();
+            reload_state_instances_from_disk(
+                &state,
+                vec![fresh],
+                Vec::new(),
+                source,
+                read_epoch,
+                metadata,
+                Default::default(),
+            )
+            .await;
+
+            let got = rx.try_recv().ok().map(|c| (c.old, c.new));
+            assert_eq!(got, want, "live={live:?} snapshot={snapshot:?} {source:?}");
+        }
+    }
+
+    /// A snapshot that predates a lifecycle mutation is dropped whole, so it publishes nothing.
+    #[tokio::test]
+    async fn a_rejected_snapshot_publishes_nothing() {
+        let row = terminal_row(Status::Running);
+        let state = crate::server::test_support::build_test_app_state(vec![row.clone()]);
+        let mut rx = state.status_tx.subscribe();
+        let read_epoch = state
+            .mutation_epoch
+            .load(std::sync::atomic::Ordering::SeqCst);
+        state
+            .mutation_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let mut fresh = row.clone();
+        fresh.status = Status::Error;
+
+        let metadata = state.canonical_metadata.read().await.clone();
+        reload_state_instances_from_disk(
+            &state,
+            vec![fresh],
+            Vec::new(),
+            StatusSource::TmuxApplied,
+            read_epoch,
+            metadata,
+            Default::default(),
+        )
+        .await;
+
+        assert!(rx.try_recv().is_err());
+        assert_eq!(state.instances.read().await[0].status, Status::Running);
+    }
+
+    /// The window the poll used to publish a second time: a reload holding a snapshot of the disk
+    /// as the handler left it is parked behind the reload gate while the real archive handler
+    /// moves the live row and publishes. Applying the snapshot afterwards must add nothing.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_parked_reload_does_not_repeat_a_handlers_move() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let row = terminal_row(Status::Running);
+        let id = row.id.clone();
+        let state = crate::server::test_support::build_test_app_state(vec![row.clone()]);
+        crate::server::test_support::seed_instances_on_disk_for_test("default", vec![row.clone()]);
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+        let mut rx = state.status_tx.subscribe();
+        // What the poll read from disk once the archive had settled the row to Idle.
+        let mut fresh = row.clone();
+        fresh.status = Status::Idle;
+        let read_epoch = state
+            .mutation_epoch
+            .load(std::sync::atomic::Ordering::SeqCst);
+
+        let gate = state.session_service.disk_reload_guard().await;
+        let mut reload = Box::pin(reload_state_instances_from_disk(
+            &state,
+            vec![fresh],
+            Vec::new(),
+            StatusSource::TmuxApplied,
+            read_epoch,
+            state.canonical_metadata.read().await.clone(),
+            Default::default(),
+        ));
+        assert!(
+            futures_util::poll!(reload.as_mut()).is_pending(),
+            "the reload must be parked on the gate"
+        );
+
+        crate::server::api::sessions::update_session_archive(
+            axum::extract::State(Arc::clone(&state)),
+            axum::extract::Path(id),
+            Ok(axum::Json(crate::daemon::UpdateArchiveBody {
+                archived: true,
+                kill_pane: false,
+            })),
+        )
+        .await;
+        drop(gate);
+        reload.await;
+
+        let first = rx.try_recv().expect("the handler published its move");
+        assert_eq!((first.old, first.new), (Status::Running, Status::Idle));
+        assert!(rx.try_recv().is_err(), "the reload must not repeat it");
     }
 
     fn live_repair_fixture() -> (Arc<AppState>, Instance, LiveStructuredWorkerRecord, Storage) {

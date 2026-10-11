@@ -195,13 +195,10 @@ pub struct App {
     /// daemon, wait for health, and then open the structured view.
     pending_daemon_start_open: Option<String>,
     /// Set by `Action::SmartRenameNow` so the async loop can run the daemon
-    /// `/smart-rename` POST for a structured session (#3039).
+    /// canonical `/smart-rename` request for either session backend.
     pending_smart_rename: Option<String>,
-    /// Debounce for structured preview-on-select: the session the cursor
-    /// settled on and when, so rapid list navigation doesn't connect a
-    /// WebSocket per keystroke. The mounted view itself lives on
-    /// `HomeView::structured_preview` (it is preview content); this App
-    /// side only drives the async mount/unmount.
+    /// Debounce for structured preview-on-select, so fast navigation doesn't
+    /// connect a WebSocket per keystroke.
     preview_mount_pending: Option<(String, std::time::Instant)>,
     /// Version of the install currently being attempted (auto or manual).
     /// Set when the install task is spawned; transferred to
@@ -1494,7 +1491,7 @@ impl App {
                                 }
                                 // Same for an "Auto-name now" palette/menu click.
                                 if let Some(session_id) = self.pending_smart_rename.take() {
-                                    self.perform_smart_rename(&session_id).await;
+                                    self.perform_smart_rename(&session_id);
                                 }
                             }
                             continue;
@@ -1695,6 +1692,7 @@ impl App {
             if let Some(ready) = self.home.take_native_attachment() {
                 use crate::tui::home::panes::PaneIntent;
                 match ready.intent {
+                    PaneIntent::Preview => self.needs_redraw = true,
                     PaneIntent::Attach => self.attach_native_target(ready, terminal)?,
                     PaneIntent::LiveSend(target) => {
                         // The toast that covered the revive settles with the
@@ -1807,14 +1805,9 @@ impl App {
             }
 
             needs_full_refresh |= self.home.try_present_reload_failure_dialog();
-
             needs_full_refresh |= self.home.try_clear_recovered_reload_dialog();
-
-            // Another surface (web live view, another TUI) took the
-            // size-owner lock: exit live mode and let its grid stand,
-            // instead of the old silent fight where the next keystroke or
-            // preview-rect jitter stole the lock back.
             needs_full_refresh |= self.home.poll_live_send_takeover();
+            needs_full_refresh |= self.home.try_present_shortcut_bar_tip();
 
             if last_heartbeat.elapsed() >= HEARTBEAT_INTERVAL {
                 crate::session::write_tui_heartbeat();
@@ -2789,51 +2782,25 @@ impl App {
         }
 
         if let Some(session_id) = self.pending_smart_rename.take() {
-            self.perform_smart_rename(&session_id).await;
+            self.perform_smart_rename(&session_id);
         }
 
         Ok(())
     }
 
-    /// Run a stashed on-demand "Auto-name now" for a structured session: resolve
-    /// the daemon and POST `/smart-rename`. The daemon forces past the disabled
-    /// setting and runs the one-shot detached; the new title arrives over the
-    /// structured-view WS and the file watcher refreshes the row, so the TUI
-    /// mutates no session state itself. A no-daemon state surfaces as a
-    /// transient status rather than failing the loop (#3039).
-    async fn perform_smart_rename(&mut self, session_id: &str) {
-        use crate::acp::client::{require_daemon, HttpClient, ManagerError};
-
+    fn perform_smart_rename(&mut self, session_id: &str) {
         let title = self
             .home
             .get_instance(session_id)
-            .map(|i| i.title.clone())
+            .map(|row| row.title.clone())
             .unwrap_or_default();
-
-        let endpoint = match require_daemon().await {
-            Ok(e) => e,
-            Err(ManagerError::NoDaemonRunning(_)) => {
-                self.set_status(
-                    "Auto-name needs a running daemon; open the structured view first.",
-                );
-                return;
-            }
-            Err(e) => {
-                self.set_status(format!("daemon unreachable: {e}"));
-                return;
-            }
-        };
-        let http = match HttpClient::new(endpoint) {
-            Ok(h) => h,
-            Err(e) => {
-                self.set_status(format!("auto-name failed: {e}"));
-                return;
-            }
-        };
-        self.set_status(match http.smart_rename(session_id).await {
-            Ok(()) => format!("auto-naming \"{title}\"…"),
-            Err(e) => format!("auto-name failed: {e}"),
-        });
+        match self.home.session_feed.submit_request(
+            session_id.to_owned(),
+            crate::tui::session_feed::SessionRequest::SmartRename,
+        ) {
+            Ok(()) => self.set_status(format!("auto-naming \"{title}\"…")),
+            Err(error) => self.set_status(format!("auto-name failed: {error}")),
+        }
     }
 
     /// Run a stashed view switch: resolve the daemon, POST the matching
@@ -3475,10 +3442,12 @@ impl App {
         }
         let target = crate::tmux::Session::from_name(&ready.tmux_name);
         let lease = ready.lease;
+        self.home.clear_preview_pane_sync(&ready.id);
         let attach_result = self.with_raw_mode_disabled(
             terminal,
             Box::new(move || {
                 anyhow::ensure!(lease.is_valid(), "Native interaction permission revoked");
+                target.reset_size_to_latest_client();
                 target.attach()
             }),
         )?;

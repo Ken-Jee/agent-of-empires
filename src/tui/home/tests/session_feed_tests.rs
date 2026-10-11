@@ -285,6 +285,173 @@ fn native_attachment_never_survives_a_cancelled_context() {
     }
 }
 
+#[test]
+#[serial]
+fn tool_preview_enter_upgrades_one_canonical_preparation() {
+    use crate::daemon::{MutationReceipt, RuntimeCursor, TerminalTarget, TerminalTargetStatus};
+    use crate::session::{AuxiliaryObservation, AuxiliaryTarget, PaneObservation, PanePresence};
+    use crate::tui::home::panes::PaneIntent;
+    for observed in [
+        None,
+        Some(PanePresence::Absent),
+        Some(PanePresence::Unknown),
+    ] {
+        let mut env = create_test_env_with_sessions(1);
+        let id = env.view.instance_at(0).id.clone();
+        env.view.select_session_by_id(&id);
+        let mut respond = env.view.session_feed.terminal_driver_for_test();
+        let SessionFeedResult::Snapshot(mut snapshot) = daemon_snapshot(&env.view, &id, "Stopped")
+        else {
+            unreachable!()
+        };
+        if let Some(state) = observed {
+            Arc::make_mut(&mut snapshot).contents.sessions[0]
+                .auxiliary
+                .push(AuxiliaryObservation {
+                    target: AuxiliaryTarget::Tool {
+                        tool_name: "probe".into(),
+                    },
+                    pane: PaneObservation {
+                        state,
+                        ..Default::default()
+                    },
+                });
+        }
+        env.view
+            .session_feed
+            .publish_for_test(SessionFeedResult::Snapshot(snapshot.clone()));
+        env.view.apply_session_feed();
+        env.view.tool_hotkey_cache = vec![("probe".into(), KeyCode::Char('g'), KeyModifiers::ALT)];
+        assert_eq!(
+            env.view
+                .handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::ALT), None),
+            None
+        );
+        assert_eq!(env.view.view_mode, ViewMode::Tool("probe".into()));
+        if observed == Some(PanePresence::Unknown) {
+            assert!(env.view.info_dialog.is_some());
+            assert!(env.view.pending_native_attachment.is_none());
+            assert!(env.view.session_feed.can_submit(&id));
+            continue;
+        }
+        assert!(env.view.info_dialog.is_none());
+        assert!(!env.view.session_feed.can_submit(&id));
+        assert_eq!(
+            env.view.handle_key(key(KeyCode::Enter), None),
+            Some(Action::AttachToolSession(id.clone(), "probe".into()))
+        );
+        let pane = crate::tui::home::panes::NativePane::Auxiliary(AuxiliaryTarget::Tool {
+            tool_name: "probe".into(),
+        });
+        env.view
+            .prepare_native_attachment(&id, pane, None, PaneIntent::Attach)
+            .unwrap();
+        respond(Ok(MutationReceipt {
+            cursor: RuntimeCursor {
+                epoch: "test".into(),
+                revision: 2,
+            },
+            outcome: TerminalTarget {
+                tmux_session: "canonical-tool".into(),
+                status: TerminalTargetStatus::Created,
+                lifecycle_generation: 0,
+                profile: "test".into(),
+            },
+        }));
+        env.view.apply_session_feed();
+        assert!(env.view.take_native_attachment().is_none());
+        assert!(!env.view.session_feed.can_submit(&id));
+        let committed = Arc::make_mut(&mut snapshot);
+        committed.cursor.revision = 2;
+        committed.contents.sessions[0].auxiliary = vec![AuxiliaryObservation {
+            target: AuxiliaryTarget::Tool {
+                tool_name: "probe".into(),
+            },
+            pane: PaneObservation {
+                state: PanePresence::Alive,
+                tmux_session: Some("canonical-tool".into()),
+                legacy_tool: None,
+            },
+        }];
+        env.view
+            .session_feed
+            .publish_for_test(SessionFeedResult::Snapshot(snapshot));
+        env.view.apply_session_feed();
+        let ready = env
+            .view
+            .take_native_attachment()
+            .expect("same preparation must enter attach after canonical publication");
+        assert!(matches!(ready.intent, PaneIntent::Attach));
+        assert_eq!(ready.tmux_name, "canonical-tool");
+        assert!(ready.lease.is_valid());
+        assert!(env.view.session_feed.can_submit(&id));
+    }
+}
+
+#[test]
+#[serial]
+fn auxiliary_receipt_never_outlives_its_row_generation_or_profile() {
+    use crate::daemon::{MutationReceipt, RuntimeCursor, TerminalTarget, TerminalTargetStatus};
+    use crate::session::{AuxiliaryObservation, AuxiliaryTarget, PaneObservation, PanePresence};
+    for (receipt_profile, snapshot_generation) in [("test", 1), ("other", 0)] {
+        let mut env = create_test_env_with_sessions(1);
+        let id = env.view.instance_at(0).id.clone();
+        env.view.select_session_by_id(&id);
+        let mut respond = env.view.session_feed.terminal_driver_for_test();
+        let SessionFeedResult::Snapshot(mut snapshot) = daemon_snapshot(&env.view, &id, "Stopped")
+        else {
+            unreachable!()
+        };
+        Arc::make_mut(&mut snapshot).contents.sessions[0]
+            .auxiliary
+            .push(AuxiliaryObservation {
+                target: AuxiliaryTarget::Host { index: 0 },
+                pane: PaneObservation {
+                    state: PanePresence::Alive,
+                    tmux_session: Some("same-name".into()),
+                    legacy_tool: None,
+                },
+            });
+        env.view
+            .session_feed
+            .publish_for_test(SessionFeedResult::Snapshot(snapshot.clone()));
+        env.view.apply_session_feed();
+        env.view
+            .prepare_native_attachment(
+                &id,
+                crate::tui::home::panes::NativePane::Auxiliary(AuxiliaryTarget::Host { index: 0 }),
+                None,
+                crate::tui::home::panes::PaneIntent::Attach,
+            )
+            .unwrap();
+        respond(Ok(MutationReceipt {
+            cursor: RuntimeCursor {
+                epoch: "test".into(),
+                revision: 2,
+            },
+            outcome: TerminalTarget {
+                tmux_session: "same-name".into(),
+                status: TerminalTargetStatus::Exists,
+                lifecycle_generation: 0,
+                profile: receipt_profile.into(),
+            },
+        }));
+        let committed = Arc::make_mut(&mut snapshot);
+        committed.cursor.revision = 2;
+        committed.contents.sessions[0].lifecycle_generation = snapshot_generation;
+        env.view
+            .session_feed
+            .publish_for_test(SessionFeedResult::Snapshot(snapshot));
+        env.view.apply_session_feed();
+        assert!(env.view.take_native_attachment().is_none());
+        assert!(env.view.info_dialog.is_some());
+        assert!(
+            env.view.session_feed.can_submit(&id),
+            "a confirmed receipt settles the mutation but must not attach a replacement row"
+        );
+    }
+}
+
 /// A session another client created reaches disk before the daemon publishes
 /// it. The view must gain it from the snapshot, loading from storage rather
 /// than rebuilding a lossy row out of the wire projection.
@@ -1083,7 +1250,7 @@ fn restart_attachment_waits_for_its_receipt_and_lifecycle_generation() {
                     tmux_session: "restarted-agent".into(),
                     status: TerminalTargetStatus::Restarted,
                     lifecycle_generation: 5,
-                    profile: String::new(),
+                    profile: "test".into(),
                 }),
             },
         }))
@@ -1648,7 +1815,7 @@ fn cancelled_attach_live_send_and_send_settle_without_a_continuation_in_either_r
                     tmux_session: "owned-pane".into(),
                     status: TerminalTargetStatus::Exists,
                     lifecycle_generation: 0,
-                    profile: String::new(),
+                    profile: "test".into(),
                 },
             });
             if receipt_first {

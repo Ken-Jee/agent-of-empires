@@ -44,7 +44,7 @@ export interface WizardData {
   structuredViewDirty: boolean;
   agentModel: string;
   agentEffort: string;
-  /** Existing Claude session id to import and resume. */
+  /** Existing native ACP session id to import and resume. */
   importAcpSessionId: string;
   [key: string]: unknown;
 }

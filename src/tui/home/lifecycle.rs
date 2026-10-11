@@ -120,6 +120,10 @@ impl HomeView {
             selected_group: None,
             selected_group_profile: None,
             view_mode,
+            show_last_prompt: false,
+            last_prompt_cache: None,
+            last_prompt_slot: last_prompt::new_slot(),
+            last_prompt_in_flight: false,
             sort_order,
             group_by,
             row_tag_mode: resolved.session.row_tag,
@@ -238,6 +242,7 @@ impl HomeView {
             pending_stop_auxiliary: None,
             pending_legacy_tool_preparation: None,
             pending_image_pull: None,
+            confirm_checked: Vec::new(),
             pending_switch_view_session: None,
             pending_daemon_start_session: None,
             structured_preview: None,
@@ -251,6 +256,7 @@ impl HomeView {
             search_match_index: 0,
             available_tools,
             show_diagnostics: resolved.session.show_diagnostics_pane,
+            show_shortcut_bar: resolved.session.show_shortcut_bar,
             metrics_poller: crate::tui::metrics_poller::MetricsPoller::new(),
             pending_metrics_refresh: false,
             metrics: crate::process::metrics::MetricsSnapshot::default(),
@@ -338,6 +344,8 @@ impl HomeView {
                 .and_then(|c| c.app_state.archived_section_collapsed)
                 .unwrap_or(true),
             trashed_section_collapsed: true,
+            hide_stopped_in_groups: false,
+            group_totals: HashMap::new(),
             restart_cooldown_at: std::collections::HashMap::new(),
             tool_configs: user_config
                 .as_ref()
@@ -364,7 +372,7 @@ impl HomeView {
         }
 
         view.refresh_registered_projects();
-        view.flat_items = view.build_flat_items();
+        view.refresh_flat_items();
         view.update_selected();
         // Stable subscription order keeps the shared watcher target deterministic.
         let mut initial_disk_profiles: Vec<String> = view.storages.keys().cloned().collect();
@@ -383,6 +391,7 @@ impl HomeView {
             }
         };
         view.rewire_config_subscriptions(&initial_config_profiles);
+        view.refresh_shortcut_bar_tip();
         Ok(view)
     }
 
@@ -420,6 +429,7 @@ impl HomeView {
 
     /// Refresh read-only presentation metadata, retaining the last acknowledged canonical projection.
     pub fn reload(&mut self) -> anyhow::Result<()> {
+        self.refresh_shortcut_bar_tip();
         self.reload_storage_only()
     }
 

@@ -1,7 +1,7 @@
 import { useState } from "react";
-import type { AgentInfo, ClaudeSessionSummary } from "../../../lib/types";
+import type { AgentInfo, ImportableSession } from "../../../lib/types";
 import { DirectoryBrowser } from "../../DirectoryBrowser";
-import { ClaudeSessionPicker } from "./ClaudeSessionPicker";
+import { ImportSessionPicker } from "./ImportSessionPicker";
 import { CloneRepoForm } from "./CloneRepoForm";
 import { ProjectSearchList } from "./ProjectSearchList";
 import { useProjectPicker } from "./projectPicker";
@@ -14,8 +14,7 @@ interface Props {
   data: WizardData;
   onChange: (field: string, value: unknown) => void;
   initialTab?: Tab;
-  /** Built-in + custom agents, used only to gate the Claude import tab.
-   *  Optional so render sites that never reach import (and tests) can omit it. */
+  /** Only used to offer agents on the import tab. */
   agents?: AgentInfo[];
   /** Reports the selected saved project's worktree override, if any. */
   onSelectSavedProject?: (override: boolean | undefined) => void;
@@ -48,32 +47,29 @@ export function ProjectStep({
     onPicked?.();
   };
 
-  // Claude import needs both the claude CLI and the claude-agent-acp adapter
-  // resolvable on the host; gate the tab on both so it never shows when
-  // either is missing. See #2276.
-  const claudeImportAvailable = agents.some((a) => a.name === "claude" && a.installed && a.acp_installed);
+  // Import resumes through the built-in ACP adapter, so it needs both the CLI and the adapter.
+  const importAgents = agents
+    .filter((a) => a.kind === "builtin" && a.acp_capable && a.installed && a.acp_installed && a.acp_allowed !== false)
+    .map((a) => a.name);
 
   const tabs: { id: Tab; label: string }[] = [
     ...(hasPicks ? [{ id: "recent" as Tab, label: "Recent" }] : []),
     { id: "browse", label: "Browse" },
     { id: "clone", label: "Clone URL" },
-    // Only offer the Claude import when claude and its ACP adapter are both
-    // installed; importing resumes via claude-agent-acp, so without it the
-    // tab can only ever fail at spawn. See #2276.
-    ...(claudeImportAvailable ? [{ id: "import" as Tab, label: "Import from Claude" }] : []),
+    ...(importAgents.length > 0 ? [{ id: "import" as Tab, label: "Import session" }] : []),
     { id: "scratch", label: "Scratch" },
   ];
 
-  // #2276: importing an existing Claude Code session prefills the original
-  // cwd and forces a structured-view claude session that resumes it. Worktree
-  // and scratch are cleared: the on-disk session id only resolves in its
-  // recorded cwd.
-  const handleImportSelect = (s: ClaudeSessionSummary) => {
+  // Native imports resume in their host cwd, without worktrees, extra repos or a sandbox.
+  const handleImportSelect = (s: ImportableSession, agent: string) => {
     onChange("scratch", false);
     onChange("path", s.cwd);
-    onChange("tool", "claude");
+    onChange("tool", agent);
     onChange("useStructuredView", true);
     onChange("useWorktree", false);
+    onChange("extraRepoPaths", []);
+    onChange("repoBases", {});
+    onChange("sandboxEnabled", false);
     onChange("attachExisting", false);
     onChange("importAcpSessionId", s.session_id);
     if (s.title) onChange("title", s.title.slice(0, 60));
@@ -134,9 +130,19 @@ export function ProjectStep({
 
       {!loading && activeTab === "browse" && <DirectoryBrowser onSelect={selectPath} />}
 
-      {!loading && activeTab === "import" && claudeImportAvailable && (
-        <ClaudeSessionPicker onSelect={handleImportSelect} selectedSessionId={data.importAcpSessionId} />
-      )}
+      {!loading &&
+        activeTab === "import" &&
+        importAgents.length > 0 &&
+        (profile ? (
+          <ImportSessionPicker
+            agents={importAgents}
+            profile={profile}
+            onSelect={handleImportSelect}
+            selectedSessionId={data.importAcpSessionId}
+          />
+        ) : (
+          <p className="text-sm text-text-muted">Resolve the server profile or select a profile to import a session.</p>
+        ))}
 
       {!loading && activeTab === "clone" && <CloneRepoForm onCloned={selectPath} />}
 

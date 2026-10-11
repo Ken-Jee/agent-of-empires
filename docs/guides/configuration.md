@@ -133,6 +133,10 @@ Stop = "idle"
 Notification = "waiting"
 ```
 
+After your 31st session creation, a one-time tip explains how to hide the shortcut bar.
+It waits until the home screen is free, respects **Show tips**, and never changes the setting.
+You can browse tips from **Ctrl+K > Show tips** even with the bar hidden.
+
 | Option | Default | Description |
 |--------|---------|-------------|
 | `default_tool` | (auto-detect) | Default agent for new sessions. Falls back to the first available tool if unset or unavailable. Can be set to a custom agent name. |
@@ -143,6 +147,7 @@ Notification = "waiting"
 | `row_tag` | `"branch"` | Controls the compact metadata shown next to each TUI session title: `none` shows nothing; `auto` shows the profile code only in all-profiles view; `profile` always shows the profile code; `sandbox` shows `sb` on sandboxed sessions; `branch` shows a compact worktree or workspace branch tag. |
 | `show_activity_age` | `true` | Show the age column at the right edge of each TUI session row: time since the agent stopped on `Idle` rows, time since last access on `Unknown` rows, and remaining snooze time under the Attention sort. |
 | `sidebar_position` | `"left"` | Places the TUI session list on the left or right. Narrow terminals keep the list above the preview. Global only. |
+| `show_shortcut_bar` | `true` | Show the TUI's bottom shortcut row, including the LIVE banner. Global only, under Settings > Global > Interaction. Hiding it gives that row to the main view; shortcuts, `?` help, dialog controls, and temporary notifications still work. |
 | `tie_workdir_to_name` | `true` | Keep a managed worktree session's directory named after its title. See [Worktrees](worktrees.md#naming). |
 | `yolo_mode_default` | `false` | Enable YOLO mode by default for new sessions (skip permission prompts). Works with or without sandbox. In tmux mode this passes `--dangerously-skip-permissions` to the agent CLI; in structured view it maps to ACP `bypassPermissions` (see [Structured view: Permission modes and YOLO](../structured-view/controls.md#permission-modes-and-yolo) for the adapter caveat). |
 | `pre_trust_agent_folders` | `false` | Pre-trust each host session's worktree in the agent's own config so it does not open on a folder-trust prompt. Applies to Claude Code (`projects.<path>.hasTrustDialogAccepted` in `.claude.json`), Codex (`projects.<path>.trust_level`), and Gemini (a per-path entry in `trustedFolders.json`); other agents have no such prompt and are untouched. Config-location overrides (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `GEMINI_CLI_TRUSTED_FOLDERS_PATH`) are honored. An `agent_config_dir` entry for the session's agent wins over them. Sandboxed sessions pre-trust their container workspace regardless of this setting, because that config is staged per session; this setting covers host sessions, where the record is written to your real agent config and outlives the session. `.mcp.json` servers still ask per server and the session's permission mode is unchanged, but trust is also what activates the repo's own `.claude/settings.json`: an untrusted workspace drops its `permissions.allow` rules. And since the prompt is what holds a session before startup, pre-trusting lets that file's hooks run with nobody having looked at the repo first. Enable it only for directories you would have trusted by hand. |

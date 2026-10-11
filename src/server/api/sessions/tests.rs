@@ -2594,6 +2594,7 @@ async fn wait_until_left_starting_resolves_on_broadcast() {
         .send(crate::server::push::StatusChange {
             instance_id: "wait-resolves".to_string(),
             instance_title: "starting".to_string(),
+            effective_profile: "default".to_string(),
             old: Status::Starting,
             new: Status::Waiting,
             at: chrono::Utc::now(),
@@ -3855,350 +3856,6 @@ async fn worktree_edits_quiesce_structured_worker_only_when_its_cwd_moves() {
     }
 }
 
-#[test]
-#[serial_test::serial]
-fn apply_post_restart_sync_propagates_agent_session_id() {
-    // The rapid double-restart case: in-memory state is stale because the 2s
-    // poller has not refreshed, while the just-finished restart produced a
-    // Claude UUID. The sync must propagate it, or a second ensure_session inside
-    // the poller window mints a fresh UUID and orphans the conversation.
-    let mut live = make_test_instance();
-    live.status = Status::Stopped;
-    live.last_error = Some("prior failure".to_string());
-    live.agent_session_id = None;
-    live.last_start_time = None;
-    let before = live.clone();
-
-    let mut started = make_test_instance();
-    started.status = Status::Starting;
-    started.agent_session_id = Some("claude-uuid-restart".to_string());
-    started.omp_capture_generation = Some("omp-generation-restart".to_string());
-    let mut poller = crate::session::poller::SessionPoller::new(
-        "omp-restarted".to_string(),
-        "claude".to_string(),
-        None,
-    );
-    assert_eq!(
-        poller.start(before.id.clone(), Box::new(|| None), Box::new(|_| {}), None,),
-        crate::session::poller::PollerSpawn::Spawned
-    );
-    let restarted_poller = std::sync::Arc::new(std::sync::Mutex::new(poller));
-    started.session_id_poller = Some(restarted_poller.clone());
-    started.last_start_time = Some(std::time::Instant::now());
-
-    apply_post_restart_sync(&mut live, &before, &started);
-
-    assert_eq!(live.status, Status::Starting);
-    assert!(live.last_error.is_none());
-    assert_eq!(
-        live.agent_session_id.as_deref(),
-        Some("claude-uuid-restart")
-    );
-    assert_eq!(
-        live.omp_capture_generation.as_deref(),
-        Some("omp-generation-restart")
-    );
-    assert!(live.session_id_poller_is_running());
-    assert_eq!(live.last_start_time, started.last_start_time);
-
-    let mut generation_converged = before.clone();
-    generation_converged.agent_session_id = Some("peer-sid".to_string());
-    generation_converged.omp_capture_generation = Some("omp-generation-restart".to_string());
-    apply_post_restart_identity_sync(&mut generation_converged, &before, &started);
-    assert_eq!(
-        generation_converged.agent_session_id.as_deref(),
-        Some("peer-sid")
-    );
-
-    let mut peer_relaunched = before.clone();
-    peer_relaunched.omp_capture_generation = Some("peer-generation".to_string());
-    apply_post_restart_identity_sync(&mut peer_relaunched, &before, &started);
-    assert_eq!(
-        peer_relaunched.omp_capture_generation.as_deref(),
-        Some("peer-generation")
-    );
-    let mut peer = before.clone();
-    peer.pi_session_path = Some("/peer/transcript.jsonl".into());
-    let expected = peer.conversation_state();
-    apply_post_restart_identity_sync(&mut peer, &before, &started);
-    assert_eq!(peer.conversation_state(), expected);
-    restarted_poller
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .stop();
-}
-
-#[test]
-fn apply_post_restart_identity_sync_clears_the_live_poller_schedule() {
-    let mut before = make_test_instance();
-    before.omp_capture_generation = Some("generation-a".to_string());
-    before.last_start_time = Some(std::time::Instant::now() - std::time::Duration::from_secs(60));
-    let now = std::time::Instant::now();
-    before.poller_repair.defer(now);
-    before.poller_repair.defer(now);
-    assert_eq!(before.poller_repair.deferrals(), 2);
-
-    let mut started = before.clone();
-    started.omp_capture_generation = Some("generation-b".to_string());
-    // A relaunch stamps its start time next to the schedule it clears (start.rs).
-    started.last_start_time = Some(std::time::Instant::now());
-    started.poller_repair.reset();
-    let mut poller = crate::session::poller::SessionPoller::new(
-        "omp-restarted".to_string(),
-        "claude".to_string(),
-        None,
-    );
-    assert_eq!(
-        poller.start(before.id.clone(), Box::new(|| None), Box::new(|_| {}), None,),
-        crate::session::poller::PollerSpawn::Spawned
-    );
-    let restarted_poller = std::sync::Arc::new(std::sync::Mutex::new(poller));
-    started.session_id_poller = Some(restarted_poller.clone());
-
-    let mut live = before.clone();
-    apply_post_restart_identity_sync(&mut live, &before, &started);
-    assert_eq!(
-        live.poller_repair.deferrals(),
-        0,
-        "the merged live row must not keep the pre-restart backoff"
-    );
-
-    let mut peer_relaunched = before.clone();
-    peer_relaunched.omp_capture_generation = Some("peer-generation".to_string());
-    apply_post_restart_identity_sync(&mut peer_relaunched, &before, &started);
-    assert_eq!(peer_relaunched.poller_repair.deferrals(), 0);
-
-    // A relaunch that replaced the pane without installing a poller carries one that watches the
-    // superseded execution, which the row is about to give up: the applier stops it and hands
-    // back nothing.
-    let launch_2 = crate::session::ActiveExecution {
-        launch_id: "launch-2".into(),
-        binding: crate::session::ExecutionBinding {
-            agent: "claude".into(),
-            stores: Vec::new(),
-            configuration: Vec::new(),
-            cwd: PathBuf::from("/tmp"),
-            cwd_filesystem: "host".into(),
-            filesystem: "host".into(),
-            exported_default_store: None,
-        },
-        capture: None,
-        container: None,
-    };
-    let mut superseded_poller = crate::session::poller::SessionPoller::new(
-        "omp-restarted".to_string(),
-        "claude".to_string(),
-        Some(launch_2.clone()),
-    );
-    assert_eq!(
-        superseded_poller.start(before.id.clone(), Box::new(|| None), Box::new(|_| {}), None,),
-        crate::session::poller::PollerSpawn::Spawned
-    );
-    let mut superseded = started.clone();
-    superseded.session_id_poller = Some(std::sync::Arc::new(std::sync::Mutex::new(
-        superseded_poller,
-    )));
-    superseded.active_execution = Some(crate::session::ActiveExecution {
-        launch_id: "launch-3".into(),
-        ..launch_2.clone()
-    });
-    let mut live = before.clone();
-    live.agent_session_id = Some("peer-sid".to_string());
-    live.active_execution = Some(launch_2);
-    live.session_id_poller = superseded.session_id_poller.clone();
-    apply_post_restart_identity_sync(&mut live, &before, &superseded);
-    assert_eq!(
-        live.active_execution.as_ref().map(|e| e.launch_id.as_str()),
-        Some("launch-3"),
-        "the row takes the execution the launch ran"
-    );
-    assert!(
-        !superseded.session_id_poller_is_running(),
-        "the poller for the superseded launch is stopped"
-    );
-    assert!(
-        live.session_id_poller.is_none(),
-        "and it is not handed back beside the execution it cannot watch"
-    );
-
-    // A relaunch that reached the launch stamp replaced the poller, so the schedule that paced it
-    // goes with it, even though the live row's own walk had gone deeper since.
-    let relaunched = started.clone();
-    let mut live = before.clone();
-    live.poller_repair.reprobe(now);
-    live.poller_repair.reprobe(now);
-    apply_post_restart_identity_sync(&mut live, &before, &relaunched);
-    assert!(
-        live.poller_repair.due(std::time::Instant::now()),
-        "the row is due at once rather than waiting out the re-probe the relaunch replaced"
-    );
-
-    restarted_poller
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .stop();
-}
-
-fn sync_row(
-    status: Status,
-    last_error: Option<&str>,
-    sid: Option<&str>,
-    failed_sid: Option<&str>,
-) -> Instance {
-    let mut inst = make_test_instance();
-    inst.status = status;
-    inst.last_error = last_error.map(str::to_string);
-    inst.agent_session_id = sid.map(str::to_string);
-    inst.resume_probe_failed_sid = failed_sid.map(str::to_string);
-    inst
-}
-
-type SyncCase = (
-    &'static str,
-    Instance,
-    Instance,
-    Instance,
-    (Status, Option<&'static str>, &'static str, &'static str),
-);
-
-/// Restart and cascade syncs take the start outcome's sid and resume-failed
-/// marker unless a peer already wrote a newer sid (or the marker for the same
-/// sid). Only the restart sync also carries status and error.
-#[test]
-fn restart_and_cascade_syncs_take_the_start_outcome_but_keep_peer_writes() {
-    use Status::{Error, Running, Starting};
-    let resumed = sync_row(Running, Some("prior failure"), Some("sid-before"), None);
-    let mut failed = sync_row(
-        Error,
-        Some("resume failed"),
-        Some("sid-after"),
-        Some("sid-after"),
-    );
-    failed.last_error_check = Some(std::time::Instant::now());
-    let stale_before = sync_row(Running, None, Some("stale-sid"), None);
-    let stale_started = sync_row(
-        Error,
-        Some("resume failed"),
-        Some("stale-sid"),
-        Some("stale-sid"),
-    );
-    let peer = sync_row(Running, Some("keep me"), Some("peer-sid"), Some("peer-sid"));
-    let same = sync_row(Running, None, Some("same-sid"), None);
-    let mut same_marked = same.clone();
-    same_marked.resume_probe_failed_sid = Some("same-sid".to_string());
-    let mut same_started = same.clone();
-    same_started.status = Starting;
-
-    let restart: [SyncCase; 3] = [
-        (
-            "failed resume propagates",
-            resumed.clone(),
-            resumed.clone(),
-            failed.clone(),
-            (Error, Some("resume failed"), "sid-after", "sid-after"),
-        ),
-        (
-            "peer sid write survives",
-            stale_before.clone(),
-            peer.clone(),
-            stale_started.clone(),
-            (Error, Some("resume failed"), "peer-sid", "peer-sid"),
-        ),
-        (
-            "peer marker for the same sid survives",
-            same.clone(),
-            same_marked,
-            same_started,
-            (Starting, None, "same-sid", "same-sid"),
-        ),
-    ];
-    for (label, before, mut live, started, (status, error, sid, failed_sid)) in restart {
-        apply_post_restart_sync(&mut live, &before, &started);
-        assert_eq!(live.status, status, "{label}");
-        assert_eq!(live.last_error.as_deref(), error, "{label}");
-        assert_eq!(live.agent_session_id.as_deref(), Some(sid), "{label}");
-        assert_eq!(
-            live.resume_probe_failed_sid.as_deref(),
-            Some(failed_sid),
-            "{label}"
-        );
-        if label == "failed resume propagates" {
-            assert!(live.last_error_check.is_some());
-        }
-    }
-
-    let mut cascade_live = resumed.clone();
-    cascade_live.last_error = Some("keep me".to_string());
-    let cascade: [SyncCase; 2] = [
-        (
-            "marker propagates without status",
-            cascade_live.clone(),
-            cascade_live,
-            failed,
-            (Running, Some("keep me"), "sid-after", "sid-after"),
-        ),
-        (
-            "peer sid write survives",
-            stale_before,
-            peer,
-            stale_started,
-            (Running, Some("keep me"), "peer-sid", "peer-sid"),
-        ),
-    ];
-    for (label, before, mut live, started, (status, error, sid, failed_sid)) in cascade {
-        apply_cascade_state_sync(&mut live, &before, &started);
-        assert_eq!(live.status, status, "cascade: {label}");
-        assert_eq!(live.last_error.as_deref(), error, "cascade: {label}");
-        assert_eq!(
-            live.agent_session_id.as_deref(),
-            Some(sid),
-            "cascade: {label}"
-        );
-        assert_eq!(
-            live.resume_probe_failed_sid.as_deref(),
-            Some(failed_sid),
-            "cascade: {label}"
-        );
-    }
-}
-
-#[test]
-fn restart_sync_rejects_an_older_lifecycle_generation() {
-    let mut before = make_test_instance();
-    before.lifecycle_generation = 4;
-
-    let mut started = before.clone();
-    started.status = Status::Error;
-    started.agent_session_id = Some("stale-restart-sid".to_string());
-    started.retroactive_capture_excludes = [crate::session::ConversationBinding::unknown(
-        "stale-exclusion".to_string(),
-    )]
-    .into();
-
-    let mut live = before.clone();
-    live.lifecycle_generation = 5;
-    live.status = Status::Running;
-    live.agent_session_id = Some("newer-restart-sid".to_string());
-    live.retroactive_capture_excludes = [crate::session::ConversationBinding::unknown(
-        "newer-exclusion".to_string(),
-    )]
-    .into();
-
-    assert!(!apply_post_restart_sync(&mut live, &before, &started));
-    apply_cascade_state_sync(&mut live, &before, &started);
-
-    assert_eq!(live.lifecycle_generation, 5);
-    assert_eq!(live.status, Status::Running);
-    assert_eq!(live.agent_session_id.as_deref(), Some("newer-restart-sid"));
-    assert_eq!(
-        live.retroactive_capture_excludes,
-        [crate::session::ConversationBinding::unknown(
-            "newer-exclusion".to_string()
-        )]
-        .into()
-    );
-}
-
 /// A tool name must resolve to a built-in agent, or to a custom agent whose
 /// configured command is non-empty.
 #[test]
@@ -4591,6 +4248,249 @@ async fn worker_stopping_handlers_wait_for_an_in_flight_submission() {
             .await
             .unwrap_or_else(|_| panic!("{which} must finish once the submission releases"));
     }
+}
+
+/// What an opted-in plugin worker receives: the real forwarder runs over `status_tx`, so a test
+/// sees exactly what a plugin would, including transitions no producer published. Subscribe
+/// before calling the handler under test.
+struct PluginStatusFeed {
+    rx: tokio::sync::mpsc::Receiver<String>,
+    _host: std::sync::Arc<crate::plugin::host::PluginHost>,
+    _dir: tempfile::TempDir,
+}
+
+impl PluginStatusFeed {
+    async fn attach(state: &std::sync::Arc<crate::server::AppState>, profile: &str) -> Self {
+        crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
+        let mut profiles: HashMap<String, Vec<Instance>> = HashMap::new();
+        for row in state.instances.write().await.iter_mut() {
+            row.source_profile = row.effective_profile();
+            profiles
+                .entry(crate::session::config::effective_profile(
+                    &row.source_profile,
+                ))
+                .or_default()
+                .push(row.clone());
+        }
+        for (profile, rows) in profiles {
+            crate::server::test_support::seed_instances_on_disk_for_test(&profile, rows);
+        }
+        *state.canonical_metadata.write().await =
+            crate::server::reload::load_all_profiles(&state.file_watch)
+                .unwrap()
+                .metadata;
+        let dir = tempfile::tempdir().unwrap();
+        let host = crate::plugin::host::PluginHost::new(
+            dir.path(),
+            profile,
+            None,
+            state.runtime.work.clone(),
+        )
+        .unwrap();
+        let rx = host.register_test_worker("acme.watcher", Some(16)).await;
+        state.runtime.work.spawn(
+            "plugin status test forwarder",
+            crate::server::plugin_status::run_forwarder(
+                state.status_tx.subscribe(),
+                host.clone(),
+                state.shutdown.clone(),
+            ),
+        );
+        Self {
+            rx,
+            _host: host,
+            _dir: dir,
+        }
+    }
+
+    /// The next `(session, from, to)` the worker was notified of.
+    async fn next_of_session(&mut self) -> (String, String, String) {
+        let line = tokio::time::timeout(std::time::Duration::from_secs(10), self.rx.recv())
+            .await
+            .expect("the plugin was never notified of the transition")
+            .expect("worker queue closed");
+        let msg: serde_json::Value = serde_json::from_str(line.trim_end()).unwrap();
+        (
+            msg["params"]["session_id"].as_str().unwrap().to_string(),
+            msg["params"]["from"].as_str().unwrap().to_string(),
+            msg["params"]["to"].as_str().unwrap().to_string(),
+        )
+    }
+
+    /// The next `(from, to)` the worker was notified of.
+    async fn next(&mut self) -> (String, String) {
+        let (_, from, to) = self.next_of_session().await;
+        (from, to)
+    }
+}
+
+/// `Instance::archive` settles a Running, Waiting or Starting row to Idle on the live row. With
+/// `kill_pane = false` no worker or pane teardown reports it, and the next poll tick snapshots the
+/// row already Idle, so unless the handler publishes the move no plugin ever hears of it.
+#[tokio::test]
+async fn archive_session_notifies_plugins_of_the_idle_it_settles_to() {
+    let _home = crate::session::test_support::isolate_app_dir();
+    let mut running = make_test_instance();
+    running.source_profile = "default".to_string();
+    let mut idle = make_test_instance();
+    idle.source_profile = "default".to_string();
+    idle.status = Status::Idle;
+    let (running_id, idle_id) = (running.id.clone(), idle.id.clone());
+    let state = crate::server::test_support::build_test_app_state(vec![idle, running]);
+    let mut feed = PluginStatusFeed::attach(&state, "default").await;
+    let archive = |id: String| {
+        let state = std::sync::Arc::clone(&state);
+        async move {
+            update_session_archive(
+                State(state),
+                Path(id),
+                Ok(Json(UpdateArchiveBody {
+                    archived: true,
+                    kill_pane: false,
+                })),
+            )
+            .await
+        }
+    };
+
+    // An already-Idle row moves nothing, so it must publish nothing. Events are handled in
+    // order, so the next event seen being the running session's proves that.
+    archive(idle_id).await;
+    archive(running_id.clone()).await;
+
+    assert_eq!(
+        feed.next_of_session().await,
+        (running_id, "Running".into(), "Idle".into())
+    );
+}
+
+/// `stop_session` writes `Stopped` straight onto the live row. The next poll tick snapshots
+/// the row already stopped and trailing ACP events are ignored for a stopped row, so unless
+/// the handler publishes the move itself no plugin ever hears of it.
+#[tokio::test]
+async fn stop_session_notifies_plugins() {
+    let _home = crate::session::test_support::isolate_app_dir();
+    let mut inst = make_test_instance();
+    inst.view = crate::session::View::Structured;
+    inst.source_profile = "default".to_string();
+    let id = inst.id.clone();
+    let state = crate::server::test_support::build_test_app_state(vec![inst]);
+    let mut feed = PluginStatusFeed::attach(&state, "default").await;
+
+    stop_session(State(std::sync::Arc::clone(&state)), Path(id)).await;
+
+    assert_eq!(feed.next().await, ("Running".into(), "Stopped".into()));
+}
+
+/// The same gap for the explicit structured start, which flips the live row to `Idle`.
+#[tokio::test]
+async fn start_session_notifies_plugins() {
+    let _home = crate::session::test_support::isolate_app_dir();
+    let mut inst = Instance::new("start-notify", "/tmp/aoe-start-notify");
+    inst.view = crate::session::View::Structured;
+    inst.source_profile = "default".to_string();
+    inst.status = Status::Stopped;
+    let id = inst.id.clone();
+    Storage::new_unwatched("default")
+        .unwrap()
+        .update(|rows, _| {
+            *rows = vec![inst.clone()];
+            Ok(())
+        })
+        .unwrap();
+    let state = crate::server::test_support::build_test_app_state(vec![inst]);
+    let mut feed = PluginStatusFeed::attach(&state, "default").await;
+
+    start_session(State(std::sync::Arc::clone(&state)), Path(id), Ok(None)).await;
+
+    assert_eq!(feed.next().await, ("Stopped".into(), "Idle".into()));
+}
+
+/// A canonical purge reservation publishes its transition before removal.
+#[tokio::test]
+async fn delete_session_notifies_plugins_that_the_session_is_deleting() {
+    let _home = crate::session::test_support::isolate_app_dir();
+    let state = delete_race_state("sess-delete-notify");
+    let mut feed =
+        PluginStatusFeed::attach(&state, &crate::session::config::effective_profile("")).await;
+    let mut status_rx = state.status_tx.subscribe();
+
+    let response = delete_session(
+        State(std::sync::Arc::clone(&state)),
+        Path("sess-delete-notify".to_string()),
+        Some(Json(DeleteSessionBody::default())),
+    )
+    .await
+    .into_response();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    assert_eq!(feed.next().await, ("Idle".into(), "Deleting".into()));
+    let change = status_rx
+        .try_recv()
+        .expect("the canonical reservation was adopted");
+    assert_eq!((change.old, change.new), (Status::Idle, Status::Deleting));
+    assert!(
+        status_rx.try_recv().is_err(),
+        "the transition is emitted once"
+    );
+    assert!(state.instances.read().await.is_empty());
+}
+
+/// Failed purge bookkeeping publishes only its committed error transition.
+#[tokio::test]
+async fn failed_delete_notifies_plugins_of_the_error() {
+    let _home = crate::session::test_support::isolate_app_dir();
+    let state = delete_race_state("sess-delete-error");
+    state.instances.write().await[0].status = Status::Deleting;
+    let mut feed =
+        PluginStatusFeed::attach(&state, &crate::session::config::effective_profile("")).await;
+    let mut status_rx = state.status_tx.subscribe();
+
+    let worker_state = state.clone();
+    tokio::task::spawn_blocking(move || {
+        use crate::session::SessionStore;
+        let native = crate::server::session_store::NativeSessionStore::open(
+            worker_state,
+            &crate::session::config::effective_profile(""),
+            Some("sess-delete-error".into()),
+        )
+        .unwrap();
+        let store: &dyn SessionStore = &native;
+        let rejected: anyhow::Result<()> = store.update(|rows, _| {
+            let row = rows
+                .iter_mut()
+                .find(|row| row.id == "sess-delete-error")
+                .unwrap();
+            row.status = Status::Error;
+            anyhow::bail!("reject before commit")
+        });
+        assert!(rejected.is_err());
+        assert_eq!(store.load().unwrap()[0].status, Status::Deleting);
+        store
+            .update(|rows, _| {
+                let row = rows
+                    .iter_mut()
+                    .find(|row| row.id == "sess-delete-error")
+                    .unwrap();
+                row.status = Status::Error;
+                row.last_error = Some("boom".into());
+                Ok(())
+            })
+            .unwrap();
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(feed.next().await, ("Deleting".into(), "Error".into()));
+    assert_eq!(state.instances.read().await[0].status, Status::Error);
+    let change = status_rx
+        .try_recv()
+        .expect("the failed-purge status was adopted");
+    assert_eq!((change.old, change.new), (Status::Deleting, Status::Error));
+    assert!(
+        status_rx.try_recv().is_err(),
+        "rejected writes emit no transition"
+    );
 }
 
 /// A direct stop sets `Stopped` on the live in-memory row without going through
@@ -5419,6 +5319,85 @@ async fn start_rechecks_the_stored_row() {
     }
 }
 
+/// The HTTP send boundary strips terminal control bytes from captured snippets before tmux input.
+#[tokio::test]
+#[serial_test::serial]
+async fn send_strips_bracketed_paste_escape_from_captured_snippet() {
+    if crate::tmux::tmux_command().arg("-V").output().is_err() {
+        eprintln!("tmux not available; skipping");
+        return;
+    }
+    let _home = crate::session::test_support::isolate_app_dir();
+    let project = tempfile::tempdir().unwrap();
+    let mut inst = make_test_instance();
+    inst.source_profile = "default".to_string();
+    inst.project_path = project.path().to_str().unwrap().to_owned();
+    Storage::new_unwatched("default")
+        .unwrap()
+        .update(|rows, _| {
+            *rows = vec![inst.clone()];
+            Ok(())
+        })
+        .unwrap();
+    let id = inst.id.clone();
+    let pane = crate::tmux::Session::generate_name(&id, &inst.title);
+    let created = crate::tmux::tmux_command()
+        .args([
+            "new-session",
+            "-d",
+            "-s",
+            &pane,
+            "-c",
+            project.path().to_str().unwrap(),
+            "cat",
+        ])
+        .status();
+    if !created.map(|status| status.success()).unwrap_or(false) {
+        eprintln!("tmux new-session failed; skipping");
+        return;
+    }
+    crate::tmux::refresh_session_cache();
+    let state = crate::server::test_support::build_test_app_state(vec![inst]);
+    crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+    let response = send_message(
+        State(state),
+        Path(id),
+        Ok(Json(SendMessageRequest {
+            message: "Captured snippet: prefix\x1b[200~code 雪\x1b[201~following text".to_string(),
+            revive: false,
+        })),
+    )
+    .await
+    .into_response();
+    let status = response.status();
+    let response_body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&response_body)
+    );
+    let expected = "Captured snippet: prefixcode 雪following text";
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    let captured = loop {
+        let output = crate::tmux::tmux_command()
+            .args(["capture-pane", "-p", "-t", &pane])
+            .output()
+            .expect("tmux capture-pane");
+        let captured = String::from_utf8_lossy(&output.stdout).into_owned();
+        if captured.contains(expected) || std::time::Instant::now() >= deadline {
+            break captured;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    };
+    let _ = crate::tmux::tmux_command()
+        .args(["kill-session", "-t", &pane])
+        .output();
+    assert!(captured.contains(expected), "{captured:?}");
+    assert!(!captured.contains('\x1b'), "{captured:?}");
+}
 /// #4116: web `/send` rechecks the stored row under the lifecycle lock, so a peer's archive or
 /// purge of a session with a live pane refuses the keystrokes, and an archive survives the send.
 #[tokio::test]
@@ -7533,4 +7512,269 @@ async fn a_cancelled_create_does_not_freeze_its_idempotency_key() {
             .is_none(),
         "a cancelled create must not occupy a replay slot"
     );
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn import_requires_a_listed_id_in_its_cwd_on_a_plain_host_session() {
+    use crate::session::test_support::isolate_home;
+    let tmp = tempfile::tempdir().unwrap();
+    let claude = tmp.path().join("claude");
+    let project = tmp.path().join("proj");
+    let other = tmp.path().join("other");
+    let bin = tmp.path().join("bin");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::create_dir_all(&other).unwrap();
+    std::fs::create_dir_all(&bin).unwrap();
+    let pi_acp = bin.join("pi-acp");
+    std::fs::write(
+        &pi_acp,
+        format!(
+            r#"#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -En 's/.*"id":("[^"]*"|[0-9]+).*/\1/p')
+  case $line in
+    *'"method":"initialize"'*)
+      printf '{{"jsonrpc":"2.0","id":%s,"result":{{"protocolVersion":1,"agentCapabilities":{{"loadSession":true,"sessionCapabilities":{{"list":{{}}}}}}}}}}\n' "$id" ;;
+    *'"method":"session/list"'*)
+      printf '{{"jsonrpc":"2.0","id":%s,"result":{{"sessions":[{{"sessionId":"listed","cwd":"{}"}}]}}}}\n' "$id" ;;
+  esac
+done
+"#,
+            project.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(
+        &pi_acp,
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+    )
+    .unwrap();
+    let path = std::env::join_paths(
+        std::iter::once(bin).chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+    )
+    .unwrap();
+    let _env = isolate_home(tmp.path())
+        .and_set("CLAUDE_CONFIG_DIR", &claude)
+        .and_set("PATH", path);
+    let store = claude.join("projects").join("-proj");
+    std::fs::create_dir_all(&store).unwrap();
+    std::fs::write(
+        store.join("listed.jsonl"),
+        format!(
+            r#"{{"type":"user","cwd":"{}","message":{{"role":"user","content":"hi"}}}}"#,
+            project.display()
+        ),
+    )
+    .unwrap();
+
+    let state = crate::server::test_support::build_test_app_state(Vec::new());
+    let other = other.to_string_lossy().into_owned();
+    for (extra, message) in [
+        (
+            serde_json::json!({ "agent_name": "wrapper" }),
+            "requires a built-in ACP agent",
+        ),
+        (
+            serde_json::json!({ "scratch": true, "path": "" }),
+            "cannot use scratch",
+        ),
+        (
+            serde_json::json!({ "extra_repo_paths": ["/x"] }),
+            "cannot use scratch",
+        ),
+        (serde_json::json!({ "sandbox": true }), "cannot use scratch"),
+        (
+            serde_json::json!({ "worktree_branch": "feat/x" }),
+            "cannot use scratch",
+        ),
+        (serde_json::json!({ "path": other }), "Unknown session"),
+        (
+            serde_json::json!({ "import_acp_session_id": "unlisted" }),
+            "Unknown session",
+        ),
+        (
+            serde_json::json!({ "tool": "pi", "path": other }),
+            "Unknown session",
+        ),
+        (
+            serde_json::json!({ "tool": "pi", "import_acp_session_id": "unlisted" }),
+            "Unknown session",
+        ),
+    ] {
+        let mut body = serde_json::json!({
+            "path": project.to_string_lossy(),
+            "tool": "claude",
+            "title": "imported",
+            "import_acp_session_id": "listed",
+        });
+        for (k, v) in extra.as_object().unwrap() {
+            body[k] = v.clone();
+        }
+        let (status, json) = post_create(&state, body).await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::BAD_REQUEST,
+            "{extra}: {json}"
+        );
+        assert!(
+            json["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains(message),
+            "{extra}: {json}"
+        );
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn failed_forced_trash_drop_requires_selected_identity_and_returns_receipt() {
+    let _home = crate::session::test_support::isolate_app_dir();
+    crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
+    let profile = "failed-trash-drop";
+    let mut row = Instance::new("failed forced purge", "");
+    let root = crate::session::scratch::provision_scratch_dir(&row.id).unwrap();
+    row.project_path = root.to_string_lossy().into_owned();
+    row.scratch = true;
+    let payload = root.join("retained-files");
+    std::fs::write(&payload, b"must survive metadata drop").unwrap();
+    row.source_profile = profile.into();
+    row.view = crate::session::View::Structured;
+    row.trash();
+    row.lifecycle_generation = 4;
+    row.record_failed_purge(true);
+    crate::server::test_support::seed_instances_on_disk_for_test(profile, vec![row.clone()]);
+    let state = crate::server::test_support::build_test_app_state(vec![row.clone()]);
+    *state.canonical_metadata.write().await =
+        crate::server::reload::load_all_profiles(&state.file_watch)
+            .unwrap()
+            .metadata;
+    for (marker, generation, trashed_at, status) in [
+        (None, Some(4), row.trashed_at, StatusCode::CONFLICT),
+        (Some(false), Some(4), row.trashed_at, StatusCode::CONFLICT),
+        (Some(true), None, row.trashed_at, StatusCode::BAD_REQUEST),
+        (Some(true), Some(4), None, StatusCode::BAD_REQUEST),
+    ] {
+        let worker_state = state.clone();
+        let id = row.id.clone();
+        tokio::task::spawn_blocking(move || {
+            let native = crate::server::session_store::NativeSessionStore::open(
+                worker_state,
+                profile,
+                Some(id.clone()),
+            )
+            .unwrap();
+            (&native as &dyn crate::session::SessionStore)
+                .update(|rows, _| {
+                    let row = rows.iter_mut().find(|row| row.id == id).unwrap();
+                    row.failed_purge = None;
+                    if let Some(forced) = marker {
+                        row.record_failed_purge(forced);
+                    }
+                    Ok(())
+                })
+                .unwrap();
+        })
+        .await
+        .unwrap();
+        state.runtime.publish(&state).await.unwrap();
+        let storage = Storage::open_unwatched(profile).unwrap();
+        let before = std::fs::read(storage.sessions_path()).unwrap();
+        let mut status_rx = state.status_tx.subscribe();
+        let response = delete_session(
+            State(state.clone()),
+            Path(row.id.clone()),
+            Some(Json(DeleteSessionBody {
+                expected_trash: true,
+                expected_trashed_at: trashed_at,
+                expected_generation: generation,
+                drop_failed: true,
+                ..Default::default()
+            })),
+        )
+        .await
+        .into_response();
+        assert_eq!(
+            response.status(),
+            status,
+            "marker={marker:?}, generation={generation:?}, trashed_at={trashed_at:?}"
+        );
+        assert_eq!(std::fs::read(storage.sessions_path()).unwrap(), before);
+        assert!(
+            status_rx.try_recv().is_err(),
+            "refusals never reserve a purge"
+        );
+        assert_eq!(
+            std::fs::read(&payload).unwrap(),
+            b"must survive metadata drop"
+        );
+        let stored = Storage::open_unwatched(profile).unwrap().load().unwrap();
+        assert_eq!(stored[0].id, row.id);
+        assert_eq!(stored[0].lifecycle_generation, 4);
+        assert_eq!(stored[0].failed_purge_forced(), marker);
+        assert_eq!(
+            state
+                .runtime
+                .snapshot(&state)
+                .await
+                .unwrap()
+                .value
+                .contents
+                .sessions[0]
+                .failed_purge_forced,
+            marker
+        );
+    }
+    for (generation, status) in [(3, StatusCode::CONFLICT), (4, StatusCode::OK)] {
+        let response = delete_session(
+            State(state.clone()),
+            Path(row.id.clone()),
+            Some(Json(DeleteSessionBody {
+                expected_trash: true,
+                expected_trashed_at: row.trashed_at,
+                expected_generation: Some(generation),
+                drop_failed: true,
+                ..Default::default()
+            })),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), status);
+        assert_eq!(
+            std::fs::read(&payload).unwrap(),
+            b"must survive metadata drop"
+        );
+        let stored = Storage::open_unwatched(profile).unwrap().load().unwrap();
+        let snapshot = state.runtime.snapshot(&state).await.unwrap();
+        if generation == 3 {
+            assert_eq!(stored.len(), 1);
+            assert_eq!(stored[0].failed_purge_forced(), Some(true));
+            assert_eq!(
+                snapshot.value.contents.sessions[0].failed_purge_forced,
+                Some(true)
+            );
+        } else {
+            assert!(stored.is_empty());
+            assert!(snapshot.value.contents.sessions.is_empty());
+            assert_eq!(
+                response
+                    .headers()
+                    .get(crate::daemon::RUNTIME_EPOCH_HEADER)
+                    .unwrap()
+                    .to_str()
+                    .unwrap(),
+                snapshot.value.cursor.epoch
+            );
+            assert_eq!(
+                response
+                    .headers()
+                    .get(crate::daemon::RUNTIME_REVISION_HEADER)
+                    .unwrap()
+                    .to_str()
+                    .unwrap(),
+                snapshot.value.cursor.revision.to_string()
+            );
+        }
+    }
 }

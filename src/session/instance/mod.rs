@@ -197,6 +197,13 @@ pub struct PendingInitialTurn {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct FailedPurge {
+    lifecycle_generation: u64,
+    trashed_at: DateTime<Utc>,
+    forced: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Instance {
     pub id: String,
     pub title: String,
@@ -337,6 +344,8 @@ pub struct Instance {
     /// absent in older `sessions.json` rows, so no migration is needed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trashed_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) failed_purge: Option<FailedPurge>,
 
     /// The `project_path` a managed-worktree session had before it was
     /// trashed, captured when the trash flow relocates the worktree into the
@@ -765,4 +774,24 @@ pub struct Instance {
     /// constructions remain functional without an explicit injection.
     #[serde(skip, default)]
     pub(crate) file_watch: Option<std::sync::Arc<crate::file_watch::FileWatchService>>,
+}
+
+impl Instance {
+    pub(crate) fn record_failed_purge(&mut self, forced: bool) {
+        self.failed_purge = self.trashed_at.map(|trashed_at| FailedPurge {
+            lifecycle_generation: self.lifecycle_generation,
+            trashed_at,
+            forced,
+        });
+    }
+
+    pub(crate) fn failed_purge_forced(&self) -> Option<bool> {
+        self.failed_purge
+            .as_ref()
+            .filter(|failed| {
+                failed.lifecycle_generation == self.lifecycle_generation
+                    && Some(failed.trashed_at) == self.trashed_at
+            })
+            .map(|failed| failed.forced)
+    }
 }

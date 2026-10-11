@@ -1390,7 +1390,7 @@ async fn daemon_trash_restore_purge_preserves_collisions_and_allows_retry() {
     assert!(row.trashed_at.is_some());
     assert_eq!(std::path::Path::new(&row.project_path), worktree);
     use agent_of_empires::daemon::{
-        DaemonClientError, DeleteSessionBody, PurgeOutcome, RuntimeFrame,
+        ApiErrorCode, DaemonClientError, DeleteSessionBody, PurgeOutcome, RuntimeFrame,
     };
     use futures_util::StreamExt;
     let stream = tokio::net::UnixStream::connect(app.join("daemon/api.sock"))
@@ -1412,9 +1412,16 @@ async fn daemon_trash_restore_purge_preserves_collisions_and_allows_retry() {
         )
         .await
         .expect_err("dirty worktree purge must fail");
-    assert!(
-        matches!(refused, DaemonClientError::Status { status, .. } if status == reqwest::StatusCode::INTERNAL_SERVER_ERROR)
-    );
+    let DaemonClientError::Committed {
+        cursor: failed_cursor,
+        code,
+    } = refused
+    else {
+        panic!("dirty purge must preserve its committed failure receipt: {refused}");
+    };
+    assert_eq!(code, ApiErrorCode::PurgeFailed);
+    assert_eq!(failed_cursor.epoch, epoch);
+    assert!(failed_cursor.revision > snapshot.cursor.revision);
     assert_eq!(
         std::fs::read_to_string(&dirty).unwrap(),
         "preserve until forced"
@@ -1427,6 +1434,8 @@ async fn daemon_trash_restore_purge_preserves_collisions_and_allows_retry() {
         .json()
         .await
         .unwrap();
+    assert_eq!(retained.cursor.epoch, failed_cursor.epoch);
+    assert!(retained.cursor.revision >= failed_cursor.revision);
     let retained = retained
         .contents
         .sessions
@@ -1435,6 +1444,7 @@ async fn daemon_trash_restore_purge_preserves_collisions_and_allows_retry() {
         .unwrap();
     assert_eq!(retained.status, Status::Error.wire_str());
     assert!(retained.lifecycle_reservation.is_none());
+    assert_eq!(retained.failed_purge_forced, Some(false));
     let receipt = sdk
         .purge_session(
             &id,
@@ -1728,6 +1738,7 @@ async fn daemon_terminal_commands_apply_dimensions_archive_and_abandon_policy() 
         keep_scratch: false,
         use_cleanup_defaults: false,
         expected_trash: false,
+        ..Default::default()
     })
     .unwrap();
     let request = format!("DELETE /api/sessions/{id} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n{}: {epoch}\r\nContent-Length: {}\r\n\r\n{body}",

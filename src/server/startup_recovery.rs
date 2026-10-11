@@ -236,10 +236,10 @@ pub(super) async fn daemon_startup_recovery_mark(
             crate::session::recovery::orphaned_agents_alive(&scan_input)
         })
         .await
-        .unwrap_or_else(|_| vec![false; candidates.len()]);
+        .unwrap_or_else(|_| vec![true; candidates.len()]);
         let mut idx = 0;
         candidates.retain(|i| {
-            let alive = orphan_flags.get(idx).copied().unwrap_or(false);
+            let alive = orphan_flags.get(idx).copied().unwrap_or(true);
             idx += 1;
             if alive {
                 tracing::info!(
@@ -341,122 +341,64 @@ pub(super) async fn daemon_startup_recovery_cascade(
                             .get(&session_name)
                             .map(|m| !m.pane_dead)
                             .unwrap_or(false);
-                        !has_live_tmux && crate::session::recovery::is_recovery_candidate(i)
+                        i.lifecycle_generation == inst.lifecycle_generation
+                            && i.source_profile == inst.source_profile
+                            && !has_live_tmux
+                            && crate::session::recovery::is_recovery_candidate(i)
                     })
                     .cloned()
             };
             // #2994.
-            let still_candidate = match recheck_inst {
+            let generation = match recheck_inst {
                 Some(inst) => {
+                    let generation = inst.lifecycle_generation;
                     let alive = tokio::task::spawn_blocking(move || {
                         crate::session::recovery::orphaned_agent_process_alive(&inst)
                     })
                     .await
-                    .unwrap_or(false);
-                    !alive
+                    .unwrap_or(true);
+                    (!alive).then_some(generation)
                 }
-                None => false,
+                None => None,
             };
-            if !still_candidate {
-                // Phase A pre-marked this id and seeded recovery_pending; without draining,
-                // the refresher would keep re-stamping the mark and status_poll_loop would
-                // suppress the real status even though we are not running a cascade.
+            let Some(generation) = generation else {
                 crate::session::recovery::drain_recovery_pending(
                     &inst_state.recovery_pending,
                     &inst_state.recently_restarted,
                     &id,
                 );
                 return;
-            }
+            };
 
             // Phase A already marked this id, but re-mark now to refresh the timestamp so
             // the suppression window covers the full cascade latency starting from this
             // point rather than from the (possibly older) Phase A snapshot.
             crate::session::recovery::mark_recently_restarted(&inst_state.recently_restarted, &id);
 
-            // Refresh the working snapshot from latest in-memory state.
-            let mut working = {
-                let instances = inst_state.instances.read().await;
-                instances
-                    .iter()
-                    .find(|i| i.id == id)
-                    .cloned()
-                    .unwrap_or(inst)
-            };
-            let title = working.title.clone();
-            let result = tokio::task::spawn_blocking(move || {
-                let res = crate::session::recovery::run_recovery_for_instance(&mut working);
-                (working, res)
-            })
+            drop(_guard);
+            let response = crate::server::api::sessions::recovery_restart(
+                inst_state.clone(),
+                id.clone(),
+                generation,
+            )
             .await;
-
-            match result {
-                Ok((updated, Ok(outcome))) => {
-                    tracing::info!(
-                        target: "session.startup_recovery",
-                        instance_id = %id,
-                        title = %title,
-                        ?outcome,
-                        "recovery completed",
-                    );
-                    let mut instances = inst_state.instances.write().await;
-                    if let Some(slot) = instances.iter_mut().find(|i| i.id == id) {
-                        *slot = updated;
-                    }
-                    drop(instances);
-                    // Release the suppression now that the cascade has succeeded and the
-                    // pane is alive.
-                    crate::session::recovery::drain_recovery_pending(
-                        &inst_state.recovery_pending,
-                        &inst_state.recently_restarted,
-                        &id,
-                    );
-                }
-                Ok((updated, Err(e))) => {
-                    tracing::warn!(
-                        target: "session.startup_recovery",
-                        instance_id = %id,
-                        title = %title,
-                        error = %e,
-                        "recovery cascade failed",
-                    );
-                    let mut instances = inst_state.instances.write().await;
-                    if let Some(slot) = instances.iter_mut().find(|i| i.id == id) {
-                        *slot = updated;
-                    }
-                    drop(instances);
-                    // Release the suppression so the next poll respects the Error state
-                    // instead of forcing Status::Starting for the rest of the TTL window.
-                    crate::session::recovery::drain_recovery_pending(
-                        &inst_state.recovery_pending,
-                        &inst_state.recently_restarted,
-                        &id,
-                    );
-                }
-                Err(join_err) => {
-                    tracing::error!(
-                        target: "session.startup_recovery",
-                        instance_id = %id,
-                        title = %title,
-                        error = %join_err,
-                        "recovery worker panicked",
-                    );
-                    let mut instances = inst_state.instances.write().await;
-                    if let Some(slot) = instances.iter_mut().find(|i| i.id == id) {
-                        slot.status = crate::session::Status::Error;
-                        slot.last_error = Some(format!("recovery worker panicked: {}", join_err));
-                        // Same stickiness arming as the cascade-Err arm above.
-                        slot.last_error_check = Some(std::time::Instant::now());
-                    }
-                    drop(instances);
-                    // Same suppression release as above.
-                    crate::session::recovery::drain_recovery_pending(
-                        &inst_state.recovery_pending,
-                        &inst_state.recently_restarted,
-                        &id,
-                    );
-                }
+            if response.status().is_success() {
+                tracing::info!(
+                    target: "session.startup_recovery",
+                    instance_id = %id, title = %inst.title, "recovery completed",
+                );
+            } else {
+                tracing::warn!(
+                    target: "session.startup_recovery",
+                    instance_id = %id, title = %inst.title, status = %response.status(),
+                    "canonical recovery restart refused or failed",
+                );
             }
+            crate::session::recovery::drain_recovery_pending(
+                &inst_state.recovery_pending,
+                &inst_state.recently_restarted,
+                &id,
+            );
         });
     }
 
@@ -760,6 +702,102 @@ mod tests {
                 .await
                 .is_none()
         );
+    }
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn recovery_refuses_a_superseded_candidate_without_publishing() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let mut row = crate::session::Instance::new("superseded recovery", "/tmp/recovery");
+        row.source_profile = "test".into();
+        row.lifecycle_generation = 1;
+        row.status = crate::session::Status::Stopped;
+        test_support::seed_instances_on_disk_for_test("test", vec![row.clone()]);
+        let state = test_support::build_test_app_state(vec![row.clone()]);
+        test_support::refresh_canonical_metadata_for_test(&state).await;
+        let mut rx = state.status_tx.subscribe();
+        let response =
+            crate::server::api::sessions::recovery_restart(state.clone(), row.id.clone(), 0).await;
+        assert_eq!(response.status(), axum::http::StatusCode::CONFLICT);
+        assert!(rx.try_recv().is_err());
+        let current = state.instances.read().await;
+        assert_eq!(current[0].lifecycle_generation, 1);
+        assert_eq!(current[0].status, crate::session::Status::Stopped);
+        assert!(current[0].lifecycle_reservation.is_none());
+        let disk = test_support::load_instances_from_disk_for_test("test");
+        assert_eq!(disk[0].lifecycle_generation, 1);
+        assert!(disk[0].lifecycle_reservation.is_none());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn recovery_refuses_shelved_rows_after_the_candidate_snapshot() {
+        use crate::session::{Instance, Status, View};
+        let _home = crate::session::test_support::isolate_app_dir();
+        for structured in [false, true] {
+            for (shelve, code) in [
+                (Instance::archive as fn(&mut Instance), "session_archived"),
+                (Instance::trash as fn(&mut Instance), "session_trashed"),
+            ] {
+                for published in [false, true] {
+                    let mut candidate = Instance::new("shelved recovery", "/tmp/recovery");
+                    candidate.source_profile = "test".into();
+                    candidate.view = if structured {
+                        View::Structured
+                    } else {
+                        View::Terminal
+                    };
+                    candidate.status = Status::Running;
+                    candidate.last_error = Some("previous diagnostic".into());
+                    let mut shelved = candidate.clone();
+                    shelve(&mut shelved);
+                    test_support::seed_instances_on_disk_for_test("test", vec![shelved.clone()]);
+                    let visible = if published {
+                        shelved
+                    } else {
+                        candidate.clone()
+                    };
+                    let state = test_support::build_test_app_state(vec![visible.clone()]);
+                    test_support::refresh_canonical_metadata_for_test(&state).await;
+                    let disk_before = serde_json::to_value(
+                        test_support::load_instances_from_disk_for_test("test"),
+                    )
+                    .unwrap();
+                    let mut rx = state.status_tx.subscribe();
+                    let response = crate::server::api::sessions::recovery_restart(
+                        state.clone(),
+                        candidate.id,
+                        candidate.lifecycle_generation,
+                    )
+                    .await;
+                    assert_eq!(response.status(), axum::http::StatusCode::CONFLICT);
+                    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                        .await
+                        .unwrap();
+                    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                    assert_eq!(
+                        body["error"], code,
+                        "structured={structured} published={published}"
+                    );
+                    assert!(
+                        rx.try_recv().is_err(),
+                        "refused recovery publishes no status edge"
+                    );
+                    let current = state.instances.read().await;
+                    assert_eq!(
+                        serde_json::to_value(&current[0]).unwrap(),
+                        serde_json::to_value(visible).unwrap()
+                    );
+                    let disk_after = serde_json::to_value(
+                        test_support::load_instances_from_disk_for_test("test"),
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        disk_after, disk_before,
+                        "recovery must not mutate shelved metadata"
+                    );
+                }
+            }
+        }
     }
 
     /// #2994 wiring test for `daemon_startup_recovery_mark` (Phase A).

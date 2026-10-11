@@ -538,6 +538,7 @@ pub(super) async fn status_poll_loop(
                 std::collections::HashMap::new();
             for (idx, old) in observed_transitions(&instances, &prev) {
                 let inst = &instances[idx];
+
                 let decision = decide_passive_transition(inst, old, unread_enabled);
                 if decision.patch.is_none() && !decision.mark_unread {
                     continue;
@@ -590,7 +591,6 @@ pub(super) async fn status_poll_loop(
                         );
                     }
                 }
-                let _ = state.status_tx.send(change);
             }
         }
     }

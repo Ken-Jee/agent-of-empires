@@ -177,6 +177,7 @@ impl Instance {
     pub fn trash(&mut self) {
         if self.trashed_at.is_none() {
             self.trashed_at = Some(Utc::now());
+            self.failed_purge = None;
         }
     }
 
@@ -184,6 +185,7 @@ impl Instance {
     /// archived, depending on the preserved sibling flags). Idempotent.
     pub fn untrash(&mut self) {
         self.trashed_at = None;
+        self.failed_purge = None;
     }
 
     pub fn is_trashed(&self) -> bool {

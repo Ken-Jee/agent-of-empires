@@ -482,6 +482,13 @@
       ]
     },
     {
+      "id": "settings.list-field",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": ["tests/settings-list-field.spec.ts", "src/components/settings/__tests__/StructuredWidgets.test.tsx"],
+      "components": ["web/src/components/settings/FormFields.tsx", "web/src/components/settings/SchemaSection.tsx"]
+    },
+    {
       "id": "settings.mobile-header",
       "kind": "mocked-playwright",
       "risk": "medium",
@@ -616,6 +623,13 @@
       "components": ["web/src/components/SettingsView.tsx", "web/src/components/settings/SchemaSection.tsx"]
     },
     {
+      "id": "settings.tui-shortcut-bar",
+      "kind": "live-playwright",
+      "risk": "medium",
+      "specs": ["tests/live/settings-persistence.spec.ts"],
+      "components": ["web/src/components/SettingsView.tsx", "web/src/components/settings/SchemaSection.tsx"]
+    },
+    {
       "id": "settings.tmux-persistence",
       "kind": "vitest",
       "risk": "medium",
@@ -731,7 +745,7 @@
     {
       "id": "notifications.push-subscription",
       "kind": "vitest",
-      "risk": "medium",
+      "risk": "high",
       "specs": ["src/hooks/usePushSubscription.test.ts", "src/lib/pushHealth.test.ts"],
       "components": ["web/src/hooks/usePushSubscription.ts", "web/src/lib/pushHealth.ts"]
     },
@@ -787,6 +801,19 @@
         "web/src/App.tsx",
         "web/src/components/acp/StructuredView.tsx",
         "web/src/lib/repinOnResize.ts"
+      ]
+    },
+    {
+      "id": "sidebar.terminal-focus-handoff",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": ["tests/terminal-focus-shortcut.spec.ts", "src/hooks/useKeyboardShortcuts.test.ts"],
+      "components": [
+        "web/src/App.tsx",
+        "web/src/components/WorkspaceSidebar.tsx",
+        "web/src/components/sidebar/SessionRow.tsx",
+        "web/src/hooks/useKeyboardShortcuts.ts",
+        "web/src/lib/shortcuts.ts"
       ]
     },
     {
@@ -1229,17 +1256,29 @@
       "components": [
         "web/src/components/session-wizard/SessionWizard.tsx",
         "web/src/components/session-wizard/steps/ProjectStep.tsx",
-        "web/src/components/session-wizard/steps/ClaudeSessionPicker.tsx"
+        "web/src/components/session-wizard/steps/ImportSessionPicker.tsx"
       ]
     },
     {
-      "id": "wizard.import-claude-session.unit",
+      "id": "wizard.import-session",
+      "kind": "mocked-playwright",
+      "risk": "high",
+      "specs": ["tests/wizard-project.spec.ts"],
+      "components": [
+        "web/src/components/session-wizard/SessionWizard.tsx",
+        "web/src/components/session-wizard/steps/ProjectStep.tsx",
+        "web/src/components/session-wizard/steps/ImportSessionPicker.tsx"
+      ]
+    },
+    {
+      "id": "wizard.import-session.unit",
       "kind": "vitest",
       "risk": "high",
+      "notes": "Generic ACP import reads the acknowledged served or explicitly selected profile, waits while Server default is unresolved, and never writes the implicit profile choice into the form.",
       "specs": ["src/components/session-wizard/__tests__/ProjectStep.test.tsx"],
       "components": [
         "web/src/components/session-wizard/steps/ProjectStep.tsx",
-        "web/src/components/session-wizard/steps/ClaudeSessionPicker.tsx"
+        "web/src/components/session-wizard/steps/ImportSessionPicker.tsx"
       ]
     },
     {
@@ -1968,6 +2007,14 @@
       "notes": "The shared Dialog links its body as the accessible description; bodies with controls point it at their prompt, and ScratchOverridesModal opts out."
     },
     {
+      "id": "acp.compaction-summary",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/components/acp/ThreadMessages.test.tsx"],
+      "components": ["web/src/components/acp/activityMessages.ts", "web/src/components/acp/ThreadMessages.tsx"],
+      "notes": "The summary an agent retains on /compact renders as a collapsed card under the compaction divider; replacement and clearing are server-side row patches covered by Rust tests."
+    },
+    {
       "id": "acp.tool-group-chunking",
       "kind": "vitest",
       "risk": "medium",
@@ -2096,6 +2143,30 @@
         "web/src/components/diff/comments/CommentsBanner.tsx",
         "web/src/components/diff/comments/CommentForm.tsx",
         "web/src/components/diff/comments/CommentCard.tsx"
+      ]
+    },
+    {
+      "id": "diff-comments.terminal-send-flow",
+      "kind": "mocked-playwright",
+      "risk": "high",
+      "specs": ["tests/diff-comments.spec.ts"],
+      "components": [
+        "web/src/App.tsx",
+        "web/src/components/MobileMainPane.tsx",
+        "web/src/components/diff/DiffFileViewer.tsx",
+        "web/src/components/diff/comments/SendCommentsDialog.tsx"
+      ]
+    },
+    {
+      "id": "diff-comments.terminal-live-delivery",
+      "kind": "live-playwright",
+      "risk": "high",
+      "specs": ["tests/live/diff-comments-terminal.spec.ts"],
+      "components": [
+        "web/src/App.tsx",
+        "web/src/components/MobileMainPane.tsx",
+        "web/src/components/diff/DiffFileViewer.tsx",
+        "web/src/components/diff/comments/SendCommentsDialog.tsx"
       ]
     },
     {
@@ -2537,6 +2608,9 @@
       ],
       "components": [
         "web/src/components/acp/Composer.tsx",
+        "web/src/components/WorkspaceSidebar.tsx",
+        "web/src/hooks/useKeyboardShortcuts.ts",
+        "web/src/lib/shortcuts.ts",
         "web/src/components/acp/recallNav.ts",
         "web/src/components/acp/ComposerControls.tsx"
       ]
@@ -2802,8 +2876,8 @@
       "id": "acp.ws-reconnect-liveness",
       "kind": "vitest",
       "risk": "high",
-      "specs": ["src/hooks/useAcpSession.test.ts"],
-      "components": ["web/src/hooks/useAcpSession.ts"]
+      "specs": ["src/hooks/useAcpSession.test.ts", "tests/acp-reconnect-hung-dial.spec.ts"],
+      "components": ["web/src/hooks/useAcpSession.ts", "web/src/hooks/acpSession/useAcpConnection.ts"]
     },
     {
       "id": "acp.args",
@@ -2885,6 +2959,22 @@
       "components": ["web/src/components/acp/WrapToggle.tsx"]
     },
     {
+      "id": "acp.tool-run-folding",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": [
+        "tests/acp-structured-view.spec.ts",
+        "src/components/acp/ToolExpansion.test.tsx",
+        "src/components/acp/activityMessages.test.ts",
+        "src/lib/toolAnchor.test.ts"
+      ],
+      "components": [
+        "web/src/components/acp/ToolExpansion.tsx",
+        "web/src/components/acp/GroupToolCards.tsx",
+        "web/src/lib/toolAnchor.ts"
+      ]
+    },
+    {
       "id": "acp.queued-prompt-expand-bounds",
       "kind": "vitest",
       "risk": "medium",
@@ -2935,6 +3025,13 @@
       "risk": "medium",
       "specs": ["tests/acp-submit-repin.spec.ts"],
       "components": ["web/src/components/acp/StructuredView.tsx"]
+    },
+    {
+      "id": "acp.typing-keeps-transcript-pinned",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": ["tests/acp-typing-keeps-pin.spec.ts"],
+      "components": ["web/src/components/acp/Composer.tsx", "web/src/components/acp/composerInput.ts"]
     },
     {
       "id": "acp.mobile-jump-to-bottom",
@@ -4013,7 +4110,7 @@
       "id": "sidebar.add-project",
       "kind": "vitest",
       "risk": "high",
-      "description": "Attach eligibility, request, and worker outcomes; native conversation continuation is best-effort, not a modal guarantee.",
+      "description": "Picker lists saved projects from the session profile and recents; failed reads retry without dropping typed paths. A clicked row or typed path posts to attach with canonical ACK consumption; attach eligibility and worker outcomes; native continuation remains best-effort.",
       "specs": ["src/components/__tests__/AddProjectAction.test.tsx"],
       "components": [
         "web/src/components/WorkspaceSidebar.tsx",
@@ -4285,9 +4382,10 @@
         "web/src/components/plugin/PluginSlots.tsx",
         "web/src/components/plugin/PluginPane.tsx",
         "web/src/components/plugin/SlotChrome.tsx",
-        "web/src/components/plugin/paneBlocks.tsx"
+        "web/src/components/plugin/paneBlocks.tsx",
+        "web/src/components/plugin/BlockMarkdown.tsx"
       ],
-      "notes": "The api_version 12 pane block vocabulary: callout, bar and columns, plus the interactive row (clicking a row fires its `method` with the block's `params`, e.g. github.select_pr) and the pinned pane footer. api_version 13 adds the sparkline block (per-sample band coloring) and the global home-pane slot (PluginHomePanes), covered by the sparkline and home-pane cases in PluginSlots.test.tsx."
+      "notes": "The api_version 12 pane block vocabulary: callout, bar and columns, plus the interactive row (clicking a row fires its `method` with the block's `params`, e.g. github.select_pr) and the pinned pane footer. api_version 13 adds the sparkline block (per-sample band coloring) and the global home-pane slot (PluginHomePanes), covered by the sparkline and home-pane cases in PluginSlots.test.tsx. api_version 15 adds the sanitised markdown block (BlockMarkdown: no raw HTML, no remote images, href-policy links), covered by the markdown block cases there."
     },
     {
       "id": "plugins.composer-actions",
@@ -4321,6 +4419,7 @@
       "risk": "high",
       "specs": [
         "src/components/session-wizard/__tests__/SessionWizard.test.tsx",
+        "src/components/session-wizard/__tests__/ProjectStep.test.tsx",
         "src/components/session-wizard/__tests__/SessionWizard.projectWorktreeOverride.test.tsx",
         "src/components/session-wizard/__tests__/SessionWizard.lastProject.test.tsx",
         "src/components/session-wizard/__tests__/projectPickerScope.test.ts"
@@ -4328,6 +4427,8 @@
       "components": [
         "web/src/App.tsx",
         "web/src/components/session-wizard/SessionWizard.tsx",
+        "web/src/components/session-wizard/steps/ProjectStep.tsx",
+        "web/src/components/session-wizard/steps/ImportSessionPicker.tsx",
         "web/src/components/session-wizard/steps/projectPicker.ts",
         "web/src/components/session-wizard/steps/ExtraReposPicker.tsx"
       ]

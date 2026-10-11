@@ -22,12 +22,7 @@ mod tests {
                 let root = crate::session::get_app_dir()?;
                 std::fs::write(root.join(".schema_version"), version.to_string())?;
                 if version >= 36 {
-                    std::fs::write(
-                        root.join("pending-purge-owners.json"),
-                        serde_json::to_vec(
-                            &serde_json::json!({"version": if version == 36 { 1 } else { 2 }, "owners": []}),
-                        )?,
-                    )?;
+                    crate::session::purge_owners::initialize(&root)?;
                 }
                 let launch = serde_json::json!({"schema":2,"pid":42,"instance_id":"retained-instance","auth_mode":auth,"remote":false});
                 for name in ["serve.launch", "serve.rollback.launch"] {

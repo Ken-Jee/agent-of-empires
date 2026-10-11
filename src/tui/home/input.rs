@@ -29,6 +29,10 @@ use crate::tui::diff::{DiffAction, DiffView};
 use crate::tui::responsive;
 use crate::tui::settings::{SettingsAction, SettingsView};
 
+/// Empty Trash checkbox keys.
+const EMPTY_TRASH_FORCE_FAILED: &str = "force_failed";
+const EMPTY_TRASH_DROP_FAILED: &str = "drop_failed";
+
 /// Longest gap between two left-clicks on one row that still counts as a double-click;
 /// 400ms matches most desktop environments.
 const DOUBLE_CLICK_THRESHOLD: std::time::Duration = std::time::Duration::from_millis(400);
@@ -490,11 +494,27 @@ impl HomeView {
                 self.view_mode = ViewMode::Structured;
                 return None;
             } else {
-                self.view_mode = ViewMode::Tool(tool_name);
+                self.view_mode = ViewMode::Tool(tool_name.clone());
                 self.preview_scroll_offset = 0;
                 self.tool_preview_cache = super::PreviewCache::default();
             }
-            return self.maybe_auto_start_live_send();
+            if let Some(action) = self.maybe_auto_start_live_send() {
+                return Some(action);
+            }
+            if let Some(id) = self.selected_session.clone() {
+                if let Err(error) = self.prepare_native_attachment(
+                    &id,
+                    super::panes::NativePane::Auxiliary(crate::session::AuxiliaryTarget::Tool {
+                        tool_name,
+                    }),
+                    crate::terminal::get_size(),
+                    super::panes::PaneIntent::Preview,
+                ) {
+                    self.info_dialog =
+                        Some(InfoDialog::new("Tool preview failed", &error.to_string()));
+                }
+            }
+            return None;
         }
 
         if command_is_empty {
@@ -1098,7 +1118,11 @@ impl HomeView {
                 None
             }
             "empty_trash" => {
-                self.empty_trash_all();
+                let checked = std::mem::take(&mut self.confirm_checked);
+                self.empty_trash_all(
+                    checked.contains(&EMPTY_TRASH_FORCE_FAILED),
+                    checked.contains(&EMPTY_TRASH_DROP_FAILED),
+                );
                 None
             }
             "pull_sandbox_image" => self.pending_image_pull.take().map(Action::SpawnImagePull),
@@ -1138,9 +1162,26 @@ impl HomeView {
 
     /// Confirm before permanently purging every trashed session. The purge is
     /// irreversible, so it keeps the destructive red tone; an already-empty trash gets an
-    /// info dialog instead of a confirm that would delete nothing.
+    /// info dialog instead of a confirm that would delete nothing. Rows whose last delete
+    /// failed get an opt-in escalation: forced delete, then removal from aoe.
     pub(super) fn prompt_empty_trash(&mut self) {
-        let count = self.instances.values().filter(|i| i.is_trashed()).count();
+        let mut count = 0;
+        let mut failed = 0;
+        let mut failed_forced = 0;
+        for inst in self.instances.values().filter(|i| {
+            i.is_trashed()
+                && self
+                    .active_profile
+                    .as_ref()
+                    .is_none_or(|profile| *profile == i.source_profile)
+        }) {
+            count += 1;
+            match self.failed_delete_forced(inst) {
+                Some(false) => failed += 1,
+                Some(true) => failed_forced += 1,
+                None => {}
+            }
+        }
         if count == 0 {
             self.info_dialog = Some(InfoDialog::new(
                 "Trash is empty",
@@ -1149,11 +1190,27 @@ impl HomeView {
             return;
         }
         let noun = if count == 1 { "session" } else { "sessions" };
-        self.confirm_dialog = Some(ConfirmDialog::new(
-            "Empty Trash",
-            &format!("Permanently delete {count} trashed {noun}? This cannot be undone."),
-            "empty_trash",
-        ));
+        let mut message =
+            format!("Permanently delete {count} trashed {noun}? This cannot be undone.");
+        if failed_forced > 0 {
+            message.push_str(
+                "\n\nRemoving from aoe skips cleanup: worktrees and branches stay on disk.",
+            );
+        }
+        let mut dialog = ConfirmDialog::new("Empty Trash", &message, "empty_trash");
+        if failed > 0 {
+            dialog = dialog.checkbox(
+                EMPTY_TRASH_FORCE_FAILED,
+                &format!("Force delete {failed} that failed before"),
+            );
+        }
+        if failed_forced > 0 {
+            dialog = dialog.checkbox(
+                EMPTY_TRASH_DROP_FAILED,
+                &format!("Remove {failed_forced} from aoe that failed a forced delete"),
+            );
+        }
+        self.confirm_dialog = Some(dialog);
     }
 
     /// Confirm before archiving every active session under the focused group: a whole
@@ -1389,6 +1446,7 @@ impl HomeView {
                     }
                     DialogResult::Submit(()) => {
                         let dont_ask_again = dialog.dont_ask_again();
+                        self.confirm_checked = dialog.checked_keys();
                         self.confirm_dialog = None;
                         if self.settings_close_confirm {
                             // Discard runs the keyboard path's exact sequence, theme
@@ -2168,6 +2226,7 @@ impl HomeView {
                 DialogResult::Submit(_) => {
                     let action = dialog.action().to_string();
                     let dont_ask_again = dialog.dont_ask_again();
+                    self.confirm_checked = dialog.checked_keys();
                     self.confirm_dialog = None;
                     if dont_ask_again {
                         self.apply_confirm_dont_ask_again(&action);
@@ -2525,10 +2584,30 @@ impl HomeView {
             return None;
         }
 
+        // Ctrl+L toggles the last-prompt footer. Routed here, after the live-send
+        // relay and every dialog above, and gated on `!is_live_send_capturing()`
+        // with exact modifiers, so a configured `C-l` exit/leader still reaches
+        // the agent and a distinct Ctrl+Alt+L is not consumed.
+        if key.code == KeyCode::Char('l')
+            && key.modifiers == KeyModifiers::CONTROL
+            && !self.is_live_send_capturing()
+        {
+            self.show_last_prompt = !self.show_last_prompt;
+            if !self.show_last_prompt {
+                self.last_prompt_cache = None;
+            }
+            return None;
+        }
+
         // Drain a queued earned-tip pop now that the home view is idle: every
         // overlay-routing block above has returned. Skipped while searching so it can't
         // interrupt a query, and opening it consumes the keystroke. #2262
-        if !self.search_active && self.pending_tip_pop.is_some() && self.drain_pending_tip_pop() {
+        if !self.search_active
+            && self
+                .pending_tip_pop
+                .is_some_and(|tip| tip.id != crate::tips::SHORTCUT_BAR_TIP_ID)
+            && self.drain_pending_tip_pop()
+        {
             return None;
         }
 
@@ -2686,7 +2765,9 @@ impl HomeView {
                 // A structured session has no tmux pane to attach or live-send into, so
                 // both Tab meanings are vacuous; say so instead of ignoring the press.
                 if let Some(id) = self.selected_session.as_deref() {
-                    if self.get_instance(id).is_some_and(|i| i.is_structured()) {
+                    if matches!(self.view_mode, ViewMode::Structured)
+                        && self.get_instance(id).is_some_and(|i| i.is_structured())
+                    {
                         return Some(Action::SetTransientStatus(
                             "Structured sessions have no tmux pane; press Enter to open the structured view."
                                 .to_string(),
@@ -2921,6 +3002,7 @@ impl HomeView {
             }
             ActionId::ToggleContainer => self.toggle_container_for_selected(),
             ActionId::TogglePreviewInfo => self.toggle_preview_info(),
+            ActionId::ToggleHideStopped => self.toggle_hide_stopped_in_groups(),
             ActionId::ToggleDiagnostics => self.toggle_diagnostics(),
             ActionId::OpenSystemHealth => self.open_system_health(),
             ActionId::SortPicker => self.show_sort_picker(),
@@ -2929,6 +3011,7 @@ impl HomeView {
             ActionId::NextWaiting => self.jump_to_next_waiting(),
             ActionId::Tips => self.open_tips_dialog(),
             ActionId::Fork => self.open_fork_from_selection(),
+            ActionId::EmptyTrash => self.prompt_empty_trash(),
             ActionId::AutoName => return self.auto_name_selected(),
         }
         None
@@ -3552,10 +3635,7 @@ impl HomeView {
         }
     }
 
-    /// "Auto-name now": run the agent one-shot title generator for the selected
-    /// session, even when auto-rename-on-start is off (#3039) and over a chosen title.
-    /// Terminal sessions rename via a detached child, structured ones through the daemon.
-    /// Best-effort, not a synchronous rename.
+    /// Ask the daemon to auto-name the selected canonical session.
     fn auto_name_selected(&mut self) -> Option<Action> {
         let Some(id) = self.selected_session.clone() else {
             self.info_dialog = Some(InfoDialog::new(
@@ -3564,89 +3644,7 @@ impl HomeView {
             ));
             return None;
         };
-        let Some((title, structured, profile, tool, command, project_path, sandboxed)) =
-            self.get_instance(&id).map(|inst| {
-                (
-                    inst.title.clone(),
-                    inst.is_structured(),
-                    inst.source_profile.clone(),
-                    inst.tool.clone(),
-                    inst.command.clone(),
-                    inst.project_path.clone(),
-                    inst.is_sandboxed(),
-                )
-            })
-        else {
-            self.info_dialog = Some(InfoDialog::new("Error", "Could not find session data."));
-            return None;
-        };
-
-        if structured {
-            return Some(Action::SmartRenameNow(id));
-        }
-
-        // Preflight the gates the detached child re-applies, so this action stops
-        // reporting "auto-naming" for a session the child will silently drop
-        // (#3159). The child stays the authority; this is feedback and
-        // fork avoidance. `setting_on` and `force` are true because the manual
-        // action runs even when auto-rename-on-start is off (#3039) and over any
-        // title, matching the `--force` the child receives and the web preflight.
-        let resolved = crate::session::config::repo_config::resolve_config_with_repo_or_warn(
-            &profile,
-            std::path::Path::new(&project_path),
-        );
-        let cfg =
-            crate::session::smart_rename::resolve_smart_rename_config(&resolved.session, None);
-        if let Err(reason) = crate::session::smart_rename::check_eligible_resolved(
-            true,
-            true,
-            true,
-            &title,
-            &tool,
-            cfg.rename_agent,
-            sandboxed,
-            &command,
-            cfg.overrides,
-        ) {
-            self.info_dialog = Some(InfoDialog::new("Can't Auto-Name", reason.user_message()));
-            return None;
-        }
-
-        // A sandboxed session's one-shot runs inside its container, so a stopped container
-        // means "not now" rather than "never". Only sandboxed sessions are inspected, so
-        // the common path spawns no `docker inspect`.
-        if sandboxed {
-            use crate::containers::Probe;
-            // A failed inspection is not a stopped container: telling the user to start
-            // one that may already be running sends them the wrong way, so the daemon
-            // error is surfaced verbatim.
-            match crate::containers::DockerContainer::from_session_id(&id).probe_running() {
-                Probe::Running => {}
-                Probe::NotRunning => {
-                    self.info_dialog = Some(InfoDialog::new(
-                        "Container Not Running",
-                        "This session's sandbox container isn't running, so its agent can't be asked for a name. Open the session to start it, then try again.",
-                    ));
-                    return None;
-                }
-                Probe::Unknown(e) => {
-                    self.info_dialog = Some(InfoDialog::new(
-                        "Container State Unknown",
-                        &format!(
-                            "Couldn't check this session's sandbox container, so its agent can't be asked for a name: {e}"
-                        ),
-                    ));
-                    return None;
-                }
-            }
-        }
-
-        crate::session::smart_rename::spawn_smart_rename_now(&profile, &id);
-        // Transient status (not a modal), matching the structured path's
-        // feedback so the two on-demand triggers behave the same.
-        Some(Action::SetTransientStatus(format!(
-            "auto-naming \"{title}\"…"
-        )))
+        Some(Action::SmartRenameNow(id))
     }
 
     fn open_serve(&mut self) {
@@ -3997,6 +3995,7 @@ impl HomeView {
                 if visible_sessions.contains(&inst.id)
                     || current_session.as_deref() == Some(inst.id.as_str())
                     || inst.is_dismissed()
+                    || self.hidden_by_filter(inst)
                 {
                     return false;
                 }
@@ -4094,7 +4093,7 @@ impl HomeView {
             if matches!(inst.status, Status::Deleting | Status::Creating) {
                 return None;
             }
-            if inst.is_structured() {
+            if inst.is_structured() && matches!(self.view_mode, ViewMode::Structured) {
                 // The embedded structured view takes over the preview pane, so leave
                 // live-send first (mirrors `exit_live_send_before_attach`).
                 self.exit_live_send_if_active();
@@ -4105,8 +4104,7 @@ impl HomeView {
             ViewMode::Structured => {
                 // `default_attach_mode = LiveSend` swaps the historical tmux attach for
                 // live-send on Enter / double-click. Terminal view honors the same
-                // setting against the paired terminal pane; Tool view keeps
-                // AttachToolSession.
+                // setting against the displayed auxiliary pane as well.
                 //
                 // Routing through `start_live_send` honors the same-target guard, so a
                 // double-click on the live row does not re-run ensure_pane_ready and
@@ -4145,6 +4143,12 @@ impl HomeView {
                 Some(Action::AttachTerminal(id, terminal_mode))
             }
             ViewMode::Tool(ref tool_name) => {
+                if matches!(
+                    self.default_attach_mode(&id),
+                    Some(crate::session::AttachMode::LiveSend)
+                ) {
+                    return self.start_live_send();
+                }
                 let tool_name = tool_name.clone();
                 self.exit_live_send_before_attach();
                 Some(Action::AttachToolSession(id, tool_name))
@@ -4161,8 +4165,8 @@ impl HomeView {
             if matches!(inst.status, Status::Deleting | Status::Creating) {
                 return None;
             }
-            // Structured rows never reach here: the Tab keybinding refuses them with a
-            // "no tmux pane" toast first.
+            // A structured agent pane is refused by Tab before this helper; its
+            // auxiliary terminal/tool views still have daemon-owned tmux targets.
         }
         match self.view_mode {
             ViewMode::Structured => Some(Action::AttachSession(id)),
@@ -4249,6 +4253,12 @@ impl HomeView {
                     }
                 }
             }
+            if let Some(header) = self.header_row_for_hidden_session(&sid) {
+                self.cursor = header;
+                self.update_selected();
+                self.context_menu = None;
+                return;
+            }
         }
         if self.flat_items.is_empty() {
             self.cursor = 0;
@@ -4264,7 +4274,7 @@ impl HomeView {
     pub(super) fn apply_sort_order(&mut self, new_order: SortOrder) {
         self.sort_order = new_order;
         if self.search_active && !self.search_query.value().is_empty() {
-            self.flat_items = self.build_flat_items();
+            self.refresh_flat_items();
             self.update_search();
         } else {
             self.rebuild_flat_items();
@@ -4278,7 +4288,7 @@ impl HomeView {
         }
     }
 
-    fn apply_group_by(&mut self, new_mode: GroupByMode) {
+    pub(super) fn apply_group_by(&mut self, new_mode: GroupByMode) {
         self.group_by = new_mode;
         self.rebuild_flat_items();
         self.reseat_cursor_after_rebuild();
@@ -4998,12 +5008,7 @@ impl HomeView {
     /// gives an empty state rather than silence.
     pub(super) fn open_tips_dialog(&mut self) {
         let config = load_config().ok().flatten().unwrap_or_default();
-        let signals = crate::tips::TipSignals {
-            new_session_with_selection_count: config.app_state.new_session_with_selection_count,
-            used_new_from_selection: config.app_state.used_new_from_selection,
-            system_health_tip_earned: config.app_state.system_health_tip_earned,
-            used_system_health: config.app_state.used_system_health,
-        };
+        let signals = crate::tips::TipSignals::from(&config);
         let eligible = crate::tips::eligible(crate::tips::TipSurface::Tui, &signals);
         self.tips_dialog = Some(TipsDialog::new(
             eligible,
@@ -5082,9 +5087,47 @@ impl HomeView {
         }
     }
 
-    /// After the new-session dialog closes, queue an earned tip if one just became
-    /// eligible and tips aren't disabled. `drain_pending_tip_pop` shows it on the next
-    /// keystroke, so it never interrupts an in-flight action.
+    /// Refresh on startup and the storage heartbeat, including creates in other profiles.
+    pub(super) fn refresh_shortcut_bar_tip(&mut self) {
+        if let Ok(Some(config)) = load_config() {
+            self.tips_unseen = super::tips_unseen_count(&config);
+            self.queue_shortcut_bar_tip(&config);
+        }
+    }
+
+    pub(super) fn queue_shortcut_bar_tip(&mut self, config: &crate::session::Config) {
+        if !config.session.show_tips || self.pending_tip_pop.is_some() {
+            return;
+        }
+        self.pending_tip_pop = crate::tips::eligible_unseen(
+            crate::tips::TipSurface::Tui,
+            &config.app_state.tips_seen,
+            &crate::tips::TipSignals::from(config),
+        )
+        .into_iter()
+        .find(|tip| tip.id == crate::tips::SHORTCUT_BAR_TIP_ID);
+    }
+
+    /// Present without consuming a key or interrupting agent input or another action.
+    pub(in crate::tui) fn try_present_shortcut_bar_tip(&mut self) -> bool {
+        if !self
+            .pending_tip_pop
+            .is_some_and(|tip| tip.id == crate::tips::SHORTCUT_BAR_TIP_ID)
+            || self.has_dialog()
+            || self.is_creation_pending()
+            || self.structured_preview_pending
+            || self
+                .structured_preview
+                .as_ref()
+                .is_some_and(|view| view.is_active())
+            || self.pending_paste.is_some()
+        {
+            return false;
+        }
+        self.drain_pending_tip_pop()
+    }
+
+    /// Queue an earned tip after an action closes its dialog.
     pub(super) fn queue_earned_tip_pop(&mut self) {
         if self.pending_tip_pop.is_some() {
             return;
@@ -5093,12 +5136,7 @@ impl HomeView {
         if !config.session.show_tips {
             return;
         }
-        let signals = crate::tips::TipSignals {
-            new_session_with_selection_count: config.app_state.new_session_with_selection_count,
-            used_new_from_selection: config.app_state.used_new_from_selection,
-            system_health_tip_earned: config.app_state.system_health_tip_earned,
-            used_system_health: config.app_state.used_system_health,
-        };
+        let signals = crate::tips::TipSignals::from(&config);
         self.pending_tip_pop = crate::tips::next_earned_pop(
             crate::tips::TipSurface::Tui,
             &config.app_state.tips_seen,
@@ -5114,9 +5152,33 @@ impl HomeView {
             return false;
         };
         let config = load_config().ok().flatten().unwrap_or_default();
-        // Re-check: the user may have disabled tips between queueing and now.
-        if !config.session.show_tips {
+        if !config.session.show_tips
+            || !crate::tips::eligible_unseen(
+                crate::tips::TipSurface::Tui,
+                &config.app_state.tips_seen,
+                &crate::tips::TipSignals::from(&config),
+            )
+            .iter()
+            .any(|eligible| eligible.id == tip.id)
+        {
             return false;
+        }
+        if tip.id == crate::tips::SHORTCUT_BAR_TIP_ID {
+            // Claim before opening so concurrent TUIs and interrupted dialogs cannot repeat it.
+            match update_app_state(|state| {
+                if state.tips_seen.iter().any(|seen| seen == tip.id) {
+                    return false;
+                }
+                state.tips_seen.push(tip.id.to_owned());
+                true
+            }) {
+                Ok(true) => {}
+                Ok(false) => return false,
+                Err(error) => {
+                    tracing::warn!(target: "tui.input", %error, "Failed to persist shortcut bar tip state");
+                    return false;
+                }
+            }
         }
         self.tips_dialog = Some(TipsDialog::new(
             vec![tip],
@@ -5289,8 +5351,9 @@ impl HomeView {
     /// Open the delete dialog (or a force-remove confirm, or the group delete-options
     /// dialog) for the current selection, mirroring the `'d'` / `'D'` gating: Terminal
     /// view rejects deletion with an info dialog, Creating sessions are inert,
-    /// stuck-Deleting sessions get a force-remove confirm, and Project and organization
-    /// groups can't be deleted. Shared by the keys and the context menu.
+    /// stuck-Deleting sessions get a force-remove confirm, Project and organization
+    /// groups can't be deleted, and the Trash header offers to empty the trash. Shared by
+    /// the keys and the context menu.
     pub(super) fn open_delete_for_selected(&mut self) {
         // Deletion only allowed in Structured View.
         if self.view_mode == ViewMode::Terminal {
@@ -5435,6 +5498,8 @@ impl HomeView {
                 self.confirm_dialog =
                     Some(ConfirmDialog::new("Delete Group", &message, "delete_group"));
             }
+        } else if matches!(self.section_at_cursor(), Some(SidebarSection::Trash)) {
+            self.prompt_empty_trash();
         }
     }
 
@@ -5997,9 +6062,8 @@ impl HomeView {
         if matches!(inst.status, Status::Creating | Status::Deleting) {
             return None;
         }
-        // Acp-mode sessions are not tmux-backed, so live-send has no target: no-op rather
-        // than enqueue an `Action::EnterLiveSend` that would fail downstream.
-        if inst.is_structured() {
+        // A structured agent has no tmux target, but its auxiliary terminal/tool panes do.
+        if inst.is_structured() && matches!(self.view_mode, ViewMode::Structured) {
             return None;
         }
         // Pick the target from the pane being previewed: Structured view to the agent
@@ -6167,6 +6231,36 @@ impl HomeView {
         if let Some(state) = self.live_send.clone() {
             self.exit_live_send_and_restore_sizing(&state);
         }
+    }
+
+    /// End live-send when a rebuild has left its target hidden by the `y` filter, whatever
+    /// changed (its status, the sort, the grouping, its group): a stopped session's terminal
+    /// can outlive its agent, and keys must not reach a pane the list no longer shows. The
+    /// selection is left for the caller's rebuild to settle.
+    pub(super) fn end_live_send_if_hidden(&mut self) {
+        let Some(state) = self.live_send.clone() else {
+            return;
+        };
+        if !self
+            .get_instance(&state.session_id)
+            .is_some_and(|inst| self.hidden_by_filter(inst))
+        {
+            return;
+        }
+        let selection = (
+            self.cursor,
+            self.selected_session.clone(),
+            self.selected_group.clone(),
+            self.selected_group_profile.clone(),
+        );
+        self.exit_live_send_and_restore_sizing(&state);
+        (
+            self.cursor,
+            self.selected_session,
+            self.selected_group,
+            self.selected_group_profile,
+        ) = selection;
+        self.flash_status("Live send ended: its session is hidden (y to show)");
     }
 
     /// Tear down live-send state and restore the tmux window's automatic sizing:
@@ -6516,7 +6610,7 @@ impl HomeView {
     /// `search_matches` keeps stale indices, and `n`/`N` jumps to the wrong sessions
     /// (#2676).
     pub(super) fn rebuild_flat_items(&mut self) {
-        self.flat_items = self.build_flat_items();
+        self.refresh_flat_items();
         if !self.search_matches.is_empty() {
             self.refresh_search_matches();
         }

@@ -72,6 +72,7 @@ pub enum ActionId {
     /// running agent/process counts). Persisted via
     /// `session.show_diagnostics_pane` so it survives restarts.
     ToggleDiagnostics,
+    ToggleHideStopped,
     /// Open the read-only host and running-agent resource view.
     OpenSystemHealth,
     SortPicker,
@@ -94,9 +95,10 @@ pub enum ActionId {
     Fork,
     /// Run the agent-driven "Auto-name now" one-shot for the selected
     /// still-default-named session, on demand and even when auto-rename-on-start
-    /// is disabled (#3039). Terminal sessions rename locally; structured
-    /// sessions go through the daemon.
+    /// is disabled (#3039). Both session backends use the canonical daemon command.
     AutoName,
+    /// Permanently purge every trashed session after a confirm (palette only; no chord).
+    EmptyTrash,
 }
 
 impl ActionId {
@@ -995,6 +997,21 @@ pub static BINDINGS: &[Binding] = &[
         }),
     },
     Binding {
+        id: ActionId::ToggleHideStopped,
+        non_strict: &[k('y')],
+        strict: &[k('Y')],
+        context: Context::Always,
+        help: Some(HelpMeta {
+            section: HelpSection::Views,
+            desc: "Hide stopped sessions in groups (toggle)",
+        }),
+        palette: Some(PaletteMeta {
+            title: "Hide stopped sessions in groups",
+            keywords: &["hide", "show", "stopped", "grey", "compact", "filter"],
+            group: PaletteGroup::Views,
+        }),
+    },
+    Binding {
         id: ActionId::SortPicker,
         // Shift+O sorts in both modes; bare `o` only outside strict.
         non_strict: &[k('o'), k('O'), ctrl('o')],
@@ -1098,9 +1115,21 @@ pub static BINDINGS: &[Binding] = &[
             group: PaletteGroup::Actions,
         }),
     },
+    Binding {
+        id: ActionId::EmptyTrash,
+        non_strict: &[],
+        strict: &[],
+        context: Context::Always,
+        help: None,
+        palette: Some(PaletteMeta {
+            title: "Empty trash",
+            keywords: &["trash", "empty", "purge", "delete", "clear"],
+            group: PaletteGroup::Actions,
+        }),
+    },
     // The mnemonic keys (a/A, n/N, r/R, t/T) are taken and the home keyspace is saturated
     // (see Fork), so "Auto-name now" lands on the free v/V pair. Gated to a
-    // still-default-named session inside the handler.
+    // still-default-named session by the daemon handler.
     Binding {
         id: ActionId::AutoName,
         non_strict: &[k('v')],
@@ -1161,6 +1190,7 @@ pub fn palette_id(id: ActionId) -> &'static str {
         ActionId::ToggleSnooze => "snooze",
         ActionId::ToggleUnread => "toggle-unread",
         ActionId::TogglePreviewInfo => "toggle-preview-info",
+        ActionId::ToggleHideStopped => "toggle-hide-stopped",
         ActionId::ToggleDiagnostics => "toggle-diagnostics",
         ActionId::OpenSystemHealth => "open-system-health",
         ActionId::SortPicker => "pick-sort",
@@ -1180,6 +1210,7 @@ pub fn palette_id(id: ActionId) -> &'static str {
         ActionId::Skills => "skills",
         ActionId::Fork => "fork",
         ActionId::AutoName => "auto-name",
+        ActionId::EmptyTrash => "empty-trash",
     }
 }
 
@@ -1288,6 +1319,7 @@ mod tests {
             // `u` is Update regardless of whether an update is available.
             (key('u'), ActionId::Update),
             (key('U'), ActionId::ToggleUnread),
+            (key('y'), ActionId::ToggleHideStopped),
             (ctrl_key('o'), ActionId::SortPicker),
         ];
         let strict = [
@@ -1298,6 +1330,7 @@ mod tests {
             (key('P'), ActionId::Projects),
             (key('O'), ActionId::SortPicker),
             (key('U'), ActionId::ToggleUnread),
+            (key('Y'), ActionId::ToggleHideStopped),
             (ctrl_key('d'), ActionId::Diff),
             (ctrl_key('r'), ActionId::Serve),
             (ctrl_key('t'), ActionId::AttachTerminal),

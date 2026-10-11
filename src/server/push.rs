@@ -20,24 +20,41 @@ use tokio::sync::RwLock;
 
 use super::push_send::PUSH_TTL_SECS;
 
-/// Emitted when an instance's status changes. The broadcast channel on
-/// `AppState.status_tx` carries these; `push.rs` is the only consumer in
-/// v1, but future features (UI realtime, webhooks) can subscribe too.
+/// Committed status transitions consumed by push, callbacks and plugin workers.
 #[derive(Clone, Debug)]
 pub struct StatusChange {
     pub instance_id: String,
     pub instance_title: String,
+    /// The session's effective profile when the change was published, so an async consumer can
+    /// still scope it after the row is gone.
+    pub effective_profile: String,
     pub old: Status,
     pub new: Status,
     pub at: DateTime<Utc>,
 }
 
-/// Capacity of the broadcast channel. Large enough that short bursts of
-/// concurrent transitions (e.g., `/api/sessions` bulk refresh) don't drop
-/// events even if the consumer is momentarily behind. If a receiver lags
-/// past this, broadcast surfaces `RecvError::Lagged` and the consumer
-/// logs and continues; push delivery is best-effort anyway.
-pub const STATUS_CHANNEL_CAPACITY: usize = 64;
+/// Publish once after the authoritative status commit; unchanged rows emit nothing.
+pub fn publish_status_change(
+    status_tx: &tokio::sync::broadcast::Sender<StatusChange>,
+    inst: &crate::session::Instance,
+    old: Status,
+) {
+    if inst.status == old {
+        return;
+    }
+    let _ = status_tx.send(StatusChange {
+        instance_id: inst.id.clone(),
+        instance_title: inst.title.clone(),
+        effective_profile: inst.effective_profile(),
+        old,
+        new: inst.status,
+        at: Utc::now(),
+    });
+}
+
+/// Capacity of the broadcast channel. Every handler, the reload and the ACP events publish
+/// here, so a bulk start or delete can emit hundreds of moves before a slow subscriber lags.
+pub const STATUS_CHANNEL_CAPACITY: usize = 256;
 
 /// Dwell requirement for Waiting: Claude sometimes pauses briefly in
 /// Waiting before resolving, and tmux scrape results flicker. Require
@@ -1240,6 +1257,28 @@ pub async fn test(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn publish_status_change_carries_the_profile_and_skips_a_no_op() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel(4);
+        let mut inst = crate::session::Instance::new("t", "/tmp/p");
+        inst.source_profile = "work".to_string();
+        inst.status = Status::Running;
+        let old = inst.status;
+
+        publish_status_change(&tx, &inst, old);
+        assert!(
+            rx.try_recv().is_err(),
+            "an unmoved status publishes nothing"
+        );
+
+        inst.status = Status::Stopped;
+        publish_status_change(&tx, &inst, old);
+        let change = rx.try_recv().expect("the move is published");
+        assert_eq!(change.instance_id, inst.id);
+        assert_eq!(change.effective_profile, "work");
+        assert_eq!((change.old, change.new), (Status::Running, Status::Stopped));
+    }
+
     use super::*;
 
     #[test]
@@ -1585,6 +1624,7 @@ mod tests {
             StatusChange {
                 instance_id: id.clone(),
                 instance_title: "my session".to_string(),
+                effective_profile: "default".into(),
                 old: Status::Running,
                 new: Status::Waiting,
                 at: Utc::now(),
@@ -1600,6 +1640,7 @@ mod tests {
             StatusChange {
                 instance_id: id.clone(),
                 instance_title: "my session".to_string(),
+                effective_profile: "default".into(),
                 old: Status::Waiting,
                 new: Status::Running,
                 at: Utc::now(),
@@ -1615,6 +1656,7 @@ mod tests {
         let ev = |new: Status| StatusChange {
             instance_id: id.clone(),
             instance_title: "s".into(),
+            effective_profile: "default".into(),
             old: Status::Running,
             new,
             at: Utc::now(),
@@ -1709,6 +1751,7 @@ mod tests {
             StatusChange {
                 instance_id: id.clone(),
                 instance_title: "s".to_string(),
+                effective_profile: "default".into(),
                 old: Status::Running,
                 new: Status::Waiting,
                 at: Utc::now(),
@@ -1720,6 +1763,7 @@ mod tests {
             StatusChange {
                 instance_id: id.clone(),
                 instance_title: "s".to_string(),
+                effective_profile: "default".into(),
                 old: Status::Waiting,
                 new: Status::Stopped,
                 at: Utc::now(),
