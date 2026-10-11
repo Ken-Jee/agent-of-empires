@@ -1,5 +1,5 @@
 import { useState } from "react";
-import type { AgentInfo, ImportableSession } from "../../../lib/types";
+import type { AgentInfo, ImportableSession, ProjectOverrides } from "../../../lib/types";
 import { DirectoryBrowser } from "../../DirectoryBrowser";
 import { ImportSessionPicker } from "./ImportSessionPicker";
 import { CloneRepoForm } from "./CloneRepoForm";
@@ -16,8 +16,9 @@ interface Props {
   initialTab?: Tab;
   /** Only used to offer agents on the import tab. */
   agents?: AgentInfo[];
-  /** Reports the selected saved project's worktree override, if any. */
-  onSelectSavedProject?: (override: boolean | undefined) => void;
+  /** Called on every path selection with the saved project's overrides, `undefined` when the path is
+   *  unregistered or has none, or `null` when the registry could not be loaded (unknown). */
+  onSelectSavedProject?: (overrides: ProjectOverrides | undefined | null, path: string) => void;
   /** Called after any pick, so the wizard can return to its form. */
   onPicked?: () => void;
 }
@@ -34,7 +35,7 @@ export function ProjectStep({
 }: Props) {
   // Until a tab is picked, show Recent while loading or when there are picks, else Browse.
   const [manualTab, setManualTab] = useState<Tab | null>(initialTab ?? (data.scratch ? "scratch" : null));
-  const { loading, error, retry, saved, query, setQuery, filteredSaved, filteredRecent, hasPicks } =
+  const { loading, error, retry, registryAvailable, saved, query, setQuery, filteredSaved, filteredRecent, hasPicks } =
     useProjectPicker(profile);
   const activeTab: Tab = manualTab ?? (!loading && !hasPicks ? "browse" : "recent");
 
@@ -43,7 +44,8 @@ export function ProjectStep({
   const selectPath = (path: string) => {
     onChange("path", path);
     const matched = saved.find((project) => normalizePath(project.path) === normalizePath(path));
-    onSelectSavedProject?.(matched?.overrides?.worktree_enabled);
+    // A failed registry request reports `null`: the overrides are unknown, which is not "none".
+    onSelectSavedProject?.(registryAvailable ? matched?.overrides : null, path);
     onPicked?.();
   };
 
@@ -73,6 +75,8 @@ export function ProjectStep({
     onChange("attachExisting", false);
     onChange("importAcpSessionId", s.session_id);
     if (s.title) onChange("title", s.title.slice(0, 60));
+    onChange("worktreeBranch", "");
+    onChange("baseBranch", "");
     onPicked?.();
   };
 

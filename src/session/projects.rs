@@ -77,11 +77,17 @@ pub struct ProjectOverrides {
     /// sessions launched against this project.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub smart_rename: Option<bool>,
+    /// Overrides `sandbox.enabled_by_default` (start in container by default)
+    /// for new sessions launched against this project.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox_enabled: Option<bool>,
 }
 
 impl ProjectOverrides {
     pub fn is_empty(&self) -> bool {
-        self.worktree_enabled.is_none() && self.smart_rename.is_none()
+        self.worktree_enabled.is_none()
+            && self.smart_rename.is_none()
+            && self.sandbox_enabled.is_none()
     }
 }
 
@@ -119,22 +125,52 @@ pub struct Project {
     pub scope: ProjectScope,
 }
 
-#[derive(Debug, Default, PartialEq, Serialize)]
+#[derive(Debug, Default, PartialEq)]
 pub struct ProjectPatch {
     /// Absent preserves the value; present None clears it.
-    #[serde(
-        rename = "default_base_branch",
-        skip_serializing_if = "Option::is_none"
-    )]
     pub base_branch: Option<Option<String>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub pinned: Option<bool>,
     /// Absent preserves the override; present None restores inheritance.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub worktree_enabled: Option<Option<bool>>,
-    /// Absent preserves the override; present None restores inheritance.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub smart_rename: Option<Option<bool>>,
+    pub sandbox_enabled: Option<Option<bool>>,
+}
+
+impl Serialize for ProjectPatch {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        #[derive(Serialize)]
+        struct Overrides<'a> {
+            #[serde(skip_serializing_if = "Option::is_none")]
+            worktree_enabled: Option<&'a Option<bool>>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            smart_rename: Option<&'a Option<bool>>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            sandbox_enabled: Option<&'a Option<bool>>,
+        }
+        #[derive(Serialize)]
+        struct Body<'a> {
+            #[serde(skip_serializing_if = "Option::is_none")]
+            default_base_branch: Option<&'a Option<String>>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            pinned: Option<bool>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            overrides: Option<Overrides<'a>>,
+        }
+        let overrides = (self.worktree_enabled.is_some()
+            || self.smart_rename.is_some()
+            || self.sandbox_enabled.is_some())
+        .then_some(Overrides {
+            worktree_enabled: self.worktree_enabled.as_ref(),
+            smart_rename: self.smart_rename.as_ref(),
+            sandbox_enabled: self.sandbox_enabled.as_ref(),
+        });
+        Body {
+            default_base_branch: self.base_branch.as_ref(),
+            pinned: self.pinned,
+            overrides,
+        }
+        .serialize(serializer)
+    }
 }
 
 fn default_scope() -> ProjectScope {
@@ -266,7 +302,8 @@ pub fn load_profile(profile: &str) -> Result<Vec<Project>> {
 }
 
 /// Load union of global + profile, deduped by canonical path. Profile entries
-/// shadow global ones with the same path.
+/// shadow global ones with the same path. Unreadable registries are errors,
+/// so failed reads cannot silently discard per-project defaults.
 pub fn load_merged(profile: &str) -> Result<Vec<Project>> {
     Ok(merge_project_scopes(
         load_global()?,
@@ -587,6 +624,9 @@ pub fn update(
         if let Some(enabled) = patch.smart_rename {
             existing[idx].overrides.smart_rename = enabled;
         }
+        if let Some(enabled) = patch.sandbox_enabled {
+            existing[idx].overrides.sandbox_enabled = enabled;
+        }
         Ok(idx)
     })
 }
@@ -655,6 +695,15 @@ pub fn find_by_canonical_path(profile: &str, path: &Path) -> Option<Project> {
         .ok()?
         .into_iter()
         .find(|p| canonical_key(&p.path) == target)
+}
+
+/// Like [`find_by_canonical_path`], but an unreadable registry is an error rather than "not
+/// registered", for callers whose defaults depend on the project's overrides.
+pub fn find_by_canonical_path_strict(profile: &str, path: &Path) -> Result<Option<Project>> {
+    let target = canonical_key(path.to_string_lossy());
+    Ok(load_merged(profile)?
+        .into_iter()
+        .find(|p| canonical_key(&p.path) == target))
 }
 
 /// Resolve the effective `smart_rename` override for a session: `session_cfg`'s resolved
@@ -1003,8 +1052,10 @@ mod tests {
         let updated = update_overrides("default", global, "MixedCase", |ov| {
             ov.worktree_enabled = Some(true);
             ov.smart_rename = Some(false);
+            ov.sandbox_enabled = Some(true);
         })?;
         assert_eq!(updated.overrides.worktree_enabled, Some(true));
+        assert_eq!(updated.overrides.sandbox_enabled, Some(true));
         let updated = update_overrides("default", global, "MixedCase", |ov| {
             ov.worktree_enabled = None;
         })?;
@@ -1075,6 +1126,25 @@ mod tests {
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].name, "second");
         assert_eq!(merged[0].scope, ProjectScope::Profile);
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn merged_load_fails_on_an_unreadable_registry() -> Result<()> {
+        let temp = tempdir()?;
+        let _app_dir = isolate_app_dir_at(temp.path());
+
+        // A registry that does not exist is empty, not broken.
+        assert!(load_merged("default")?.is_empty());
+
+        for path in [global_path()?, profile_path("default")?] {
+            fs::create_dir_all(path.parent().expect("registry dir"))?;
+            fs::write(&path, "{ not json")?;
+            assert!(load_merged("default").is_err(), "{}", path.display());
+            assert!(find_by_canonical_path_strict("default", temp.path()).is_err());
+            fs::remove_file(&path)?;
+        }
         Ok(())
     }
 

@@ -68,7 +68,7 @@ environment = ["ANTHROPIC_API_KEY"]
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `enabled_by_default` | `false` | Auto-enable sandbox for new sessions |
+| `enabled_by_default` | `false` | Auto-enable sandbox for new sessions. Overridable per project. |
 | `default_image` | `ghcr.io/agent-of-empires/aoe-sandbox:latest` | Docker image to use |
 | `auto_cleanup` | `true` | Remove containers when sessions are deleted |
 | `cpu_limit` | (none) | CPU limit (e.g., "4") |

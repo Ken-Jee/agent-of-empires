@@ -99,11 +99,8 @@ export function splitSavedAndRecent(
   return { saved, recent: recent.filter((r) => !savedPaths.has(normalizePath(r.path))) };
 }
 
-/** Saved paths are read for the workflow's resolved profile. With none resolved
- * yet the read has no scope to carry, and the daemon answers an unscoped
- * `profile_required` 400, so that load waits for a profile instead of firing a
- * request whose only possible answer is the error; recents are scope-free and
- * still load. */
+/** Saved projects wait for an acknowledged profile and always use its explicit scope.
+ * Recents are scope-free. */
 export function useProjectPicker(profile: string | undefined, excludePaths: string[] = []) {
   const [recent, setRecent] = useState<RecentProject[]>([]);
   const [saved, setSaved] = useState<ProjectInfo[]>([]);
@@ -117,9 +114,7 @@ export function useProjectPicker(profile: string | undefined, excludePaths: stri
 
   useEffect(() => {
     let cancelled = false;
-    // Only the saved read is profile-scoped, so it is the only one held back
-    // while the profile is unresolved; recents carry no scope and load either
-    // way, and the effect re-runs once `profile` lands.
+    // Only saved projects wait for the acknowledged profile.
     const savedProjects = profile ? fetchProjects({ profile }) : Promise.resolve<ProjectInfo[] | null>([]);
     void Promise.all([fetchSessions(), fetchRecentProjects(), savedProjects]).then(
       ([envelope, recentEnvelope, saved]) => {
@@ -171,6 +166,7 @@ export function useProjectPicker(profile: string | undefined, excludePaths: stri
       setLoadedScope(null);
       setRetryAttempt((attempt) => attempt + 1);
     },
+    registryAvailable: Boolean(profile) && loadedScope === scope && failedScope !== scope,
     saved: visibleSaved,
     recent: visibleRecent,
     query,

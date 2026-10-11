@@ -43,6 +43,19 @@ vi.mock("../../../lib/api", () => ({
     projects: [{ path: "/tmp/proj", display_name: "proj", tool: "claude", last_used_at: "2026-01-01T00:00:00Z" }],
   }),
   fetchProjects: vi.fn().mockResolvedValue([]),
+  listImportableSessions: vi.fn().mockResolvedValue({
+    ok: true,
+    truncated: false,
+    sessions: [
+      {
+        session_id: "native",
+        cwd: "/tmp/proj",
+        title: "Native title",
+        updated_at: "2020-01-01T00:00:00Z",
+        cwd_exists: true,
+      },
+    ],
+  }),
   createSession: (...args: unknown[]) => createSession(...args),
   reviewCreationTrust: (...args: unknown[]) => reviewCreationTrust(...args),
 }));
@@ -99,6 +112,60 @@ const launch = async () => {
   fireEvent.click(button);
 };
 const payload = (call = 0) => createSession.mock.calls[call]![0];
+
+describe("SessionWizard native import late defaults", () => {
+  it.each([true, false])(
+    "keeps a native import on the host after the original registry settles (success %s)",
+    async (success) => {
+      let resolveProjects!: (projects: Awaited<ReturnType<typeof fetchProjects>>) => void;
+      let resolveSettings!: (settings: Awaited<ReturnType<typeof fetchSettings>>) => void;
+      vi.mocked(fetchProjects).mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            resolveProjects = resolve;
+          }),
+      );
+      vi.mocked(fetchSettings).mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            resolveSettings = resolve;
+          }),
+      );
+      vi.mocked(fetchAgents).mockResolvedValueOnce([agent("claude", { acp_installed: true })]);
+      renderWizard({ path: "/tmp/proj", worktreeEnabled: true, sandboxEnabled: true });
+      fireEvent.click(screen.getByText("Project"));
+      fireEvent.click(await screen.findByRole("button", { name: "Import session" }));
+      fireEvent.click((await screen.findByText("Native title")).closest("button")!);
+      await act(async () => {
+        resolveProjects(
+          success
+            ? [
+                {
+                  name: "proj",
+                  path: "/tmp/proj",
+                  scope: "global",
+                  pinned: false,
+                  overrides: { worktree_enabled: true, sandbox_enabled: true },
+                },
+              ]
+            : null,
+        );
+        resolveSettings({ worktree: { enabled: true }, sandbox: { enabled_by_default: true } });
+      });
+      await launch();
+      await waitFor(() => expect(createSession).toHaveBeenCalledOnce());
+      expect(payload()).toMatchObject({
+        import_acp_session_id: "native",
+        path: "/tmp/proj",
+        sandbox: false,
+        worktree_enabled: false,
+      });
+      expect(payload().worktree_branch).toBeUndefined();
+      expect(payload().extra_repo_paths).toBeUndefined();
+      expect(payload().base_branch).toBeUndefined();
+    },
+  );
+});
 
 describe("SessionWizard structured view payload", () => {
   it.each([
@@ -290,6 +357,25 @@ describe("SessionWizard hooks trust", () => {
 });
 
 describe("SessionWizard rows", () => {
+  it.each([
+    ["sandbox_enabled", "Sandbox unavailable: settl runs on the host only"],
+    ["worktree_enabled", "Worktree unavailable: settl runs on the host only"],
+  ])("refuses a host-only agent with a seeded %s project override", async (field, message) => {
+    vi.mocked(fetchAgents).mockResolvedValueOnce([agent("settl", { host_only: true })]);
+    vi.mocked(fetchProjects).mockResolvedValueOnce([
+      {
+        name: "proj",
+        path: "/tmp/proj",
+        scope: "global",
+        pinned: false,
+        overrides: { [field]: true },
+      },
+    ]);
+    renderWizard({ path: "/tmp/proj", tool: "settl" });
+    await launch();
+    await screen.findByText(message + ". Turn it off to launch.");
+    expect(createSession).not.toHaveBeenCalled();
+  });
   const viewSwitch = () => screen.getByRole("switch", { name: "Use structured view" }) as HTMLButtonElement;
 
   it.each([

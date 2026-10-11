@@ -1,6 +1,5 @@
-// The live daemon inherits process.env, so any variable naming config, data, or credentials would point it at
-// real agent state. Path-shaped names are dropped wholesale, a few needed ones are kept, and host state under
-// unsuffixed names is dropped or pinned by name (#3657). isolatedEnv.test.ts enforces the contract against src/.
+// Live daemons must resolve config, data and credentials inside the isolated HOME.
+// System and toolchain paths intentionally remain inherited.
 
 import { join } from "node:path";
 

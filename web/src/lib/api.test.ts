@@ -55,6 +55,22 @@ const skill = {
 };
 const preview = { kind: "consent_required", dismissed: false, consent: { id: "p" } };
 
+describe("project container override serialization", () => {
+  it.each([true, false, undefined])("serializes %s without turning inherit into false", async (override) => {
+    fetchSpy.mockResolvedValueOnce(json({}));
+    await api.createProject({
+      path: "/repo",
+      scope: "profile",
+      profile: "served",
+      overrides: { sandbox_enabled: override },
+    });
+    const { init } = lastCall();
+    const body = bodyOf(init);
+    expect(body).toMatchObject({ path: "/repo", scope: "profile", profile: "served" });
+    expect(body.overrides).toEqual(override === undefined ? {} : { sandbox_enabled: override });
+  });
+});
+
 const requestCases: RequestCase[] = [
   ["GET /api/sessions", () => api.fetchSessions(), { respond: runtimeJson(sessions), result: { ...sessions, cursor } }],
   [
@@ -255,6 +271,7 @@ const requestCases: RequestCase[] = [
   ["GET /api/groups", () => api.fetchGroups()],
   ["GET /api/projects?profile=default", () => api.fetchProjects({ profile: "default" })],
   ["GET /api/projects?scope=global", () => api.fetchProjects({ scope: "global" })],
+  ["GET /api/projects?scope=profile&profile=served", () => api.fetchProjects({ scope: "profile", profile: "served" })],
   [
     "GET /api/importable-sessions?agent=pi&profile=work",
     () => api.listImportableSessions("pi", "work"),
@@ -304,11 +321,14 @@ const requestCases: RequestCase[] = [
         { scope: "global" },
         {
           default_base_branch: "develop",
-          overrides: { worktree_enabled: true, smart_rename: null },
+          overrides: { worktree_enabled: true, smart_rename: null, sandbox_enabled: false },
         },
       ),
     {
-      body: { default_base_branch: "develop", overrides: { worktree_enabled: true, smart_rename: null } },
+      body: {
+        default_base_branch: "develop",
+        overrides: { worktree_enabled: true, smart_rename: null, sandbox_enabled: false },
+      },
       respond: json({}),
     },
   ],
@@ -321,9 +341,18 @@ const requestCases: RequestCase[] = [
     },
   ],
   [
-    "PATCH /api/projects/a%20b?scope=profile&profile=default",
-    () => api.updateProject("a b", { scope: "profile", profile: "default" }, { pinned: true }),
-    { body: { pinned: true }, respond: json({ pinned: true }), result: { ok: true, project: { pinned: true } } },
+    "PATCH /api/projects/a%20b?scope=profile&profile=served",
+    () =>
+      api.updateProject(
+        "a b",
+        { scope: "profile", profile: "served" },
+        { pinned: true, overrides: { sandbox_enabled: null } },
+      ),
+    {
+      body: { pinned: true, overrides: { sandbox_enabled: null } },
+      respond: json({ pinned: true }),
+      result: { ok: true, project: { pinned: true } },
+    },
   ],
   [
     "POST /api/sessions",
@@ -651,6 +680,7 @@ describe("settings saves", () => {
 
 const failureCases: [string, () => Promise<unknown>, unknown][] = [
   ["fetchSessions", () => api.fetchSessions(), null],
+  ["fetchProjects", () => api.fetchProjects({ profile: "work" }), null],
   ["searchConversations", () => api.searchConversations("q"), []],
   ["updateWorkspaceOrdering", () => api.updateWorkspaceOrdering([]), false],
   ["getSessionFileContents", () => api.getSessionFileContents("s1", "a"), null],

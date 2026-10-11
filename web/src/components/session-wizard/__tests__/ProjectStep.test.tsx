@@ -53,6 +53,7 @@ function renderStep(
   const onPicked = vi.fn();
   const step = (d: Partial<WizardData>) => (
     <ProjectStep
+      profile="default"
       profile={d.profile || "default"}
       data={{ ...initialData, ...d }}
       onChange={onChange}
@@ -137,7 +138,7 @@ describe("recent and saved projects", () => {
     expect(onPicked).toHaveBeenCalledTimes(1);
   });
 
-  it("reports each selection's saved worktree override, undefined when there is none", async () => {
+  it("reports each selection's saved overrides, undefined when there are none", async () => {
     vi.mocked(fetchProjects).mockResolvedValue([
       { name: "alpha", path: "/repo/alpha", scope: "global", pinned: false, overrides: { worktree_enabled: true } },
       { name: "beta", path: "/repo/beta", scope: "global", pinned: false },
@@ -153,7 +154,28 @@ describe("recent and saved projects", () => {
     );
     fireEvent.click((await screen.findByText("/repo/alpha")).closest("button")!);
     fireEvent.click((await screen.findByText("/repo/beta")).closest("button")!);
-    expect(onSelectSavedProject.mock.calls).toEqual([[true], [undefined]]);
+    expect(onSelectSavedProject.mock.calls).toEqual([
+      [{ worktree_enabled: true }, "/repo/alpha"],
+      [undefined, "/repo/beta"],
+    ]);
+  });
+
+  it("reports null, not undefined, when the registry could not be loaded", async () => {
+    vi.mocked(fetchRecentProjects).mockResolvedValue({
+      projects: [{ path: "/repo/alpha", display_name: "alpha", last_used_at: null, tool: "claude" }],
+    } as Awaited<ReturnType<typeof fetchRecentProjects>>);
+    vi.mocked(fetchProjects).mockResolvedValue(null);
+    const onSelectSavedProject = vi.fn();
+    render(
+      <ProjectStep
+        profile="default"
+        data={initialData}
+        onChange={vi.fn()}
+        onSelectSavedProject={onSelectSavedProject}
+      />,
+    );
+    fireEvent.click((await screen.findByText("/repo/alpha")).closest("button")!);
+    expect(onSelectSavedProject.mock.calls).toEqual([[null, "/repo/alpha"]]);
   });
 
   it("falls back to the Browse tab with nothing to pick", async () => {
@@ -256,6 +278,10 @@ describe("Import session tab", () => {
         sandboxEnabled: true,
         extraRepoPaths: ["/previous/repo"],
         repoBases: { "/previous/repo": "main" },
+        scratch: true,
+        attachExisting: true,
+        worktreeBranch: "old",
+        baseBranch: "main",
       },
       { initialTab: "import", agents: [CLAUDE] },
     );
@@ -269,6 +295,10 @@ describe("Import session tab", () => {
       extraRepoPaths: [],
       repoBases: {},
       sandboxEnabled: false,
+      scratch: false,
+      attachExisting: false,
+      worktreeBranch: "",
+      baseBranch: "",
     });
   });
 

@@ -33,6 +33,8 @@ impl From<Project> for ProjectResponse {
 #[derive(Deserialize)]
 pub struct ProjectQuery {
     pub scope: Option<String>,
+    /// Profile whose registry entries to resolve; defaults to the served profile.
+    #[serde(default)]
     pub profile: Option<String>,
 }
 
@@ -92,6 +94,12 @@ pub async fn list_projects(
             "Use global, profile, or omit the scope for merged projects",
         );
     }
+    if let Some(profile) = query.profile.as_deref() {
+        if let Err(message) = super::validate_profile_name(profile) {
+            return project_error(StatusCode::BAD_REQUEST, "bad_profile", &message);
+        }
+    }
+    let _namespace = state.profile_namespace.read().await;
     let snapshot = match state.runtime.publish(&state).await {
         Ok(snapshot) => snapshot,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
@@ -100,7 +108,11 @@ pub async fn list_projects(
     if query.scope.as_deref() == Some("global") {
         return Json(&contents.global_projects).into_response();
     }
-    let index = match profile_index(&contents.profiles, query.profile.as_deref()) {
+    let served = state.served_profile();
+    let index = match profile_index(
+        &contents.profiles,
+        Some(query.profile.as_deref().unwrap_or(&served)),
+    ) {
         Ok(index) => index,
         Err(response) => return response,
     };
@@ -391,6 +403,7 @@ pub async fn delete_project(
 struct OverridesPatch {
     worktree_enabled: Option<Option<bool>>,
     smart_rename: Option<Option<bool>>,
+    sandbox_enabled: Option<Option<bool>>,
 }
 
 fn parse_overrides_patch(
@@ -418,9 +431,21 @@ fn parse_overrides_patch(
             ));
         }
     };
+    let sandbox_enabled = match body.get("sandbox_enabled") {
+        None => None,
+        Some(serde_json::Value::Null) => Some(None),
+        Some(serde_json::Value::Bool(b)) => Some(Some(*b)),
+        Some(_) => {
+            return Err((
+                "bad_field",
+                "overrides.sandbox_enabled must be a boolean or null",
+            ))
+        }
+    };
     Ok(OverridesPatch {
         worktree_enabled,
         smart_rename,
+        sandbox_enabled,
     })
 }
 
@@ -450,6 +475,7 @@ fn parse_project_patch(
         && pinned.is_none()
         && overrides.worktree_enabled.is_none()
         && overrides.smart_rename.is_none()
+        && overrides.sandbox_enabled.is_none()
     {
         return Err((
             "no_fields",
@@ -461,6 +487,7 @@ fn parse_project_patch(
         pinned,
         worktree_enabled: overrides.worktree_enabled,
         smart_rename: overrides.smart_rename,
+        sandbox_enabled: overrides.sandbox_enabled,
     })
 }
 
@@ -642,9 +669,13 @@ mod tests {
                     .method("PATCH")
                     .uri("/api/projects/target?scope=profile&profile=beta")
                     .header("content-type", "application/json")
-                    .body(Body::from(
-                        r#"{"pinned":true,"default_base_branch":" release ","overrides":{"worktree_enabled":true,"smart_rename":false}}"#,
-                    ))?,
+                    .body(Body::from(serde_json::to_vec(&projects::ProjectPatch {
+                        base_branch: Some(Some(" release ".into())),
+                        pinned: Some(true),
+                        worktree_enabled: Some(Some(true)),
+                        smart_rename: Some(Some(false)),
+                        sandbox_enabled: Some(Some(true)),
+                    })?))?,
             )
             .await?;
         assert_eq!(response.status(), axum::http::StatusCode::OK);
@@ -685,6 +716,7 @@ mod tests {
         );
         assert_eq!(profile.projects[0].overrides.worktree_enabled, Some(true));
         assert_eq!(profile.projects[0].overrides.smart_rename, Some(false));
+        assert_eq!(profile.projects[0].overrides.sandbox_enabled, Some(true));
         projects::add(
             "beta",
             ProjectScope::Profile,
@@ -709,10 +741,52 @@ mod tests {
             serde_json::from_slice::<serde_json::Value>(&bytes)?,
             serde_json::to_value(&profile.projects)?
         );
-        for (body, expected_base, expected_smart_rename) in [
-            (r#"{"pinned":false}"#, Some("release"), Some(false)),
-            (r#"{"default_base_branch":null}"#, None, Some(false)),
-            (r#"{"overrides":{"smart_rename":null}}"#, None, None),
+        for (patch, expected_base, expected_smart_rename, expected_sandbox) in [
+            (
+                projects::ProjectPatch {
+                    pinned: Some(false),
+                    ..Default::default()
+                },
+                Some("release"),
+                Some(false),
+                Some(true),
+            ),
+            (
+                projects::ProjectPatch {
+                    base_branch: Some(None),
+                    ..Default::default()
+                },
+                None,
+                Some(false),
+                Some(true),
+            ),
+            (
+                projects::ProjectPatch {
+                    smart_rename: Some(None),
+                    ..Default::default()
+                },
+                None,
+                None,
+                Some(true),
+            ),
+            (
+                projects::ProjectPatch {
+                    sandbox_enabled: Some(Some(false)),
+                    ..Default::default()
+                },
+                None,
+                None,
+                Some(false),
+            ),
+            (
+                projects::ProjectPatch {
+                    sandbox_enabled: Some(None),
+                    ..Default::default()
+                },
+                None,
+                None,
+                None,
+            ),
         ] {
             let response = router
                 .clone()
@@ -721,21 +795,56 @@ mod tests {
                         .method("PATCH")
                         .uri("/api/projects/target?scope=profile&profile=beta")
                         .header("content-type", "application/json")
-                        .body(Body::from(body))?,
+                        .body(Body::from(serde_json::to_vec(&patch)?))?,
                 )
                 .await?;
             assert_eq!(response.status(), axum::http::StatusCode::OK);
+            let receipt_epoch = response.headers()[crate::daemon::RUNTIME_EPOCH_HEADER]
+                .to_str()?
+                .to_owned();
+            let receipt_revision = response.headers()[crate::daemon::RUNTIME_REVISION_HEADER]
+                .to_str()?
+                .parse::<u64>()?;
             let bytes = axum::body::to_bytes(response.into_body(), 16 * 1024 * 1024).await?;
             let project: crate::daemon::ProjectResponse = serde_json::from_slice(&bytes)?;
             assert!(!project.pinned);
             assert_eq!(project.default_base_branch.as_deref(), expected_base);
             assert_eq!(project.overrides.worktree_enabled, Some(true));
             assert_eq!(project.overrides.smart_rename, expected_smart_rename);
+            assert_eq!(project.overrides.sandbox_enabled, expected_sandbox);
+            let persisted = projects::load_profile("beta")?;
+            assert_eq!(persisted[0].overrides, project.overrides);
+            let snapshot = state.runtime.snapshot(&state).await?;
+            assert_eq!(receipt_epoch, snapshot.value.cursor.epoch);
+            assert_eq!(receipt_revision, snapshot.value.cursor.revision);
+            assert_eq!(
+                projects::load_profile("alpha")?[0].overrides,
+                crate::session::ProjectOverrides::default()
+            );
+            assert_eq!(
+                persisted
+                    .iter()
+                    .map(|p| p.name.as_str())
+                    .collect::<Vec<_>>(),
+                ["target", "peer", "late"]
+            );
+            assert!(persisted[1..]
+                .iter()
+                .all(|p| !p.pinned && p.default_base_branch.is_none() && p.overrides.is_empty()));
+            let profile = snapshot
+                .value
+                .contents
+                .profiles
+                .iter()
+                .find(|p| p.name == "beta")
+                .unwrap();
+            assert_eq!(profile.projects[0].overrides, project.overrides);
         }
         let before = projects::load_profile("beta")?;
         for body in [
             r#"{"default_base_branch":"trunk","pinned":"false"}"#,
             r#"{"overrides":{"worktree_enabled":"yes"}}"#,
+            r#"{"default_base_branch":"trunk","overrides":{"sandbox_enabled":1}}"#,
             r#"{"overrides":"nope"}"#,
             "{}",
         ] {

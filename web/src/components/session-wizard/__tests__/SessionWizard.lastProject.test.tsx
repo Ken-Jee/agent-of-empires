@@ -29,7 +29,7 @@ vi.mock("../../../lib/api", () => ({
   fetchAgents: vi.fn().mockResolvedValue([]),
   fetchIsGitRepo: (...args: unknown[]) => fetchIsGitRepo(...args),
   fetchGroups: vi.fn().mockResolvedValue([]),
-  fetchDockerStatus: vi.fn().mockResolvedValue({ available: false }),
+  fetchDockerStatus: vi.fn().mockResolvedValue({ available: true }),
   fetchProfiles: (...args: unknown[]) => fetchProfiles(...args),
   fetchVolumeIgnoresPreview: vi.fn().mockResolvedValue({ acknowledged: true, globs: [] }),
   markVolumeIgnoresGlobsAcknowledged: vi.fn().mockResolvedValue(undefined),

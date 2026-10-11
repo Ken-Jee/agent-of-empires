@@ -10,7 +10,7 @@ const fetchProjects = vi.fn();
 const fetchRecentProjects = vi.fn();
 const fetchBranches = vi.fn();
 vi.mock("../../../lib/api", () => ({
-  fetchProjects: () => fetchProjects(),
+  fetchProjects: (...args: unknown[]) => fetchProjects(...args),
   fetchSessions: () =>
     Promise.resolve({ sessions: [], workspace_ordering: [], cursor: { epoch: "boot", revision: 1n } }),
   fetchRecentProjects: () => fetchRecentProjects(),
@@ -62,6 +62,7 @@ describe("ExtraReposPicker selection", () => {
     const { container } = setup();
     expect(container.textContent).toContain("none");
     await loaded(container);
+    expect(fetchProjects).toHaveBeenCalledWith({ profile: "default" });
     expect(row(container, "alpha")).toBeTruthy();
     expect(row(container, "beta")).toBeTruthy();
     expect(row(container, "primary")).toBeFalsy();

@@ -96,11 +96,11 @@ With more than one row selected, right-click (long-press on touch) any selected 
 
 A **Projects** section near the bottom of the sidebar (above "Snoozed & archived") lists your saved projects that are not pinned and have no live session. It is the same registry the new-session wizard's "Saved projects" tab reads, and it shows on every grouping axis. The section is expanded by default; its collapsed state persists per-browser.
 
-Pinned projects are not in this section: a pinned project always renders above as its own header, with or without sessions (pin from a project header's right-click menu). A project that has live sessions also renders above as its normal group. So the section is the home for the "saved but neither pinned nor currently in use" projects, which previously lived only on the standalone Projects page (now removed).
+Pinned projects always render above as their own headers, with or without sessions. Projects with live sessions also render above as normal groups.
 
 - **Add** with the **+** on the section header: browse for a path or type one, optionally set a name and a default base branch, choose global or profile scope, then save. The project appears in the section, ready to start work in.
 - **Start a session** by clicking a project row (or its **+**), which opens the new-session flow in that repo. Once it has a session it moves up into the normal group list.
-- **Project settings** and **Remove** live in the row's right-click (long-press on touch) menu. Project settings control the default base branch plus worktree-by-default and smart-rename overrides. Remove targets that row's registrations; see [project registry scope](../multi-repo-workspaces.md#web-dashboard). The add, edit, and remove controls are hidden in read-only mode.
+- **Project settings** and **Remove** live in the row's right-click (long-press on touch) menu. Project settings control the default base branch plus worktree-by-default, smart-rename and start-in-container overrides. Remove targets that row's registrations; see [project registry scope](../multi-repo-workspaces.md#web-dashboard). The add, edit, and remove controls are hidden in read-only mode.
 
 ## Settings
 

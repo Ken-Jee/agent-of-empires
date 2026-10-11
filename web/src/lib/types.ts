@@ -337,6 +337,7 @@ export interface GroupInfo {
 export interface ProjectOverrides {
   worktree_enabled?: boolean;
   smart_rename?: boolean;
+  sandbox_enabled?: boolean;
 }
 
 export interface ProjectInfo {

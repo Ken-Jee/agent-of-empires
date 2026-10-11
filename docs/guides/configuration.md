@@ -14,7 +14,7 @@ Over the web API, `GET /api/settings` returns the settings as they apply to the 
 
 Global-only settings use the global config. On upgrade, values from the default profile move there and copies in other profiles are removed. The profile settings API rejects global-only fields; use `PATCH /api/settings` instead.
 
-A project registry entry can override `worktree.enabled` and `session.smart_rename` for that project from the web Projects view or the TUI add-project form. Project overrides win over all three configuration layers. They live in the user's `projects.json`, not the repository, so they do not weaken either field's `repo = "deny"` policy.
+A project registry entry can override `worktree.enabled`, `session.smart_rename` and `sandbox.enabled_by_default` for that project from the web Projects view or the TUI add-project form. Project overrides win over all three configuration layers. They live in the user's `projects.json`, not the repository, so they do not weaken these fields' `repo = "deny"` policy.
 
 ## File Locations
 
