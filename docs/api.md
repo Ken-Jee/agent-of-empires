@@ -21,9 +21,16 @@ The private local Unix socket verifies its owner instead. A native client using
 that socket does not need the TCP passphrase or a loopback login, including when
 the dashboard runs behind a proxy.
 
+Local native transport trusts processes running as the same OS user. Kernel peer
+credentials establish UID ownership, not the identity of a particular daemon
+instance or executable. Namespace, tmux locator, and protocol checks reject
+accidental runtime mismatches; they do not authenticate a malicious same-UID peer.
+
 Native clients require HTTPS for credentials outside loopback and disable
 redirects. Local native connections bypass environment proxies. Their error
 diagnostics omit login and elevation response bodies, which can reflect secrets.
+Native HTTP operation deadlines cover connection, headers, and the complete body
+stream with one absolute budget, including explicit longer operation timeouts.
 
 Read-only mode (`aoe serve --read-only`) blocks every write endpoint
 with `403 read_only`. Read endpoints work normally.
@@ -496,6 +503,12 @@ curl -sS \
 ```
 
 ## Native mutation completion
+
+Each receipt belongs to its original HTTP request. The TUI routes that response
+through the command's dedicated oneshot channel and permits only one pending
+mutation per session row; concurrent creations retain separate caller tokens.
+The epoch/revision cursor is a snapshot-application fence, not a request identifier.
+A snapshot alone cannot settle a command whose HTTP response has not arrived.
 
 The TUI settles a mutation only after applying a same-epoch snapshot at
 or beyond its receipt. If profile storage cannot be loaded, the TUI retains the

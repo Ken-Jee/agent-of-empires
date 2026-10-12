@@ -133,7 +133,7 @@ pub struct AppState {
     pub allowed_origins: Vec<String>,
     /// Per-instance mutex guarding mutations that must not interleave
     /// (e.g. `ensure_session` decide-and-restart). Entries are created on
-    /// first use and live for the lifetime of the process — there are only
+    /// first use and live for the lifetime of the process; there are only
     /// as many as the user has sessions.
     pub instance_locks: Arc<RwLock<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
     /// Per-`idempotency_key` mutex serializing `POST /api/sessions` create

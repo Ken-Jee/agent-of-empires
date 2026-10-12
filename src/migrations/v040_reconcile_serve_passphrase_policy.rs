@@ -1,7 +1,7 @@
 //! Reconcile persisted daemon launch policy with the current schema.
 
 pub fn run() -> anyhow::Result<()> {
-    super::v035_serve_passphrase_policy::run()
+    super::v039_serve_passphrase_policy::run()
 }
 
 #[cfg(test)]

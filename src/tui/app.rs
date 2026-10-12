@@ -903,8 +903,8 @@ impl App {
                             //
                             // Only fire when home accepts paste routing
                             // (`wants_paste_burst`). Non-paste-aware dialogs
-                            // — command palette, profile picker, projects,
-                            // info, etc. — capture text via `handle_key`
+                            // (command palette, profile picker, projects,
+                            // info, etc.) capture text via `handle_key`
                             // only; bursting through them strands the input
                             // in `pending_paste` and leaves the dialog empty.
                             // CI caught this regression with e2e harnesses
@@ -1313,7 +1313,7 @@ impl App {
                                     None
                                 } else if self.home.handle_dialog_click(mouse.column, mouse.row)
                                 {
-                                    // A modal swallowed the click — drop any
+                                    // A modal swallowed the click; drop any
                                     // leftover preview highlight so it doesn't
                                     // linger behind / through the dialog.
                                     let _ = self.home.clear_preview_selection();

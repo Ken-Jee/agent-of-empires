@@ -409,7 +409,7 @@ fn preview_visible_rows_equal_output_area_with_info_shown() {
 }
 
 /// Precedence: unread paints only on resting (Idle/Unknown) rows. A live
-/// status supersedes it, keeping its own spinner — so a Running session that
+/// status supersedes it, keeping its own spinner; so a Running session that
 /// also carries an unread marker must NOT show the solid unread dot. See the
 /// #2088 review note about jumbled precedence.
 #[test]

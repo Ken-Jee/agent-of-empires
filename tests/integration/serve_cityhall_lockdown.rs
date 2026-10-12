@@ -223,7 +223,7 @@ async fn sensitive_routes_are_blocked() {
         // Host-side admin reads: skills and MCP definitions are read out of the
         // agents' own config files under $HOME, and the plugin surface is the
         // installed third-party code (its manifests, icons, workers' UI state,
-        // and job logs) — the same host state the denied plugin mutations act on.
+        // and job logs); the same host state the denied plugin mutations act on.
         (Method::GET, "/api/skills", ""),
         (Method::GET, "/api/skills/claude-user/review", ""),
         (Method::GET, "/api/mcp/servers?agent=claude", ""),

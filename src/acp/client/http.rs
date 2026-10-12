@@ -754,11 +754,8 @@ impl HttpClient {
 }
 
 async fn decode_replay(response: reqwest::Response) -> Result<ReplayResponse, HttpError> {
-    decode_replay_until(
-        response,
-        tokio::time::Instant::now() + std::time::Duration::from_secs(15),
-    )
-    .await
+    let deadline = crate::daemon::transport::response_deadline(&response);
+    decode_replay_until(response, deadline).await
 }
 
 async fn decode_replay_until(
@@ -785,7 +782,11 @@ async fn decode_replay_until(
                 }
                 chunk = tokio::time::timeout_at(deadline, response.chunk()) => {
                     chunk.map_err(|_| io::Error::from(io::ErrorKind::TimedOut))?
-                        .map_err(|_| io::Error::from(io::ErrorKind::ConnectionAborted))?
+                        .map_err(|error| io::Error::from(if error.is_timeout() {
+                            io::ErrorKind::TimedOut
+                        } else {
+                            io::ErrorKind::ConnectionAborted
+                        }))?
                 }
             };
             Ok(chunk.map(|chunk| (chunk, (response, cancellation))))
@@ -1232,17 +1233,20 @@ mod tests {
             };
             let client = HttpClient::new(endpoint).unwrap();
             let response = client
-                .execute(client.http.get(format!(
-                    "{}/api/sessions/test/acp/replay?since=0",
-                    client.endpoint.base_url
-                )))
+                .execute(
+                    client
+                        .http
+                        .get(format!(
+                            "{}/api/sessions/test/acp/replay?since=0",
+                            client.endpoint.base_url
+                        ))
+                        .timeout(Duration::from_millis(100)),
+                )
                 .await
                 .unwrap();
-            let result = decode_replay_until(
-                response,
-                tokio::time::Instant::now() + Duration::from_secs(1),
-            )
-            .await;
+            let result = tokio::time::timeout(Duration::from_secs(2), decode_replay(response))
+                .await
+                .expect("the original request deadline bounds replay");
             assert!(matches!(
                 result,
                 Err(HttpError::Daemon(crate::daemon::DaemonClientError::Timeout))

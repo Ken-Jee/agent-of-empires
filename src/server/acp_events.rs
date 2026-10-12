@@ -2387,7 +2387,7 @@ mod tests {
             ),
             Some(StatusIntent::Set(Status::Error))
         );
-        // AcpSessionAssigned heals an Error banner only — never
+        // AcpSessionAssigned heals an Error banner only; never
         // clobbers an in-progress Running/Waiting turn.
         assert_eq!(
             derive_acp_status(
@@ -2911,7 +2911,7 @@ mod tests {
     /// #4127: a first `session/load` reattaching a legacy session re-assigns the
     /// very id the row already carries, so `apply_acp_session_change` takes its
     /// same-id arm and returns without persisting anything. The route the
-    /// launch applied must still be attested there — on disk and in memory — or
+    /// launch applied must still be attested there (on disk and in memory) or
     /// the legacy binding keeps deriving it from the configuration as it
     /// stands, which is the guess #4127 forbids.
     #[tokio::test]

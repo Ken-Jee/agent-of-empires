@@ -13,4 +13,10 @@ Migrations must be idempotent, use `tracing::info!`, gate platform-specific ones
 
 Do not reuse a published migration number for a different transformation. When integrating divergent schema histories, preserve the published meaning and add idempotent reconciliation steps newer than both histories. Test upgrades from each history and a second run over the migrated state.
 
+Published schemas 35, 36, and 37 retain custom-sort admission, creation-count
+seeding, and trash identity respectively. Launch-policy conversion runs at 39;
+schema 44 reconciles policy for earlier PR installations through schema 43.
+That reconciliation does not initialize purge ownership: a missing journal must
+remain missing rather than fabricate ownership proof.
+
 A migration that retypes a persisted field must call `crate::session::backup_before_migration` before rewriting, so the build that predates the new shape still has bytes it can read. What that build does with a row it cannot decode, and what the migration backup is worth to a user who forces a downgrade, is covered under [Downgrading](../installation.md#downgrading).

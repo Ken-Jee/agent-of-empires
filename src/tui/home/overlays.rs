@@ -88,7 +88,7 @@ impl HomeView {
     ///   the snapshot underneath and only re-renders the preview pane.
     ///
     /// `has_dialog()` ORs `live_send.is_some()` on top, so it would also
-    /// gate off the fast path it's supposed to enable — that's why the
+    /// gate off the fast path it's supposed to enable; that's why the
     /// fast path needs this method instead.
     pub(in crate::tui) fn has_non_live_send_overlay(&self) -> bool {
         self.show_help
@@ -191,7 +191,7 @@ impl HomeView {
     /// The detector exists to solve the home-view shortcut-shadowing problem:
     /// Mosh strips bracketed-paste markers, so a pasted stream of `KeyCode::Char`
     /// events would fire `n`/`d`/`r`/etc. shortcuts on the home view. When a
-    /// dialog captures keys into a text input, those shortcuts don't fire —
+    /// dialog captures keys into a text input, those shortcuts don't fire,
     /// but the dialog also won't receive a synthesized `Paste` event unless
     /// it routes through `handle_paste`. Bursting through a dialog that only
     /// handles `Key` events strands the text in `pending_paste` and leaves
@@ -199,7 +199,7 @@ impl HomeView {
     ///
     /// So: burst is safe when no dialog is open (home shortcuts at risk) or
     /// when one of the four paste-routed dialogs is open (rename / send_message
-    /// / new / settings — each forwards to `handle_paste`). For every other
+    /// / new / settings; each forwards to `handle_paste`). For every other
     /// dialog (command palette, profile picker, projects, info, etc.) keys
     /// must dispatch individually so the dialog input receives them.
     pub fn wants_paste_burst(&self) -> bool {

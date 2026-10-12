@@ -314,7 +314,7 @@ fn get_app_dir_path() -> Result<PathBuf> {
 ///
 /// Self-extinguishing by design: once `get_app_dir` creates the dev dir on
 /// any subsequent call, this returns `None` and the warning stops. No flag
-/// file, no config state, no dismissal logic — the directory topology IS
+/// file, no config state, no dismissal logic; the directory topology IS
 /// the state.
 ///
 /// Returns `None` on release builds (the dev/release split doesn't apply),
@@ -1423,7 +1423,7 @@ mod tests {
         let temp = isolate_app_dir();
         let release = release_dir_in(&temp);
         fs::create_dir_all(&release).unwrap();
-        // Release dir exists but has no content — user has no prior state
+        // Release dir exists but has no content; user has no prior state
         // to lose visibility of, so don't nag them.
         assert!(debug_namespace_drift().is_none());
     }
@@ -1436,7 +1436,7 @@ mod tests {
         fs::create_dir_all(release.join("profiles")).unwrap();
 
         let drift = debug_namespace_drift();
-        // Only assert presence on debug builds — release builds compile this
+        // Only assert presence on debug builds; release builds compile this
         // function to `None`.
         if cfg!(debug_assertions) {
             let (r, d) = drift.expect("expected drift on debug build");

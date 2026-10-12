@@ -1426,7 +1426,7 @@ mod tests {
     }
 
     /// The store this session's capture reads is the one the container mounts,
-    /// and a sandboxed session ignores `session.environment` — so a `HOME`
+    /// and a sandboxed session ignores `session.environment`; so a `HOME`
     /// entry in the profile must not move the store off the host home the
     /// launcher stages it under. Reading the profile entry instead leaves the
     /// identity sidecar with a bind dir nothing mounted (no sidecar is ever

@@ -181,6 +181,9 @@ The remote session picker uses bearer authentication only. Bearer credentials ar
 For direct `aoe acp` operations against an explicitly configured passphrase-only TCP or remote endpoint, set `AOE_DAEMON_PASSPHRASE`. The ACP clients perform the `/api/login` handshake and reuse its device-bound session, with credentials cached on disk per endpoint URL across CLI invocations. Passphrases are sent only over HTTPS or loopback HTTP. This does not add passphrase login to the remote session picker, whose sessions client uses bearer authentication.
 
 With no explicit remote or TCP endpoint, native clients use the local owner-verified Unix API and need neither credential variable. The kernel peer identity authorizes the connection (`SO_PEERCRED` on Linux), including when the dashboard runs with `--behind-proxy`. `serve.passphrase` is retained for daemon restart recall, not native-client authentication. TCP loopback callers remain a separate authentication path; behind a proxy, the passphrase wall applies to them too.
+This is a same-OS-user trust boundary, not daemon-instance authentication;
+namespace and tmux checks establish runtime consistency. See the
+[native transport trust model](api.md#authentication).
 
 ## Headless CLI verbs
 

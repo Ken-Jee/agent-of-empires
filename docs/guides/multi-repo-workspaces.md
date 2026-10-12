@@ -207,6 +207,6 @@ Multi-repo sessions are bucketed into a single **Multi-repo** group at the botto
 
 ## Related
 
-- [Worktrees Reference](worktrees.md) — how the per-repo worktrees are created.
-- [Repository Configuration & Hooks](repo-config.md) — `on_create` hooks for fixed sibling repos that don't need a registry entry.
-- [CLI Reference](../cli/reference.md) — full `aoe project` and `aoe add --project` flag listing.
+- [Worktrees Reference](worktrees.md): how the per-repo worktrees are created.
+- [Repository Configuration & Hooks](repo-config.md): `on_create` hooks for fixed sibling repos that don't need a registry entry.
+- [CLI Reference](../cli/reference.md): full `aoe project` and `aoe add --project` flag listing.

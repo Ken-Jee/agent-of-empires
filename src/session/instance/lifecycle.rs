@@ -207,7 +207,7 @@ impl Instance {
     ///
     /// A structured creation has nothing left to fence once the row, its
     /// worktree, branch, sandbox and scratch dir are durable, so it drops the
-    /// reservation rather than hold a purge off for the whole ACP handshake —
+    /// reservation rather than hold a purge off for the whole ACP handshake,
     /// a wait with no durable effect. What remains after the release is
     /// ownership proof, and the durable generation is exactly that: every peer
     /// transition mints a newer one, so a mismatch means an archive, trash,
@@ -436,7 +436,7 @@ impl Instance {
     /// re-reads the row under this same lifecycle lock before and after the
     /// handshake and retires the runner when a peer took it meanwhile. What
     /// this adds is the settle, which must not stamp a status onto a row a
-    /// peer now owns — hence the generation the creation published in place of
+    /// peer now owns, hence the generation the creation published in place of
     /// the reservation it gave up.
     pub(crate) fn reacquire_created_launch_locks_after_handshake(
         &mut self,

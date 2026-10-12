@@ -1,5 +1,4 @@
-//! Persists the pre-v035 launch record's passphrase policy (and the rollback
-//! credential derived from it).
+//! Persists legacy launch-record passphrase policy and its rollback credential.
 //!
 //! The daemon lifecycle transaction is only taken when there is still
 //! something to write. A daemon transition holds that lock for the whole of

@@ -81,8 +81,8 @@ impl Drop for FinalPiDrainHookGuard {
 ///
 /// Only the last two variants are failures a caller should retry with
 /// backoff or warn about. A session can legitimately have nothing to poll
-/// right now — its capture metadata is not resolvable yet, its sandbox
-/// store is not mounted, another process holds the store lease — and
+/// right now: its capture metadata is not resolvable yet, its sandbox
+/// store is not mounted, another process holds the store lease, and
 /// treating those as failed spawns misreports a healthy fleet as over
 /// budget.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

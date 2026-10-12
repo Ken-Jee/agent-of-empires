@@ -1941,7 +1941,7 @@ fn tui_serve_dialog_escape_returns_home() {
 /// stays alive. Regression guard for the self-detection bug where the parent
 /// pre-wrote the child's PID into `serve.pid`, then the child re-entered
 /// `run()`, found its own PID via `daemon_pid()`, and bailed with
-/// "A serve daemon is already running" — about itself.
+/// "A serve daemon is already running"; about itself.
 #[test]
 #[parallel]
 fn cli_serve_daemon_starts_and_stops_cleanly() {
@@ -3518,7 +3518,7 @@ fn cli_acp_tail_connects_to_behind_proxy_passphrase_daemon() {
 /// The daemon's `--profile` must reach the served layer. `aoe --profile work`
 /// serve ran its own machinery (status rules, push, plugin host) on `work`
 /// while `/api/about` and every unaddressed read answered for the machine-wide
-/// `default_profile` -- two profiles at once, chosen by nobody's intent.
+/// `default_profile`: two profiles at once, chosen by nobody's intent.
 ///
 /// Asserted in one pass:
 ///   1. `default_profile = "default"` in machine config, both profiles on

@@ -151,7 +151,7 @@ pub(crate) fn host_hook_disclosure_config_with_repo(
 /// `routed_root` is the store the launch pins for this session's agent (see
 /// `Instance::routed_hook_root`). It replaces the whole config directory, as
 /// the agent's config-dir variable does, and outranks both the declared
-/// `session.agent_config_dir` and the profile environment — the recorded store
+/// `session.agent_config_dir` and the profile environment; the recorded store
 /// is what the launch exports to the agent, so it is what the agent reads.
 fn host_hook_config_path(
     tool_name: &str,

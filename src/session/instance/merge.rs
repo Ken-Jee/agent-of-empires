@@ -608,7 +608,7 @@ mod tests {
     ///
     /// Exercised at the splice level, not through the drag: `reorder.rs` writes through
     /// `Storage::update`, so this covers the merge the storage layer would fall back to.
-    /// The `pre != post` guard is the other half of the arm — a row the action left alone
+    /// The `pre != post` guard is the other half of the arm; a row the action left alone
     /// keeps disk's own index, so the merge neither places an unplaced row nor erases an
     /// index a peer placed while the action was renaming it.
     #[test]

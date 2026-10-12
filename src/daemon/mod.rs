@@ -812,28 +812,28 @@ impl DaemonClient {
         &self,
         response: &mut reqwest::Response,
     ) -> Result<(String, bool), DaemonClientError> {
-        let mut bytes = Vec::with_capacity(MAX_ERROR_BODY_BYTES);
-        let mut truncated = false;
-        while let Some(chunk) = response
-            .chunk()
-            .await
-            .map_err(|_| DaemonClientError::Transport)?
-        {
-            let remaining = MAX_ERROR_BODY_BYTES.saturating_sub(bytes.len());
-            if chunk.len() > remaining {
-                bytes.extend_from_slice(&chunk[..remaining]);
-                truncated = true;
-                break;
+        tokio::time::timeout_at(transport::response_deadline(response), async {
+            let mut bytes = Vec::with_capacity(MAX_ERROR_BODY_BYTES);
+            let mut truncated = false;
+            while let Some(chunk) = response.chunk().await.map_err(transport::request_error)? {
+                let remaining = MAX_ERROR_BODY_BYTES.saturating_sub(bytes.len());
+                if chunk.len() > remaining {
+                    bytes.extend_from_slice(&chunk[..remaining]);
+                    truncated = true;
+                    break;
+                }
+                bytes.extend_from_slice(&chunk);
             }
-            bytes.extend_from_slice(&chunk);
-        }
 
-        let mut body = String::from_utf8_lossy(&bytes).into_owned();
-        if body.len() > MAX_ERROR_BODY_BYTES {
-            truncate_utf8(&mut body, MAX_ERROR_BODY_BYTES);
-            truncated = true;
-        }
-        Ok((body, truncated))
+            let mut body = String::from_utf8_lossy(&bytes).into_owned();
+            if body.len() > MAX_ERROR_BODY_BYTES {
+                truncate_utf8(&mut body, MAX_ERROR_BODY_BYTES);
+                truncated = true;
+            }
+            Ok((body, truncated))
+        })
+        .await
+        .map_err(|_| DaemonClientError::Timeout)?
     }
 }
 
@@ -862,7 +862,7 @@ fn mutation_cursor(
 }
 
 async fn discard_bounded_body(response: &mut reqwest::Response) -> Result<(), DaemonClientError> {
-    tokio::time::timeout(DEFAULT_TIMEOUT, async {
+    tokio::time::timeout_at(transport::response_deadline(response), async {
         let limit = MAX_SUCCESS_BODY_BYTES;
         if response
             .content_length()
@@ -871,11 +871,7 @@ async fn discard_bounded_body(response: &mut reqwest::Response) -> Result<(), Da
             return Err(DaemonClientError::ResponseTooLarge { limit });
         }
         let mut remaining = limit;
-        while let Some(chunk) = response
-            .chunk()
-            .await
-            .map_err(|_| DaemonClientError::Transport)?
-        {
+        while let Some(chunk) = response.chunk().await.map_err(transport::request_error)? {
             remaining = remaining
                 .checked_sub(chunk.len())
                 .ok_or(DaemonClientError::ResponseTooLarge { limit })?;
@@ -911,7 +907,7 @@ async fn read_bounded_body(
     response: &mut reqwest::Response,
     limit: usize,
 ) -> Result<Vec<u8>, DaemonClientError> {
-    tokio::time::timeout(DEFAULT_TIMEOUT, async {
+    tokio::time::timeout_at(transport::response_deadline(response), async {
         if response
             .content_length()
             .is_some_and(|length| length > limit as u64)
@@ -924,11 +920,7 @@ async fn read_bounded_body(
             .unwrap_or_default()
             .min(limit);
         let mut bytes = Vec::with_capacity(capacity);
-        while let Some(chunk) = response
-            .chunk()
-            .await
-            .map_err(|_| DaemonClientError::Transport)?
-        {
+        while let Some(chunk) = response.chunk().await.map_err(transport::request_error)? {
             if chunk.len() > limit.saturating_sub(bytes.len()) {
                 return Err(DaemonClientError::ResponseTooLarge { limit });
             }

@@ -99,7 +99,7 @@ impl RateLimiter {
             // the newcomer instead (the previous behavior) left it entirely
             // untracked: an attacker who filled the table with distinct
             // source addresses then got unlimited auth attempts from any
-            // address not already in it. Evict instead — a locked record is
+            // address not already in it. Evict instead; a locked record is
             // chosen only once every other entry is locked too, so an active
             // lockout is never lifted while there is any other room.
             let victim = failures

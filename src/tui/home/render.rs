@@ -3390,7 +3390,7 @@ impl HomeView {
     ///
     /// Walks the frame buffer rather than re-rendering, so the
     /// underlying preview pane keeps its existing styles (colored
-    /// diff text, syntax highlighting from the agent) — only the
+    /// diff text, syntax highlighting from the agent); only the
     /// bg/fg pair swaps. Cells outside the buffer area are skipped
     /// rather than treated as an error: a terminal resize during a
     /// drag can leave a stale extent off-screen for one frame.

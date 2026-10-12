@@ -44,7 +44,7 @@ fn install_live_for_first_session(env: &mut TestEnv) -> String {
 }
 
 /// Install live-send state pointing at a session id the env does
-/// NOT contain — used to verify the drift check fires (auto-exit
+/// NOT contain; used to verify the drift check fires (auto-exit
 /// + info dialog) when the underlying instance has vanished.
 fn install_live_orphan(env: &mut TestEnv) {
     env.view.live_send = Some(LiveSendState {

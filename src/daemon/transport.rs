@@ -1,6 +1,7 @@
 //! Native HTTP transport. Unix identity is checked on the connected stream.
 
 use std::path::Path;
+#[cfg(test)]
 use std::time::Duration;
 
 use super::DaemonClientError;
@@ -111,17 +112,20 @@ pub(crate) async fn execute(
     unix_path: Option<&Path>,
     request: reqwest::Request,
 ) -> Result<reqwest::Response, DaemonClientError> {
+    use futures_util::StreamExt;
+    let deadline =
+        tokio::time::Instant::now() + request.timeout().copied().unwrap_or(super::DEFAULT_TIMEOUT);
     let Some(path) = unix_path else {
-        return http
-            .execute(request)
+        let mut response = tokio::time::timeout_at(deadline, http.execute(request))
             .await
-            .map_err(|_| DaemonClientError::Transport);
+            .map_err(|_| DaemonClientError::Timeout)?
+            .map_err(request_error)?;
+        response
+            .extensions_mut()
+            .insert(OperationDeadline(deadline));
+        return Ok(response);
     };
-    let timeout = request
-        .timeout()
-        .copied()
-        .unwrap_or(Duration::from_secs(15));
-    tokio::time::timeout(timeout, async {
+    tokio::time::timeout_at(deadline, async {
         let stream = connect_unix(path).await?;
         let (mut sender, connection) =
             hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(stream))
@@ -130,9 +134,8 @@ pub(crate) async fn execute(
         tokio::spawn(async move {
             let _ = connection.await;
         });
-        let mut request: axum::http::Request<reqwest::Body> = request
-            .try_into()
-            .map_err(|_: reqwest::Error| DaemonClientError::Transport)?;
+        let mut request: axum::http::Request<reqwest::Body> =
+            request.try_into().map_err(request_error)?;
         if !request.headers().contains_key(axum::http::header::HOST) {
             request.headers_mut().insert(
                 axum::http::header::HOST,
@@ -143,17 +146,98 @@ pub(crate) async fn execute(
             .send_request(request)
             .await
             .map_err(|_| DaemonClientError::UnixTransport)?;
-        let response = response
-            .map(|body| reqwest::Body::wrap_stream(axum::body::Body::new(body).into_data_stream()));
-        Ok(reqwest::Response::from(response))
+        let response = response.map(|body| {
+            let source = axum::body::Body::new(body).into_data_stream();
+            let chunks = futures_util::stream::try_unfold(source, move |mut source| async move {
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(std::io::Error::from(std::io::ErrorKind::TimedOut));
+                }
+                let chunk = tokio::time::timeout_at(deadline, source.next())
+                    .await
+                    .map_err(|_| std::io::Error::from(std::io::ErrorKind::TimedOut))?;
+                match chunk {
+                    Some(Ok(chunk)) => Ok(Some((chunk, source))),
+                    Some(Err(error)) => Err(std::io::Error::other(error)),
+                    None => Ok(None),
+                }
+            });
+            reqwest::Body::wrap_stream(chunks)
+        });
+        let mut response = reqwest::Response::from(response);
+        response
+            .extensions_mut()
+            .insert(OperationDeadline(deadline));
+        Ok(response)
     })
     .await
     .map_err(|_| DaemonClientError::Timeout)?
 }
 
+#[derive(Clone, Copy)]
+struct OperationDeadline(tokio::time::Instant);
+
+pub(crate) fn response_deadline(response: &reqwest::Response) -> tokio::time::Instant {
+    response
+        .extensions()
+        .get::<OperationDeadline>()
+        .map_or_else(
+            || tokio::time::Instant::now() + super::DEFAULT_TIMEOUT,
+            |deadline| deadline.0,
+        )
+}
+
+pub(crate) fn request_error(error: reqwest::Error) -> DaemonClientError {
+    if error.is_timeout() {
+        DaemonClientError::Timeout
+    } else {
+        DaemonClientError::Transport
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn unix_body_keeps_the_header_operation_deadline() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("api.sock");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let (headers, sent) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            let mut used = 0;
+            while !request[..used].windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                let count = stream.read(&mut request[used..]).await.unwrap();
+                assert!(count > 0, "request must contain complete HTTP headers");
+                used += count;
+            }
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n")
+                .await
+                .unwrap();
+            headers.send(()).unwrap();
+            let mut eof = [0];
+            let _ = stream.read(&mut eof).await;
+        });
+        let http = reqwest::Client::new();
+        let request = http
+            .get("http://localhost/operation")
+            .timeout(Duration::from_millis(100))
+            .build()
+            .unwrap();
+        let mut response = execute(&http, Some(&path), request).await.unwrap();
+        sent.await.unwrap();
+        let body = tokio::time::timeout(Duration::from_secs(1), response.chunk()).await;
+        assert!(
+            matches!(body, Ok(Err(ref error)) if error.is_timeout()),
+            "body={body:?}"
+        );
+        drop(response);
+        server.await.unwrap();
+    }
 
     #[tokio::test]
     async fn unix_requests_honor_their_operation_deadline() {
@@ -245,5 +329,172 @@ mod tests {
         prepare_runtime_directory(&app.join("daemon")).unwrap();
 
         assert_eq!(std::fs::metadata(&app).unwrap().mode() & 0o777, 0o755);
+    }
+
+    async fn serve_deadline_body<S>(
+        mut stream: S,
+        headers_after: Duration,
+        chunks: usize,
+        chunk_after: Duration,
+    ) where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut request = Vec::new();
+        let mut buf = [0; 1024];
+        while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+            let count = stream.read(&mut buf).await.unwrap();
+            assert!(count > 0);
+            request.extend_from_slice(&buf[..count]);
+        }
+        tokio::time::sleep(headers_after).await;
+        stream
+            .write_all(
+                format!("HTTP/1.1 200 OK\r\nContent-Length: {chunks}\r\nConnection: close\r\n\r\n")
+                    .as_bytes(),
+            )
+            .await
+            .unwrap();
+        for _ in 0..chunks {
+            tokio::time::sleep(chunk_after).await;
+            if stream.write_all(b" ").await.is_err() {
+                break;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn body_helpers_share_deadlines_without_shortening_long_operations() {
+        for unix in [true, false] {
+            for (headers_ms, chunks, chunk_ms, timeout_ms, expires) in [
+                (0, 2, 0, 1000, false),
+                (70, 1, 60, 100, true),
+                (0, 10, 20, 100, true),
+                (0, 1, 16000, 30000, false),
+            ] {
+                // One real-clock long-body case is sufficient; both transports share the helpers.
+                if !unix && chunk_ms == 16000 {
+                    continue;
+                }
+                for consumer in 0..3 {
+                    if chunk_ms == 16000 && consumer != 0 {
+                        continue;
+                    }
+                    let temp = tempfile::tempdir().unwrap();
+                    let path = temp.path().join("api.sock");
+                    let (url, server) = if unix {
+                        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+                        let server = tokio::spawn(async move {
+                            let (stream, _) = listener.accept().await.unwrap();
+                            serve_deadline_body(
+                                stream,
+                                Duration::from_millis(headers_ms),
+                                chunks,
+                                Duration::from_millis(chunk_ms),
+                            )
+                            .await;
+                        });
+                        ("http://localhost/operation".to_owned(), server)
+                    } else {
+                        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                        let url = format!("http://{}/operation", listener.local_addr().unwrap());
+                        let server = tokio::spawn(async move {
+                            let (stream, _) = listener.accept().await.unwrap();
+                            serve_deadline_body(
+                                stream,
+                                Duration::from_millis(headers_ms),
+                                chunks,
+                                Duration::from_millis(chunk_ms),
+                            )
+                            .await;
+                        });
+                        (url, server)
+                    };
+                    let http = reqwest::Client::new();
+                    let request = http
+                        .get(&url)
+                        .timeout(Duration::from_millis(timeout_ms))
+                        .build()
+                        .unwrap();
+                    let mut response = execute(&http, unix.then_some(path.as_path()), request)
+                        .await
+                        .unwrap();
+                    let client = super::super::DaemonClient::new(&url, None).unwrap();
+                    let result = match consumer {
+                        0 => super::super::read_bounded_body(&mut response, 1024)
+                            .await
+                            .map(|_| ()),
+                        1 => super::super::discard_bounded_body(&mut response).await,
+                        _ => client.read_error_body(&mut response).await.map(|_| ()),
+                    };
+                    assert_eq!(
+                        matches!(result, Err(DaemonClientError::Timeout)),
+                        expires,
+                        "unix={unix}, consumer={consumer}, chunks={chunks}, result={result:?}"
+                    );
+                    if !expires {
+                        result.unwrap();
+                    }
+                    drop(response);
+                    server.abort();
+                    let _ = server.await;
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn create_hook_error_body_uses_the_request_deadline_and_bad_json_is_decode() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for malformed in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("api.sock");
+            let listener = tokio::net::UnixListener::bind(&path).unwrap();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = [0; 4096];
+                let mut used = 0;
+                while !request[..used].windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                    let count = stream.read(&mut request[used..]).await.unwrap();
+                    assert!(count > 0, "request must contain complete HTTP headers");
+                    used += count;
+                }
+                if malformed {
+                    stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\nConnection: close\r\n\r\n{",
+                        )
+                        .await
+                        .unwrap();
+                } else {
+                    stream.write_all(b"HTTP/1.1 400 Bad Request\r\nAoE-Error-Code: create_hook_failed\r\nContent-Length: 100\r\n\r\n").await.unwrap();
+                    let mut eof = [0];
+                    let _ = stream.read(&mut eof).await;
+                }
+            });
+            let client = super::super::DaemonClient::new_unix(&path).unwrap();
+            let request = client
+                .http
+                .get("http://localhost/operation")
+                .timeout(Duration::from_millis(100));
+            let result = tokio::time::timeout(
+                Duration::from_secs(2),
+                client.request_json::<serde_json::Value>(request),
+            )
+            .await
+            .unwrap();
+            if malformed {
+                assert!(matches!(
+                    result,
+                    Err(DaemonClientError::AuthenticatedDecode)
+                ));
+            } else {
+                assert!(
+                    matches!(result, Err(DaemonClientError::Timeout)),
+                    "result={result:?}"
+                );
+            }
+            server.await.unwrap();
+        }
     }
 }

@@ -48,12 +48,12 @@
 //!   path forks nothing per keystroke.
 //!
 //! Reserved (non-forwarded) chords:
-//! - The configured exit chord list — exits live mode (see above).
-//! - `Shift+PageUp` / `Shift+PageDown` — scroll the preview pane back
+//! - The configured exit chord list: exits live mode (see above).
+//! - `Shift+PageUp` / `Shift+PageDown`: scroll the preview pane back
 //!   through agent history without exiting. Matches the terminal-
 //!   emulator convention. Bare `PageUp` / `PageDown` still passes
 //!   through, so agents that page their own UI keep working.
-//! - Mouse wheel over the preview pane — also scrolls the preview,
+//! - Mouse wheel over the preview pane: also scrolls the preview,
 //!   handled by `handle_scroll_up` / `handle_scroll_down`.
 
 use std::sync::mpsc::{channel, Sender};

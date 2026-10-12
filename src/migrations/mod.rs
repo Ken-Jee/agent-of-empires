@@ -48,15 +48,16 @@ mod v031_conversation_provenance;
 mod v032_bound_capture_exclusions;
 pub(crate) mod v033_isolate_sandbox_content;
 mod v034_trash_retention_minutes;
-mod v035_serve_passphrase_policy;
+mod v035_custom_sort_order;
 mod v036_session_creation_count;
 mod v037_trash_lifecycle_id;
 mod v038_canonical_sidebar;
-mod v039_custom_sort_order;
+mod v039_serve_passphrase_policy;
 mod v040_reconcile_serve_passphrase_policy;
 mod v041_pending_purge_owners;
 mod v042_reconcile_session_creation_count;
 mod v043_reconcile_trash_lifecycle_id;
+mod v044_reconcile_serve_passphrase_policy;
 
 /// Fixtures shared by migrations that rewrite agent hook files.
 #[cfg(test)]
@@ -97,7 +98,7 @@ use anyhow::Result;
 use std::fs;
 use tracing::{debug, info};
 
-const CURRENT_VERSION: u32 = 43;
+const CURRENT_VERSION: u32 = 44;
 const VERSION_FILE: &str = ".schema_version";
 
 struct Migration {
@@ -279,8 +280,8 @@ const MIGRATIONS: &[Migration] = &[
     },
     Migration {
         version: 35,
-        name: "serve_passphrase_policy",
-        run: v035_serve_passphrase_policy::run,
+        name: "custom_sort_order",
+        run: v035_custom_sort_order::run,
     },
     Migration {
         version: 36,
@@ -299,8 +300,8 @@ const MIGRATIONS: &[Migration] = &[
     },
     Migration {
         version: 39,
-        name: "custom_sort_order",
-        run: v039_custom_sort_order::run,
+        name: "serve_passphrase_policy",
+        run: v039_serve_passphrase_policy::run,
     },
     Migration {
         version: 40,
@@ -321,6 +322,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 43,
         name: "reconcile_trash_lifecycle_id",
         run: v043_reconcile_trash_lifecycle_id::run,
+    },
+    Migration {
+        version: 44,
+        name: "reconcile_serve_passphrase_policy",
+        run: v044_reconcile_serve_passphrase_policy::run,
     },
 ];
 

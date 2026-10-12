@@ -7443,7 +7443,7 @@ async fn a_trust_changed_refusal_does_not_freeze_its_idempotency_key() {
 /// A cancelled create is the refusal a user asked for, so its key stays live
 /// too. Each distinct cancelled key also occupies one of the registry's
 /// `MAX_FAILURES` slots for a whole `FAILURE_TTL`, and when those run out every
-/// keyed create is refused with `create_failures_full` — including the TUI's,
+/// keyed create is refused with `create_failures_full`, including the TUI's,
 /// which has no way to release one.
 #[tokio::test]
 #[serial_test::serial]

@@ -425,7 +425,7 @@ pub(super) struct SandboxHealth {
 ///
 /// The reservation arm of the guard this feeds measures a launch from
 /// `lifecycle_reservation.at` against [`Instance::LIFECYCLE_RESERVATION_TTL`],
-/// and this one protects the same object — the launch — after the reservation is
+/// and this one protects the same object (the launch) after the reservation is
 /// released, which is exactly when a committed launch's row is still
 /// `Starting`. So it uses the same TTL, but the reservation's own stamp is gone
 /// by then and it reads the row's durable launch stamp instead:

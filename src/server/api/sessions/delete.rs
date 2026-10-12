@@ -216,8 +216,8 @@ pub(crate) async fn purge_session_artifacts(
 }
 
 /// Drop the in-memory locks a removed session's row held. Called on every path
-/// where the row is gone from storage — including the unproven structured
-/// shutdown — because nothing else will ever clear them for that id.
+/// where the row is gone from storage (including the unproven structured
+/// shutdown), because nothing else will ever clear them for that id.
 async fn release_removed_session_locks(state: &AppState, id: &str) {
     state.instance_locks.write().await.remove(id);
     state.session_service.forget_prompt_lock(id).await;
