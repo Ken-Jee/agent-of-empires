@@ -676,6 +676,37 @@ mod tests {
             crate::session::Instance::new("repaired-path", repaired.path().to_str().unwrap());
         row.agent_session_id = Some(uuid::Uuid::new_v4().to_string());
         let id = row.id.clone();
+        // ENV_LOCK already isolates the app and ledger. An unrelated, non-aoe
+        // pane keeps the shared server alive and is not swept by stop-all tests.
+        let probe = crate::tmux::test_helpers::TmuxTestSession::new("recovery_probe");
+        let started = crate::tmux::tmux_command()
+            .args(["new-session", "-d", "-s", probe.name(), "exec cat"])
+            .output()
+            .expect("create unrelated recovery probe pane");
+        assert!(
+            started.status.success(),
+            "{}",
+            String::from_utf8_lossy(&started.stderr)
+        );
+        let panes = crate::tmux::batch_pane_metadata().expect("owned probe authority is healthy");
+        let present = crate::tmux::tmux_command()
+            .args(["has-session", "-t", probe.name()])
+            .output()
+            .expect("probe session presence");
+        assert!(
+            present.status.success(),
+            "{}",
+            String::from_utf8_lossy(&present.stderr)
+        );
+        let candidate_session = crate::tmux::resolve_agent_session_name_in(
+            &panes,
+            &row.id,
+            &crate::tmux::Session::generate_name(&row.id, &row.title),
+        );
+        assert!(
+            !panes.contains_key(&candidate_session),
+            "candidate still has no tmux pane"
+        );
         assert!(crate::session::recovery::is_recovery_candidate(&row));
         let state = test_support::build_test_app_state(vec![row]);
         assert!(daemon_startup_recovery_mark(

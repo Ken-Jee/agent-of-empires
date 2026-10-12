@@ -4048,55 +4048,102 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn test_opencode_mount_preserves_sqlite_db_across_prepares() {
-        // Regression for #2605: the positive policy does not declare the
-        // sandbox-owned SQLite database as host content, and preparation never
-        // deletes it, so resume identity survives every refresh.
+        // Ownership receipts and preparation must use the same isolated app directory.
+        let _app = crate::session::test_support::isolate_app_dir();
         let dir = TempDir::new().unwrap();
         let host = dir.path().join(".local/share/opencode");
         let sandbox = host.join(SANDBOX_SUBDIR);
-        fs::create_dir_all(&sandbox).unwrap();
-
-        let db_bytes = b"SQLite format 3\0-opencode-session-state";
-        fs::write(sandbox.join("opencode.db"), db_bytes).unwrap();
-        fs::write(sandbox.join("opencode.db-wal"), b"wal-frames").unwrap();
-        fs::write(sandbox.join("opencode.db-shm"), b"shm-index").unwrap();
-
-        // Host config so `sync_agent_config` has real work to do; without a
-        // non-empty host_dir the sync short-circuits and we would not exercise
-        // the code path that used to wipe the DB.
-        fs::write(host.join("config.json"), "{}").unwrap();
-
+        fs::create_dir_all(&host).unwrap();
         let mount = AGENT_CONFIG_MOUNTS
             .iter()
             .find(|m| m.tool_name == "opencode" && m.host_rel == ".local/share/opencode")
             .expect("opencode data-dir mount");
-        let out = prepare_owned_fixture(
+        let session = crate::session::config::SessionConfig::default();
+        let owned = prepare_owned_fixture(
             mount,
             dir.path(),
             None,
             CredentialFold::Freshest,
-            &crate::session::config::SessionConfig::default(),
+            &session,
             dir.path(),
         )
         .unwrap();
-        assert_eq!(out, sandbox);
+        assert_eq!(owned, sandbox);
 
-        assert!(
-            out.join("opencode.db").exists(),
-            "opencode.db must survive prepare_sandbox_dir (regression of #2605)",
-        );
+        // The agent creates native history only after its root is proven owned.
+        let database = rusqlite::Connection::open(sandbox.join("opencode.db")).unwrap();
+        database
+            .execute_batch(
+                "PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;
+             CREATE TABLE history(session_id TEXT PRIMARY KEY, transcript TEXT);
+             INSERT INTO history VALUES ('private-session', 'private-transcript');",
+            )
+            .unwrap();
+        let db_bytes = fs::read(sandbox.join("opencode.db")).unwrap();
+        let wal_bytes = fs::read(sandbox.join("opencode.db-wal")).unwrap();
+        let shm_bytes = fs::read(sandbox.join("opencode.db-shm")).unwrap();
+
+        // New declared host files force real refresh work on both calls. Do not
+        // recertify the root: production preparation must retain its authority.
+        for (file, contents) in [
+            ("auth.json", r#"{"token":"first-refresh"}"#),
+            ("mcp-auth.json", r#"{"refresh":2}"#),
+        ] {
+            fs::write(host.join(file), contents).unwrap();
+            let out = super::prepare_sandbox_dir(
+                mount,
+                dir.path(),
+                None,
+                CredentialFold::Freshest,
+                true,
+                &session,
+                dir.path(),
+            )
+            .unwrap();
+            assert_eq!(out, sandbox);
+            let copied: serde_json::Value =
+                serde_json::from_slice(&fs::read(out.join(file)).unwrap()).unwrap();
+            assert_eq!(
+                copied,
+                serde_json::from_str::<serde_json::Value>(contents).unwrap(),
+                "declared host content must actually refresh"
+            );
+            assert!(
+                out.join("opencode.db").exists(),
+                "opencode.db must survive preparation (regression of #2605)"
+            );
+            assert_eq!(
+                fs::read(out.join("opencode.db")).unwrap(),
+                db_bytes,
+                "opencode.db content must be untouched"
+            );
+            assert!(
+                out.join("opencode.db-wal").exists(),
+                "opencode.db-wal must survive"
+            );
+            assert_eq!(
+                fs::read(out.join("opencode.db-wal")).unwrap(),
+                wal_bytes,
+                "uncheckpointed native history must be untouched"
+            );
+            assert!(
+                out.join("opencode.db-shm").exists(),
+                "opencode.db-shm must survive"
+            );
+            assert_eq!(
+                fs::read(out.join("opencode.db-shm")).unwrap(),
+                shm_bytes,
+                "native SQLite shared memory must be untouched"
+            );
+        }
+        let history: (String, String) = database
+            .query_row("SELECT session_id, transcript FROM history", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .unwrap();
         assert_eq!(
-            fs::read(out.join("opencode.db")).unwrap(),
-            db_bytes,
-            "opencode.db content must be untouched",
-        );
-        assert!(
-            out.join("opencode.db-wal").exists(),
-            "opencode.db-wal must survive",
-        );
-        assert!(
-            out.join("opencode.db-shm").exists(),
-            "opencode.db-shm must survive",
+            history,
+            ("private-session".into(), "private-transcript".into())
         );
     }
 

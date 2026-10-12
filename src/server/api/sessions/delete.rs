@@ -223,12 +223,12 @@ async fn release_removed_session_locks(state: &AppState, id: &str) {
     state.session_service.forget_prompt_lock(id).await;
 }
 
-async fn finish_structured_purge(state: &AppState, id: &str) -> anyhow::Result<()> {
-    match state.acp_supervisor.shutdown_and_delete(id).await {
-        Ok(()) | Err(crate::acp::supervisor::SupervisorError::UnknownSession(_)) => {}
-        Err(error) => return Err(error.into()),
-    }
-    state.acp_supervisor.forget_session(id);
+pub(super) async fn finish_structured_purge(state: &AppState, id: &str) -> anyhow::Result<()> {
+    state
+        .acp_supervisor
+        .shutdown_and_delete_and_wait(id, std::time::Duration::from_secs(5))
+        .await?;
+    state.acp_supervisor.forget_session(id)?;
     state.acp_event_store.delete_session(id);
     Ok(())
 }

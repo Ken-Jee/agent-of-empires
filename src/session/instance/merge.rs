@@ -21,12 +21,12 @@ impl Instance {
 
     /// Keep launch-owned process state without replacing a fresh status observation.
     pub(crate) fn inherit_process_runtime(&mut self, prior: Self) {
+        self.inherit_acp_load_capability(&prior);
         self.last_start_time = prior.last_start_time;
         self.session_id_poller = prior.session_id_poller;
         self.poller_repair = prior.poller_repair;
         self.session_id_poller_retry_after = prior.session_id_poller_retry_after;
         self.retroactive_capture_excludes = prior.retroactive_capture_excludes;
-        self.acp_load_session_capable = prior.acp_load_session_capable;
         self.force_fresh_next_launch = prior.force_fresh_next_launch;
         self.pending_host_env = prior.pending_host_env;
         self.pi_extension_launched = prior.pi_extension_launched;
@@ -35,6 +35,14 @@ impl Instance {
         if let (Some(fresh), Some(previous)) = (self.sandbox_info.as_mut(), prior.sandbox_info) {
             fresh.before_start_env = previous.before_start_env;
         }
+    }
+
+    fn inherit_acp_load_capability(&mut self, previous: &Self) {
+        self.acp_load_session_capable = if self.is_structured() && previous.is_structured() {
+            previous.acp_load_session_capable
+        } else {
+            None
+        };
     }
 
     /// Mutates launch-owned state. A strictly newer lifecycle generation also
@@ -131,7 +139,7 @@ impl Instance {
         self.last_start_time = previous.last_start_time;
         self.adopt_poller(previous);
         self.adopt_poller_repair(previous);
-        self.acp_load_session_capable = previous.acp_load_session_capable;
+        self.inherit_acp_load_capability(previous);
     }
 
     /// Carry live launch and polling state across a committed profile move.
@@ -506,6 +514,36 @@ mod tests {
         Instance::new("s", "/tmp/x")
     }
 
+    #[test]
+    fn acp_load_capability_belongs_to_structured_runtime_on_reload() {
+        for (previous_view, fresh_view, capability, expected) in [
+            (View::Structured, View::Structured, true, Some(true)),
+            (View::Structured, View::Structured, false, Some(false)),
+            (View::Structured, View::Terminal, true, None),
+            (View::Structured, View::Terminal, false, None),
+            (View::Terminal, View::Structured, true, None),
+            (View::Terminal, View::Structured, false, None),
+        ] {
+            let mut previous = inst();
+            previous.view = previous_view;
+            previous.acp_load_session_capable = Some(capability);
+            let mut fresh = inst();
+            fresh.id = previous.id.clone();
+            fresh.view = fresh_view;
+            let mut native = fresh.clone();
+            native.inherit_process_runtime(previous.clone());
+            assert_eq!(
+                native.acp_load_session_capable, expected,
+                "native merge {previous_view:?} -> {fresh_view:?}, capability={capability}"
+            );
+            fresh.merge_runtime_from_reload(&previous);
+            assert_eq!(
+                fresh.acp_load_session_capable, expected,
+                "TUI reload {previous_view:?} -> {fresh_view:?}, capability={capability}"
+            );
+        }
+    }
+
     fn patch(
         status: Status,
         idle_entered_at: Option<DateTime<Utc>>,
@@ -763,6 +801,7 @@ mod tests {
     fn runtime_reload_keeps_newer_disk_lifecycle_and_runtime_only_state() {
         let floor = |secs| Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs));
         let mut previous = inst();
+        previous.view = View::Structured;
         previous.lifecycle_generation = 3;
         previous.status = Status::Error;
         previous.idle_entered_at = Some(Utc::now());
@@ -778,6 +817,7 @@ mod tests {
         };
 
         let mut reloaded = inst();
+        reloaded.view = View::Structured;
         reloaded.id = previous.id.clone();
         reloaded.lifecycle_generation = 4;
         reloaded.status = Status::Stopped;

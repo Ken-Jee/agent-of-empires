@@ -2,6 +2,67 @@ use super::*;
 
 #[tokio::test]
 #[serial_test::serial]
+async fn structured_purge_waits_for_a_pending_runner_retirement() -> anyhow::Result<()> {
+    use crate::acp::runner_lifecycle::{test_support::FakeProcessControl, ProcessControl};
+    use crate::acp::supervisor::test_support::{recording_gated_launcher, spawn_request, Gate};
+    use crate::process::worker_registry;
+    use std::sync::{atomic::Ordering, Arc};
+    let _home = crate::session::test_support::isolate_app_dir();
+    let mut row = Instance::new("purge pending handshake", "/tmp");
+    row.view = crate::session::View::Structured;
+    row.source_profile = "default".into();
+    crate::server::test_support::seed_instances_on_disk_for_test(
+        &row.source_profile,
+        vec![row.clone()],
+    );
+    let control = Arc::new(FakeProcessControl::default());
+    control.alive(4848);
+    let gate = Gate::default();
+    let (launcher, deleted) = recording_gated_launcher(&gate, 4848, &row.id, "native-purge-id");
+    let state = crate::server::test_support::build_test_app_state_impl(
+        vec![row.clone()],
+        Vec::new(),
+        Vec::new(),
+        None,
+        false,
+        |_| {},
+        |supervisor| {
+            supervisor
+                .with_process_control(control.clone())
+                .with_launcher(launcher)
+        },
+    );
+    let reservation = state.acp_supervisor.reserve_spawn(&row.id).await?;
+    let lease = reservation.lease().clone();
+    let mut request = spawn_request(&row.id);
+    request.source_profile = Some(row.source_profile.clone());
+    let supervisor = state.acp_supervisor.clone();
+    let spawner = tokio::spawn(async move { supervisor.spawn_inner(request, reservation).await });
+    gate.entered.notified().await;
+    let finishing = super::delete::finish_structured_purge(&state, &row.id);
+    tokio::pin!(finishing);
+    assert!(
+        futures_util::poll!(&mut finishing).is_pending(),
+        "purge cannot mark structured cleanup complete before retirement"
+    );
+    assert!(state.acp_supervisor.test_cancel_requested(&lease));
+    assert!(matches!(
+        state.acp_supervisor.forget_session(&row.id),
+        Err(crate::acp::supervisor::SupervisorError::TeardownPending(_))
+    ));
+    gate.open.notify_one();
+    finishing.await?;
+    assert!(spawner.await?.is_err());
+    assert!(deleted.load(Ordering::SeqCst));
+    assert!(control.signals().contains(&(4848, "TERM")));
+    assert!(!control.is_alive(4848));
+    assert!(worker_registry::load(&row.id)?.is_none());
+    assert!(!state.acp_supervisor.is_owned(&row.id).await);
+    Ok(())
+}
+
+#[tokio::test]
+#[serial_test::serial]
 async fn create_receipts_include_published_rows_and_idempotent_retries() -> anyhow::Result<()> {
     if !crate::tmux::is_tmux_available() {
         return Ok(());

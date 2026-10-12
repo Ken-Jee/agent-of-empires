@@ -148,10 +148,15 @@ impl<S: BroadcastSink> Supervisor<S> {
             }
         };
 
+        let identity = client.runner_pid().map(|pid| RunnerIdentity {
+            pid,
+            generation: lease.epoch(),
+        });
         // A peer that archived or trashed the row during the handshake wins: retire the runner.
         if let Err(refused) =
             admit_durable_launch(req.launch_admission.as_ref(), &req.session_id).await
         {
+            super::teardown::retire_client(&self.lifecycle, &lease, &client, identity).await;
             drop(client);
             self.reap_failed_launch(&lease).await;
             return Err(refused);
@@ -167,10 +172,6 @@ impl<S: BroadcastSink> Supervisor<S> {
         let inbound = client
             .take_inbound()
             .expect("freshly spawned AcpClient always has inbound receiver");
-        let identity = client.runner_pid().map(|pid| RunnerIdentity {
-            pid,
-            generation: lease.epoch(),
-        });
         let kind = WorkerKind::Runner {
             spawn_config: Box::new(config),
         };
@@ -403,7 +404,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         let install = lock_recover(&self.lifecycle).install(&lease, identity);
         if let Err(refusal) = install {
             drop(workers);
-            let _ = client.shutdown().await;
+            super::teardown::retire_client(&self.lifecycle, &lease, &client, identity).await;
             drop(client);
             return Err(self.retire_refused_install(&lease, identity, refusal).await);
         }
@@ -675,8 +676,9 @@ impl<S: BroadcastSink> Supervisor<S> {
         .await?;
 
         if let Err(refused) = admit_durable_launch(admission.as_ref(), &session_id).await {
-            drop(client);
             let lease = reservation.lease().clone();
+            super::teardown::retire_client(&self.lifecycle, &lease, &client, Some(identity)).await;
+            drop(client);
             lock_recover(&self.lifecycle).convert_to_stopping(&lease);
             let settlement =
                 tear_down_runner(&*self.process_control, &session_id, Some(identity)).await;
@@ -1377,6 +1379,59 @@ mod tests {
             control.signals().iter().any(|(pid, _)| *pid == 4545),
             "the runner launched for the archived row must be torn down"
         );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn cancelled_terminal_handoff_cannot_forget_a_pending_runner() {
+        use crate::acp::runner_lifecycle::ProcessControl;
+        let _home = isolate_home();
+        let control = Arc::new(FakeProcessControl::default());
+        control.alive(4646);
+        let gate = Gate::default();
+        let sup = Arc::new(
+            Supervisor::new(VecSink::new())
+                .with_process_control(control.clone())
+                .with_launcher(gated_launcher(&gate, 4646)),
+        );
+        let mut row = crate::session::Instance::new("s-terminal-handoff", "/tmp");
+        row.id = "s-terminal-handoff".into();
+        row.view = crate::session::View::Structured;
+        let storage = crate::session::Storage::new_unwatched(&row.source_profile).unwrap();
+        storage
+            .update(|rows, _| {
+                *rows = vec![row.clone()];
+                Ok(())
+            })
+            .unwrap();
+        let mut request = spawn_request(&row.id);
+        request.source_profile = Some(row.source_profile.clone());
+        let spawner = {
+            let sup = Arc::clone(&sup);
+            tokio::spawn(async move { sup.spawn(request).await })
+        };
+        gate.entered.notified().await;
+        storage
+            .update(|rows, _| {
+                rows[0].view = crate::session::View::Terminal;
+                rows[0].lifecycle_generation += 1;
+                Ok(())
+            })
+            .unwrap();
+        sup.shutdown(&row.id).await.unwrap();
+        let _ = sup.forget_session(&row.id);
+        gate.open.notify_one();
+        assert!(matches!(
+            spawner.await.unwrap(),
+            Err(SupervisorError::SpawnCancelled(_))
+        ));
+        assert!(
+            control.signals().contains(&(4646, "TERM")),
+            "cancelled handoff must retain the matching teardown lease"
+        );
+        assert!(!control.is_alive(4646));
+        assert!(worker_registry::load(&row.id).unwrap().is_none());
+        assert_eq!(sup.worker_state(&row.id).await, AcpWorkerState::Absent);
     }
 
     #[tokio::test]

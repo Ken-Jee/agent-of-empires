@@ -106,7 +106,7 @@ pub(crate) fn build_test_app_state_with_launcher(
     )
 }
 
-fn build_test_app_state_impl(
+pub(crate) fn build_test_app_state_impl(
     prior: Vec<Instance>,
     allowed_hosts: Vec<String>,
     allowed_origins: Vec<String>,

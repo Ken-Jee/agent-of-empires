@@ -10,7 +10,6 @@ use crate::acp::runner_lifecycle::{
     Lease, LifecycleTable, ProcessControl, RunnerIdentity, Settlement, StopDecision,
 };
 use crate::acp::state::{BackgroundAgentStatus, Event};
-use crate::daemon::AcpWorkerState;
 use crate::process::worker_registry;
 
 /// Grace after SIGTERM before SIGKILL, and after SIGKILL before parking the teardown.
@@ -35,26 +34,43 @@ impl<S: BroadcastSink> Supervisor<S> {
             .await
     }
 
-    /// Stop a worker being permanently discarded, releasing agent-side state
-    /// via `session/delete`. Reversible stops must not use this.
-    pub async fn shutdown_and_delete(&self, session_id: &str) -> Result<(), SupervisorError> {
-        self.shutdown_with_reason(session_id, "user_stopped", true)
+    /// Permanently discard a worker and wait for its matching retirement.
+    /// Reversible stops must not delete the adapter-side transcript.
+    pub async fn shutdown_and_delete_and_wait(
+        &self,
+        session_id: &str,
+        deadline: Duration,
+    ) -> Result<(), SupervisorError> {
+        self.shutdown_and_wait_with_policy(session_id, deadline, true)
             .await
     }
 
-    /// `shutdown`, then wait for the resume/teardown to settle and the runner
-    /// process to exit so a following spawn cannot collide on its socket.
+    /// Wait for an in-flight launch and its teardown, not merely cancellation.
     pub async fn shutdown_and_wait(
         &self,
         session_id: &str,
         deadline: Duration,
     ) -> Result<(), SupervisorError> {
+        self.shutdown_and_wait_with_policy(session_id, deadline, false)
+            .await
+    }
+
+    async fn shutdown_and_wait_with_policy(
+        &self,
+        session_id: &str,
+        deadline: Duration,
+        delete_adapter_state: bool,
+    ) -> Result<(), SupervisorError> {
         let record_before = worker_registry::load(session_id).map_err(|error| {
             SupervisorError::Acp(crate::acp::acp_client::AcpError::Spawn(error.to_string()))
         })?;
         let pid_before = record_before.as_ref().map(|record| record.pid);
-        let start = Instant::now();
-        match self.shutdown(session_id).await {
+        let stopped = self
+            .shutdown_with_reason(session_id, "user_stopped", delete_adapter_state)
+            .await;
+        // The existing synchronous teardown grace precedes the settlement wait.
+        let deadline = tokio::time::Instant::now() + deadline;
+        match stopped {
             Ok(()) => {}
             Err(SupervisorError::UnknownSession(_)) => {
                 if record_before
@@ -63,44 +79,37 @@ impl<S: BroadcastSink> Supervisor<S> {
                 {
                     return Err(SupervisorError::TeardownPending(session_id.into()));
                 }
-                return Ok(());
             }
-            Err(e) => return Err(e),
+            Err(error) => return Err(error),
         }
         loop {
             let notified = self.worker_notify.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
-            if !matches!(
-                self.worker_state(session_id).await,
-                AcpWorkerState::Resuming | AcpWorkerState::Stopping
-            ) {
+            if !self.is_owned(session_id).await {
                 break;
             }
-            let remaining = deadline.saturating_sub(start.elapsed());
-            if remaining.is_zero() {
+            if tokio::time::timeout_at(deadline, notified).await.is_err()
+                && self.is_owned(session_id).await
+            {
                 return Err(SupervisorError::TeardownPending(session_id.into()));
             }
-            let _ = tokio::time::timeout(remaining, notified).await;
         }
         #[cfg(unix)]
         if let Some(pid) = pid_before {
-            let start = Instant::now();
-            while start.elapsed() < deadline && worker_registry::is_pid_alive(pid) {
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-            if worker_registry::is_pid_alive(pid) {
-                return Err(SupervisorError::TeardownPending(session_id.into()));
+            while self.process_control.is_alive(pid) {
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() {
+                    return Err(SupervisorError::TeardownPending(session_id.into()));
+                }
+                tokio::time::sleep(TEARDOWN_POLL.min(remaining)).await;
             }
         }
         #[cfg(not(unix))]
         {
             let _ = pid_before;
-            warn!(
-                target: "acp.supervisor",
-                session = %session_id,
-                "shutdown_and_wait called on non-Unix host; PID wait is unimplemented for this platform"
-            );
+            warn!(target: "acp.supervisor", session = %session_id,
+                "shutdown_and_wait called on non-Unix host; PID wait is unimplemented for this platform");
         }
         Ok(())
     }
@@ -114,7 +123,8 @@ impl<S: BroadcastSink> Supervisor<S> {
         // Same lock order as `begin_resume`, so a resume cannot slip between
         // the decision and the handle removal.
         let mut workers = self.workers.lock().await;
-        let decision = lock_recover(&self.lifecycle).begin_stop(session_id, stop_reason);
+        let decision =
+            lock_recover(&self.lifecycle).begin_stop(session_id, stop_reason, delete_adapter_state);
         match decision {
             StopDecision::TearDown { lease, identity } => {
                 let handle = workers.remove(session_id);
@@ -125,7 +135,7 @@ impl<S: BroadcastSink> Supervisor<S> {
                     return Ok(());
                 };
                 if delete_adapter_state {
-                    try_session_delete(&handle.client, session_id).await;
+                    try_session_delete(&handle.client, session_id, identity).await;
                 }
                 let _ = handle.client.shutdown().await;
                 handle.drain_task.abort();
@@ -393,9 +403,27 @@ fn registry_disowns(session_id: &str, identity: Option<RunnerIdentity>) -> bool 
     }
 }
 
+/// A cancelled launch may finish its handshake after a permanent stop was requested.
+pub(super) async fn retire_client(
+    lifecycle: &std::sync::Mutex<LifecycleTable>,
+    lease: &Lease,
+    client: &AcpClient,
+    identity: Option<RunnerIdentity>,
+) {
+    let delete = lock_recover(lifecycle).delete_adapter_state_requested(lease);
+    if delete {
+        try_session_delete(client, lease.session_id(), identity).await;
+    }
+    let _ = client.shutdown().await;
+}
+
 /// Fire the experimental `session/delete` for the session's stored ACP id.
 /// Every outcome is non-fatal; the caller proceeds to SIGTERM.
-async fn try_session_delete(client: &AcpClient, session_id: &str) {
+async fn try_session_delete(
+    client: &AcpClient,
+    session_id: &str,
+    identity: Option<RunnerIdentity>,
+) {
     let id = session_id.to_string();
     let loaded = tokio::task::spawn_blocking(move || worker_registry::load(&id))
         .await
@@ -412,6 +440,14 @@ async fn try_session_delete(client: &AcpClient, session_id: &str) {
             return;
         }
     };
+    if identity.is_some_and(|identity| {
+        !record
+            .as_ref()
+            .is_some_and(|record| identity.matches_record(record.pid, record.generation))
+    }) {
+        debug!(target: "acp.protocol", session = %session_id, "skipping session/delete: registry owner changed");
+        return;
+    }
     let (acp_id, adapter) = record.map_or((None, String::new()), |rec| {
         (rec.stored_acp_session_id, rec.agent_key)
     });
@@ -570,7 +606,7 @@ pub(super) fn settle_lease(
 #[cfg(test)]
 mod tests {
     use super::super::test_support::*;
-    use super::super::{ResumeKind, ResumeReservationOutcome};
+    use super::super::{AcpWorkerState, ResumeKind, ResumeReservationOutcome};
     use super::*;
     use crate::acp::runner_lifecycle::test_support::FakeProcessControl;
     use std::sync::Arc;
@@ -961,6 +997,48 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
+    async fn permanent_retirement_does_not_delete_a_replacement_native_session() {
+        let (_home, tmp) = isolate_home();
+        let control = Arc::new(FakeProcessControl::default());
+        control.alive(6651).alive(6652);
+        let sup = Supervisor::new(VecSink::new()).with_process_control(control.clone());
+        let (client, _events, deleted) = AcpClient::fake_for_test_recording(
+            crate::acp::state::AcpSessionId("s-delete-owned".into()),
+        );
+        sup.test_install_handle(
+            "s-delete-owned",
+            client,
+            WorkerKind::Stdio,
+            Some(RunnerIdentity {
+                pid: 6651,
+                generation: 10,
+            }),
+        )
+        .await;
+        let mut replacement = worker_record("s-delete-owned", 6652, tmp.path().join("replacement"))
+            .with_generation(11);
+        replacement.stored_acp_session_id = Some("replacement-native-session".into());
+        worker_registry::save(&replacement).unwrap();
+        sup.shutdown_with_reason("s-delete-owned", "user_stopped", true)
+            .await
+            .unwrap();
+        assert!(!deleted.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(control.signals().contains(&(6651, "TERM")));
+        assert!(!control.signals().iter().any(|(pid, _)| *pid == 6652));
+        assert!(control.is_alive(6652));
+        let retained = worker_registry::load("s-delete-owned").unwrap().unwrap();
+        assert_eq!(
+            (
+                retained.pid,
+                retained.generation,
+                retained.stored_acp_session_id
+            ),
+            (6652, 11, Some("replacement-native-session".into()))
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
     async fn only_permanent_removal_sends_session_delete() {
         use std::sync::atomic::Ordering;
         let (_home, tmp) = isolate_home();
@@ -986,7 +1064,9 @@ mod tests {
         let (client, keep) = register("s-keep");
         sup.test_install_handle("s-keep", client, WorkerKind::Stdio, None)
             .await;
-        sup.shutdown("s-keep").await.expect("shutdown ok");
+        sup.shutdown_and_wait("s-keep", Duration::from_secs(5))
+            .await
+            .expect("shutdown ok");
         assert!(
             !keep.load(Ordering::SeqCst),
             "a reversible stop keeps the transcript resumable"
@@ -995,7 +1075,9 @@ mod tests {
         let (client, purge) = register("s-del");
         sup.test_install_handle("s-del", client, WorkerKind::Stdio, None)
             .await;
-        sup.shutdown_and_delete("s-del").await.expect("delete ok");
+        sup.shutdown_and_delete_and_wait("s-del", Duration::from_secs(5))
+            .await
+            .expect("delete ok");
         assert!(
             purge.load(Ordering::SeqCst),
             "permanent removal sends session/delete"
@@ -1009,10 +1091,11 @@ mod tests {
         let control = Arc::new(FakeProcessControl::default());
         control.alive(4343);
         let gate = Gate::default();
+        let (launcher, deleted) = recording_gated_launcher(&gate, 4343, "s-wait", "native-keep-id");
         let sup = Arc::new(
             Supervisor::new(VecSink::new())
                 .with_process_control(control)
-                .with_launcher(gated_launcher(&gate, 4343)),
+                .with_launcher(launcher),
         );
         let spawner = {
             let sup = Arc::clone(&sup);
@@ -1033,6 +1116,10 @@ mod tests {
             spawner.await.unwrap(),
             Err(SupervisorError::SpawnCancelled(_))
         ));
+        assert!(
+            !deleted.load(std::sync::atomic::Ordering::SeqCst),
+            "a cancelled reversible stop keeps the native transcript"
+        );
     }
 
     #[tokio::test]
@@ -1194,7 +1281,7 @@ mod tests {
             table.install(&lease, Some(identity)).unwrap();
             // The stop began, then its driver went away before settling.
             assert!(matches!(
-                table.begin_stop("s-orphan", "user_stopped"),
+                table.begin_stop("s-orphan", "user_stopped", false),
                 StopDecision::TearDown { .. }
             ));
         }

@@ -144,12 +144,38 @@ impl Instance {
         let profile = self.effective_profile();
         let storage = crate::session::storage::Storage::new(&profile, self.resolve_file_watch())
             .context("failed to open lifecycle lock storage")?;
+        self.start_with_size_opts_in(size, skip_on_launch, &storage, false)
+    }
+
+    /// Native mutations use the same launch path with their canonical store.
+    pub(crate) fn start_in(&mut self, storage: &dyn crate::session::SessionStore) -> Result<()> {
+        crate::session::validate_instance_id(&self.id)
+            .context("refusing to launch: AOE_INSTANCE_ID failed validation")?;
+        if self.is_structured() {
+            return Ok(());
+        }
+        self.start_with_size_opts_in(None, false, storage, true)
+            .map(|_| ())
+    }
+
+    fn start_with_size_opts_in(
+        &mut self,
+        size: Option<(u16, u16)>,
+        skip_on_launch: bool,
+        storage: &dyn crate::session::SessionStore,
+        require_tracked_row: bool,
+    ) -> Result<LaunchSidOutcome> {
+        storage.check_available()?;
 
         let title_lock = crate::session::storage::acquire_session_title_lock(&self.id)
             .context("failed to acquire instance launch title lock")?;
         let lifecycle_lock = storage
+            .storage()
             .acquire_instance_lifecycle_lock(&self.id)
             .context("failed to acquire instance launch lock")?;
+        if require_tracked_row {
+            self.reconcile_from_store(storage)?;
+        }
         if self.is_structured() {
             return Ok(LaunchSidOutcome::Skipped);
         }
@@ -170,9 +196,17 @@ impl Instance {
         } else {
             false
         };
-        self.reconcile_from_store(&storage)?;
+        if !require_tracked_row {
+            // A default-store no-op on a live pane needs no durable launch row.
+            // A real launch still requires and rechecks its authoritative row.
+            self.reconcile_from_store(storage)?;
+            if self.is_structured() {
+                return Ok(LaunchSidOutcome::Skipped);
+            }
+            self.ensure_startable()?;
+        }
         let generation = self.acquire_lifecycle_reservation(
-            &storage,
+            storage,
             LifecycleOperation::Launch,
             Some(Status::Starting),
         )?;
@@ -180,17 +214,17 @@ impl Instance {
         // Hooks may invoke aoe; retain the token, not the flocks, across them.
         drop(lifecycle_lock);
         drop(title_lock);
-        let hook_result = self.run_pre_launch_hooks(skip_on_launch, &storage, None);
+        let hook_result = self.run_pre_launch_hooks(skip_on_launch, storage, None);
         let (_title_lock, _lifecycle_lock) =
-            self.reacquire_launch_locks_after_hooks(&storage, generation, hook_result)?;
-        self.reconcile_sidecar_into_disk_in(&storage)?;
-        let expected = self.apply_fresh_launch_intent_in(&storage);
+            self.reacquire_launch_locks_after_hooks(storage, generation, hook_result)?;
+        self.reconcile_sidecar_into_disk_in(storage)?;
+        let expected = self.apply_fresh_launch_intent_in(storage);
 
         let mut prepared =
-            match self.prepare_launch_command_in(CaptureStorage::Scoped(&storage), expected) {
+            match self.prepare_launch_command_in(CaptureStorage::Scoped(storage), expected) {
                 Ok(prepared) => prepared,
                 Err(error) => {
-                    self.fail_reserved_launch(&storage, generation, &error, false);
+                    self.fail_reserved_launch(storage, generation, &error, false);
                     return Err(error);
                 }
             };
@@ -198,16 +232,16 @@ impl Instance {
             if corpse_pane {
                 self.kill_clean_locked()?;
                 prepared = self.refresh_prepared_prime_launch_after_pane_stop_in(
-                    CaptureStorage::Scoped(&storage),
+                    CaptureStorage::Scoped(storage),
                     prepared,
                 )?;
             }
-            let outcome = self.spawn_prepared_launch(size, &storage, prepared)?;
-            self.commit_lifecycle_launch(&storage, generation, false)?;
+            let outcome = self.spawn_prepared_launch(size, storage, prepared)?;
+            self.commit_lifecycle_launch(storage, generation, false)?;
             Ok(outcome)
         })();
         if let Err(error) = result {
-            self.fail_reserved_launch(&storage, generation, &error, true);
+            self.fail_reserved_launch(storage, generation, &error, true);
             return Err(error);
         }
         result
@@ -745,6 +779,56 @@ mod tests {
         inst.view = View::Structured;
         let outcome = inst.start_with_size_opts(None, false).unwrap();
         assert_eq!(outcome, LaunchSidOutcome::Skipped);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn native_start_requires_a_tracked_row_even_for_a_preexisting_live_pane(
+    ) -> anyhow::Result<()> {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let project = tempfile::tempdir()?;
+        let mut row = Instance::new(
+            "native tracked-row admission",
+            project.path().to_str().unwrap(),
+        );
+        row.source_profile = "default".into();
+        let storage = crate::session::Storage::new_unwatched(&row.source_profile)?;
+        assert!(storage.load()?.is_empty());
+        let name = crate::tmux::Session::generate_name(&row.id, &row.title);
+        let _pane = crate::tmux::test_helpers::TmuxTestSession::from_name(name.clone());
+        row.tmux_session()?.create(
+            project.path().to_str().unwrap(),
+            Some("exec cat"),
+            "default",
+        )?;
+        let before = crate::tmux::test_helpers::pane_field(&name, "#{pane_pid}");
+        assert!(!before.is_empty());
+        let state = crate::server::test_support::build_test_app_state(vec![row.clone()]);
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+        let result = tokio::task::spawn_blocking(move || {
+            let native = crate::server::session_store::NativeSessionStore::open(
+                state,
+                &row.source_profile,
+                Some(row.id.clone()),
+            )?;
+            row.start_in(&native)
+        })
+        .await?;
+        let error = result.unwrap_err();
+        assert!(
+            matches!(
+                error.downcast_ref::<LifecycleReservationError>(),
+                Some(LifecycleReservationError::Superseded)
+            ),
+            "{error:#}"
+        );
+        assert_eq!(
+            crate::tmux::test_helpers::pane_field(&name, "#{pane_pid}"),
+            before,
+            "native admission refusal does not respawn the live pane"
+        );
+        assert!(storage.load()?.is_empty());
+        Ok(())
     }
 
     /// #4116: every launch funnel rereads the row and refuses an archived or

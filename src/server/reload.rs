@@ -1986,8 +1986,10 @@ mod tests {
         // A capability the prior row discovered is runtime state too: a reload
         // must not drop it and make the next load re-probe the session.
         let mut prior = Instance::new("seed", "/tmp/seed");
+        prior.view = crate::session::View::Structured;
         prior.acp_load_session_capable = Some(true);
         let mut fresh = Instance::new("seed", "/tmp/seed");
+        fresh.view = crate::session::View::Structured;
         merge_runtime_fields(prior, &mut fresh);
         assert_eq!(fresh.acp_load_session_capable, Some(true));
     }

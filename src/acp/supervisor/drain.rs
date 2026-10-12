@@ -439,7 +439,8 @@ impl<S: BroadcastSink> Drain<S> {
         match refused {
             None => {}
             Some(InstallError::Cancelled { reason }) => {
-                let _ = client.shutdown().await;
+                super::teardown::retire_client(&self.lifecycle, &respawn_lease, &client, identity)
+                    .await;
                 self.finish_cancelled(&respawn_lease, previous, reason, identity)
                     .await;
                 return None;

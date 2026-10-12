@@ -81,6 +81,7 @@ enum Phase {
 struct Entry {
     epoch: u64,
     phase: Phase,
+    delete_adapter_state: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -218,10 +219,13 @@ impl LifecycleTable {
         self.stale_cancels.remove(session_id);
     }
 
-    pub fn forget(&mut self, session_id: &str) {
-        self.entries.remove(session_id);
+    pub fn forget(&mut self, session_id: &str) -> bool {
+        if self.entries.contains_key(session_id) {
+            return false;
+        }
         self.last_generation.remove(session_id);
         self.stale_cancels.remove(session_id);
+        true
     }
 
     pub fn last_generation(&self, session_id: &str) -> u64 {
@@ -246,6 +250,7 @@ impl LifecycleTable {
             Entry {
                 epoch,
                 phase: Phase::Starting { kind, cancel: None },
+                delete_adapter_state: false,
             },
         );
         Ok(self.lease(session_id, epoch))
@@ -308,10 +313,16 @@ impl LifecycleTable {
     }
 
     /// Ask for the session's worker to stop.
-    pub fn begin_stop(&mut self, session_id: &str, reason: &str) -> StopDecision {
+    pub fn begin_stop(
+        &mut self,
+        session_id: &str,
+        reason: &str,
+        delete_adapter_state: bool,
+    ) -> StopDecision {
         let Some(entry) = self.entries.get_mut(session_id) else {
             return StopDecision::NotOwned;
         };
+        entry.delete_adapter_state |= delete_adapter_state;
         let epoch = entry.epoch;
         match &mut entry.phase {
             Phase::Starting { cancel, .. } | Phase::Respawning { cancel } => {
@@ -343,6 +354,7 @@ impl LifecycleTable {
             session_id.to_string(),
             Entry {
                 epoch,
+                delete_adapter_state: false,
                 phase: Phase::Stopping {
                     attempts: 0,
                     since: Instant::now(),
@@ -424,6 +436,13 @@ impl LifecycleTable {
             Phase::Starting { cancel, .. } | Phase::Respawning { cancel } => cancel.clone(),
             _ => None,
         }
+    }
+
+    /// Permanent retirement applies only to the matching runner lease.
+    pub fn delete_adapter_state_requested(&self, lease: &Lease) -> bool {
+        self.entries
+            .get(&lease.session_id)
+            .is_some_and(|entry| entry.epoch == lease.epoch && entry.delete_adapter_state)
     }
 
     /// Claim a parked teardown for another attempt, or one still marked
@@ -665,6 +684,49 @@ mod tests {
     }
 
     #[test]
+    fn forgetting_cannot_release_active_or_unproven_runner_ownership() {
+        let mut table = LifecycleTable::new(1);
+        let initial = table.admit(ID, ResumeKind::Spawn).unwrap();
+        assert!(!table.forget(ID));
+        assert_eq!(
+            table.admit(ID, ResumeKind::Spawn).unwrap_err(),
+            AdmitError::AlreadyPresent
+        );
+        table
+            .install(&initial, Some(identity(11, initial.epoch())))
+            .unwrap();
+        assert!(!table.forget(ID));
+        let (replacement, _) = table.begin_respawn(&initial).unwrap();
+        assert!(!table.forget(ID));
+        assert!(matches!(
+            table.begin_stop(ID, "user_stopped", false),
+            StopDecision::CancelRequested
+        ));
+        let runner = identity(12, replacement.epoch());
+        assert!(matches!(
+            table.install(&replacement, Some(runner)),
+            Err(InstallError::Cancelled { .. })
+        ));
+        assert!(!table.forget(ID));
+        table.settle(&replacement, Settlement::Unproven(Some(runner)));
+        assert!(!table.forget(ID));
+        assert_eq!(
+            table.admit(ID, ResumeKind::Spawn).unwrap_err(),
+            AdmitError::TeardownPending
+        );
+        let retry = table.claim_retry(ID, Duration::ZERO).unwrap();
+        assert!(!table.forget(ID));
+        table.settle(&retry.lease, Settlement::Proven);
+        assert!(table.forget(ID));
+        let next = table.admit(ID, ResumeKind::Spawn).unwrap();
+        assert!(next.epoch() > replacement.epoch());
+        assert!(matches!(
+            table.install(&replacement, Some(runner)),
+            Err(InstallError::Stale)
+        ));
+    }
+
+    #[test]
     fn identity_matches_record_with_legacy_generation() {
         let cases = [
             (identity(7, 5), 7, 5, true),
@@ -696,7 +758,7 @@ mod tests {
         let StopDecision::TearDown {
             lease: stop,
             identity: id,
-        } = table.begin_stop(ID, "user_stopped")
+        } = table.begin_stop(ID, "user_stopped", false)
         else {
             panic!("running worker must hand teardown to the stopper");
         };
@@ -706,7 +768,7 @@ mod tests {
         assert!(!table.is_running(ID));
         assert!(table.is_owned(ID));
         assert!(matches!(
-            table.begin_stop(ID, "again"),
+            table.begin_stop(ID, "again", false),
             StopDecision::AlreadyStopping
         ));
         assert_eq!(
@@ -724,12 +786,12 @@ mod tests {
         let mut table = LifecycleTable::new(1);
         let lease = table.admit(ID, ResumeKind::Attach).unwrap();
         assert!(matches!(
-            table.begin_stop(ID, "archived"),
+            table.begin_stop(ID, "archived", false),
             StopDecision::CancelRequested
         ));
         assert_eq!(table.cancel_requested(&lease).as_deref(), Some("archived"));
         assert!(matches!(
-            table.begin_stop(ID, "later"),
+            table.begin_stop(ID, "later", false),
             StopDecision::CancelRequested
         ));
         assert_eq!(
@@ -805,7 +867,7 @@ mod tests {
         assert!(table.begin_respawn(&first).is_err());
 
         assert!(matches!(
-            table.begin_stop(ID, "user_stopped"),
+            table.begin_stop(ID, "user_stopped", false),
             StopDecision::CancelRequested
         ));
         assert_eq!(
@@ -845,7 +907,7 @@ mod tests {
             vec![ID.to_string()]
         );
         assert!(matches!(
-            table.begin_stop(ID, "x"),
+            table.begin_stop(ID, "x", false),
             StopDecision::AlreadyStopping
         ));
     }
@@ -881,7 +943,7 @@ mod tests {
         let mut table = LifecycleTable::new(1);
         let lease = table.admit(ID, ResumeKind::Attach).unwrap();
         assert!(matches!(
-            table.begin_stop(ID, "user_stopped"),
+            table.begin_stop(ID, "user_stopped", false),
             StopDecision::CancelRequested
         ));
         assert!(table.abandon(&lease), "the attach failed before install");

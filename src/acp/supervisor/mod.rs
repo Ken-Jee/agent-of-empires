@@ -9,7 +9,7 @@ mod requests;
 mod sink;
 mod teardown;
 #[cfg(test)]
-mod test_support;
+pub(crate) mod test_support;
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -383,14 +383,17 @@ impl<S: BroadcastSink> Supervisor<S> {
         lock_recover(&self.lifecycle).phase(session_id).into()
     }
 
-    /// Drop per-session bookkeeping for a deleted session.
-    pub fn forget_session(&self, session_id: &str) {
+    /// Drop bookkeeping only after the matching runner retirement is proven.
+    pub fn forget_session(&self, session_id: &str) -> Result<(), SupervisorError> {
+        if !lock_recover(&self.lifecycle).forget(session_id) {
+            return Err(SupervisorError::TeardownPending(session_id.into()));
+        }
         if let Ok(mut guard) = self.next_seqs.lock() {
             guard.remove(session_id);
         }
-        lock_recover(&self.lifecycle).forget(session_id);
         lock_recover(&self.startup_failures).remove(session_id);
         lock_recover(&self.respawned_in_place).remove(session_id);
+        Ok(())
     }
 
     /// Seed seq counters from the event store's stored maxima.

@@ -457,16 +457,28 @@ mod tests {
     /// #3650: endpoints that tear the worker down wait for an in-flight
     /// submission, or `send_turn` would respawn the worker they stop.
     #[tokio::test]
+    #[serial_test::serial]
     async fn worker_stopping_acp_endpoints_wait_for_an_in_flight_submission() {
         let _app_dir = crate::session::test_support::isolate_app_dir();
+        crate::session::config::update_app_state(|state| {
+            state.has_acknowledged_agent_hooks = true;
+        })
+        .unwrap();
+        let project = tempfile::tempdir().unwrap();
         use std::time::Duration;
 
         for which in ["shutdown", "switch", "disable"] {
-            let mut inst = crate::session::Instance::new("acp-3650", "/tmp/aoe-3650-acp");
+            let mut inst =
+                crate::session::Instance::new("acp-3650", project.path().to_str().unwrap());
             inst.id = format!("sess-3650-acp-{which}");
+            inst.source_profile = "default".into();
             inst.view = crate::session::View::Structured;
             inst.status = crate::session::Status::Idle;
             inst.acp_load_session_capable = Some(true);
+            inst.command = "sleep 60".into();
+            let _pane = crate::tmux::test_helpers::TmuxTestSession::from_name(
+                crate::tmux::Session::generate_name(&inst.id, &inst.title),
+            );
             let id = inst.id.clone();
             if which == "disable" {
                 crate::session::Storage::new_unwatched(&inst.source_profile)
@@ -478,6 +490,9 @@ mod tests {
                     .unwrap();
             }
             let state = crate::server::test_support::build_test_app_state(vec![inst]);
+            if which == "disable" {
+                crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+            }
 
             let delivering = state.session_service.prompt_submission(&id).await;
             let mut claims = state.session_service.watch_submission_claims();
@@ -506,10 +521,20 @@ mod tests {
             assert_eq!(claims.try_recv().expect("contender reached claim"), id);
 
             drop(delivering);
-            tokio::time::timeout(Duration::from_secs(10), handler)
+            let response = tokio::time::timeout(Duration::from_secs(10), handler)
                 .await
                 .unwrap_or_else(|_| panic!("{which} must finish once the submission releases"));
             if which == "disable" {
+                let status = response.status();
+                let body = axum::body::to_bytes(response.into_body(), 4096)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    status,
+                    StatusCode::OK,
+                    "disable: {}",
+                    String::from_utf8_lossy(&body)
+                );
                 let instances = state.instances.read().await;
                 let inst = instances.iter().find(|inst| inst.id == id).unwrap();
                 assert_eq!(inst.acp_load_session_capable, None);
@@ -587,13 +612,16 @@ mod tests {
                     (Some(true), StatusCode::OK),
                 ] {
                     let profile = "handoff-reload";
-                    let mut cached = crate::session::Instance::new(
-                        "handoff",
-                        temp.path().join("missing").to_str().unwrap(),
-                    );
+                    let project = tempfile::tempdir().unwrap();
+                    let mut cached =
+                        crate::session::Instance::new("handoff", project.path().to_str().unwrap());
                     cached.tool = "shell".into();
+                    cached.command = "sleep 60".into();
                     cached.source_profile = profile.into();
                     let id = cached.id.clone();
+                    let _pane = crate::tmux::test_helpers::TmuxTestSession::from_name(
+                        crate::tmux::Session::generate_name(&id, &cached.title),
+                    );
                     let mut durable = cached.clone();
                     durable.view = crate::session::View::Structured;
                     durable.acp_session_id = Some("11111111-1111-4111-8111-111111111111".into());
@@ -605,6 +633,7 @@ mod tests {
                         })
                         .unwrap();
                     let state = crate::server::test_support::build_test_app_state(vec![cached]);
+                    crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
                     let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
                     let (release_tx, release_rx) = std::sync::mpsc::channel();
                     let holder = tokio::task::spawn_blocking(move || {
@@ -646,7 +675,16 @@ mod tests {
                         .await
                         .unwrap()
                         .into_response();
-                    assert_eq!(response.status(), expected_status, "reload={reload:?}");
+                    let status = response.status();
+                    let body = axum::body::to_bytes(response.into_body(), 4096)
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        status,
+                        expected_status,
+                        "reload={reload:?}: {}",
+                        String::from_utf8_lossy(&body)
+                    );
                     let expected_sid = if expected_status == StatusCode::OK {
                         None
                     } else {
@@ -679,14 +717,18 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
         let profile = "handoff-contention";
-        let mut inst =
-            crate::session::Instance::new("handoff", temp.path().join("missing").to_str().unwrap());
+        let project = tempfile::tempdir().unwrap();
+        let mut inst = crate::session::Instance::new("handoff", project.path().to_str().unwrap());
         inst.tool = "shell".into();
+        inst.command = "sleep 60".into();
         inst.source_profile = profile.into();
         inst.view = crate::session::View::Structured;
         inst.acp_session_id = Some("original-acp".into());
         inst.agent_session_id = Some("native-preserved".into());
         let id = inst.id.clone();
+        let _pane = crate::tmux::test_helpers::TmuxTestSession::from_name(
+            crate::tmux::Session::generate_name(&id, &inst.title),
+        );
         let expected = inst.conversation_state();
         let mut other = crate::session::Instance::new("other", "/tmp/other");
         other.source_profile = profile.into();
@@ -701,6 +743,7 @@ mod tests {
             })
             .unwrap();
         let state = crate::server::test_support::build_test_app_state(rows);
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
         let listener = tokio::spawn(crate::server::acp_events::acp_event_listener(state.clone()));
         tokio::time::timeout(Duration::from_secs(2), async {
             while state.acp_events_tx.receiver_count() == 0 {
@@ -787,7 +830,11 @@ mod tests {
             "storage contention blocked the global instance cache"
         );
         assert!(still_waiting);
-        assert_eq!(response.status(), StatusCode::OK);
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
         state
             .acp_events_tx
             .send(crate::server::AcpBroadcastFrame {
