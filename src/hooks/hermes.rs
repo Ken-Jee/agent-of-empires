@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde_json::Value;
-use serde_yaml::{Mapping, Value as Yaml};
+use yaml_serde::{Mapping, Value as Yaml};
 
 use crate::agents::ResolvedHookEvent;
 
@@ -40,7 +40,7 @@ pub fn install_hermes_hooks_with_events(
         let mut config = if content.trim().is_empty() {
             Yaml::Mapping(Mapping::new())
         } else {
-            serde_yaml::from_str(&content)
+            yaml_serde::from_str(&content)
                 .with_context(|| format!("Failed to parse {}", config_path.display()))?
         };
         let yaml_before = config.clone();
@@ -89,7 +89,7 @@ pub fn install_hermes_hooks_with_events(
             return Ok(());
         }
         if yaml_changed {
-            write_file(config_path, serde_yaml::to_string(&config)?.as_bytes())?;
+            write_file(config_path, yaml_serde::to_string(&config)?.as_bytes())?;
         }
         if allowlist_changed {
             write_file(&allowlist_path, allowlist.as_bytes())?;
@@ -108,7 +108,7 @@ pub fn uninstall_hermes_hooks(config_path: &Path) -> Result<bool> {
         if content.trim().is_empty() {
             return Ok(false);
         }
-        let mut config: Yaml = serde_yaml::from_str(&content)
+        let mut config: Yaml = yaml_serde::from_str(&content)
             .with_context(|| format!("Failed to parse {}", config_path.display()))?;
         let hooks_key = Yaml::String("hooks".to_string());
         let Some(root) = config.as_mapping_mut() else {
@@ -139,7 +139,7 @@ pub fn uninstall_hermes_hooks(config_path: &Path) -> Result<bool> {
             root.remove(&hooks_key);
         }
 
-        crate::session::atomic_write(config_path, serde_yaml::to_string(&config)?.as_bytes())?;
+        crate::session::atomic_write(config_path, yaml_serde::to_string(&config)?.as_bytes())?;
         log_removed(config_path);
         Ok(true)
     })
@@ -219,18 +219,20 @@ mod tests {
     }
 
     fn read_yaml(path: &Path) -> Yaml {
-        serde_yaml::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+        yaml_serde::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
     }
 
     #[test]
     fn hermes_hooks_install_beside_user_config_and_uninstall() {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("config.yaml");
-        std::fs::write(
-            &path,
-            "model: hermes-pro\nhooks:\n  pre_tool_call:\n    - command: \"echo user-hook\"\n      matcher: \"terminal\"\nhooks_auto_accept: false\n",
-        )
-        .unwrap();
+        let input = "model: hermes-pro\nhooks:\n  pre_tool_call:\n    - command: \"echo user-hook\"\n      matcher: \"terminal\"\nhooks_auto_accept: false\nvendor: !custom {enabled: true, label: on, code: 001}\n17: [true, false, 'true', 2]\ndefaults: &defaults {token: keep}\ncopy: *defaults\n";
+        std::fs::write(&path, input).unwrap();
+        let mut unrelated_before: Yaml = yaml_serde::from_str(input).unwrap();
+        unrelated_before
+            .as_mapping_mut()
+            .unwrap()
+            .remove(Yaml::String("hooks".into()));
         let allowlist_path = tmp.path().join("shell-hooks-allowlist.json");
         std::fs::write(&allowlist_path, "{\"version\":7,\"approvals\":[]}").unwrap();
 
@@ -260,6 +262,17 @@ mod tests {
             allowlist["approvals"].as_array().unwrap().len(),
             events.len()
         );
+        let mut unrelated_after = config.clone();
+        unrelated_after
+            .as_mapping_mut()
+            .unwrap()
+            .remove(Yaml::String("hooks".into()));
+        assert_eq!(unrelated_after, unrelated_before);
+        let config_bytes = std::fs::read(&path).unwrap();
+        let allowlist_bytes = std::fs::read(&allowlist_path).unwrap();
+        install(&path).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), config_bytes);
+        assert_eq!(std::fs::read(&allowlist_path).unwrap(), allowlist_bytes);
 
         assert!(uninstall_hermes_hooks(&path).unwrap());
         let config = read_yaml(&path);

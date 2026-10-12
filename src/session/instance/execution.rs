@@ -935,8 +935,8 @@ impl NativeLaunchInputs {
             }
         }
         if let Some(bytes) = self.read_native_file(&root.join("config.yaml"))? {
-            let mut config: serde_yaml::Value =
-                serde_yaml::from_slice(&bytes).context("Hermes config.yaml cannot be resolved")?;
+            let mut config: yaml_serde::Value =
+                yaml_serde::from_slice(&bytes).context("Hermes config.yaml cannot be resolved")?;
             config
                 .apply_merge()
                 .context("Hermes YAML merges cannot be resolved")?;
@@ -956,12 +956,12 @@ impl NativeLaunchInputs {
             }
             if let Some(secrets) = config
                 .get("secrets")
-                .and_then(serde_yaml::Value::as_mapping)
+                .and_then(yaml_serde::Value::as_mapping)
             {
                 anyhow::ensure!(
                     !secrets.values().any(|value| value
                         .get("enabled")
-                        .and_then(serde_yaml::Value::as_bool)
+                        .and_then(yaml_serde::Value::as_bool)
                         == Some(true)),
                     "Hermes external secret sources can redirect the declared namespace"
                 );
@@ -2972,6 +2972,33 @@ mod tests {
         };
         let database = crate::session::instance::test_helpers::create_hermes_database(root.path());
         (root, inputs, database)
+    }
+
+    #[test]
+    fn hermes_yaml_aliases_and_merges_preserve_namespace_refusals() {
+        let (root, mut inputs, _database) = hermes_fixture();
+        inputs.environment.insert(
+            "HERMES_MANAGED_DIR".into(),
+            root.path().join("managed").display().to_string(),
+        );
+        for (config, accepted) in [
+            ("terminal: {backend: local, cwd: '.'}\n", true),
+            ("remote: &remote {backend: ssh}\nterminal: *remote\n", false),
+            ("remote: &remote {backend: ssh}\nterminal: {<<: *remote}\n", false),
+            ("remote: &remote {backend: ssh}\nterminal: {<<: *remote, backend: local}\n", true),
+            ("local: &local {backend: local}\nremote: &remote {backend: ssh}\nterminal: {<<: [*local, *remote]}\n", true),
+            ("local: &local {backend: local}\nremote: &remote {backend: ssh}\nterminal: {<<: [*remote, *local]}\n", false),
+            ("outside: &outside {cwd: /foreign-store}\nterminal: {<<: *outside, backend: local}\n", false),
+            ("external: &external {enabled: true}\nsecrets: {vault: *external}\n", false),
+            ("secrets: {vault: {enabled: True}}\n", false),
+            ("secrets: {vault: {enabled: 'true'}}\n", true),
+            ("secrets: {vault: {enabled: false}}\n", true),
+            ("terminal: {<<: 17}\n", false),
+            ("terminal: [", false),
+        ] {
+            std::fs::write(root.path().join("config.yaml"), config).unwrap();
+            assert_eq!(inputs.validate_hermes_namespace(root.path()).is_ok(), accepted, "{config:?}");
+        }
     }
 
     #[test]
