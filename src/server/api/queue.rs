@@ -99,7 +99,17 @@ pub async fn queue_enqueue(
         Ok(b) => b,
         Err((status, msg)) => return (status, msg).into_response(),
     };
-    match buffer_and_enqueue(&state, &id, &req.id, req.text, &blobs, req.origin_device).await {
+    match buffer_and_enqueue(
+        &state,
+        &id,
+        &req.id,
+        req.text,
+        &blobs,
+        req.origin_device,
+        None,
+    )
+    .await
+    {
         Ok(entry) => (StatusCode::OK, Json(entry)).into_response(),
         Err((status, msg)) => (status, msg).into_response(),
     }
@@ -131,6 +141,7 @@ pub(super) async fn buffer_and_enqueue(
     text: String,
     blobs: &[crate::acp::event_store::AttachmentBlob],
     origin_device: Option<String>,
+    origin_plugin: Option<String>,
 ) -> Result<crate::daemon::QueuedPromptEntry, (StatusCode, String)> {
     validate_queued_text(&text)?;
     let queue = state.session_service.queued_prompts_snapshot(id).await;
@@ -193,7 +204,14 @@ pub(super) async fn buffer_and_enqueue(
 
     match state
         .session_service
-        .enqueue_prompt(id, prompt_id.to_string(), text, refs, origin_device)
+        .enqueue_prompt(
+            id,
+            prompt_id.to_string(),
+            text,
+            refs,
+            origin_device,
+            origin_plugin,
+        )
         .await
     {
         Some(entry) => Ok(entry),

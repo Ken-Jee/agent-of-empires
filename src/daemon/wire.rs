@@ -726,6 +726,9 @@ pub struct QueuedPromptEntry {
     /// rows migrated from a pre-server-queue client localStorage.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin_device: Option<String>,
+    /// Plugin that queued this through `sessions.message.send`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin_plugin: Option<String>,
 }
 
 /// Public lifecycle state for a structured view worker, surfaced via

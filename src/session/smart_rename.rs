@@ -1843,6 +1843,7 @@ mod serve {
                 text: "hi".into(),
                 attachments: vec![],
                 synthesized: false,
+                origin_plugin: None,
             };
             assert!(!should_trigger_smart_rename(&non_stop, id, &empty, &empty));
 

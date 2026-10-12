@@ -283,6 +283,7 @@ impl HttpClient {
             attachments: Vec::new(),
             prompt_id: None,
             no_revive,
+            queued_prompt_id: None,
         };
         let res = self.execute(self.http.post(&url).json(&body)).await?;
         let res = check_status(res, session_id)?;

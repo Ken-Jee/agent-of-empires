@@ -1450,6 +1450,7 @@ mod tests {
             attachments: Vec::new(),
             prompt_id: None,
             synthesized: false,
+            origin_plugin: None,
         };
         let stopped = || Event::Stopped {
             reason: "prompt_complete".into(),
@@ -1855,6 +1856,7 @@ mod tests {
                     attachments: Vec::new(),
                     prompt_id: None,
                     synthesized: false,
+                    origin_plugin: None,
                 },
                 Event::BackgroundAgentLaunched {
                     agent_id: "bg-1".into(),
@@ -2201,6 +2203,7 @@ mod tests {
                     text: "hi".into(),
                     attachments: Vec::new(),
                     synthesized: false,
+                    origin_plugin: None,
                 },
                 false,
                 false
@@ -2436,6 +2439,7 @@ mod tests {
                     text: "spawn and go".into(),
                     attachments: Vec::new(),
                     synthesized: false,
+                    origin_plugin: None,
                 },
             )
             .unwrap();
@@ -2623,6 +2627,7 @@ mod tests {
                     text: "hi".into(),
                     attachments: Vec::new(),
                     synthesized: false,
+                    origin_plugin: None,
                 },
             ),
             (
@@ -2878,6 +2883,7 @@ mod tests {
                     text: "go".into(),
                     attachments: Vec::new(),
                     synthesized: false,
+                    origin_plugin: None,
                 },
                 Status::Running,
             ),

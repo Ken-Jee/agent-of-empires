@@ -6806,6 +6806,7 @@ fn native_runtime_frame_stays_readable_with_a_valid_full_text_queue() {
             attachments: Vec::new(),
             created_at: "2026-01-01T00:00:00Z".into(),
             origin_device: None,
+            origin_plugin: None,
         })
         .collect();
     let snapshot = RuntimeSnapshot {

@@ -789,7 +789,7 @@ async fn sessions_turn_send(
     Ok(serde_json::json!({}))
 }
 
-/// Deliver a short text message to any session, as if the user had typed it. Unlike
+/// Deliver a short text message to any session, marked as sent by the plugin. Unlike
 /// `sessions.turn.send` there is no ownership check: the `session.message` grant is the gate.
 async fn sessions_message_send(
     deps: &Arc<SessionRpcDeps>,
@@ -816,9 +816,9 @@ async fn sessions_message_send(
 
     let result = async {
         deps.policy.admit_message(&plugin_id)?;
-        let (task_deps, task_req) = (Arc::clone(deps), req.clone());
+        let (task_deps, task_req, task_plugin) = (Arc::clone(deps), req.clone(), plugin_id.clone());
         within_deadline(MESSAGE_DEADLINE, async move {
-            deliver_message(&task_deps, &task_req).await
+            deliver_message(&task_deps, &task_plugin, &task_req).await
         })
         .await
     }
@@ -872,6 +872,7 @@ fn session_not_found() -> DispatchError {
 
 async fn deliver_message(
     deps: &Arc<SessionRpcDeps>,
+    plugin_id: &str,
     req: &MessageSendRequest,
 ) -> Result<MessageSendResponse, DispatchError> {
     let is_structured = {
@@ -884,7 +885,7 @@ async fn deliver_message(
         inst.is_structured()
     };
     if is_structured {
-        return deliver_structured(&deps.session_service, req).await;
+        return deliver_structured(&deps.session_service, plugin_id, req).await;
     }
     if deps.cityhall_mode {
         return Err(DispatchError::with_kind(
@@ -910,12 +911,15 @@ async fn deliver_message(
 /// The user-prompt path: a busy agent steers or queues the message instead of refusing it.
 async fn deliver_structured(
     service: &Arc<SessionService>,
+    plugin_id: &str,
     req: &MessageSendRequest,
 ) -> Result<MessageSendResponse, DispatchError> {
     use crate::acp::dispatch::{PromptDispatch, QueueReason};
 
     let id = req.session_id.as_str();
-    let caller = SessionCaller::User;
+    let caller = SessionCaller::PluginMessage {
+        plugin_id: plugin_id.to_string(),
+    };
     let _submission = service
         .admit_prompt_submission(&caller, id)
         .await
@@ -941,6 +945,7 @@ async fn deliver_structured(
                     req.message.clone(),
                     Vec::new(),
                     None,
+                    Some(plugin_id.to_string()),
                 )
                 .await
                 .ok_or_else(session_not_found)?;
@@ -1640,6 +1645,7 @@ mod tests {
                 attachments: Vec::new(),
                 prompt_id: None,
                 synthesized: false,
+                origin_plugin: None,
             },
         ));
         let out = dispatch(
@@ -1657,6 +1663,32 @@ mod tests {
             .await;
         assert_eq!(queue.len(), 1);
         assert_eq!(queue[0].text, "PR #7 was merged");
+        assert_eq!(queue[0].origin_plugin.as_deref(), Some("cron"));
+    }
+
+    #[tokio::test]
+    async fn message_send_marks_the_published_prompt_as_plugin_originated() {
+        use crate::acp::state::Event;
+        let _home = crate::session::test_support::isolate_app_dir();
+        let (deps, state, _dir, _cmds) = foreign_live_session("sess-msg-origin").await;
+        dispatch(
+            &deps,
+            &ctx_with(&["session.message"]),
+            "sessions.message.send",
+            &message_params("sess-msg-origin", "PR #7 was merged"),
+        )
+        .await
+        .expect("delivered");
+        let origin = state
+            .acp_event_store
+            .replay_from("sess-msg-origin", 0)
+            .into_iter()
+            .find_map(|(_, e)| match e {
+                Event::UserPromptSent { origin_plugin, .. } => Some(origin_plugin),
+                _ => None,
+            })
+            .expect("the prompt is persisted before it is forwarded");
+        assert_eq!(origin.as_deref(), Some("cron"));
     }
 
     #[tokio::test]
@@ -1878,6 +1910,7 @@ mod tests {
                 &[],
                 None,
                 false,
+                None,
             )
             .await;
         drop(winner);
@@ -1938,6 +1971,7 @@ mod tests {
             attachments: Vec::new(),
             prompt_id: None,
             synthesized: false,
+            origin_plugin: None,
         };
         // Each state named by the disposition it would have leaked.
         for (label, events, expected) in [
