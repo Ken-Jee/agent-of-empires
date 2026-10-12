@@ -465,6 +465,7 @@ pub(super) async fn instance_lock_in(
         }
     }
     let mut guard = locks.write().await;
+    guard.retain(|_, lock| Arc::strong_count(lock) > 1);
     guard
         .entry(id.to_string())
         .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))

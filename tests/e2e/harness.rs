@@ -745,6 +745,8 @@ last_seen_version = "{}"
             .arg("-y")
             .arg("30")
             .arg(&cmd_str)
+            // This harness owns server teardown, including gaps between TUI processes.
+            .args([";", "set-option", "-s", "exit-empty", "off"])
             .env("HOME", self.home_dir.path())
             .env("XDG_CONFIG_HOME", self.home_dir.path().join(".config"))
             .env("PATH", self.env_path())

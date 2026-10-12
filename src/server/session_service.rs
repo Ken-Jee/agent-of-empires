@@ -1713,17 +1713,7 @@ impl SessionService {
     }
 
     pub async fn instance_lock(&self, id: &str) -> Arc<tokio::sync::Mutex<()>> {
-        {
-            let guard = self.instance_locks.read().await;
-            if let Some(lock) = guard.get(id) {
-                return lock.clone();
-            }
-        }
-        let mut guard = self.instance_locks.write().await;
-        guard
-            .entry(id.to_string())
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-            .clone()
+        crate::server::state::instance_lock_in(&self.instance_locks, id).await
     }
 
     /// The session's single prompt-submission authority: hold this guard
@@ -1796,13 +1786,14 @@ impl SessionService {
         };
         match lock {
             Some(lock) => lock,
-            None => self
-                .prompt_locks
-                .write()
-                .await
-                .entry(id.to_string())
-                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-                .clone(),
+            None => {
+                let mut locks = self.prompt_locks.write().await;
+                locks.retain(|_, lock| Arc::strong_count(lock) > 1);
+                locks
+                    .entry(id.to_owned())
+                    .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                    .clone()
+            }
         }
     }
 
@@ -1923,12 +1914,27 @@ impl SessionService {
             .unwrap_or(false)
     }
 
-    /// Drop a deleted session's submission lock, mirroring the `instance_locks`
-    /// removal the same delete paths already do. The registry is keyed by
-    /// session id and nothing prunes it otherwise, so without this a long-lived
-    /// daemon retains one entry per session it has ever seen.
+    /// Prune unused submission authority without splitting held or queued guards.
+    /// A miss also reaps unreferenced entries, so deferred deleted gates stay bounded.
     pub(crate) async fn forget_prompt_lock(&self, id: &str) {
-        self.prompt_locks.write().await.remove(id);
+        let mut locks = self.prompt_locks.write().await;
+        if locks
+            .get(id)
+            .is_some_and(|lock| Arc::strong_count(lock) == 1)
+        {
+            locks.remove(id);
+        }
+    }
+
+    /// The cleanup caller owns native absence exclusion and runs on a blocking thread.
+    pub(crate) fn forget_prompt_lock_blocking(&self, id: &str) {
+        let mut locks = self.prompt_locks.blocking_write();
+        if locks
+            .get(id)
+            .is_some_and(|lock| Arc::strong_count(lock) == 1)
+        {
+            locks.remove(id);
+        }
     }
 
     /// Registry size for a test asserting `prompt_locks` stays bounded (e.g.
@@ -3113,9 +3119,9 @@ mod tests {
         .session_service
         .clone();
 
-        // A surviving session's entry makes the assertions a return to a prior
-        // size rather than an emptied map.
-        drop(service.prompt_submission("sess-3687-live").await);
+        // Keep a surviving session's authority active so miss-GC cannot retire it.
+        // Both deletion windows must return to that same held gate, not merely an empty map.
+        let _live_submission = service.prompt_submission("sess-3687-live").await;
         let before = service.prompt_locks_len().await;
         assert_eq!(before, 1);
 

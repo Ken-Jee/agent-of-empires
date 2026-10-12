@@ -30,6 +30,7 @@ use super::runner_lifecycle::{
 use super::state::AcpSessionId;
 use crate::daemon::AcpWorkerState;
 use crate::session::SandboxInfo;
+pub(crate) use teardown::RetirementTarget;
 
 pub(crate) use agents::apply_agent_command_override;
 pub(crate) use launch::host_spawn_environment;
@@ -196,7 +197,16 @@ impl ResumeReservation {
 
 impl Drop for ResumeReservation {
     fn drop(&mut self) {
-        if lock_recover(&self.lifecycle).abandon(&self.lease) {
+        let mut lifecycle = lock_recover(&self.lifecycle);
+        if let Some(identity) = self.lease.spawned_runner() {
+            if lifecycle.convert_to_stopping(&self.lease) {
+                lifecycle.settle(
+                    &self.lease,
+                    super::runner_lifecycle::Settlement::Unproven(Some(identity)),
+                );
+                self.notify.notify_waiters();
+            }
+        } else if lifecycle.abandon(&self.lease) {
             self.notify.notify_waiters();
         }
     }

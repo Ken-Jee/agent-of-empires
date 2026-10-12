@@ -111,7 +111,8 @@ impl<S: BroadcastSink> Supervisor<S> {
         admit_durable_launch(req.launch_admission.as_ref(), &req.session_id).await?;
         let session_id = req.session_id.as_str();
         let warmup_guard = self.warmup_guard(&req.agent).await;
-        let (config, context_reset) = self.spawn_config(&req, lease.epoch()).await?;
+        let (mut config, context_reset) = self.spawn_config(&req, lease.epoch()).await?;
+        config.launch_lease = Some(lease.clone());
         debug!(
             target: "acp.supervisor",
             session = %session_id,
@@ -353,6 +354,7 @@ impl<S: BroadcastSink> Supervisor<S> {
 
         Ok((
             SpawnConfig {
+                launch_lease: None,
                 agent_key: req.agent.clone(),
                 tool: req.tool.clone(),
                 spec,
@@ -469,15 +471,18 @@ impl<S: BroadcastSink> Supervisor<S> {
     /// Retire a runner a failed spawn left behind under this lease's generation.
     async fn reap_failed_launch(&self, lease: &Lease) {
         let session_id = lease.session_id();
-        let Ok(Some(record)) = worker_registry::load(session_id) else {
+        let identity = lease.spawned_runner().or_else(|| {
+            worker_registry::load(session_id)
+                .ok()
+                .flatten()
+                .filter(|record| record.generation == lease.epoch())
+                .map(|record| RunnerIdentity {
+                    pid: record.pid,
+                    generation: record.generation,
+                })
+        });
+        let Some(identity) = identity else {
             return;
-        };
-        if record.generation != lease.epoch() {
-            return;
-        }
-        let identity = RunnerIdentity {
-            pid: record.pid,
-            generation: record.generation,
         };
         if !lock_recover(&self.lifecycle).convert_to_stopping(lease) {
             return;
@@ -661,7 +666,8 @@ impl<S: BroadcastSink> Supervisor<S> {
             None
         };
 
-        let mut client = AcpClient::attach(
+        reservation.lease().record_runner(identity);
+        let client = AcpClient::attach(
             record.socket_path.clone(),
             cwd,
             additional_dirs,
@@ -672,8 +678,16 @@ impl<S: BroadcastSink> Supervisor<S> {
             agent_key,
             record.source_profile.clone(),
             Some(tokio::time::Instant::now() + std::time::Duration::from_secs(3)),
+            Some(reservation.lease().clone()),
         )
-        .await?;
+        .await;
+        let mut client = match client {
+            Ok(client) => client,
+            Err(error) => {
+                self.reap_failed_launch(reservation.lease()).await;
+                return Err(error.into());
+            }
+        };
 
         if let Err(refused) = admit_durable_launch(admission.as_ref(), &session_id).await {
             let lease = reservation.lease().clone();

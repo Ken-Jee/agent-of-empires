@@ -16,7 +16,7 @@ use super::{AnchoredDir, Instance, Storage};
 
 pub(crate) const FILE_NAME: &str = "pending-purge-owners.json";
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "state", rename_all = "snake_case")]
 enum RunnerCapture {
     Uncaptured,
@@ -361,6 +361,40 @@ impl PurgeOwner {
 
     pub(crate) fn ensure_captured_runner_stopped(&self) -> Result<()> {
         self.runner.ensure_stopped(self.session_id.as_deref())
+    }
+
+    pub(crate) fn ensure_retirement_target(
+        &self,
+        target: &crate::acp::supervisor::RetirementTarget,
+    ) -> Result<()> {
+        match (&self.runner, target.identity) {
+            (RunnerCapture::Captured { pid, generation }, Some(identity)) => {
+                anyhow::ensure!(
+                    identity.pid == *pid && identity.generation == *generation,
+                    "Captured runner was replaced before retirement; purge resources retained"
+                );
+            }
+            (RunnerCapture::Uncaptured, Some(_)) => {
+                anyhow::ensure!(
+                    target.lease.is_some(),
+                    "Uncaptured runner has no owned producer; purge resources retained"
+                );
+            }
+            (RunnerCapture::Unresolved { error }, _) => {
+                anyhow::bail!("Runner ownership unresolved; purge resources retained: {error}");
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    pub(crate) fn ensure_current(&self, store: &impl super::SessionStore) -> Result<()> {
+        let current = Self::recover(store.storage(), &self.token)?;
+        anyhow::ensure!(
+            current.session_id == self.session_id && current.runner == self.runner,
+            "Pending purge owner identity changed before cleanup"
+        );
+        Ok(())
     }
 
     pub(crate) fn release(self) -> Result<()> {

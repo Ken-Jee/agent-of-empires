@@ -149,16 +149,15 @@ pub(crate) struct PurgeTransaction<S: SessionStore + 'static> {
     additional_protection: Option<CleanupProtection>,
 }
 
-/// A purge whose durable row has already been removed. The same lifecycle
-/// flock remains held while irreversible sidecars are removed.
+/// A purge whose journal ownership and row removal are durable. Exclusion
+/// is released while its captured producer retires, then reacquired for cleanup.
 #[must_use = "committed purge sidecars must be finished"]
 pub(crate) struct CommittedPurge<S: SessionStore> {
     store: S,
     request: DeletionRequest,
     owner: super::purge_owners::PurgeOwner,
     additional_protection: Option<CleanupProtection>,
-    _lifecycle_lock: Option<StorageFlock>,
-    _identity_lock: Option<StorageFlock>,
+    retirement_exclusion: Option<(StorageFlock, StorageFlock)>,
 }
 
 #[derive(Clone, Copy)]
@@ -687,6 +686,8 @@ impl<S: SessionStore + 'static> PurgeTransaction<S> {
             return Err(Box::new(self.result_for_gate(gate, row)));
         }
         self.adopt_row(row.expect("committed purge owns the removed row"));
+        drop(self.lifecycle_lock.take());
+        drop(_identity);
         Ok(CommittedPurge {
             owner: owner.expect("committed purge has durable ownership"),
             store: self.store.take().expect("committed purge owns its backend"),
@@ -695,12 +696,7 @@ impl<S: SessionStore + 'static> PurgeTransaction<S> {
                 .take()
                 .expect("committed purge owns its request"),
             additional_protection: self.additional_protection.take(),
-            _lifecycle_lock: Some(
-                self.lifecycle_lock
-                    .take()
-                    .expect("active purge transaction must own its lifecycle lock"),
-            ),
-            _identity_lock: None,
+            retirement_exclusion: None,
         })
     }
 
@@ -865,8 +861,9 @@ impl<S: SessionStore + 'static> PurgeTransaction<S> {
 }
 
 impl<S: SessionStore> CommittedPurge<S> {
-    pub fn finish(mut self) -> DeletionResult {
-        drop(self._lifecycle_lock.take());
+    /// The callback owns native bookkeeping cleanup only after physical exit and authority checks.
+    pub(crate) fn finish(mut self, cleanup: impl FnOnce(&str, &S) -> Result<()>) -> DeletionResult {
+        self.release_retirement_exclusion();
         let exclusion = (|| -> Result<_> {
             let identity = super::acquire_session_identity_lock()?;
             let lifecycle = self
@@ -874,6 +871,7 @@ impl<S: SessionStore> CommittedPurge<S> {
                 .storage()
                 .acquire_instance_lifecycle_lock(&self.request.session_id)?;
             self.store.check_available()?;
+            self.owner.ensure_current(&self.store)?;
             anyhow::ensure!(
                 !self
                     .store
@@ -895,27 +893,23 @@ impl<S: SessionStore> CommittedPurge<S> {
                 );
             }
         };
-        self.finish_with_exclusion()
+        self.finish_with_exclusion(cleanup)
     }
 
-    pub(crate) fn finish_recovered(self) -> DeletionResult {
-        if self._identity_lock.is_none() {
-            return DeletionResult::rejected(
-                self.request.session_id,
-                DeletionDisposition::Removed,
-                "Recovered purge lacks identity authority",
-                None,
-            );
-        }
-        self.finish_with_exclusion()
-    }
-
-    fn finish_with_exclusion(self) -> DeletionResult {
+    fn finish_with_exclusion(self, cleanup: impl FnOnce(&str, &S) -> Result<()>) -> DeletionResult {
         if let Err(error) = self.owner.ensure_captured_runner_stopped() {
             return DeletionResult::rejected(
                 self.request.session_id,
                 DeletionDisposition::Removed,
                 error.to_string(),
+                None,
+            );
+        }
+        if let Err(error) = cleanup(&self.request.session_id, &self.store) {
+            return DeletionResult::rejected(
+                self.request.session_id,
+                DeletionDisposition::Removed,
+                format!("Session removed, but structured projection cleanup is unproven: {error}"),
                 None,
             );
         }
@@ -937,12 +931,35 @@ impl<S: SessionStore> CommittedPurge<S> {
         result
     }
 
+    /// Recovery retains its short preparation fence until the caller freezes its retirement target.
+    pub(crate) fn release_retirement_exclusion(&mut self) {
+        drop(self.retirement_exclusion.take());
+    }
+
+    /// Freeze recovery retirement while its absent-row and owner preparation fence still holds.
+    pub(crate) fn capture_retirement_target(
+        &mut self,
+        capture: impl FnOnce(&str) -> Result<crate::acp::supervisor::RetirementTarget>,
+    ) -> Result<crate::acp::supervisor::RetirementTarget> {
+        let target = capture(&self.request.session_id)?;
+        self.owner.ensure_retirement_target(&target)?;
+        self.release_retirement_exclusion();
+        Ok(target)
+    }
+
     pub(crate) fn session_id(&self) -> &str {
         &self.request.session_id
     }
 
     pub(crate) fn is_structured(&self) -> bool {
         self.request.instance.is_structured()
+    }
+
+    pub(crate) fn ensure_retirement_target(
+        &self,
+        target: &crate::acp::supervisor::RetirementTarget,
+    ) -> Result<()> {
+        self.owner.ensure_retirement_target(target)
     }
 
     /// Durable journal token of the owner backing this purge, so a caller can
@@ -952,11 +969,9 @@ impl<S: SessionStore> CommittedPurge<S> {
     }
 }
 
-/// Rebuild the first durable committed purge whose row is still absent and
-/// whose owner token is not in `attempted`. The caller retains the returned
-/// identity and lifecycle locks across any structured shutdown and the
-/// idempotent resource cleanup, and adds the selected token to `attempted` so
-/// a failing owner is never reselected within the same pass.
+/// Rebuild the first committed owner whose row is absent and token unattempted.
+/// Hold identity and lifecycle exclusion only through synchronous retirement target capture.
+/// Both are released before retirement awaits; cleanup reacquires and revalidates them.
 pub(crate) fn recover_committed_purge(
     attempted: &mut HashSet<String>,
 ) -> Result<Option<CommittedPurge<Storage>>> {
@@ -990,8 +1005,7 @@ pub(crate) fn recover_committed_purge(
                 request,
                 owner,
                 additional_protection,
-                _lifecycle_lock: Some(lifecycle),
-                _identity_lock: Some(identity),
+                retirement_exclusion: Some((lifecycle, identity)),
             })
         })();
         match attempt {
@@ -2332,7 +2346,7 @@ mod tests {
             let worker = std::thread::spawn(move || {
                 ready_tx.send(()).unwrap();
                 let result = match committed {
-                    Some(committed) => committed.finish(),
+                    Some(committed) => committed.finish(|_, _| Ok(())),
                     None => transaction.unwrap().complete(),
                 };
                 result_tx.send(result).unwrap();
@@ -2471,7 +2485,10 @@ mod tests {
                 crate::process::worker_registry::delete(&record.session_id).unwrap();
             });
             let result = if irreversible {
-                transaction.begin_irreversible().unwrap().finish()
+                transaction
+                    .begin_irreversible()
+                    .unwrap()
+                    .finish(|_, _| Ok(()))
             } else {
                 transaction.complete()
             };
@@ -2714,7 +2731,7 @@ mod tests {
                                     "purge followed a changed selection"
                                 );
                                 assert_eq!(
-                                    committed.finish().disposition,
+                                    committed.finish(|_, _| Ok(())).disposition,
                                     DeletionDisposition::Removed
                                 );
                                 assert!(storage.load().unwrap().is_empty());
@@ -3004,7 +3021,7 @@ mod tests {
             .unwrap()
             .expect("the owner kept by a lost commit must be recoverable");
         assert_eq!(committed.session_id(), id.as_str());
-        let recovered = committed.finish_recovered();
+        let recovered = committed.finish(|_, _| Ok(()));
         assert!(recovered.success, "recovery must finish: {recovered:?}");
         assert!(recover_committed_purge(&mut HashSet::new())
             .unwrap()
@@ -3064,7 +3081,7 @@ mod tests {
             .unwrap()
             .expect("the owner after the impossible legacy plan must be recovered");
         assert_eq!(committed.session_id(), recoverable_id);
-        let result = committed.finish_recovered();
+        let result = committed.finish(|_, _| Ok(()));
         assert!(
             result.success,
             "the recoverable owner must finish: {result:?}"
@@ -3254,7 +3271,7 @@ mod tests {
         let recovered = recover_committed_purge(&mut HashSet::new())
             .unwrap()
             .expect("durable purge retry");
-        let result = recovered.finish_recovered();
+        let result = recovered.finish(|_, _| Ok(()));
         assert!(result.success);
         assert!(super::super::purge_owners::protection(&storage, None)
             .unwrap()
@@ -3757,7 +3774,7 @@ mod tests {
             storage.load().unwrap().is_empty(),
             "durable row must be gone before irreversible cleanup starts"
         );
-        let result = committed.finish();
+        let result = committed.finish(|_, _| Ok(()));
         assert_eq!(result.disposition, DeletionDisposition::Removed);
     }
 

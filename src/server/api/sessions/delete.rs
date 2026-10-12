@@ -46,12 +46,14 @@ pub(crate) async fn purge_session_artifacts(
     );
     if body.drop_failed {
         let consent = consent.ok_or(crate::session::LifecycleReservationError::Superseded)?;
+        let retirement = state.acp_supervisor.capture_retirement(id)?;
         let worker_state = state.clone();
         let status_id = id.to_owned();
+        let worker_profile = profile.clone();
         let instance = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
             let store = crate::server::session_store::NativeSessionStore::open(
                 worker_state,
-                &profile,
+                &worker_profile,
                 None,
             )?;
             crate::session::deletion::drop_failed_purge(&store, &status_id, &consent)?
@@ -60,16 +62,21 @@ pub(crate) async fn purge_session_artifacts(
         .await??;
         let mut cleanup_errors = Vec::new();
         if instance.is_structured() {
-            if let Err(error) = finish_structured_purge(state, id).await {
+            if let Err(error) = finish_structured_purge(state, id, &retirement).await {
                 tracing::warn!(session = %id, %error, "dropped purge structured cleanup failed");
                 cleanup_errors.push("Structured worker cleanup remains unproven".into());
             }
         }
-        tokio::task::spawn_blocking(move || {
-            crate::session::deletion::cleanup_abandoned_session(instance)
-        })
-        .await?;
-        release_removed_session_locks(state, id).await;
+        let cleanup_state = state.clone();
+        if let Err(error) =
+            tokio::task::spawn_blocking(move || cleanup_abandoned_native(cleanup_state, instance))
+                .await?
+        {
+            cleanup_errors.push(format!(
+                "Abandoned runtime cleanup remains unproven: {error}"
+            ));
+        }
+        release_removed_session_locks(state, id, &profile).await?;
         return Ok(PurgeOutcome::Deleted {
             messages: vec![
                 "Session record dropped after a forced purge failed; worktree files retained"
@@ -78,6 +85,12 @@ pub(crate) async fn purge_session_artifacts(
             cleanup_errors,
         });
     }
+    // Freeze the original worker before reservation, so a refused registry read cannot strand Purge.
+    let retirement = if instance.is_structured() {
+        Some(state.acp_supervisor.capture_retirement(id)?)
+    } else {
+        None
+    };
     let request = crate::session::deletion::DeletionRequest {
         session_id: id.to_owned(),
         instance,
@@ -90,10 +103,11 @@ pub(crate) async fn purge_session_artifacts(
     };
     let worker_state = state.clone();
     let status_id = id.to_owned();
+    let worker_profile = profile.clone();
     let reservation = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
         let store = crate::server::session_store::NativeSessionStore::open(
             worker_state,
-            &profile,
+            &worker_profile,
             Some(status_id),
         )?;
         match consent {
@@ -109,8 +123,7 @@ pub(crate) async fn purge_session_artifacts(
         PurgeReservation::Rejected(result) => {
             return match result.disposition {
                 DeletionDisposition::AlreadyGone => {
-                    state.instance_locks.write().await.remove(id);
-                    state.session_service.forget_prompt_lock(id).await;
+                    release_removed_session_locks(state, id, &profile).await?;
                     Ok(PurgeOutcome::Deleted {
                         messages: result.errors,
                         cleanup_errors: Vec::new(),
@@ -149,13 +162,18 @@ pub(crate) async fn purge_session_artifacts(
     let transaction = tokio::task::spawn_blocking(move || transaction.run_hooks()).await??;
     let transcript_purged = transaction.instance().is_structured();
     let result = if transcript_purged {
+        let retirement =
+            retirement.expect("structured purge captured worker ownership before reservation");
         match tokio::task::spawn_blocking(move || transaction.begin_irreversible()).await? {
             Err(result) => *result,
             Ok(committed) => {
                 // Commit removal before destroying a transcript that cannot be restored.
-                let shutdown = finish_structured_purge(state, id).await;
+                let shutdown = match committed.ensure_retirement_target(&retirement) {
+                    Ok(()) => finish_structured_purge(state, id, &retirement).await,
+                    Err(error) => Err(error),
+                };
                 // Both paths removed the row; neither may retain its prompt lock.
-                release_removed_session_locks(state, id).await;
+                release_removed_session_locks(state, id, &profile).await?;
                 if let Err(error) = shutdown {
                     // Dropping CommittedPurge releases exclusion, never its durable journal owner.
                     // Recovery will prove structured exit before retrying resource teardown.
@@ -165,7 +183,7 @@ pub(crate) async fn purge_session_artifacts(
                         cleanup_errors: vec![format!("Session removed, but resources retained because structured shutdown is unproven: {error}")],
                     });
                 }
-                tokio::task::spawn_blocking(move || committed.finish()).await?
+                finish_committed_purge(state.clone(), committed).await?
             }
         }
     } else {
@@ -203,7 +221,7 @@ pub(crate) async fn purge_session_artifacts(
     } else {
         Vec::new()
     };
-    release_removed_session_locks(state, id).await;
+    release_removed_session_locks(state, id, &profile).await?;
     if let Some(entry) = recent_entry {
         if let Err(error) = crate::session::record_recent_project(entry) {
             tracing::warn!(target: "http.api.sessions", %error, "recording recent project after delete failed");
@@ -215,26 +233,114 @@ pub(crate) async fn purge_session_artifacts(
     })
 }
 
-/// Drop the in-memory locks a removed session's row held. Called on every path
-/// where the row is gone from storage (including the unproven structured
-/// shutdown), because nothing else will ever clear them for that id.
-async fn release_removed_session_locks(state: &AppState, id: &str) {
-    state.instance_locks.write().await.remove(id);
-    state.session_service.forget_prompt_lock(id).await;
+/// Prune only unused mutex authority, under healthy native absence exclusion.
+pub(super) async fn release_removed_session_locks(
+    state: &Arc<AppState>,
+    id: &str,
+    profile: &str,
+) -> anyhow::Result<bool> {
+    let (state, id, profile) = (state.clone(), id.to_owned(), profile.to_owned());
+    tokio::task::spawn_blocking(move || {
+        release_removed_session_locks_blocking(state, &id, &profile)
+    })
+    .await?
 }
 
-pub(super) async fn finish_structured_purge(state: &AppState, id: &str) -> anyhow::Result<()> {
+pub(crate) fn release_removed_session_locks_blocking(
+    state: Arc<AppState>,
+    id: &str,
+    profile: &str,
+) -> anyhow::Result<bool> {
+    use crate::session::SessionStore;
+    let store =
+        crate::server::session_store::NativeSessionStore::open(state.clone(), profile, None)?;
+    let _identity = crate::session::acquire_session_identity_lock()?;
+    let _lifecycle = store.storage().acquire_instance_lifecycle_lock(id)?;
+    store.check_available()?;
+    if store.load()?.iter().any(|row| row.id == id) {
+        return Ok(false);
+    }
+    prune_unused_session_locks(&state, id);
+    Ok(true)
+}
+
+fn prune_unused_session_locks(state: &AppState, id: &str) {
+    let mut locks = state.instance_locks.blocking_write();
+    if locks
+        .get(id)
+        .is_some_and(|lock| Arc::strong_count(lock) == 1)
+    {
+        locks.remove(id);
+    }
+    drop(locks);
+    state.session_service.forget_prompt_lock_blocking(id);
+}
+
+pub(super) async fn finish_structured_purge(
+    state: &AppState,
+    id: &str,
+    retirement: &crate::acp::supervisor::RetirementTarget,
+) -> anyhow::Result<()> {
     state
         .acp_supervisor
-        .shutdown_and_delete_and_wait(id, std::time::Duration::from_secs(5))
+        .shutdown_captured_and_delete_and_wait(id, retirement, std::time::Duration::from_secs(5))
         .await?;
-    state.acp_supervisor.forget_session(id)?;
-    state.acp_event_store.delete_session(id);
+    Ok(())
+}
+
+/// Native bookkeeping is irreversible cleanup and shares the committed authority fence.
+pub(super) async fn finish_committed_purge<S: crate::session::SessionStore + 'static>(
+    state: Arc<AppState>,
+    committed: crate::session::deletion::CommittedPurge<S>,
+) -> anyhow::Result<crate::session::deletion::DeletionResult> {
+    let structured = committed.is_structured();
+    Ok(tokio::task::spawn_blocking(move || {
+        committed.finish(|id, original_store| {
+            use crate::session::SessionStore;
+            let store = crate::server::session_store::NativeSessionStore::open(
+                state.clone(),
+                original_store.storage().profile(),
+                None,
+            )?;
+            store.check_available()?;
+            if structured {
+                state.acp_supervisor.forget_session(id)?;
+                state.acp_event_store.delete_session(id);
+            }
+            prune_unused_session_locks(&state, id);
+            Ok(())
+        })
+    })
+    .await?)
+}
+
+fn cleanup_abandoned_native(state: Arc<AppState>, instance: Instance) -> anyhow::Result<()> {
+    use crate::session::SessionStore;
+    let store = crate::server::session_store::NativeSessionStore::open(
+        state.clone(),
+        &instance.source_profile,
+        None,
+    )?;
+    let _identity = crate::session::acquire_session_identity_lock()?;
+    let _lifecycle = store
+        .storage()
+        .acquire_instance_lifecycle_lock(&instance.id)?;
+    store.check_available()?;
+    anyhow::ensure!(
+        !store.load()?.iter().any(|row| row.id == instance.id),
+        "session identity was reused before abandoned runtime cleanup"
+    );
+    if instance.is_structured() {
+        state.acp_supervisor.forget_session(&instance.id)?;
+        state.acp_event_store.delete_session(&instance.id);
+    }
+    prune_unused_session_locks(&state, &instance.id);
+    crate::session::deletion::cleanup_abandoned_session(instance);
     Ok(())
 }
 
 /// Retry every committed purge whose row was removed before cleanup could be
-/// proven. The durable plan is removed only by `finish_recovered` after all
+/// proven. The durable plan is removed only by `CommittedPurge::finish` after all
 /// resource stages succeed. A pass attempts each journal owner at most once,
 /// so a permanently failing owner cannot spin the loop; the periodic caller
 /// retries it, and the failing owner stays in the journal.
@@ -260,7 +366,7 @@ pub(crate) async fn recover_pending_purges(state: &Arc<AppState>) {
         };
         let (selection, returned_attempts) = selection;
         attempted = returned_attempts;
-        let committed = match selection {
+        let mut committed = match selection {
             Ok(Some(committed)) => committed,
             Ok(None) => break,
             Err(error) => {
@@ -271,14 +377,32 @@ pub(crate) async fn recover_pending_purges(state: &Arc<AppState>) {
         let token = committed.owner_token().to_owned();
         let id = committed.session_id().to_owned();
         let structured = committed.is_structured();
-        if structured {
-            if let Err(error) = finish_structured_purge(state, &id).await {
+        let retirement = if structured {
+            match committed.capture_retirement_target(|id| {
+                state
+                    .acp_supervisor
+                    .capture_retirement(id)
+                    .map_err(anyhow::Error::from)
+            }) {
+                Ok(retirement) => Some(retirement),
+                Err(error) => {
+                    attempted.insert(token);
+                    tracing::warn!(target: "session.purge_recovery", session_id = %id, %error, "recovered retirement capture refused; purge retained");
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
+        committed.release_retirement_exclusion();
+        if let Some(retirement) = retirement {
+            if let Err(error) = finish_structured_purge(state, &id, &retirement).await {
                 attempted.insert(token);
                 tracing::warn!(target: "session.purge_recovery", session_id = %id, %error, "structured shutdown unproven; purge retained");
                 continue;
             }
         }
-        let result = match tokio::task::spawn_blocking(move || committed.finish_recovered()).await {
+        let result = match finish_committed_purge(state.clone(), committed).await {
             Ok(result) => result,
             Err(error) => {
                 tracing::warn!(target: "session.purge_recovery", session_id = %id, %error, "purge cleanup worker failed");
@@ -290,8 +414,6 @@ pub(crate) async fn recover_pending_purges(state: &Arc<AppState>) {
             tracing::warn!(target: "session.purge_recovery", session_id = %id, errors = ?result.errors, "purge cleanup incomplete; owner retained");
             continue;
         }
-        state.instance_locks.write().await.remove(&id);
-        state.session_service.forget_prompt_lock(&id).await;
     }
     drop(_namespace);
     if let Err(error) = state.runtime.publish(state).await {
@@ -727,6 +849,13 @@ pub async fn abandon_purge(
         };
         row.source_profile.clone()
     };
+    let retirement = match state.acp_supervisor.capture_retirement(&id) {
+        Ok(retirement) => retirement,
+        Err(error) => {
+            tracing::warn!(target: "http.api.sessions", session = %id, %error, "purge abandon retirement capture failed");
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+    };
     let worker_state = state.clone();
     let persist_id = id.clone();
     let committed = tokio::task::spawn_blocking(move || -> anyhow::Result<Instance> {
@@ -777,18 +906,16 @@ pub async fn abandon_purge(
     state.runtime.work.spawn("abandoned purge cleanup", async move {
         let _namespace = namespace;
         if instance.is_structured() {
-            if let Err(error) = finish_structured_purge(&cleanup_state, &instance.id).await {
+            if let Err(error) = finish_structured_purge(&cleanup_state, &instance.id, &retirement).await {
                 tracing::warn!(target: "http.api.sessions", session = %instance.id, %error, "abandoned structured shutdown remains unproven");
             }
         }
-        if let Err(error) = tokio::task::spawn_blocking(move || {
-            crate::session::deletion::cleanup_abandoned_session(instance);
-        }).await {
+        let cleanup = tokio::task::spawn_blocking(move || cleanup_abandoned_native(cleanup_state, instance))
+            .await.map_err(anyhow::Error::from).and_then(|result| result);
+        if let Err(error) = cleanup {
             tracing::error!(target: "http.api.sessions", %error, "abandoned purge cleanup task failed");
         }
     });
-    state.instance_locks.write().await.remove(&id);
-    state.session_service.forget_prompt_lock(&id).await;
     let snapshot = match state.runtime.publish(&state).await {
         Ok(snapshot) => snapshot,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),

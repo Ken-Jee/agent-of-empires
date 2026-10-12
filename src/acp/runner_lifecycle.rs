@@ -1,7 +1,10 @@
 //! Per-session ownership of a structured-view runner.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio_util::sync::CancellationToken;
 
 /// Exact identity of a runner process: its pid plus the generation stamped
 /// into its registry record at spawn. Generation 0 (older records) matches on pid alone.
@@ -27,12 +30,27 @@ pub enum ResumeKind {
 }
 
 /// Authority token for one epoch of one session.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct Lease {
     session_id: String,
     epoch: u64,
+    construction: Arc<Construction>,
 }
 
+#[derive(Debug, Default)]
+struct Construction {
+    cancellation: CancellationToken,
+    runner_pid: AtomicU32,
+    runner_generation: AtomicU64,
+}
+
+impl PartialEq for Lease {
+    fn eq(&self, other: &Self) -> bool {
+        self.session_id == other.session_id && self.epoch == other.epoch
+    }
+}
+
+impl Eq for Lease {}
 impl Lease {
     pub fn session_id(&self) -> &str {
         &self.session_id
@@ -40,6 +58,28 @@ impl Lease {
 
     pub fn epoch(&self) -> u64 {
         self.epoch
+    }
+
+    pub(crate) fn cancellation(&self) -> &CancellationToken {
+        &self.construction.cancellation
+    }
+
+    /// The producer records the exact detached child before its first post-spawn await.
+    pub(crate) fn record_runner(&self, identity: RunnerIdentity) {
+        self.construction
+            .runner_generation
+            .store(identity.generation, Ordering::Relaxed);
+        self.construction
+            .runner_pid
+            .store(identity.pid, Ordering::Release);
+    }
+
+    pub(crate) fn spawned_runner(&self) -> Option<RunnerIdentity> {
+        let pid = self.construction.runner_pid.load(Ordering::Acquire);
+        (pid != 0).then_some(RunnerIdentity {
+            pid,
+            generation: self.construction.runner_generation.load(Ordering::Relaxed),
+        })
     }
 }
 
@@ -82,6 +122,7 @@ struct Entry {
     epoch: u64,
     phase: Phase,
     delete_adapter_state: bool,
+    construction: Arc<Construction>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -196,9 +237,15 @@ impl LifecycleTable {
         Lease {
             session_id: session_id.to_string(),
             epoch,
+            construction: Arc::clone(&self.entries[session_id].construction),
         }
     }
 
+    pub(crate) fn current_lease(&self, session_id: &str) -> Option<Lease> {
+        self.entries
+            .get(session_id)
+            .map(|entry| self.lease(session_id, entry.epoch))
+    }
     fn current(&mut self, lease: &Lease) -> Option<&mut Entry> {
         self.entries
             .get_mut(&lease.session_id)
@@ -251,6 +298,7 @@ impl LifecycleTable {
                 epoch,
                 phase: Phase::Starting { kind, cancel: None },
                 delete_adapter_state: false,
+                construction: Arc::new(Construction::default()),
             },
         );
         Ok(self.lease(session_id, epoch))
@@ -327,6 +375,7 @@ impl LifecycleTable {
         match &mut entry.phase {
             Phase::Starting { cancel, .. } | Phase::Respawning { cancel } => {
                 cancel.get_or_insert_with(|| reason.to_string());
+                entry.construction.cancellation.cancel();
                 StopDecision::CancelRequested
             }
             Phase::Running { identity } => {
@@ -355,6 +404,7 @@ impl LifecycleTable {
             Entry {
                 epoch,
                 delete_adapter_state: false,
+                construction: Arc::new(Construction::default()),
                 phase: Phase::Stopping {
                     attempts: 0,
                     since: Instant::now(),
@@ -404,6 +454,7 @@ impl LifecycleTable {
             .expect("entry checked above");
         entry.epoch = epoch;
         entry.phase = Phase::Respawning { cancel: None };
+        entry.construction = Arc::new(Construction::default());
         Ok((self.lease(&session_id, epoch), identity))
     }
 

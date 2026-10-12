@@ -184,6 +184,124 @@ async fn list_profiles(client: &reqwest::Client, daemon: &ServeDaemon) -> Vec<St
     parsed.into_iter().map(|p| p.name).collect()
 }
 
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn permanent_scratch_delete_cancels_an_unanswered_initialize() {
+    use std::os::unix::fs::PermissionsExt;
+    let daemon = ServeDaemon::spawn();
+    let _home = set_temp_home(daemon.home.path());
+    agent_of_empires::session::config::update_app_state(|state| {
+        state.has_acknowledged_agent_hooks = true;
+    })
+    .unwrap();
+    let marker = daemon.home.path().join("initialize-observed");
+    let adapter = daemon.home.path().join("silent-acp-adapter");
+    std::fs::write(
+        &adapter,
+        format!(
+            "#!/bin/sh\nIFS= read -r request\nprintf '%s\\n' \"$request\" > '{}.pending'\nmv '{}.pending' '{}'\nexec sleep 120\n",
+            marker.display(), marker.display(), marker.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&adapter, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let client = reqwest::Client::new();
+    let profile = client
+        .post(daemon.url("/api/profiles"))
+        .json(&serde_json::json!({"name": "scratch-cancellation"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(profile.status().as_u16(), 201);
+    let created = client
+        .post(daemon.url("/api/sessions"))
+        .json(&serde_json::json!({
+            "title": "unanswered initialize", "path": "", "tool": "gemini", "view": "structured",
+            "scratch": true, "profile": "scratch-cancellation", "command_override": adapter,
+        }))
+        .send()
+        .await
+        .unwrap();
+    let status = created.status();
+    let created: serde_json::Value = created.json().await.unwrap();
+    assert_eq!(status.as_u16(), 201, "{created}");
+    let id = created["id"].as_str().unwrap();
+    let scratch = daemon.app_dir().join("scratch").join(id);
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !marker.exists() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the actual adapter must receive initialize");
+    let request = std::fs::read_to_string(&marker).unwrap();
+    assert!(request.contains("initialize"), "{request}");
+    let record = agent_of_empires::process::worker_registry::load(id)
+        .unwrap()
+        .unwrap();
+    struct RetireOnDrop(u32);
+    impl Drop for RetireOnDrop {
+        fn drop(&mut self) {
+            agent_of_empires::process::worker::kill_process_group(self.0);
+        }
+    }
+    let _runner = RetireOnDrop(record.pid);
+    assert!(scratch.is_dir());
+    assert!(agent_of_empires::process::worker::is_process_group_alive(
+        record.pid
+    ));
+    let response = client
+        .delete(daemon.url(&format!("/api/sessions/{id}")))
+        .json(&serde_json::json!({"force_delete": true, "keep_scratch": false}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 200);
+    let outcome: serde_json::Value = response.json().await.unwrap();
+    assert!(
+        outcome["cleanup_errors"]
+            .as_array()
+            .is_some_and(Vec::is_empty),
+        "{outcome}"
+    );
+    assert!(
+        !scratch.exists(),
+        "actual permanent DELETE retained scratch: {outcome}"
+    );
+    assert!(!agent_of_empires::process::worker::is_process_group_alive(
+        record.pid
+    ));
+    assert!(agent_of_empires::process::worker_registry::load(id)
+        .unwrap()
+        .is_none());
+    assert!(!record.socket_path.exists());
+    assert!(
+        !agent_of_empires::process::worker::control_socket_sibling(&record.socket_path).exists()
+    );
+    let rows: serde_json::Value = client
+        .get(daemon.url("/api/sessions"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(rows["sessions"].as_array().unwrap().is_empty());
+    assert!(
+        agent_of_empires::session::Storage::open_unwatched("scratch-cancellation")
+            .unwrap()
+            .load()
+            .unwrap()
+            .is_empty()
+    );
+    let journal: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(daemon.app_dir().join("pending-purge-owners.json")).unwrap(),
+    )
+    .unwrap();
+    assert!(journal["owners"].as_array().unwrap().is_empty());
+}
+
 /// RAII guard around a foreground `aoe serve` subprocess scoped to an
 /// isolated `HOME`. `Drop` kills the child and waits, even on test panic.
 struct ServeDaemon {

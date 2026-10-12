@@ -454,8 +454,11 @@ pub(crate) async fn spawn_structured_session(
         match rollback {
             Ok(result) => {
                 if matches!(result.disposition, DeletionDisposition::Removed | DeletionDisposition::AlreadyGone) {
-                    worker_state.instance_locks.blocking_write().remove(&result.session_id);
-                    runtime.block_on(worker_state.session_service.forget_prompt_lock(&result.session_id));
+                    if let Err(error) = crate::server::api::sessions::release_removed_session_locks_blocking(
+                        worker_state.clone(), &result.session_id, &storage_profile,
+                    ) {
+                        tracing::warn!(target: "session.create", %error, "Creation rollback lock cleanup refused");
+                    }
                 }
                 if !result.success {
                     tracing::warn!(target: "session.create", errors = ?result.errors, "Creation rollback incomplete");

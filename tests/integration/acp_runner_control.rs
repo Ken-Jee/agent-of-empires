@@ -743,6 +743,7 @@ for line in sys.stdin:
         "fake-agent".into(),
         None,
         Some(tokio::time::Instant::now() + Duration::from_millis(500)),
+        None,
     );
     let spawn_replacement = async {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
@@ -1434,6 +1435,7 @@ for line in sys.stdin:
         "review-agent".into(),
         None,
         None,
+        None,
     )
     .await
     .unwrap();
@@ -1603,6 +1605,7 @@ for line in sys.stdin:
         "stream-agent".into(),
         None,
         None,
+        None,
     )
     .await
     .unwrap();
@@ -1747,6 +1750,7 @@ for line in sys.stdin:
             AcpSessionId(session.into()),
             None,
             "review-agent".into(),
+            None,
             None,
             None,
         )

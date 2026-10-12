@@ -380,6 +380,7 @@ impl<S: BroadcastSink> Drain<S> {
             notify: Arc::clone(&self.notify),
         };
         config.generation = respawn_lease.epoch();
+        config.launch_lease = Some(respawn_lease.clone());
 
         tokio::time::sleep(RESPAWN_BACKOFF).await;
         let cancelled = lock_recover(&self.lifecycle).cancel_requested(&respawn_lease);
@@ -585,14 +586,16 @@ impl<S: BroadcastSink> Drain<S> {
             }
         }
         self.workers.lock().await.remove(session_id);
-        let launched = worker_registry::load(session_id)
-            .ok()
-            .flatten()
-            .filter(|r| r.generation == respawn_lease.epoch())
-            .map(|r| RunnerIdentity {
-                pid: r.pid,
-                generation: r.generation,
-            });
+        let launched = respawn_lease.spawned_runner().or_else(|| {
+            worker_registry::load(session_id)
+                .ok()
+                .flatten()
+                .filter(|record| record.generation == respawn_lease.epoch())
+                .map(|record| RunnerIdentity {
+                    pid: record.pid,
+                    generation: record.generation,
+                })
+        });
         // Under a pending stop the replaced runner is retired as well.
         let retire_previous = cancelled.is_some();
         let converted = (launched.is_some() || retire_previous)

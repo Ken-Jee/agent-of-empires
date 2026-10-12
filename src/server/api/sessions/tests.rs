@@ -39,7 +39,8 @@ async fn structured_purge_waits_for_a_pending_runner_retirement() -> anyhow::Res
     let supervisor = state.acp_supervisor.clone();
     let spawner = tokio::spawn(async move { supervisor.spawn_inner(request, reservation).await });
     gate.entered.notified().await;
-    let finishing = super::delete::finish_structured_purge(&state, &row.id);
+    let retirement = state.acp_supervisor.capture_retirement(&row.id)?;
+    let finishing = super::delete::finish_structured_purge(&state, &row.id, &retirement);
     tokio::pin!(finishing);
     assert!(
         futures_util::poll!(&mut finishing).is_pending(),
@@ -58,6 +59,349 @@ async fn structured_purge_waits_for_a_pending_runner_retirement() -> anyhow::Res
     assert!(!control.is_alive(4848));
     assert!(worker_registry::load(&row.id)?.is_none());
     assert!(!state.acp_supervisor.is_owned(&row.id).await);
+    Ok(())
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn committed_purge_preserves_a_reused_rows_structured_projection() -> anyhow::Result<()> {
+    use crate::session::deletion::{DeletionRequest, PurgeReservation, PurgeTransaction};
+    for recovered_with_replacement_worker in [false, true] {
+        let _home = crate::session::test_support::isolate_app_dir();
+        crate::session::purge_owners::initialize(&crate::session::get_app_dir()?)?;
+        let mut row = Instance::new("original projection", "");
+        let scratch = crate::session::scratch::provision_scratch_dir(&row.id)?;
+        row.project_path = scratch.to_string_lossy().into_owned();
+        row.scratch = true;
+        row.view = crate::session::View::Structured;
+        row.source_profile = "default".into();
+        crate::server::test_support::seed_instances_on_disk_for_test("default", vec![row.clone()]);
+        let state = crate::server::test_support::build_test_app_state(vec![row.clone()]);
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+        let retirement = state.acp_supervisor.capture_retirement(&row.id)?;
+        let request = DeletionRequest {
+            session_id: row.id.clone(),
+            instance: row.clone(),
+            delete_worktree: false,
+            delete_branch: false,
+            delete_sandbox: false,
+            force_delete: true,
+            detach_hooks: true,
+            keep_scratch: false,
+        };
+        let committed = tokio::task::spawn_blocking(move || {
+            let PurgeReservation::Reserved(transaction) =
+                PurgeTransaction::reserve_unwatched(request)?
+            else {
+                anyhow::bail!("selected original row must reserve");
+            };
+            transaction
+                .begin_irreversible()
+                .map_err(|result| anyhow::anyhow!(result.errors.join("; ")))
+        })
+        .await??;
+        let storage = Storage::open_unwatched("default")?;
+        let (committed, retirement) = if recovered_with_replacement_worker {
+            drop(committed);
+            let mut recovered = tokio::task::spawn_blocking(|| {
+                crate::session::deletion::recover_committed_purge(
+                    &mut std::collections::HashSet::new(),
+                )
+            })
+            .await??
+            .expect("the removed original owner must recover");
+            let retirement =
+                recovered.capture_retirement_target(|id| {
+                    assert!(storage.instance_lifecycle_lock_is_held_for_test(id),
+                "recovery must freeze its target before releasing its real preparation flock");
+                    state
+                        .acp_supervisor
+                        .capture_retirement(id)
+                        .map_err(anyhow::Error::from)
+                })?;
+            (recovered, retirement)
+        } else {
+            (committed, retirement)
+        };
+        let owner_token = committed.owner_token().to_owned();
+        let mut replacement = row.clone();
+        replacement.title = "replacement without a worker".into();
+        replacement.lifecycle_generation += 10;
+        {
+            let _identity = crate::session::acquire_session_identity_lock()?;
+            let _lifecycle = storage.acquire_instance_lifecycle_lock(&row.id)?;
+            storage.update(|rows, _| {
+                rows.push(replacement.clone());
+                Ok(())
+            })?;
+        }
+        *state.instances.write().await = vec![replacement.clone()];
+        let instance_held = state.instance_lock(&row.id).await.lock_owned().await;
+        let submission_held = state.session_service.prompt_submission(&row.id).await;
+        let sentinel = crate::acp::Event::Stopped {
+            reason: "replacement transcript sentinel".into(),
+        };
+        state.acp_event_store.record(&row.id, 17, &sentinel)?;
+        let replacement_commands = if recovered_with_replacement_worker {
+            Some(
+                state
+                    .acp_supervisor
+                    .test_insert_worker_cmd_recording(&row.id)
+                    .await,
+            )
+        } else {
+            None
+        };
+        let retirement_result =
+            super::delete::finish_structured_purge(&state, &row.id, &retirement).await;
+        if let Some(commands) = replacement_commands {
+            assert!(
+                retirement_result.is_err(),
+                "old uncaptured owner must not adopt a replacement producer"
+            );
+            assert!(
+                commands.lock().unwrap().is_empty(),
+                "replacement received an old purge command"
+            );
+            assert_eq!(
+                state.acp_supervisor.worker_state(&row.id).await,
+                crate::daemon::AcpWorkerState::Running
+            );
+        } else {
+            retirement_result?;
+        }
+        let result = super::delete::finish_committed_purge(state.clone(), committed).await?;
+        assert!(!result.success, "a reused row must refuse original cleanup");
+        assert!(!super::delete::release_removed_session_locks(&state, &row.id, "default").await?);
+        let next_instance = state
+            .session_service
+            .instance_lock(&row.id)
+            .await
+            .lock_owned();
+        tokio::pin!(next_instance);
+        assert!(
+            futures_util::poll!(&mut next_instance).is_pending(),
+            "old purge split replacement instance authority"
+        );
+        let next_submission = state.session_service.prompt_submission(&row.id);
+        tokio::pin!(next_submission);
+        assert!(
+            futures_util::poll!(&mut next_submission).is_pending(),
+            "old purge split replacement submission authority"
+        );
+        drop(instance_held);
+        drop(submission_held);
+        let _instance = next_instance.await;
+        let _submission = next_submission.await;
+        assert_eq!(
+            state.acp_event_store.highest_seq(&row.id),
+            17,
+            "original purge erased replacement event counter"
+        );
+        assert!(state.acp_event_store.replay_from(&row.id, 0).iter().any(|(_, event)| {
+        matches!(event, crate::acp::Event::Stopped { reason } if reason == "replacement transcript sentinel")
+    }));
+        assert_eq!(storage.load()?[0].title, replacement.title);
+        assert!(scratch.exists());
+        let journal: serde_json::Value = serde_json::from_slice(&std::fs::read(
+            crate::session::get_app_dir()?.join("pending-purge-owners.json"),
+        )?)?;
+        assert!(journal["owners"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|owner| owner["token"] == owner_token));
+    }
+    Ok(())
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn removed_row_pruning_keeps_held_and_queued_instance_and_submission_authority_on_reuse(
+) -> anyhow::Result<()> {
+    let _home = crate::session::test_support::isolate_app_dir();
+    let mut row = Instance::new("gate authority", "/tmp");
+    row.source_profile = "default".into();
+    crate::server::test_support::seed_instances_on_disk_for_test("default", vec![row.clone()]);
+    let state = crate::server::test_support::build_test_app_state(vec![row.clone()]);
+    crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+    let storage = Storage::open_unwatched("default")?;
+    {
+        let instance_held = state.instance_lock(&row.id).await.lock_owned().await;
+        let instance_waiter = state
+            .session_service
+            .instance_lock(&row.id)
+            .await
+            .lock_owned();
+        tokio::pin!(instance_waiter);
+        assert!(futures_util::poll!(&mut instance_waiter).is_pending());
+        let submission_held = state.session_service.prompt_submission(&row.id).await;
+        let submission_waiter = state.session_service.prompt_submission(&row.id);
+        tokio::pin!(submission_waiter);
+        assert!(futures_util::poll!(&mut submission_waiter).is_pending());
+        storage.update(|rows, _| {
+            rows.clear();
+            Ok(())
+        })?;
+        state.instances.write().await.clear();
+        assert!(super::delete::release_removed_session_locks(&state, &row.id, "default").await?);
+        let mut reused = row.clone();
+        reused.title = "reused gate authority".into();
+        reused.lifecycle_generation += 1;
+        storage.update(|rows, _| {
+            rows.push(reused.clone());
+            Ok(())
+        })?;
+        *state.instances.write().await = vec![reused];
+        let later_instance = state.instance_lock(&row.id).await.lock_owned();
+        tokio::pin!(later_instance);
+        assert!(
+            futures_util::poll!(&mut later_instance).is_pending(),
+            "reuse split instance mutex authority"
+        );
+        let later_submission = state.session_service.prompt_submission(&row.id);
+        tokio::pin!(later_submission);
+        assert!(
+            futures_util::poll!(&mut later_submission).is_pending(),
+            "reuse split submission mutex authority"
+        );
+        drop(instance_held);
+        let queued_instance = instance_waiter.await;
+        assert!(futures_util::poll!(&mut later_instance).is_pending());
+        drop(queued_instance);
+        let instance = later_instance.await;
+        drop(submission_held);
+        let queued_submission = submission_waiter.await;
+        assert!(futures_util::poll!(&mut later_submission).is_pending());
+        drop(queued_submission);
+        let submission = later_submission.await;
+        drop(instance);
+        drop(submission);
+    }
+    storage.update(|rows, _| {
+        rows.clear();
+        Ok(())
+    })?;
+    state.instances.write().await.clear();
+    assert!(super::delete::release_removed_session_locks(&state, &row.id, "default").await?);
+    assert!(!state.instance_locks.read().await.contains_key(&row.id));
+    assert_eq!(state.session_service.prompt_locks_len().await, 0);
+    Ok(())
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn committed_structured_purge_releases_admission_exclusion_before_retirement(
+) -> anyhow::Result<()> {
+    use crate::acp::runner_lifecycle::{test_support::FakeProcessControl, ProcessControl};
+    use crate::acp::supervisor::test_support::{recording_gated_launcher, spawn_request, Gate};
+    use crate::session::deletion::{DeletionRequest, PurgeReservation, PurgeTransaction};
+    let _home = crate::session::test_support::isolate_app_dir();
+    crate::session::purge_owners::initialize(&crate::session::get_app_dir()?)?;
+    for recovered in [false, true] {
+        let mut row = Instance::new("purge admission", "");
+        let scratch = crate::session::scratch::provision_scratch_dir(&row.id)?;
+        row.project_path = scratch.to_string_lossy().into_owned();
+        row.scratch = true;
+        row.view = crate::session::View::Structured;
+        row.source_profile = "default".into();
+        crate::server::test_support::seed_instances_on_disk_for_test("default", vec![row.clone()]);
+        let control = Arc::new(FakeProcessControl::default());
+        control.alive(4849);
+        let gate = Gate::default();
+        let (launcher, _) =
+            recording_gated_launcher(&gate, 4849, &row.id, "native-purge-admission");
+        let state = crate::server::test_support::build_test_app_state_impl(
+            vec![row.clone()],
+            Vec::new(),
+            Vec::new(),
+            None,
+            false,
+            |_| {},
+            |supervisor| {
+                supervisor
+                    .with_process_control(control.clone())
+                    .with_launcher(launcher)
+            },
+        );
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+        let reservation = state.acp_supervisor.reserve_spawn(&row.id).await?;
+        let mut request = spawn_request(&row.id);
+        request.source_profile = Some(row.source_profile.clone());
+        let supervisor = state.acp_supervisor.clone();
+        let spawner =
+            tokio::spawn(async move { supervisor.spawn_inner(request, reservation).await });
+        gate.entered.notified().await;
+        let deletion = DeletionRequest {
+            session_id: row.id.clone(),
+            instance: row.clone(),
+            delete_worktree: false,
+            delete_branch: false,
+            delete_sandbox: false,
+            force_delete: true,
+            detach_hooks: true,
+            keep_scratch: false,
+        };
+        let retirement = state.acp_supervisor.capture_retirement(&row.id)?;
+        let committed = tokio::task::spawn_blocking(move || {
+            let PurgeReservation::Reserved(transaction) =
+                PurgeTransaction::reserve_unwatched(deletion)?
+            else {
+                anyhow::bail!("purge must reserve the selected row");
+            };
+            transaction
+                .begin_irreversible()
+                .map_err(|result| anyhow::anyhow!(result.errors.join("; ")))
+        })
+        .await??;
+        let mut committed = if recovered {
+            drop(committed);
+            tokio::task::spawn_blocking(|| {
+                crate::session::deletion::recover_committed_purge(
+                    &mut std::collections::HashSet::new(),
+                )
+            })
+            .await??
+            .expect("committed owner must recover")
+        } else {
+            committed
+        };
+        let retirement = if recovered {
+            committed.capture_retirement_target(|id| {
+                state
+                    .acp_supervisor
+                    .capture_retirement(id)
+                    .map_err(anyhow::Error::from)
+            })?
+        } else {
+            retirement
+        };
+        committed.release_retirement_exclusion();
+        let storage = Storage::open_unwatched("default")?;
+        assert!(
+            storage.load()?.is_empty(),
+            "row removal must already be durable"
+        );
+        let held = storage.instance_lifecycle_lock_is_held_for_test(&row.id);
+        // Always release the producer, including the red lock-inversion assertion path.
+        gate.open.notify_one();
+        assert!(!held, "committed purge must release the launch admission flock before retirement (recovered={recovered})");
+        super::delete::finish_structured_purge(&state, &row.id, &retirement).await?;
+        assert!(matches!(
+            spawner.await?,
+            Err(crate::acp::supervisor::SupervisorError::SessionGone(_))
+        ));
+        let result = tokio::task::spawn_blocking(move || committed.finish(|_, _| Ok(()))).await?;
+        assert!(result.success, "{result:?}");
+        assert!(!scratch.exists());
+        assert!(!control.is_alive(4849));
+        assert!(crate::process::worker_registry::load(&row.id)?.is_none());
+        assert!(!state.acp_supervisor.is_owned(&row.id).await);
+        assert!(crate::session::deletion::recover_committed_purge(
+            &mut std::collections::HashSet::new()
+        )?
+        .is_none());
+    }
     Ok(())
 }
 
@@ -5417,6 +5761,9 @@ async fn send_strips_bracketed_paste_escape_from_captured_snippet() {
         eprintln!("tmux new-session failed; skipping");
         return;
     }
+    let _pane_guard = crate::tmux::test_helpers::TmuxTestSession::from_name(pane.clone());
+    let pane_id = crate::tmux::test_helpers::only_pane_id(&pane);
+    crate::tmux::test_helpers::wait_for_pane_command(&pane_id, "cat");
     crate::tmux::refresh_session_cache();
     let state = crate::server::test_support::build_test_app_state(vec![inst]);
     crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
@@ -5453,9 +5800,6 @@ async fn send_strips_bracketed_paste_escape_from_captured_snippet() {
         }
         std::thread::sleep(std::time::Duration::from_millis(25));
     };
-    let _ = crate::tmux::tmux_command()
-        .args(["kill-session", "-t", &pane])
-        .output();
     assert!(captured.contains(expected), "{captured:?}");
     assert!(!captured.contains('\x1b'), "{captured:?}");
 }

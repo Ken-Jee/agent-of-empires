@@ -1159,7 +1159,10 @@ mod tests {
                 };
                 let transaction = transaction.run_hooks().unwrap();
                 let result = if structured {
-                    transaction.begin_irreversible().unwrap().finish()
+                    transaction
+                        .begin_irreversible()
+                        .unwrap()
+                        .finish(|_, _| Ok(()))
                 } else {
                     transaction.complete()
                 };

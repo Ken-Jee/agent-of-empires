@@ -21,16 +21,61 @@ const TEARDOWN_RETRY_CAP: u32 = 30;
 /// A teardown claimed this long without settling lost its driver; the retry pass takes over.
 const TEARDOWN_ORPHAN_GRACE: Duration = Duration::from_secs(15);
 
+/// Frozen retirement authority, captured before committed removal releases exclusion.
+#[derive(Clone)]
+pub(crate) struct RetirementTarget {
+    pub(crate) lease: Option<Lease>,
+    pub(crate) identity: Option<RunnerIdentity>,
+}
+
 impl<S: BroadcastSink> Supervisor<S> {
+    pub(crate) fn capture_retirement(
+        &self,
+        session_id: &str,
+    ) -> Result<RetirementTarget, SupervisorError> {
+        let (lease, running_identity) = {
+            let lifecycle = lock_recover(&self.lifecycle);
+            (
+                lifecycle.current_lease(session_id),
+                lifecycle
+                    .running(session_id)
+                    .and_then(|(_, identity)| identity),
+            )
+        };
+        let record = worker_registry::load(session_id).map_err(|error| {
+            SupervisorError::Acp(crate::acp::acp_client::AcpError::Spawn(error.to_string()))
+        })?;
+        let identity = lease
+            .as_ref()
+            .and_then(Lease::spawned_runner)
+            .or(running_identity)
+            .or_else(|| {
+                record.map(|record| RunnerIdentity {
+                    pid: record.pid,
+                    generation: record.generation,
+                })
+            });
+        Ok(RetirementTarget { lease, identity })
+    }
+
+    pub(crate) async fn shutdown_captured_and_delete_and_wait(
+        &self,
+        session_id: &str,
+        target: &RetirementTarget,
+        deadline: Duration,
+    ) -> Result<(), SupervisorError> {
+        self.shutdown_and_wait_with_policy(session_id, deadline, true, Some(target))
+            .await
+    }
     /// Stop a worker, keeping its agent-side transcript resumable.
     pub async fn shutdown(&self, session_id: &str) -> Result<(), SupervisorError> {
-        self.shutdown_with_reason(session_id, "user_stopped", false)
+        self.shutdown_with_reason(session_id, "user_stopped", false, None)
             .await
     }
 
     /// Stop a worker reclaimed for inactivity.
     pub async fn shutdown_idle(&self, session_id: &str) -> Result<(), SupervisorError> {
-        self.shutdown_with_reason(session_id, "idle_auto_stop", false)
+        self.shutdown_with_reason(session_id, "idle_auto_stop", false, None)
             .await
     }
 
@@ -41,7 +86,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         session_id: &str,
         deadline: Duration,
     ) -> Result<(), SupervisorError> {
-        self.shutdown_and_wait_with_policy(session_id, deadline, true)
+        self.shutdown_and_wait_with_policy(session_id, deadline, true, None)
             .await
     }
 
@@ -51,7 +96,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         session_id: &str,
         deadline: Duration,
     ) -> Result<(), SupervisorError> {
-        self.shutdown_and_wait_with_policy(session_id, deadline, false)
+        self.shutdown_and_wait_with_policy(session_id, deadline, false, None)
             .await
     }
 
@@ -60,13 +105,20 @@ impl<S: BroadcastSink> Supervisor<S> {
         session_id: &str,
         deadline: Duration,
         delete_adapter_state: bool,
+        expected: Option<&RetirementTarget>,
     ) -> Result<(), SupervisorError> {
-        let record_before = worker_registry::load(session_id).map_err(|error| {
-            SupervisorError::Acp(crate::acp::acp_client::AcpError::Spawn(error.to_string()))
-        })?;
-        let pid_before = record_before.as_ref().map(|record| record.pid);
+        let record_before = if expected.is_none() {
+            worker_registry::load(session_id).map_err(|error| {
+                SupervisorError::Acp(crate::acp::acp_client::AcpError::Spawn(error.to_string()))
+            })?
+        } else {
+            None
+        };
+        let pid_before = expected
+            .and_then(|target| target.identity.map(|identity| identity.pid))
+            .or_else(|| record_before.as_ref().map(|record| record.pid));
         let stopped = self
-            .shutdown_with_reason(session_id, "user_stopped", delete_adapter_state)
+            .shutdown_with_reason(session_id, "user_stopped", delete_adapter_state, expected)
             .await;
         // The existing synchronous teardown grace precedes the settlement wait.
         let deadline = tokio::time::Instant::now() + deadline;
@@ -119,10 +171,17 @@ impl<S: BroadcastSink> Supervisor<S> {
         session_id: &str,
         stop_reason: &str,
         delete_adapter_state: bool,
+        expected: Option<&RetirementTarget>,
     ) -> Result<(), SupervisorError> {
         // Same lock order as `begin_resume`, so a resume cannot slip between
         // the decision and the handle removal.
         let mut workers = self.workers.lock().await;
+        if let Some(expected) = expected {
+            let current = lock_recover(&self.lifecycle).current_lease(session_id);
+            if current.is_some() && current != expected.lease {
+                return Err(SupervisorError::TeardownPending(session_id.into()));
+            }
+        }
         let decision =
             lock_recover(&self.lifecycle).begin_stop(session_id, stop_reason, delete_adapter_state);
         match decision {
@@ -185,21 +244,27 @@ impl<S: BroadcastSink> Supervisor<S> {
             StopDecision::AlreadyStopping => Ok(()),
             StopDecision::NotOwned => {
                 // A runner from a previous daemon may still be on disk.
-                let Some(record) = worker_registry::load(session_id).ok().flatten() else {
+                let identity = match expected {
+                    Some(target) => target.identity,
+                    None => worker_registry::load(session_id)
+                        .ok()
+                        .flatten()
+                        .map(|record| RunnerIdentity {
+                            pid: record.pid,
+                            generation: record.generation,
+                        }),
+                };
+                let Some(identity) = identity else {
                     drop(workers);
                     return Err(SupervisorError::UnknownSession(session_id.into()));
                 };
                 let lease = {
                     let mut table = lock_recover(&self.lifecycle);
-                    table.note_generation(session_id, record.generation);
+                    table.note_generation(session_id, identity.generation);
                     table.adopt_for_stop(session_id)
                 };
                 drop(workers);
                 worker_registry::clear_restart_marker(session_id);
-                let identity = RunnerIdentity {
-                    pid: record.pid,
-                    generation: record.generation,
-                };
                 let settlement =
                     tear_down_runner(&*self.process_control, session_id, Some(identity)).await;
                 if let Some(lease) = lease {
@@ -527,6 +592,15 @@ async fn tear_down_runner_from(
     let Some(identity) = identity else {
         return Settlement::Proven;
     };
+    if worker_registry::load(session_id)
+        .ok()
+        .flatten()
+        .is_some_and(|record| {
+            record.pid == identity.pid && !identity.matches_record(record.pid, record.generation)
+        })
+    {
+        return Settlement::Unproven(Some(identity));
+    }
     let pid = identity.pid;
     if !killed_before {
         // Sent even to a dead leader: its group's descendants still need the signal.
@@ -999,42 +1073,91 @@ mod tests {
     #[serial_test::serial]
     async fn permanent_retirement_does_not_delete_a_replacement_native_session() {
         let (_home, tmp) = isolate_home();
-        let control = Arc::new(FakeProcessControl::default());
-        control.alive(6651).alive(6652);
-        let sup = Supervisor::new(VecSink::new()).with_process_control(control.clone());
-        let (client, _events, deleted) = AcpClient::fake_for_test_recording(
-            crate::acp::state::AcpSessionId("s-delete-owned".into()),
-        );
-        sup.test_install_handle(
-            "s-delete-owned",
-            client,
-            WorkerKind::Stdio,
-            Some(RunnerIdentity {
-                pid: 6651,
-                generation: 10,
-            }),
-        )
-        .await;
-        let mut replacement = worker_record("s-delete-owned", 6652, tmp.path().join("replacement"))
+        for (replace_lease, same_pid) in [(false, false), (false, true), (true, false)] {
+            let control = Arc::new(FakeProcessControl::default());
+            control.alive(6651).alive(6652);
+            let sup = Supervisor::new(VecSink::new()).with_process_control(control.clone());
+            let (client, _events, deleted) = AcpClient::fake_for_test_recording(
+                crate::acp::state::AcpSessionId("s-delete-owned".into()),
+            );
+            sup.test_install_handle(
+                "s-delete-owned",
+                client,
+                WorkerKind::Stdio,
+                Some(RunnerIdentity {
+                    pid: 6651,
+                    generation: 10,
+                }),
+            )
+            .await;
+            let retirement = sup.capture_retirement("s-delete-owned").unwrap();
+            let replacement_pid = if same_pid { 6651 } else { 6652 };
+            let mut replacement = worker_record(
+                "s-delete-owned",
+                replacement_pid,
+                tmp.path().join("replacement"),
+            )
             .with_generation(11);
-        replacement.stored_acp_session_id = Some("replacement-native-session".into());
-        worker_registry::save(&replacement).unwrap();
-        sup.shutdown_with_reason("s-delete-owned", "user_stopped", true)
-            .await
-            .unwrap();
-        assert!(!deleted.load(std::sync::atomic::Ordering::SeqCst));
-        assert!(control.signals().contains(&(6651, "TERM")));
-        assert!(!control.signals().iter().any(|(pid, _)| *pid == 6652));
-        assert!(control.is_alive(6652));
-        let retained = worker_registry::load("s-delete-owned").unwrap().unwrap();
-        assert_eq!(
-            (
-                retained.pid,
-                retained.generation,
-                retained.stored_acp_session_id
-            ),
-            (6652, 11, Some("replacement-native-session".into()))
-        );
+            replacement.stored_acp_session_id = Some("replacement-native-session".into());
+            worker_registry::save(&replacement).unwrap();
+            let replacement_deleted = if replace_lease {
+                sup.test_respawn_worker("s-delete-owned").await;
+                let (client, _events, deleted) = AcpClient::fake_for_test_recording(
+                    crate::acp::state::AcpSessionId("replacement-native-session".into()),
+                );
+                sup.workers
+                    .lock()
+                    .await
+                    .get_mut("s-delete-owned")
+                    .unwrap()
+                    .client = Arc::new(client);
+                Some(deleted)
+            } else {
+                None
+            };
+            let result = sup
+                .shutdown_with_reason("s-delete-owned", "user_stopped", true, Some(&retirement))
+                .await;
+            assert!(!deleted.load(std::sync::atomic::Ordering::SeqCst));
+            if replace_lease {
+                assert!(matches!(result, Err(SupervisorError::TeardownPending(_))));
+                assert!(!replacement_deleted
+                    .unwrap()
+                    .load(std::sync::atomic::Ordering::SeqCst));
+                assert_eq!(
+                    sup.worker_state("s-delete-owned").await,
+                    AcpWorkerState::Running
+                );
+                assert!(control.signals().is_empty());
+            } else if same_pid {
+                result.unwrap();
+                assert_eq!(
+                    sup.worker_state("s-delete-owned").await,
+                    AcpWorkerState::Stopping
+                );
+                assert!(sup.forget_session("s-delete-owned").is_err());
+                assert!(control.signals().is_empty());
+            } else {
+                result.unwrap();
+                assert!(control.signals().contains(&(6651, "TERM")));
+                assert!(!control.signals().iter().any(|(pid, _)| *pid == 6652));
+            }
+            assert!(control.is_alive(replacement_pid));
+            let retained = worker_registry::load("s-delete-owned").unwrap().unwrap();
+            assert_eq!(
+                (
+                    retained.pid,
+                    retained.generation,
+                    retained.stored_acp_session_id
+                ),
+                (
+                    replacement_pid,
+                    11,
+                    Some("replacement-native-session".into())
+                )
+            );
+            worker_registry::delete_if_owned_by("s-delete-owned", replacement_pid, 11);
+        }
     }
 
     #[tokio::test]
@@ -1126,52 +1249,87 @@ mod tests {
     #[serial_test::serial]
     async fn shutdown_during_spawn_tears_down_the_late_runner() {
         let _home = isolate_home();
-        let control = Arc::new(FakeProcessControl::default());
-        control.alive(4242);
-        let gate = Gate::default();
-        let sink = VecSink::new();
-        let sup = Arc::new(
-            Supervisor::new(sink.clone())
-                .with_process_control(control.clone())
-                .with_launcher(gated_launcher(&gate, 4242)),
-        );
-        let spawner = {
-            let sup = Arc::clone(&sup);
-            tokio::spawn(async move { sup.spawn(spawn_request("s-late")).await })
-        };
-        gate.entered.notified().await;
-        assert_eq!(sup.worker_state("s-late").await, AcpWorkerState::Resuming);
+        for cancelled_before_publication in [false, true] {
+            let control = Arc::new(FakeProcessControl::default());
+            control.alive(4242);
+            let gate = Gate::default();
+            let sink = VecSink::new();
+            let launcher: super::super::Launcher = if cancelled_before_publication {
+                let entered = gate.entered.clone();
+                Arc::new(
+                    move |config: crate::acp::acp_client::SpawnConfig, _session_id| {
+                        let entered = entered.clone();
+                        Box::pin(async move {
+                            let lease = config
+                                .launch_lease
+                                .expect("supervisor must retain its producer lease");
+                            lease.record_runner(RunnerIdentity {
+                                pid: 4242,
+                                generation: config.generation,
+                            });
+                            entered.notify_one();
+                            lease.cancellation().cancelled().await;
+                            Err(crate::acp::acp_client::AcpError::Spawn(
+                                "constructor cancelled before registry publication".into(),
+                            ))
+                        })
+                    },
+                )
+            } else {
+                gated_launcher(&gate, 4242)
+            };
+            let sup = Arc::new(
+                Supervisor::new(sink.clone())
+                    .with_process_control(control.clone())
+                    .with_launcher(launcher),
+            );
+            let spawner = {
+                let sup = Arc::clone(&sup);
+                tokio::spawn(async move { sup.spawn(spawn_request("s-late")).await })
+            };
+            gate.entered.notified().await;
+            assert_eq!(sup.worker_state("s-late").await, AcpWorkerState::Resuming);
+            assert!(
+                worker_registry::load("s-late").unwrap().is_none(),
+                "producer has not published its registry record"
+            );
 
-        sup.shutdown("s-late")
-            .await
-            .expect("cancel is a soft success");
-        gate.open.notify_one();
-        let result = spawner.await.unwrap();
-        assert!(
-            matches!(result, Err(SupervisorError::SpawnCancelled(_))),
-            "late spawn must report the cancel, got {result:?}"
-        );
-        assert!(
-            control.signals().contains(&(4242, "TERM")),
-            "the runner the late spawn built must be signalled: {:?}",
-            control.signals()
-        );
-        assert!(!control.is_alive(4242));
-        assert_eq!(
-            stopped_reasons(&sink, "s-late"),
-            ["user_stopped"],
-            "the honored stop is published so an adopted turn closes"
-        );
-        assert!(worker_registry::load("s-late").unwrap().is_none());
-        assert!(!sup.workers.lock().await.contains_key("s-late"));
-        assert_eq!(sup.worker_state("s-late").await, AcpWorkerState::Absent);
-        assert!(
-            matches!(
-                sup.begin_resume("s-late", ResumeKind::Spawn).await.unwrap(),
-                ResumeReservationOutcome::Reserved(_)
-            ),
-            "once settled the session admits a fresh resume"
-        );
+            sup.shutdown("s-late")
+                .await
+                .expect("cancel is a soft success");
+            gate.open.notify_one();
+            let result = tokio::time::timeout(Duration::from_secs(1), spawner)
+                .await
+                .expect("active cancellation must settle the producer without registry publication")
+                .unwrap();
+            assert!(
+                matches!(result, Err(SupervisorError::SpawnCancelled(_))),
+                "late spawn must report the cancel, got {result:?}"
+            );
+            assert!(
+                control.signals().contains(&(4242, "TERM")),
+                "the runner the late spawn built must be signalled: {:?}",
+                control.signals()
+            );
+            assert!(!control.is_alive(4242));
+            if !cancelled_before_publication {
+                assert_eq!(
+                    stopped_reasons(&sink, "s-late"),
+                    ["user_stopped"],
+                    "the honored stop is published so an adopted turn closes"
+                );
+            }
+            assert!(worker_registry::load("s-late").unwrap().is_none());
+            assert!(!sup.workers.lock().await.contains_key("s-late"));
+            assert_eq!(sup.worker_state("s-late").await, AcpWorkerState::Absent);
+            assert!(
+                matches!(
+                    sup.begin_resume("s-late", ResumeKind::Spawn).await.unwrap(),
+                    ResumeReservationOutcome::Reserved(_)
+                ),
+                "once settled the session admits a fresh resume"
+            );
+        }
     }
 
     #[tokio::test(start_paused = true)]

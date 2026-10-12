@@ -198,13 +198,14 @@ pub(crate) fn request_error(error: reqwest::Error) -> DaemonClientError {
 mod tests {
     use super::*;
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn unix_body_keeps_the_header_operation_deadline() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("api.sock");
         let listener = tokio::net::UnixListener::bind(&path).unwrap();
-        let (headers, sent) = tokio::sync::oneshot::channel();
+        let (arrived, mut observed) = tokio::sync::oneshot::channel();
+        let (release, released) = tokio::sync::oneshot::channel();
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
             let mut request = [0; 4096];
@@ -214,13 +215,14 @@ mod tests {
                 assert!(count > 0, "request must contain complete HTTP headers");
                 used += count;
             }
+            arrived.send(()).unwrap();
+            released.await.unwrap();
             stream
                 .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n")
                 .await
                 .unwrap();
-            headers.send(()).unwrap();
             let mut eof = [0];
-            let _ = stream.read(&mut eof).await;
+            assert_eq!(stream.read(&mut eof).await.unwrap(), 0);
         });
         let http = reqwest::Client::new();
         let request = http
@@ -228,13 +230,52 @@ mod tests {
             .timeout(Duration::from_millis(100))
             .build()
             .unwrap();
-        let mut response = execute(&http, Some(&path), request).await.unwrap();
-        sent.await.unwrap();
-        let body = tokio::time::timeout(Duration::from_secs(1), response.chunk()).await;
-        assert!(
-            matches!(body, Ok(Err(ref error)) if error.is_timeout()),
-            "body={body:?}"
+        let start = tokio::time::Instant::now();
+        let expected_deadline = start + Duration::from_millis(100);
+        let client = tokio::spawn(async move { execute(&http, Some(&path), request).await });
+        // Keep the runtime runnable while real socket I/O establishes request arrival.
+        loop {
+            match observed.try_recv() {
+                Ok(()) => break,
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
+                    tokio::task::yield_now().await;
+                }
+                Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                    panic!("server closed before receiving the request");
+                }
+            }
+        }
+        assert_eq!(tokio::time::Instant::now(), start);
+        tokio::time::advance(Duration::from_millis(60)).await;
+        assert!(!client.is_finished());
+        release.send(()).unwrap();
+        // Paused time must not auto-advance while the OS makes headers readable.
+        while !client.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            tokio::time::Instant::now(),
+            start + Duration::from_millis(60)
         );
+        let mut response = client.await.unwrap().unwrap();
+        assert_eq!(response_deadline(&response), expected_deadline);
+        {
+            let body = tokio::time::timeout(Duration::from_secs(1), response.chunk());
+            tokio::pin!(body);
+            assert!(futures_util::poll!(&mut body).is_pending());
+            tokio::time::advance(Duration::from_millis(39)).await;
+            assert!(futures_util::poll!(&mut body).is_pending());
+            tokio::time::advance(Duration::from_millis(11)).await;
+            let result = body.await;
+            assert!(
+                matches!(result, Ok(Err(ref error)) if error.is_timeout()),
+                "body={result:?}"
+            );
+            assert_eq!(
+                tokio::time::Instant::now(),
+                start + Duration::from_millis(110)
+            );
+        }
         drop(response);
         server.await.unwrap();
     }
