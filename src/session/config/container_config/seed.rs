@@ -1728,7 +1728,7 @@ fn read_document(
     };
     let text = text.trim_start_matches('\u{feff}');
     let parsed = if yaml {
-        yaml_serde::from_str::<serde_json::Value>(text).map_err(anyhow::Error::from)
+        crate::yaml::from_str::<serde_json::Value>(text).map_err(anyhow::Error::from)
     } else {
         serde_json::from_str(text).map_err(anyhow::Error::from)
     };

@@ -936,7 +936,7 @@ impl NativeLaunchInputs {
         }
         if let Some(bytes) = self.read_native_file(&root.join("config.yaml"))? {
             let mut config: yaml_serde::Value =
-                yaml_serde::from_slice(&bytes).context("Hermes config.yaml cannot be resolved")?;
+                crate::yaml::from_slice(&bytes).context("Hermes config.yaml cannot be resolved")?;
             config
                 .apply_merge()
                 .context("Hermes YAML merges cannot be resolved")?;

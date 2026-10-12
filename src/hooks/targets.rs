@@ -312,7 +312,7 @@ fn hermes_config_has_aoe_marker(content: &str) -> bool {
     if content.trim().is_empty() {
         return false;
     }
-    let Ok(value) = yaml_serde::from_str::<yaml_serde::Value>(content) else {
+    let Ok(value) = crate::yaml::from_str::<yaml_serde::Value>(content) else {
         return false;
     };
     value

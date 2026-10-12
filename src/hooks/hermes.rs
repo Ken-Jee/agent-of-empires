@@ -40,7 +40,7 @@ pub fn install_hermes_hooks_with_events(
         let mut config = if content.trim().is_empty() {
             Yaml::Mapping(Mapping::new())
         } else {
-            yaml_serde::from_str(&content)
+            crate::yaml::from_str(&content)
                 .with_context(|| format!("Failed to parse {}", config_path.display()))?
         };
         let yaml_before = config.clone();
@@ -89,7 +89,7 @@ pub fn install_hermes_hooks_with_events(
             return Ok(());
         }
         if yaml_changed {
-            write_file(config_path, yaml_serde::to_string(&config)?.as_bytes())?;
+            write_file(config_path, crate::yaml::to_string(&config)?.as_bytes())?;
         }
         if allowlist_changed {
             write_file(&allowlist_path, allowlist.as_bytes())?;
@@ -108,7 +108,7 @@ pub fn uninstall_hermes_hooks(config_path: &Path) -> Result<bool> {
         if content.trim().is_empty() {
             return Ok(false);
         }
-        let mut config: Yaml = yaml_serde::from_str(&content)
+        let mut config: Yaml = crate::yaml::from_str(&content)
             .with_context(|| format!("Failed to parse {}", config_path.display()))?;
         let hooks_key = Yaml::String("hooks".to_string());
         let Some(root) = config.as_mapping_mut() else {
@@ -139,7 +139,7 @@ pub fn uninstall_hermes_hooks(config_path: &Path) -> Result<bool> {
             root.remove(&hooks_key);
         }
 
-        crate::session::atomic_write(config_path, yaml_serde::to_string(&config)?.as_bytes())?;
+        crate::session::atomic_write(config_path, crate::yaml::to_string(&config)?.as_bytes())?;
         log_removed(config_path);
         Ok(true)
     })
@@ -219,16 +219,16 @@ mod tests {
     }
 
     fn read_yaml(path: &Path) -> Yaml {
-        yaml_serde::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+        crate::yaml::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
     }
 
     #[test]
     fn hermes_hooks_install_beside_user_config_and_uninstall() {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("config.yaml");
-        let input = "model: hermes-pro\nhooks:\n  pre_tool_call:\n    - command: \"echo user-hook\"\n      matcher: \"terminal\"\nhooks_auto_accept: false\nvendor: !custom {enabled: true, label: on, code: 001}\n17: [true, false, 'true', 2]\ndefaults: &defaults {token: keep}\ncopy: *defaults\n";
+        let input = "model: hermes-pro\nhooks:\n  pre_tool_call:\n    - command: \"echo user-hook\"\n      matcher: \"terminal\"\nhooks_auto_accept: false\nvendor: {17: numeric, '17': quoted, enabled: true, label: on, code: 001}\nopaque: !custom {enabled: true, label: on, code: 001}\n17: [true, false, 'true', 2]\ndefaults: &defaults {token: keep}\ncopy: *defaults\n";
         std::fs::write(&path, input).unwrap();
-        let mut unrelated_before: Yaml = yaml_serde::from_str(input).unwrap();
+        let mut unrelated_before: Yaml = crate::yaml::from_str(input).unwrap();
         unrelated_before
             .as_mapping_mut()
             .unwrap()
@@ -241,6 +241,17 @@ mod tests {
         let config = read_yaml(&path);
         assert_eq!(config["model"].as_str(), Some("hermes-pro"));
         assert_eq!(config["hooks_auto_accept"].as_bool(), Some(false));
+        let vendor = config["vendor"].as_mapping().unwrap();
+        assert_eq!(
+            vendor
+                .get(Yaml::Number(17u64.into()))
+                .and_then(Yaml::as_str),
+            Some("numeric")
+        );
+        assert_eq!(
+            vendor.get(Yaml::String("17".into())).and_then(Yaml::as_str),
+            Some("quoted")
+        );
         let events = agent_events("hermes", &[]);
         for event in &events {
             let entries = config["hooks"][event.name.as_str()].as_sequence().unwrap();
