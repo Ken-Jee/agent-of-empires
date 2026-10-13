@@ -422,7 +422,7 @@ pub(crate) async fn spawn_structured_session(
         };
 
         let provisioning_failed = provision_error.is_some();
-        let rollback = |native: super::session_store::NativeSessionStore, instance: Instance, provisioning_failed: bool| { use crate::session::deletion::{DeletionDisposition, DeletionRequest, PurgeReservation, PurgeTransaction};
+        let rollback = |native: super::session_store::NativeSessionStore, instance: Instance, provisioning_failed: bool| { use crate::session::deletion::{DeletionDisposition, DeletionRequest, PurgeTransaction};
         let storage_profile = native.storage().profile().to_owned();
         let _namespace = runtime.block_on(worker_state.profile_namespace.read());
         let _submission = runtime.block_on(worker_state.session_service.prompt_submission(&instance.id));
@@ -446,10 +446,10 @@ pub(crate) async fn spawn_structured_session(
         };
         let rollback = PurgeTransaction::reserve_failed_creation(native, request, generation)
             .map(|reservation| match reservation {
-                PurgeReservation::Reserved(transaction) => transaction.complete_creation_rollback(
+                Ok(transaction) => transaction.complete_creation_rollback(
                     created_worktree.iter().chain(&created_workspace_worktrees),
                 ),
-                PurgeReservation::Rejected(result) => result,
+                Err(result) => *result,
             });
         match rollback {
             Ok(result) => {
@@ -1150,10 +1150,7 @@ mod tests {
         let reservation = crate::session::deletion::PurgeTransaction::reserve_unwatched(request)
             .expect("a purge of a just-created session reserves");
         assert!(
-            matches!(
-                reservation,
-                crate::session::deletion::PurgeReservation::Reserved(_)
-            ),
+            reservation.is_ok(),
             "a delete issued right after a create must not find the row busy"
         );
 

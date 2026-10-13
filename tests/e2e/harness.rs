@@ -20,6 +20,13 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 use tempfile::TempDir;
 
+/// The profile every harness session lives in.
+pub const PROFILE: &str = "default";
+
+/// Keeps tests off the developer's user manager; `systemd_scope.rs` opts back
+/// in with its own slice.
+pub const SYSTEMD_OFF: &str = "[systemd]\nenabled = false\n";
+
 // ---------------------------------------------------------------------------
 // App dir name (mirrors `agent_of_empires::session::APP_DIR_NAME_*`).
 // Debug builds use the `-dev` suffix; tests run in debug, so this resolves
@@ -442,6 +449,7 @@ impl TuiTestHarness {
             r#"[updates]
 update_check_mode = "off"
 
+{SYSTEMD_OFF}
 [app_state]
 has_seen_welcome = true
 has_responded_to_telemetry = true
@@ -479,7 +487,17 @@ last_seen_version = "{}"
             recording,
             cast_path: None,
             // aoe addresses tmux via `-S <socket>`, so pin it to the harness socket.
-            extra_env: vec![("AOE_TMUX_SOCKET".to_string(), tmux_socket_env)],
+            extra_env: vec![
+                ("AOE_TMUX_SOCKET".to_string(), tmux_socket_env),
+                (
+                    "XDG_RUNTIME_DIR".to_string(),
+                    config_dir.join("runtime").display().to_string(),
+                ),
+                (
+                    "DBUS_SESSION_BUS_ADDRESS".to_string(),
+                    "unix:path=/dev/null".to_string(),
+                ),
+            ],
             extra_env_remove: Vec::new(),
             extra_path_dirs: Vec::new(),
             stop_daemon_on_drop: false,
@@ -671,6 +689,95 @@ last_seen_version = "{}"
     /// Make `Drop` tear down structured view workers and the serve daemon.
     pub fn stop_daemon_on_drop(&mut self) {
         self.stop_daemon_on_drop = true;
+    }
+
+    /// Start `aoe serve --daemon --no-auth` on a free port and wait for it to bind.
+    pub fn start_daemon(&self) -> u16 {
+        self.start_daemon_with(&["--no-auth"])
+    }
+
+    /// `start_daemon` with different auth or proxy flags.
+    pub fn start_daemon_with(&self, args: &[&str]) -> u16 {
+        let port = pick_free_port();
+        let port_s = port.to_string();
+        self.run_cli_ok(&[&["serve", "--daemon", "--port", &port_s], args].concat());
+        assert!(
+            wait_for_port(port, Duration::from_secs(10)),
+            "daemon never bound port {port}"
+        );
+        port
+    }
+
+    /// Run `aoe add <args>`, assert success, and return the new session id.
+    pub fn add_session(&self, args: &[&str]) -> String {
+        parse_session_id(&self.run_cli_ok(&[&["add"], args].concat()))
+    }
+
+    /// Start a daemon and add a `claude --structured-view` session titled
+    /// `title` over a fresh git project; returns the daemon port and session id.
+    pub fn start_structured_session(&self, title: &str) -> (u16, String) {
+        let project = self.project_path();
+        init_git_repo(&project);
+        let port = self.start_daemon();
+        let id = self.add_session(&[
+            project.to_str().unwrap(),
+            "-t",
+            title,
+            "-c",
+            "claude",
+            "--structured-view",
+        ]);
+        (port, id)
+    }
+
+    /// Retry `aoe acp prompt` until accepted; the prompt fails while the
+    /// worker is still spawning or handshaking.
+    pub fn prompt_until_accepted(&self, session_id: &str, text: &str, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let out = self.run_cli(&["acp", "prompt", session_id, text]);
+            if out.status.success() {
+                return;
+            }
+            if Instant::now() >= deadline {
+                let ps = self.run_cli(&["ps", "--acp", "--dead", "--json"]);
+                panic!(
+                    "structured view worker never accepted a prompt within {timeout:?}.\n\
+                     last prompt stdout: {}\n last prompt stderr: {}\n ps --acp: {}",
+                    String::from_utf8_lossy(&out.stdout),
+                    String::from_utf8_lossy(&out.stderr),
+                    String::from_utf8_lossy(&ps.stdout),
+                );
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
+    }
+
+    /// Append TOML to the seeded `config.toml`.
+    pub fn append_config(&self, toml: &str) {
+        let path = app_dir_in(self.home_path()).join("config.toml");
+        let seeded = std::fs::read_to_string(&path).expect("read seeded config");
+        std::fs::write(&path, format!("{seeded}\n{toml}\n")).expect("write config.toml");
+    }
+
+    pub fn sessions_path(&self) -> PathBuf {
+        app_dir_in(self.home_path())
+            .join("profiles")
+            .join(PROFILE)
+            .join("sessions.json")
+    }
+
+    pub fn read_sessions(&self) -> Value {
+        let path = self.sessions_path();
+        let content = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("failed to read {}: {}", path.display(), e));
+        serde_json::from_str(&content).expect("invalid sessions JSON")
+    }
+
+    /// `read_sessions` that yields `Null` for a missing or mid-write file.
+    pub fn try_read_sessions(&self) -> Value {
+        let content = std::fs::read_to_string(self.sessions_path()).unwrap_or_default();
+        serde_json::from_str(&content).unwrap_or(Value::Null)
     }
 
     /// Build the shell command string to run inside the tmux session.
@@ -1380,86 +1487,6 @@ last_seen_version = "{}"
     pub fn send_keys_unfenced(&self, keys: &str) {
         assert!(self.spawned, "must call spawn_tui() or spawn() first");
         self.tmux_ok(&["send-keys", "-t", &self.session_name, keys], "send-keys");
-    }
-
-    /// Start `aoe serve --daemon --no-auth` on a free port and wait for it to bind.
-    pub fn start_daemon(&self) -> u16 {
-        self.start_daemon_with(&["--no-auth"])
-    }
-
-    pub fn start_daemon_with(&self, args: &[&str]) -> u16 {
-        let port = pick_free_port();
-        let port_string = port.to_string();
-        self.run_cli_ok(&[&["serve", "--daemon", "--port", &port_string], args].concat());
-        assert!(
-            wait_for_port(port, Duration::from_secs(10)),
-            "daemon never bound port {port}"
-        );
-        port
-    }
-
-    /// Run `aoe add <args>` and return the new session id.
-    pub fn add_session(&self, args: &[&str]) -> String {
-        parse_session_id(&self.run_cli_ok(&[&["add"], args].concat()))
-    }
-
-    pub fn start_structured_session(&self, title: &str) -> (u16, String) {
-        let project = self.project_path();
-        init_git_repo(&project);
-        let port = self.start_daemon();
-        let id = self.add_session(&[
-            project.to_str().unwrap(),
-            "-t",
-            title,
-            "-c",
-            "claude",
-            "--structured-view",
-        ]);
-        (port, id)
-    }
-
-    /// Retry `aoe acp prompt` while the worker starts and handshakes.
-    pub fn prompt_until_accepted(&self, session_id: &str, text: &str, timeout: Duration) {
-        let deadline = Instant::now() + timeout;
-        loop {
-            let output = self.run_cli(&["acp", "prompt", session_id, text]);
-            if output.status.success() {
-                return;
-            }
-            if Instant::now() >= deadline {
-                let processes = self.run_cli(&["ps", "--acp", "--dead", "--json"]);
-                panic!(
-                    "structured view worker never accepted a prompt within {timeout:?}.\n\
-                     last prompt stdout: {}\n last prompt stderr: {}\n ps --acp: {}",
-                    String::from_utf8_lossy(&output.stdout),
-                    String::from_utf8_lossy(&output.stderr),
-                    String::from_utf8_lossy(&processes.stdout),
-                );
-            }
-            std::thread::sleep(Duration::from_millis(250));
-        }
-    }
-
-    pub fn append_config(&self, toml: &str) {
-        let path = app_dir_in(self.home_path()).join("config.toml");
-        let seeded = std::fs::read_to_string(&path).expect("read seeded config");
-        std::fs::write(&path, format!("{seeded}\n{toml}\n")).expect("write config.toml");
-    }
-
-    pub fn sessions_path(&self) -> PathBuf {
-        app_dir_in(self.home_path()).join("profiles/default/sessions.json")
-    }
-
-    pub fn read_sessions(&self) -> Value {
-        let path = self.sessions_path();
-        let content = std::fs::read_to_string(&path)
-            .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
-        serde_json::from_str(&content).expect("invalid sessions JSON")
-    }
-
-    pub fn try_read_sessions(&self) -> Value {
-        let content = std::fs::read_to_string(self.sessions_path()).unwrap_or_default();
-        serde_json::from_str(&content).unwrap_or(Value::Null)
     }
 
     pub fn run_cli_ok(&self, args: &[&str]) -> String {

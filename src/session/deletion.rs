@@ -73,11 +73,6 @@ impl DeletionResult {
     }
 }
 
-pub(crate) enum PurgeReservation<S: SessionStore + 'static> {
-    Reserved(PurgeTransaction<S>),
-    Rejected(DeletionResult),
-}
-
 pub(crate) struct TrashPurgeConsent {
     pub trashed_at: chrono::DateTime<Utc>,
     pub trash_lifecycle_id: String,
@@ -198,7 +193,9 @@ impl CompletionGate {
 }
 
 impl PurgeTransaction<Storage> {
-    pub fn reserve_unwatched(request: DeletionRequest) -> Result<PurgeReservation<Storage>> {
+    pub fn reserve_unwatched(
+        request: DeletionRequest,
+    ) -> Result<std::result::Result<Self, Box<DeletionResult>>> {
         let profile = request.instance.source_profile.clone();
         anyhow::ensure!(
             !profile.is_empty(),
@@ -238,7 +235,7 @@ impl<S: SessionStore + 'static> PurgeTransaction<S> {
         request: DeletionRequest,
         selection: Option<PurgeSelection>,
         consent: TrashPurgeConsent,
-    ) -> Result<PurgeReservation<S>> {
+    ) -> Result<std::result::Result<Self, Box<DeletionResult>>> {
         Self::reserve_inner(backend, request, selection, None, Some(consent))
     }
 
@@ -246,7 +243,7 @@ impl<S: SessionStore + 'static> PurgeTransaction<S> {
         backend: S,
         request: DeletionRequest,
         selection: Option<PurgeSelection>,
-    ) -> Result<PurgeReservation<S>> {
+    ) -> Result<std::result::Result<Self, Box<DeletionResult>>> {
         Self::reserve_inner(backend, request, selection, None, None)
     }
 
@@ -255,7 +252,7 @@ impl<S: SessionStore + 'static> PurgeTransaction<S> {
         backend: S,
         request: DeletionRequest,
         generation: u64,
-    ) -> Result<PurgeReservation<S>> {
+    ) -> Result<std::result::Result<Self, Box<DeletionResult>>> {
         Self::reserve_inner(backend, request, None, Some(generation), None)
     }
 
@@ -265,7 +262,7 @@ impl<S: SessionStore + 'static> PurgeTransaction<S> {
         selection: Option<PurgeSelection>,
         creation_generation: Option<u64>,
         consent: Option<TrashPurgeConsent>,
-    ) -> Result<PurgeReservation<S>> {
+    ) -> Result<std::result::Result<Self, Box<DeletionResult>>> {
         anyhow::ensure!(
             request.session_id == request.instance.id,
             "purge request identity does not match its selected row"
@@ -398,12 +395,12 @@ impl<S: SessionStore + 'static> PurgeTransaction<S> {
         })?;
 
         if let Some((disposition, message, retained_instance)) = rejected {
-            return Ok(PurgeReservation::Rejected(DeletionResult::rejected(
+            return Ok(Err(Box::new(DeletionResult::rejected(
                 id,
                 disposition,
                 message,
                 retained_instance,
-            )));
+            ))));
         }
         let (generation, snapshot) =
             reserved.ok_or_else(|| anyhow::anyhow!("purge reservation produced no outcome"))?;
@@ -432,7 +429,7 @@ impl<S: SessionStore + 'static> PurgeTransaction<S> {
         transaction.capture = Some(super::purge_owners::PurgeCapture::new(
             &transaction.request().instance,
         )?);
-        Ok(PurgeReservation::Reserved(transaction))
+        Ok(Ok(transaction))
     }
     /// Resolve defaults after reservation from the complete authoritative snapshot.
     pub(crate) fn resolve_cleanup_defaults(mut self) -> Result<Self> {
@@ -577,6 +574,7 @@ impl<S: SessionStore + 'static> PurgeTransaction<S> {
     /// Persist ownership and remove the row before irreversible sidecar cleanup.
     pub fn begin_irreversible(
         mut self,
+        retirement: Option<&crate::acp::supervisor::RetirementTarget>,
     ) -> std::result::Result<CommittedPurge<S>, Box<DeletionResult>> {
         let _identity = match self.reacquire_cleanup_locks() {
             Ok(identity) => identity,
@@ -609,6 +607,12 @@ impl<S: SessionStore + 'static> PurgeTransaction<S> {
                 self.store().storage().profile(),
             );
             if matches!(gate, CompletionGate::Proceed) {
+                if let Some(retirement) = retirement {
+                    capture
+                        .as_mut()
+                        .expect("reserved purge has captured ownership")
+                        .bind_retirement(retirement)?;
+                }
                 owner = Some(super::purge_owners::PurgeOwner::record_plan(
                     self.store().storage(),
                     &instances[index],
@@ -732,12 +736,18 @@ impl<S: SessionStore + 'static> PurgeTransaction<S> {
             return self.result_for_gate(gate, retained);
         }
         self.adopt_row(retained.expect("accepted purge owns the validated row"));
-        if let Err(error) = self
+        let capture = self
             .capture
             .as_ref()
-            .expect("reserved purge has captured ownership")
-            .ensure_captured_runner_stopped()
-        {
+            .expect("reserved purge has captured ownership");
+        let retirement = if !self.request().instance.is_structured() {
+            capture
+                .retire_terminal_scopes()
+                .and_then(|()| capture.ensure_captured_runner_stopped())
+        } else {
+            capture.ensure_captured_runner_stopped()
+        };
+        if let Err(error) = retirement {
             let error = error.to_string();
             let retained = self
                 .release_reservation(std::slice::from_ref(&error))
@@ -941,8 +951,8 @@ impl<S: SessionStore> CommittedPurge<S> {
         &mut self,
         capture: impl FnOnce(&str) -> Result<crate::acp::supervisor::RetirementTarget>,
     ) -> Result<crate::acp::supervisor::RetirementTarget> {
-        let target = capture(&self.request.session_id)?;
-        self.owner.ensure_retirement_target(&target)?;
+        let mut target = capture(&self.request.session_id)?;
+        self.owner.ensure_retirement_target(&mut target)?;
         self.release_retirement_exclusion();
         Ok(target)
     }
@@ -957,7 +967,7 @@ impl<S: SessionStore> CommittedPurge<S> {
 
     pub(crate) fn ensure_retirement_target(
         &self,
-        target: &crate::acp::supervisor::RetirementTarget,
+        target: &mut crate::acp::supervisor::RetirementTarget,
     ) -> Result<()> {
         self.owner.ensure_retirement_target(target)
     }
@@ -1066,8 +1076,8 @@ pub fn execute_deletion(request: DeletionRequest) -> DeletionResult {
     let result =
         match PurgeTransaction::reserve_unwatched(request).and_then(|reservation| match reservation
         {
-            PurgeReservation::Reserved(transaction) => Ok(transaction.run_hooks()?.complete()),
-            PurgeReservation::Rejected(result) => Ok(result),
+            Ok(transaction) => Ok(transaction.run_hooks()?.complete()),
+            Err(result) => Ok(*result),
         }) {
             Ok(result) => result,
             Err(error) => DeletionResult::rejected(
@@ -2247,6 +2257,92 @@ mod tests {
             keep_scratch: false,
         }
     }
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn terminal_scope_refusal_retains_physical_scratch_and_the_durable_row() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(home.path());
+        super::super::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
+        let bin = home.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let manager = bin.join("systemctl");
+        std::fs::write(
+            &manager,
+            "#!/bin/sh\necho 'manager denies scope status' >&2\nexit 1\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&manager, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let _path = crate::session::test_support::EnvGuard::set(&[("PATH", path.as_str())]);
+        for legacy_unknown in [false, true] {
+            let profile = "terminal-scope-refusal";
+            let storage = Storage::new_unwatched(profile).unwrap();
+            let mut row = Instance::new("owned terminal", home.path().to_str().unwrap());
+            row.source_profile = profile.into();
+            row.scratch = true;
+            let scratch = crate::session::scratch::provision_scratch_dir(&row.id).unwrap();
+            row.project_path = scratch.to_string_lossy().into_owned();
+            std::fs::write(scratch.join("payload"), b"owned checkout contents").unwrap();
+            row.terminal_scopes = if legacy_unknown {
+                None
+            } else {
+                Some(vec![
+                    crate::process::worker_registry::ScopeOwnership::Owned {
+                        unit: format!("aoe-session-{}-denied.scope", row.id.replace('-', "_2d")),
+                    },
+                ])
+            };
+            storage
+                .update(|rows, _| {
+                    rows.push(row.clone());
+                    Ok(())
+                })
+                .unwrap();
+            let Ok(transaction) = PurgeTransaction::reserve(
+                Storage::open_unwatched(profile).unwrap(),
+                test_request(row.clone()),
+                None,
+            )
+            .unwrap() else {
+                panic!("the selected row must reserve before runtime scope proof");
+            };
+            let result = transaction.run_hooks().unwrap().complete();
+            assert!(
+                !result.success,
+                "a denied or unknown scope cannot release checkout resources"
+            );
+            assert_eq!(result.disposition, DeletionDisposition::Failed);
+            assert!(
+                result
+                    .errors
+                    .iter()
+                    .any(|error| error.to_ascii_lowercase().contains("scope")),
+                "{:?}",
+                result.errors
+            );
+            assert_eq!(
+                std::fs::read(scratch.join("payload")).unwrap(),
+                b"owned checkout contents"
+            );
+            let retained = storage
+                .load()
+                .unwrap()
+                .into_iter()
+                .find(|candidate| candidate.id == row.id)
+                .unwrap();
+            assert_eq!(retained.terminal_scopes, row.terminal_scopes);
+            assert!(
+                retained.lifecycle_reservation.is_none(),
+                "ordinary refusal releases only its purge reservation"
+            );
+        }
+    }
 
     #[test]
     fn test_deletion_result_success_when_no_worktree_or_sandbox() {
@@ -2317,8 +2413,8 @@ mod tests {
             )
             .unwrap()
             {
-                PurgeReservation::Reserved(transaction) => transaction,
-                PurgeReservation::Rejected(_) => panic!("initial purge rejected"),
+                Ok(transaction) => transaction,
+                Err(_) => panic!("initial purge rejected"),
             };
             let transaction = transaction.run_hooks_with(|_, _| {
                 std::fs::rename(&old, &moved).unwrap();
@@ -2333,8 +2429,13 @@ mod tests {
                     .unwrap();
             });
             let mut transaction = Some(transaction);
-            let committed =
-                structured.then(|| transaction.take().unwrap().begin_irreversible().unwrap());
+            let committed = structured.then(|| {
+                transaction
+                    .take()
+                    .unwrap()
+                    .begin_irreversible(None)
+                    .unwrap()
+            });
             let replacement = replace.then(|| {
                 let mut row = committed.as_ref().unwrap().request.instance.clone();
                 row.title = "replacement".into();
@@ -2473,7 +2574,7 @@ mod tests {
                 detach_hooks: true,
                 keep_scratch: false,
             };
-            let PurgeReservation::Reserved(transaction) = PurgeTransaction::reserve(
+            let Ok(transaction) = PurgeTransaction::reserve(
                 Storage::open_unwatched("purge-runner").unwrap(),
                 request,
                 None,
@@ -2486,7 +2587,7 @@ mod tests {
             });
             let result = if irreversible {
                 transaction
-                    .begin_irreversible()
+                    .begin_irreversible(None)
                     .unwrap()
                     .finish(|_, _| Ok(()))
             } else {
@@ -2546,7 +2647,7 @@ mod tests {
             detach_hooks: true,
             keep_scratch: false,
         };
-        let PurgeReservation::Reserved(transaction) = PurgeTransaction::reserve(
+        let Ok(transaction) = PurgeTransaction::reserve(
             Storage::open_unwatched("unresolved-capture").unwrap(),
             request,
             None,
@@ -2554,7 +2655,7 @@ mod tests {
         .unwrap() else {
             panic!("purge must be reserved")
         };
-        let result = match transaction.begin_irreversible() {
+        let result = match transaction.begin_irreversible(None) {
             Ok(_) => panic!("unresolved ownership allowed an irreversible commit"),
             Err(result) => result,
         };
@@ -2622,8 +2723,8 @@ mod tests {
             keep_scratch: false,
         };
         let transaction = match PurgeTransaction::reserve(storage, request, None).unwrap() {
-            PurgeReservation::Reserved(transaction) => transaction,
-            PurgeReservation::Rejected(_) => panic!("initial purge rejected"),
+            Ok(transaction) => transaction,
+            Err(_) => panic!("initial purge rejected"),
         };
         let result = transaction.complete();
         assert_eq!(
@@ -2701,8 +2802,8 @@ mod tests {
             )
             .unwrap()
             {
-                PurgeReservation::Rejected(result) => result,
-                PurgeReservation::Reserved(transaction) => {
+                Err(result) => *result,
+                Ok(transaction) => {
                     let transaction = transaction.run_hooks_with(|_, _| {
                         if change == "group during hooks" {
                             storage
@@ -2723,7 +2824,7 @@ mod tests {
                                 .map_err(|error| error.to_string())
                         })
                     } else {
-                        match transaction.begin_irreversible() {
+                        match transaction.begin_irreversible(None) {
                             Err(result) => *result,
                             Ok(committed) => {
                                 assert_eq!(
@@ -2788,8 +2889,8 @@ mod tests {
         )
         .unwrap()
         {
-            PurgeReservation::Reserved(transaction) => transaction,
-            PurgeReservation::Rejected(_) => panic!("initial purge rejected"),
+            Ok(transaction) => transaction,
+            Err(_) => panic!("initial purge rejected"),
         };
         let transaction = transaction.run_hooks_with(|_, _| {
             storage
@@ -2800,7 +2901,7 @@ mod tests {
                 })
                 .unwrap();
         });
-        let result = match transaction.begin_irreversible() {
+        let result = match transaction.begin_irreversible(None) {
             Err(result) => result,
             Ok(_) => panic!("purge removed a row whose execution mode changed during hooks"),
         };
@@ -2850,13 +2951,13 @@ mod tests {
         )
         .unwrap()
         {
-            PurgeReservation::Reserved(transaction) => transaction,
-            PurgeReservation::Rejected(_) => panic!("initial purge rejected"),
+            Ok(transaction) => transaction,
+            Err(_) => panic!("initial purge rejected"),
         };
         // Arm the write failure only now: the reservation itself must commit.
         // The guard disarms on drop, so the injection cannot outlive this test.
         let _failing_writes = storage.fail_writes_for_test();
-        let result = match transaction.begin_irreversible() {
+        let result = match transaction.begin_irreversible(None) {
             Err(result) => result,
             Ok(_) => panic!("a failed sessions.json write must not report a committed purge"),
         };
@@ -2990,13 +3091,13 @@ mod tests {
         let (store, fail_next_commit) =
             CommitFailsAfterWriteStore::new(Storage::open_unwatched(profile).unwrap());
         let transaction = match PurgeTransaction::reserve(store, request, None).unwrap() {
-            PurgeReservation::Reserved(transaction) => transaction,
-            PurgeReservation::Rejected(_) => panic!("initial purge rejected"),
+            Ok(transaction) => transaction,
+            Err(_) => panic!("initial purge rejected"),
         };
         // Arm the failure only now: the reservation itself must commit.
         fail_next_commit.store(true, std::sync::atomic::Ordering::SeqCst);
 
-        let result = match transaction.begin_irreversible() {
+        let result = match transaction.begin_irreversible(None) {
             Err(result) => result,
             Ok(_) => panic!("a failed commit must not report a committed purge"),
         };
@@ -3220,13 +3321,13 @@ mod tests {
         )
         .unwrap()
         {
-            PurgeReservation::Reserved(transaction) => transaction,
-            PurgeReservation::Rejected(_) => panic!("initial purge rejected"),
+            Ok(transaction) => transaction,
+            Err(_) => panic!("initial purge rejected"),
         };
         let transaction = transaction.run_hooks_with(|_, _| {
             std::fs::remove_file(&alias).unwrap();
         });
-        let committed = match transaction.begin_irreversible() {
+        let committed = match transaction.begin_irreversible(None) {
             Ok(committed) => committed,
             Err(_) => panic!("irreversible purge rejected"),
         };
@@ -3336,8 +3437,8 @@ mod tests {
         );
 
         let result = match PurgeTransaction::reserve(storage, request, None).unwrap() {
-            PurgeReservation::Reserved(transaction) => transaction.complete(),
-            PurgeReservation::Rejected(result) => {
+            Ok(transaction) => transaction.complete(),
+            Err(result) => {
                 panic!("purge rejected: {:?}", result.errors)
             }
         };
@@ -3423,8 +3524,8 @@ mod tests {
         )
         .unwrap()
         {
-            PurgeReservation::Reserved(transaction) => transaction,
-            PurgeReservation::Rejected(result) => panic!("rollback rejected: {:?}", result.errors),
+            Ok(transaction) => transaction,
+            Err(result) => panic!("rollback rejected: {:?}", result.errors),
         };
         let workspace = transaction.instance().workspace_info.as_ref().unwrap();
         assert!(workspace.cleanup_on_delete);
@@ -3477,10 +3578,10 @@ mod tests {
         )
         .unwrap();
         match rejected {
-            PurgeReservation::Rejected(result) => {
+            Err(result) => {
                 assert_eq!(result.disposition, DeletionDisposition::Busy)
             }
-            PurgeReservation::Reserved(_) => panic!("foreign creation acquired rollback ownership"),
+            Ok(_) => panic!("foreign creation acquired rollback ownership"),
         }
         assert!(marker.exists());
         assert!(storage.load().unwrap()[0]
@@ -3492,8 +3593,8 @@ mod tests {
         )
         .unwrap();
         let result = match owned {
-            PurgeReservation::Reserved(transaction) => transaction.complete(),
-            PurgeReservation::Rejected(_) => {
+            Ok(transaction) => transaction.complete(),
+            Err(_) => {
                 panic!("creation could not roll back its own resources")
             }
         };
@@ -3553,8 +3654,8 @@ mod tests {
         )
         .unwrap()
         {
-            PurgeReservation::Reserved(transaction) => transaction.complete(),
-            PurgeReservation::Rejected(result) => panic!(
+            Ok(transaction) => transaction.complete(),
+            Err(result) => panic!(
                 "a released launch reservation must not block the rollback: {:?}",
                 result.errors
             ),
@@ -3623,10 +3724,10 @@ mod tests {
         )
         .unwrap();
         match rejected {
-            PurgeReservation::Rejected(result) => {
+            Err(result) => {
                 assert_eq!(result.disposition, DeletionDisposition::Busy)
             }
-            PurgeReservation::Reserved(_) => {
+            Ok(_) => {
                 panic!("a superseded creation took rollback ownership from generation {foreign}")
             }
         }
@@ -3680,8 +3781,8 @@ mod tests {
             )
             .unwrap()
             {
-                PurgeReservation::Reserved(transaction) => transaction,
-                PurgeReservation::Rejected(_) => panic!("purge reservation was refused"),
+                Ok(transaction) => transaction,
+                Err(_) => panic!("purge reservation was refused"),
             };
             assert_eq!(
                 transaction.request().force_delete,
@@ -3724,8 +3825,8 @@ mod tests {
         )
         .unwrap()
         {
-            PurgeReservation::Reserved(transaction) => transaction,
-            PurgeReservation::Rejected(_) => panic!("initial reservation was refused"),
+            Ok(transaction) => transaction,
+            Err(_) => panic!("initial reservation was refused"),
         };
         storage
             .update(|instances, _groups| {
@@ -3734,7 +3835,7 @@ mod tests {
             })
             .unwrap();
 
-        let result = match transaction.begin_irreversible() {
+        let result = match transaction.begin_irreversible(None) {
             Ok(_) => panic!("superseded purge crossed the irreversible boundary"),
             Err(result) => *result,
         };
@@ -3763,10 +3864,10 @@ mod tests {
         )
         .unwrap()
         {
-            PurgeReservation::Reserved(transaction) => transaction,
-            PurgeReservation::Rejected(_) => panic!("retry reservation was refused"),
+            Ok(transaction) => transaction,
+            Err(_) => panic!("retry reservation was refused"),
         };
-        let committed = match retry.begin_irreversible() {
+        let committed = match retry.begin_irreversible(None) {
             Ok(committed) => committed,
             Err(_) => panic!("current purge reservation was rejected"),
         };
@@ -3801,8 +3902,8 @@ mod tests {
         )
         .unwrap()
         {
-            PurgeReservation::Reserved(transaction) => transaction,
-            PurgeReservation::Rejected(_) => panic!("selected trash must reserve"),
+            Ok(transaction) => transaction,
+            Err(_) => panic!("selected trash must reserve"),
         };
         let generation = transaction.generation;
         storage
@@ -3814,7 +3915,7 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        let result = match transaction.begin_irreversible() {
+        let result = match transaction.begin_irreversible(None) {
             Ok(_) => panic!("a superseded trash lifecycle crossed the irreversible boundary"),
             Err(result) => result,
         };
@@ -3863,8 +3964,8 @@ mod tests {
         )
         .unwrap()
         {
-            PurgeReservation::Reserved(transaction) => transaction,
-            PurgeReservation::Rejected(_) => panic!("purge reservation was refused"),
+            Ok(transaction) => transaction,
+            Err(_) => panic!("purge reservation was refused"),
         };
 
         let (purge_tx, purge_rx) = std::sync::mpsc::channel();
@@ -3986,8 +4087,8 @@ mod tests {
             )
             .unwrap()
             {
-                PurgeReservation::Reserved(transaction) => transaction,
-                PurgeReservation::Rejected(_) => panic!("purge reservation was refused"),
+                Ok(transaction) => transaction,
+                Err(_) => panic!("purge reservation was refused"),
             };
             let result = transaction.complete();
             if adopt_after_scan {
@@ -4917,8 +5018,8 @@ mod tests {
                     keep_scratch: false,
                 };
                 let transaction = match PurgeTransaction::reserve(source, request, None).unwrap() {
-                    PurgeReservation::Reserved(transaction) => transaction,
-                    PurgeReservation::Rejected(_) => panic!("initial purge rejected"),
+                    Ok(transaction) => transaction,
+                    Err(_) => panic!("initial purge rejected"),
                 };
                 let result = transaction.complete();
                 assert_eq!(
@@ -5910,13 +6011,10 @@ mod tests {
                 },
             )
             .unwrap();
-            assert!(matches!(
-                rejected,
-                PurgeReservation::Rejected(DeletionResult {
-                    disposition: DeletionDisposition::KeptRestored,
-                    ..
-                })
-            ));
+            let Err(result) = rejected else {
+                panic!("a restored trash lifecycle must refuse purge");
+            };
+            assert_eq!(result.disposition, DeletionDisposition::KeptRestored);
             assert_eq!(storage.load().unwrap()[0].lifecycle_generation, 7);
         }
         let mut transaction = match PurgeTransaction::reserve_selected_trash(
@@ -5927,8 +6025,8 @@ mod tests {
         )
         .unwrap()
         {
-            PurgeReservation::Reserved(transaction) => transaction,
-            PurgeReservation::Rejected(_) => panic!("matching failed purge is retriable"),
+            Ok(transaction) => transaction,
+            Err(_) => panic!("matching failed purge is retriable"),
         };
         assert!(transaction.request().force_delete);
         let retained = transaction

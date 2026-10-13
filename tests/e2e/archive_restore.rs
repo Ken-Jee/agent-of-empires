@@ -43,7 +43,7 @@ fn seed_group_sessions(h: &TuiTestHarness, project: &str, group: &str, sessions:
         .iter()
         .map(|(id, title)| {
             format!(
-                r#"{{"id":"{id}","title":"{title}","project_path":"{project}","group_path":"{group}","command":"","tool":"claude","yolo_mode":false,"status":"idle","created_at":"2026-01-01T00:00:00Z"}}"#,
+                r#"{{"id":"{id}","title":"{title}","project_path":"{project}","group_path":"{group}","command":"","tool":"claude","yolo_mode":false,"status":"idle","terminal_scopes":[],"created_at":"2026-01-01T00:00:00Z"}}"#,
             )
         })
         .collect();
@@ -64,7 +64,7 @@ fn seed_sessions(h: &TuiTestHarness, project: &str, titles: &[(&str, &str)]) {
         .iter()
         .map(|(id, title)| {
             format!(
-                r#"{{"id":"{id}","title":"{title}","project_path":"{project}","group_path":"","command":"","tool":"claude","yolo_mode":false,"status":"idle","created_at":"2026-01-01T00:00:00Z"}}"#,
+                r#"{{"id":"{id}","title":"{title}","project_path":"{project}","group_path":"","command":"","tool":"claude","yolo_mode":false,"status":"idle","terminal_scopes":[],"created_at":"2026-01-01T00:00:00Z"}}"#,
             )
         })
         .collect();
@@ -120,8 +120,6 @@ fn test_archive_then_unarchive_cycle() {
     h.wait_for_ready();
     h.wait_for("Archivo");
     h.wait_for("Neighbor");
-    // Cursor starts on the top row (Archivo); give startup recovery a beat.
-    std::thread::sleep(Duration::from_millis(1200));
 
     // Archive the selected session.
     h.send_keys("z");

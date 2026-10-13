@@ -98,10 +98,10 @@ mod tests {
             }
 
             crate::migrations::run_migrations().unwrap();
-            assert_eq!(crate::migrations::current_schema_version(), 44);
+            assert_eq!(crate::migrations::current_schema_version(), 45);
             assert_eq!(
                 fs::read_to_string(app.join(".schema_version")).unwrap(),
-                "44"
+                "45"
             );
             for path in sessions_file::session_files(&app).unwrap() {
                 let first = fs::read_to_string(&path).unwrap();

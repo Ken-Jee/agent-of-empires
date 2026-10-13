@@ -466,12 +466,16 @@ async fn archive_session(profile: &str, args: ArchiveArgs) -> Result<()> {
     let inst = super::resolve_session(&args.identifier, &instances)?;
     let id = inst.id.clone();
     let title = inst.title.clone();
-    let inst = inst.clone();
 
     let _lifecycle_lock = storage
         .acquire_instance_lifecycle_lock(&id)
         .context("failed to acquire instance archive lock")?;
     if !args.no_kill {
+        let inst = storage
+            .load()?
+            .into_iter()
+            .find(|row| row.id == id)
+            .context("session disappeared before archive")?;
         inst.kill_all_tmux_sessions_locked()?;
     }
 
@@ -653,8 +657,8 @@ async fn empty_trash(profile: &str) -> Result<()> {
             None,
         )?;
         let transaction = match reservation {
-            crate::session::deletion::PurgeReservation::Reserved(transaction) => transaction,
-            crate::session::deletion::PurgeReservation::Rejected(result) => {
+            Ok(transaction) => transaction,
+            Err(result) => {
                 match result.disposition {
                     crate::session::deletion::DeletionDisposition::KeptRestored => {
                         being_restored_elsewhere += 1;

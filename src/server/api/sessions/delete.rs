@@ -16,7 +16,7 @@ pub(crate) async fn purge_session_artifacts(
     additional_protection: Option<crate::session::path_identity::CleanupProtection>,
     selection: Option<crate::session::deletion::PurgeSelection>,
 ) -> anyhow::Result<PurgeOutcome> {
-    use crate::session::deletion::{DeletionDisposition, PurgeReservation, PurgeTransaction};
+    use crate::session::deletion::{DeletionDisposition, PurgeTransaction};
     if state.cityhall_mode && !instance.is_structured() {
         anyhow::bail!(super::lifecycle::LifecycleTargetError::CityHall);
     }
@@ -119,8 +119,8 @@ pub(crate) async fn purge_session_artifacts(
     })
     .await??;
     let transaction = match reservation {
-        PurgeReservation::Reserved(transaction) => transaction,
-        PurgeReservation::Rejected(result) => {
+        Ok(transaction) => transaction,
+        Err(result) => {
             return match result.disposition {
                 DeletionDisposition::AlreadyGone => {
                     release_removed_session_locks(state, id, &profile).await?;
@@ -162,13 +162,18 @@ pub(crate) async fn purge_session_artifacts(
     let transaction = tokio::task::spawn_blocking(move || transaction.run_hooks()).await??;
     let transcript_purged = transaction.instance().is_structured();
     let result = if transcript_purged {
-        let retirement =
+        let mut retirement =
             retirement.expect("structured purge captured worker ownership before reservation");
-        match tokio::task::spawn_blocking(move || transaction.begin_irreversible()).await? {
+        let committed_retirement = retirement.clone();
+        match tokio::task::spawn_blocking(move || {
+            transaction.begin_irreversible(Some(&committed_retirement))
+        })
+        .await?
+        {
             Err(result) => *result,
             Ok(committed) => {
                 // Commit removal before destroying a transcript that cannot be restored.
-                let shutdown = match committed.ensure_retirement_target(&retirement) {
+                let shutdown = match committed.ensure_retirement_target(&mut retirement) {
                     Ok(()) => finish_structured_purge(state, id, &retirement).await,
                     Err(error) => Err(error),
                 };

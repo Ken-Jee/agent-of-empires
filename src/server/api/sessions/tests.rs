@@ -65,7 +65,7 @@ async fn structured_purge_waits_for_a_pending_runner_retirement() -> anyhow::Res
 #[tokio::test]
 #[serial_test::serial]
 async fn committed_purge_preserves_a_reused_rows_structured_projection() -> anyhow::Result<()> {
-    use crate::session::deletion::{DeletionRequest, PurgeReservation, PurgeTransaction};
+    use crate::session::deletion::{DeletionRequest, PurgeTransaction};
     for recovered_with_replacement_worker in [false, true] {
         let _home = crate::session::test_support::isolate_app_dir();
         crate::session::purge_owners::initialize(&crate::session::get_app_dir()?)?;
@@ -90,13 +90,11 @@ async fn committed_purge_preserves_a_reused_rows_structured_projection() -> anyh
             keep_scratch: false,
         };
         let committed = tokio::task::spawn_blocking(move || {
-            let PurgeReservation::Reserved(transaction) =
-                PurgeTransaction::reserve_unwatched(request)?
-            else {
+            let Ok(transaction) = PurgeTransaction::reserve_unwatched(request)? else {
                 anyhow::bail!("selected original row must reserve");
             };
             transaction
-                .begin_irreversible()
+                .begin_irreversible(None)
                 .map_err(|result| anyhow::anyhow!(result.errors.join("; ")))
         })
         .await??;
@@ -295,7 +293,7 @@ async fn committed_structured_purge_releases_admission_exclusion_before_retireme
 ) -> anyhow::Result<()> {
     use crate::acp::runner_lifecycle::{test_support::FakeProcessControl, ProcessControl};
     use crate::acp::supervisor::test_support::{recording_gated_launcher, spawn_request, Gate};
-    use crate::session::deletion::{DeletionRequest, PurgeReservation, PurgeTransaction};
+    use crate::session::deletion::{DeletionRequest, PurgeTransaction};
     let _home = crate::session::test_support::isolate_app_dir();
     crate::session::purge_owners::initialize(&crate::session::get_app_dir()?)?;
     for recovered in [false, true] {
@@ -344,13 +342,11 @@ async fn committed_structured_purge_releases_admission_exclusion_before_retireme
         };
         let retirement = state.acp_supervisor.capture_retirement(&row.id)?;
         let committed = tokio::task::spawn_blocking(move || {
-            let PurgeReservation::Reserved(transaction) =
-                PurgeTransaction::reserve_unwatched(deletion)?
-            else {
+            let Ok(transaction) = PurgeTransaction::reserve_unwatched(deletion)? else {
                 anyhow::bail!("purge must reserve the selected row");
             };
             transaction
-                .begin_irreversible()
+                .begin_irreversible(None)
                 .map_err(|result| anyhow::anyhow!(result.errors.join("; ")))
         })
         .await??;

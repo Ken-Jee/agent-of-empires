@@ -58,6 +58,7 @@ mod v041_pending_purge_owners;
 mod v042_reconcile_session_creation_count;
 mod v043_reconcile_trash_lifecycle_id;
 mod v044_reconcile_serve_passphrase_policy;
+mod v045_runner_scope_ownership;
 
 /// Fixtures shared by migrations that rewrite agent hook files.
 #[cfg(test)]
@@ -98,7 +99,7 @@ use anyhow::Result;
 use std::fs;
 use tracing::{debug, info};
 
-const CURRENT_VERSION: u32 = 44;
+const CURRENT_VERSION: u32 = 45;
 const VERSION_FILE: &str = ".schema_version";
 
 struct Migration {
@@ -327,6 +328,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 44,
         name: "reconcile_serve_passphrase_policy",
         run: v044_reconcile_serve_passphrase_policy::run,
+    },
+    Migration {
+        version: 45,
+        name: "runner_scope_ownership",
+        run: v045_runner_scope_ownership::run,
     },
 ];
 

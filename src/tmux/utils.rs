@@ -1122,9 +1122,7 @@ mod tests {
             crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap())
                 .unwrap();
             for structured in [false, true] {
-                use crate::session::deletion::{
-                    DeletionRequest, PurgeReservation, PurgeTransaction,
-                };
+                use crate::session::deletion::{DeletionRequest, PurgeTransaction};
                 let mut row = crate::session::Instance::new("purge proof", "");
                 row.source_profile = "socket-proof".into();
                 row.status = crate::session::Status::Stopped;
@@ -1152,15 +1150,14 @@ mod tests {
                     detach_hooks: true,
                     keep_scratch: false,
                 };
-                let PurgeReservation::Reserved(transaction) =
-                    PurgeTransaction::reserve(store, request, None).unwrap()
+                let Ok(transaction) = PurgeTransaction::reserve(store, request, None).unwrap()
                 else {
                     panic!("purge must be admitted");
                 };
                 let transaction = transaction.run_hooks().unwrap();
                 let result = if structured {
                     transaction
-                        .begin_irreversible()
+                        .begin_irreversible(None)
                         .unwrap()
                         .finish(|_, _| Ok(()))
                 } else {

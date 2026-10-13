@@ -33,7 +33,7 @@ use crate::session::SandboxInfo;
 pub(crate) use teardown::RetirementTarget;
 
 pub(crate) use agents::apply_agent_command_override;
-pub(crate) use launch::host_spawn_environment;
+pub(crate) use launch::{host_spawn_environment, with_durable_launch};
 pub use sink::{BroadcastSink, ChannelSink};
 
 /// Post-startup respawns allowed within `RESTART_WINDOW` before the session is parked.
@@ -198,6 +198,9 @@ impl ResumeReservation {
 impl Drop for ResumeReservation {
     fn drop(&mut self) {
         let mut lifecycle = lock_recover(&self.lifecycle);
+        if lifecycle.construction_is_pending(&self.lease) {
+            self.lease.cancellation().cancel();
+        }
         if let Some(identity) = self.lease.spawned_runner() {
             if lifecycle.convert_to_stopping(&self.lease) {
                 lifecycle.settle(

@@ -62,6 +62,8 @@ pub(crate) const HAS_CODEX_MANAGED_PREFERENCES: bool = true;
 /// System memory + agent-count sampling for the TUI diagnostics strip.
 pub(crate) mod metrics;
 
+pub mod systemd;
+
 /// Protocol-agnostic plumbing for supervised worker subprocesses, lifted
 /// out of `src/acp/` so the future plugin host can reuse it.
 pub mod worker;

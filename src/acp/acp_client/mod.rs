@@ -449,13 +449,8 @@ impl AcpClient {
             }
             let runner_sandbox = sandbox.as_ref().map(|(handle, _)| handle);
             let (runner_pid, native_store) =
-                spawn_runner_detached(&config, &socket_path, session_id.0.clone(), runner_sandbox)?;
-            if let Some(lease) = &config.launch_lease {
-                lease.record_runner(crate::acp::runner_lifecycle::RunnerIdentity {
-                    pid: runner_pid,
-                    generation: config.generation,
-                });
-            }
+                spawn_runner_detached(&config, &socket_path, session_id.0.clone(), runner_sandbox)
+                    .await?;
             let mut client = Self::connect_via_socket(socket_path, launch(sandbox), None).await?;
             client.runner_pid = Some(runner_pid);
             client.native_store = native_store;

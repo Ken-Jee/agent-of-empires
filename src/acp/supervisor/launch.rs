@@ -112,6 +112,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         let session_id = req.session_id.as_str();
         let warmup_guard = self.warmup_guard(&req.agent).await;
         let (mut config, context_reset) = self.spawn_config(&req, lease.epoch()).await?;
+        lease.set_admission(req.launch_admission.clone());
         config.launch_lease = Some(lease.clone());
         debug!(
             target: "acp.supervisor",
@@ -468,7 +469,10 @@ impl<S: BroadcastSink> Supervisor<S> {
         Ok(client)
     }
 
-    /// Retire a runner a failed spawn left behind under this lease's generation.
+    /// Retire a runner a failed spawn left behind under this lease's generation
+    /// and release the scope it created, while the lease still holds the
+    /// session. A first launch has no previous runner to keep. Under a pending
+    /// stop the scope is released even when no runner of this generation exists.
     async fn reap_failed_launch(&self, lease: &Lease) {
         let session_id = lease.session_id();
         let identity = lease.spawned_runner().or_else(|| {
@@ -488,7 +492,8 @@ impl<S: BroadcastSink> Supervisor<S> {
             return;
         }
         let settlement = tear_down_runner(&*self.process_control, session_id, Some(identity)).await;
-        self.settle(lease, settlement);
+        lock_recover(&self.lifecycle).owe_sweep(lease);
+        self.settle_sweeping_if_owed(lease, settlement).await;
     }
 
     /// Tear down a built worker whose install the lifecycle table refused.
@@ -508,7 +513,9 @@ impl<S: BroadcastSink> Supervisor<S> {
                     %reason,
                     "resume cancelled by a concurrent shutdown; runner torn down"
                 );
-                self.settle(lease, settlement);
+                // The refused install left this lease stopping and owing the
+                // sweep, which holds off a replacement start until the settle.
+                self.settle_sweeping_if_owed(lease, settlement).await;
                 self.publish_next(session_id, &Event::Stopped { reason });
             }
             InstallError::Stale => {
@@ -815,14 +822,22 @@ async fn admit_durable_launch(
     admission: Option<&super::LaunchAdmission>,
     session_id: &str,
 ) -> Result<(), SupervisorError> {
-    let Some(mut admission) = admission.cloned() else {
-        return Ok(());
+    with_durable_launch(admission.cloned(), session_id.to_owned(), || Ok(())).await
+}
+
+/// The blocking producer owns the native birth check, child spawn and publication.
+pub(crate) async fn with_durable_launch<T: Send + 'static>(
+    admission: Option<super::LaunchAdmission>,
+    session_id: String,
+    operation: impl FnOnce() -> Result<T, AcpError> + Send + 'static,
+) -> Result<T, SupervisorError> {
+    let Some(mut admission) = admission else {
+        return operation().map_err(SupervisorError::Acp);
     };
     let namespace = match admission.namespace.take() {
         Some(namespace) => Some(namespace.read_owned().await),
         None => None,
     };
-    let session_id = session_id.to_owned();
     tokio::task::spawn_blocking(move || {
         let _namespace = namespace;
         let _lock = admission
@@ -848,7 +863,7 @@ async fn admit_durable_launch(
                         "structured session launch is not finalized".into(),
                     )));
                 }
-                Ok(())
+                operation().map_err(SupervisorError::Acp)
             }
         }
     })

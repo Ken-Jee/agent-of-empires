@@ -12,6 +12,7 @@ impl Instance {
         Self {
             id: generate_id(),
             title: title.to_string(),
+            terminal_scopes: Some(Vec::new()),
             last_auto_title: None,
             first_launch_names_agent: false,
             sort_index: None,

@@ -134,6 +134,9 @@ struct SessionJson {
     /// The session this one was added under with `aoe add -P`.
     #[serde(skip_serializing_if = "Option::is_none")]
     parent_session_id: Option<String>,
+    /// Expected scope unit glob (`aoe-session-<id>-*.scope`) for live sessions with a process; not proof a unit exists.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    systemd_unit: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -161,7 +164,14 @@ fn worktree_for(inst: &Instance) -> Option<WorktreeJson> {
     })
 }
 
-fn session_json(inst: &Instance, profile: &str) -> SessionJson {
+/// Whether session scopes are expected, decided without calling systemd, so
+/// `aoe list` never waits on it.
+fn systemd_scopes_active() -> bool {
+    crate::process::systemd::scopes_expected(crate::session::Config::load_or_warn().systemd.enabled)
+}
+
+fn session_json(inst: &Instance, profile: &str, systemd_namespace: Option<&str>) -> SessionJson {
+    let live = matches!(inst.effective_bucket(), SessionBucket::Active);
     SessionJson {
         id: inst.id.clone(),
         title: inst.title.clone(),
@@ -179,6 +189,9 @@ fn session_json(inst: &Instance, profile: &str) -> SessionJson {
         workspace_repos: workspace_repos_for(inst),
         worktree: worktree_for(inst),
         parent_session_id: inst.parent_session_id.clone(),
+        systemd_unit: systemd_namespace
+            .filter(|_| live && crate::process::systemd::has_process(inst.status))
+            .map(|namespace| crate::process::systemd::unit_glob(&inst.id, namespace)),
     }
 }
 
@@ -352,9 +365,12 @@ pub async fn run(profile: &str, args: ListArgs) -> Result<()> {
     // (a profile whose rows are all trashed), which is precisely the scripted
     // consumer #3350 is about.
     if args.json {
+        let systemd_namespace = systemd_scopes_active()
+            .then(|| crate::process::systemd::scope_namespace().ok())
+            .flatten();
         let sessions: Vec<SessionJson> = instances
             .iter()
-            .map(|inst| session_json(inst, storage.profile()))
+            .map(|inst| session_json(inst, storage.profile(), systemd_namespace.as_deref()))
             .collect();
         super::output::print_json(&sessions)?;
         return Ok(());
@@ -396,6 +412,9 @@ fn collect_profile_sessions(
     profiles: &[String],
     scope: SessionScope,
 ) -> (Vec<SessionJson>, Vec<String>) {
+    let systemd_namespace = systemd_scopes_active()
+        .then(|| crate::process::systemd::scope_namespace().ok())
+        .flatten();
     let mut all_sessions: Vec<SessionJson> = Vec::new();
     let mut failures = Vec::new();
     for profile_name in profiles {
@@ -405,7 +424,11 @@ fn collect_profile_sessions(
                     if !SessionScope::matches(Some(scope), inst.is_archived(), inst.is_trashed()) {
                         continue;
                     }
-                    all_sessions.push(session_json(inst, profile_name));
+                    all_sessions.push(session_json(
+                        inst,
+                        profile_name,
+                        systemd_namespace.as_deref(),
+                    ));
                 }
             }
             Err(error) => failures.push(format!("profile '{profile_name}': {error}")),
@@ -533,7 +556,7 @@ mod tests {
         );
 
         assert_eq!(
-            session_json(&child, "p").parent_session_id.as_deref(),
+            session_json(&child, "p", None).parent_session_id.as_deref(),
             Some(root.id.as_str())
         );
     }
@@ -542,7 +565,7 @@ mod tests {
     fn session_json_reports_state_and_only_the_timestamps_that_apply() {
         let plain = Instance::new("z", "/repo");
         assert_eq!(state_tag(&plain), "live");
-        let json = session_json(&plain, "p");
+        let json = session_json(&plain, "p", None);
         assert_eq!(json.state, "live");
         let serialized = serde_json::to_string(&json).unwrap();
         assert!(!serialized.contains("trashed_at"));
@@ -552,7 +575,7 @@ mod tests {
         let mut archived = Instance::new("z", "/repo");
         archived.archive();
         assert_eq!(state_tag(&archived), "archived");
-        let json = session_json(&archived, "p");
+        let json = session_json(&archived, "p", None);
         assert_eq!(json.state, "archived");
         assert!(json.archived_at.is_some());
         assert!(json.trashed_at.is_none());
@@ -560,7 +583,7 @@ mod tests {
         let mut trashed = Instance::new("z", "/repo");
         trashed.trash();
         assert_eq!(state_tag(&trashed), "trashed");
-        let json = session_json(&trashed, "p");
+        let json = session_json(&trashed, "p", None);
         assert_eq!(json.state, "trashed");
         assert!(json.trashed_at.is_some());
         assert!(json.archived_at.is_none());
@@ -606,7 +629,7 @@ mod tests {
             inst
         };
         let check = |label: &str, f: &dyn Fn(&mut Instance), snooze: bool, pin: bool, state| {
-            let value = serde_json::to_value(session_json(&row(f), "p")).unwrap();
+            let value = serde_json::to_value(session_json(&row(f), "p", None)).unwrap();
             let seen = (
                 value.get("snoozed_until").is_some(),
                 value.get("pinned_at").is_some(),
@@ -682,13 +705,51 @@ mod tests {
             "archived",
         );
 
-        let active =
-            serde_json::to_value(session_json(&row(&|i| i.snoozed_until = Some(future)), "p"))
-                .unwrap();
+        let active = serde_json::to_value(session_json(
+            &row(&|i| i.snoozed_until = Some(future)),
+            "p",
+            None,
+        ))
+        .unwrap();
         assert_eq!(
             active["snoozed_until"],
             serde_json::to_value(future).unwrap()
         );
+    }
+
+    #[test]
+    fn systemd_unit_field_serialization() {
+        let mut j = session_json(&Instance::new("example", "/repo"), "p", None);
+        j.systemd_unit = Some("aoe-session-abc123-*.scope".into());
+        let v = serde_json::to_value(&j).unwrap();
+        assert_eq!(v["systemd_unit"], "aoe-session-abc123-*.scope");
+        j.systemd_unit = None;
+        assert!(serde_json::to_value(&j)
+            .unwrap()
+            .get("systemd_unit")
+            .is_none());
+    }
+
+    #[test]
+    fn systemd_unit_only_for_live_sessions_when_scopes_are_active() {
+        let live = Instance::new("example", "/repo");
+        let mut trashed = Instance::new("example", "/repo");
+        trashed.trash();
+        let mut archived = Instance::new("example", "/repo");
+        archived.archive();
+        let mut stopped = Instance::new("example", "/repo");
+        stopped.status = crate::session::Status::Stopped;
+        assert_eq!(session_json(&live, "p", None).systemd_unit, None);
+        assert_eq!(
+            session_json(&live, "p", Some("namespace")).systemd_unit,
+            Some(format!("aoe-session-{}-namespace-*.scope", live.id))
+        );
+        for no_scope in [&trashed, &archived, &stopped] {
+            assert_eq!(
+                session_json(no_scope, "p", Some("namespace")).systemd_unit,
+                None
+            );
+        }
     }
 
     /// `list --all` never consumes `--profile`; the single-profile form goes

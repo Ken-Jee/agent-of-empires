@@ -19,4 +19,10 @@ schema 44 reconciles policy for earlier PR installations through schema 43.
 That reconciliation does not initialize purge ownership: a missing journal must
 remain missing rather than fabricate ownership proof.
 
+Schema 45 records exact runner, terminal-launch and purge scope ownership. Older
+records are migrated to unresolved authority, never assumed unscoped or
+authorized by a SID wildcard. Unknown scope ownership retains rows, journals
+and resources. Terminal launch records exact units under its existing generation
+reservation before pane birth, including when later configuration disables scopes.
+
 A migration that retypes a persisted field must call `crate::session::backup_before_migration` before rewriting, so the build that predates the new shape still has bytes it can read. What that build does with a row it cannot decode, and what the migration backup is worth to a user who forces a downgrade, is covered under [Downgrading](../installation.md#downgrading).

@@ -470,6 +470,7 @@ impl Instance {
                     &self.effective_profile(),
                     &[],
                     &env_info.env,
+                    None,
                 )?;
                 self.apply_container_terminal_tmux_options(index);
             }

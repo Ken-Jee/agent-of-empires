@@ -50,6 +50,7 @@ const NON_SUFFIX_HOST_STATE: Record<string, string> = {
   AOE_TMUX_SOCKET: "/tmp/tmux-1000/aoe.sock",
   AOE_UPDATE_API_BASE: "https://host.invalid/api",
   AOE_UPDATE_BASE_URL: "https://host.invalid",
+  DBUS_SESSION_BUS_ADDRESS: "unix:path=/host/dev/bus",
   GIT_CONFIG_GLOBAL: `${HOST}/.gitconfig`,
   GIT_CONFIG_SYSTEM: `${HOST}/etc/gitconfig`,
   GIT_SSH_COMMAND: `ssh -i ${HOST}/.ssh/id_ed25519`,
@@ -57,7 +58,6 @@ const NON_SUFFIX_HOST_STATE: Record<string, string> = {
   TMUX: "/tmp/tmux-1000/default,4242,0",
   TMUX_PANE: "%7",
 };
-
 describe("isolateEnv", () => {
   // Agent config and database paths must remain inside the isolated HOME.
   it("leaves no inherited path pointing outside the test home", () => {
@@ -72,6 +72,8 @@ describe("isolateEnv", () => {
         AOE_DAEMON_URL: "http://a-real-daemon.internal:8080",
         TMPDIR: `${HOST}/tmp`,
         LANG: "en_US.UTF-8",
+        XDG_RUNTIME_DIR: join(HOST, "runtime"),
+        DBUS_SESSION_BUS_ADDRESS: "unix:path=/host/dev/bus",
       },
       PATHS,
     );
@@ -80,6 +82,8 @@ describe("isolateEnv", () => {
       expect(`${name}=${value}`).not.toContain(HOST);
     }
     expect(env.XDG_DATA_HOME).toBe(PATHS.xdgData);
+    expect(env.XDG_RUNTIME_DIR).toBe(join(HOME, "runtime"));
+    expect(env.DBUS_SESSION_BUS_ADDRESS).toBe("unix:path=/dev/null");
     // Not a path, but it would point the harness's own `aoe` calls at it.
     expect(env.AOE_DAEMON_URL).toBeUndefined();
     // Not inherited as a toolchain path: git resolves the subprograms it runs

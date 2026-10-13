@@ -1526,6 +1526,7 @@ fn cli_acp_doctor_flags_adapters_below_the_version_floor() {
 #[test]
 #[parallel]
 fn cli_migration_34_37_43_persists_policy_and_second_run_bytes() {
+    let completed_checkpoint = agent_of_empires::migrations::current_schema_version();
     for version in [34, 37, 43] {
         let h = TuiTestHarness::new("cli_policy_upgrade");
         let app = app_dir_in(h.home_path());
@@ -1558,8 +1559,11 @@ fn cli_migration_34_37_43_persists_policy_and_second_run_bytes() {
             String::from_utf8_lossy(&first.stderr)
         );
         assert_eq!(
-            std::fs::read_to_string(app.join(".schema_version")).unwrap(),
-            "44"
+            std::fs::read_to_string(app.join(".schema_version"))
+                .unwrap()
+                .parse::<u32>()
+                .unwrap(),
+            completed_checkpoint
         );
         for name in ["serve.launch", "serve.rollback.launch"] {
             let converted: Value =
@@ -1572,6 +1576,7 @@ fn cli_migration_34_37_43_persists_policy_and_second_run_bytes() {
         let converted: Value = serde_json::from_slice(&std::fs::read(&sessions).unwrap()).unwrap();
         assert_eq!(converted[0]["trash_lifecycle_id"], identity);
         assert_eq!(converted[0]["failed_purge"]["forced"], true);
+        assert_eq!(converted[0].get("terminal_scopes"), Some(&Value::Null), "the real legacy upgrade must publish unresolved authority, not invent an empty known-unscoped list");
         assert_eq!(
             std::fs::read_to_string(app.join("state.toml")).unwrap(),
             state
@@ -1601,6 +1606,6 @@ fn cli_migration_34_37_43_persists_policy_and_second_run_bytes() {
         for (path, before) in paths.iter().zip(bytes) {
             assert_eq!(std::fs::read(path).unwrap(), before);
         }
-        eprintln!("actual CLI schema {version}->44, policy/identity/state/journal and second-run bytes preserved");
+        eprintln!("actual CLI schema {version}->{completed_checkpoint}, policy/identity/state/journal/unknown authority and second-run bytes preserved");
     }
 }

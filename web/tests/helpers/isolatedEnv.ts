@@ -71,10 +71,11 @@ export const HOST_STATE_VARS = new Set([
   "TMUX",
   "TMUX_PANE",
   // Re-pinned to the private socket by spawnAoeServe.
+  "DBUS_SESSION_BUS_ADDRESS",
   "AOE_TMUX_SOCKET",
 ]);
 
-/** Kept path variables: toolchain and system locations. XDG_RUNTIME_DIR names host sockets, not data. */
+/** Kept path variables name toolchain and system locations, never host sockets. */
 export const INHERITED_PATH_VARS = new Set([
   "CARGO_HOME",
   "DYLD_FALLBACK_LIBRARY_PATH",
@@ -82,7 +83,6 @@ export const INHERITED_PATH_VARS = new Set([
   "LD_LIBRARY_PATH",
   "RUSTUP_HOME",
   "SSL_CERT_DIR",
-  "XDG_RUNTIME_DIR",
 ]);
 
 /** Pinned rather than dropped, since git falls back to /etc/gitconfig and $HOME/.gitconfig; keeps daemon writes in the test home. */
@@ -90,6 +90,8 @@ export function pinnedVars(paths: IsolatedPaths): Record<string, string> {
   return {
     GIT_CONFIG_GLOBAL: join(paths.home, ".gitconfig"),
     GIT_CONFIG_SYSTEM: "/dev/null",
+    XDG_RUNTIME_DIR: join(paths.home, "runtime"),
+    DBUS_SESSION_BUS_ADDRESS: "unix:path=/dev/null",
   };
 }
 

@@ -19,9 +19,18 @@ pub(crate) const FILE_NAME: &str = "pending-purge-owners.json";
 #[derive(Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "state", rename_all = "snake_case")]
 enum RunnerCapture {
-    Uncaptured,
-    Captured { pid: u32, generation: u64 },
-    Unresolved { error: String },
+    Uncaptured {
+        scopes: Vec<crate::process::worker_registry::ScopeOwnership>,
+        producer_epoch: Option<u64>,
+    },
+    Captured {
+        pid: u32,
+        generation: u64,
+        scopes: Vec<crate::process::worker_registry::ScopeOwnership>,
+    },
+    Unresolved {
+        error: String,
+    },
 }
 
 impl RunnerCapture {
@@ -45,6 +54,16 @@ impl RunnerCapture {
             let Some(session_id) = session_id else {
                 anyhow::bail!("Runner session identity is missing; purge resources retained");
             };
+            let scopes = match self {
+                Self::Captured { scopes, .. } | Self::Uncaptured { scopes, .. } => scopes,
+                Self::Unresolved { .. } => unreachable!(),
+            };
+            for scope in scopes {
+                anyhow::ensure!(
+                    crate::process::systemd::scope_stopped(session_id, scope)?,
+                    "Captured runner scope has not exited; purge resources retained"
+                );
+            }
             let record = load(session_id)
                 .map_err(|error| anyhow::anyhow!("worker registry is unreadable: {error:#}"))?;
             let peer_pid = peer_pid(session_id).map_err(|error| {
@@ -115,13 +134,17 @@ fn capture_runner(session_id: &str) -> RunnerCapture {
             RunnerCapture::Captured {
                 pid: record.pid,
                 generation: record.generation,
+                scopes: vec![record.scope],
             }
         }
         Ok(Some(_)) => RunnerCapture::Unresolved {
             error: "Invalid captured runner pid".into(),
         },
         Ok(None) => match peer_pid_for(session_id) {
-            Ok(None) => RunnerCapture::Uncaptured,
+            Ok(None) => RunnerCapture::Uncaptured {
+                scopes: Vec::new(),
+                producer_epoch: None,
+            },
             Ok(Some(pid)) => RunnerCapture::Unresolved {
                 error: format!("registry absent but runner socket peer {pid} is active"),
             },
@@ -264,21 +287,118 @@ pub(crate) struct PurgeOwner {
 }
 
 pub(crate) struct PurgeCapture {
+    terminal_scopes: Option<Vec<crate::process::worker_registry::ScopeOwnership>>,
     protection: CleanupProtection,
     runner: RunnerCapture,
     session_id: String,
 }
 
+pub(crate) fn validate_journal_for_migration(content: &str) -> Result<()> {
+    decode(Some(content))?;
+    Ok(())
+}
+
 impl PurgeCapture {
     pub(crate) fn new(row: &Instance) -> Result<Self> {
-        let runner = capture_runner(&row.id);
+        let mut runner = capture_runner(&row.id);
+        if !row.is_structured() {
+            let scopes = match &mut runner {
+                RunnerCapture::Captured { scopes, .. }
+                | RunnerCapture::Uncaptured { scopes, .. } => Some(scopes),
+                RunnerCapture::Unresolved { .. } => None,
+            };
+            if let Some(scopes) = scopes {
+                for scope in row
+                    .terminal_scopes
+                    .as_deref()
+                    .unwrap_or(&[crate::process::worker_registry::ScopeOwnership::Unresolved])
+                {
+                    if !scopes.contains(scope) {
+                        scopes.push(scope.clone());
+                    }
+                }
+            }
+        }
         let protection = CleanupProtection::new([row])?;
         protection.validate()?;
         Ok(Self {
             protection,
             runner,
+            terminal_scopes: row.terminal_scopes.clone(),
             session_id: row.id.clone(),
         })
+    }
+
+    pub(crate) fn retire_terminal_scopes(&self) -> Result<()> {
+        let scopes = self
+            .terminal_scopes
+            .as_deref()
+            .context("Terminal scope ownership unresolved; purge resources retained")?;
+        crate::process::systemd::retire_scopes(&self.session_id, scopes)
+    }
+
+    pub(crate) fn bind_retirement(
+        &mut self,
+        target: &crate::acp::supervisor::RetirementTarget,
+    ) -> Result<()> {
+        if let RunnerCapture::Unresolved { error } = &self.runner {
+            anyhow::bail!("Runner ownership unresolved; purge resources retained: {error}");
+        }
+        let identity = target.identity.or_else(|| {
+            target
+                .lease
+                .as_ref()
+                .and_then(crate::acp::runner_lifecycle::Lease::spawned_runner)
+        });
+        let mut scopes = target.scopes.clone();
+        if let Some(lease) = &target.lease {
+            for scope in lease.scopes() {
+                if !scopes.contains(&scope) {
+                    scopes.push(scope);
+                }
+            }
+        }
+        self.runner = match (&self.runner, identity) {
+            (
+                RunnerCapture::Captured {
+                    pid,
+                    generation,
+                    scopes: old,
+                },
+                Some(identity),
+            ) => {
+                anyhow::ensure!(
+                    *pid == identity.pid && *generation == identity.generation,
+                    "Captured runner was replaced before purge commit"
+                );
+                for scope in old {
+                    if !scopes.contains(scope) {
+                        scopes.push(scope.clone());
+                    }
+                }
+                RunnerCapture::Captured {
+                    pid: *pid,
+                    generation: *generation,
+                    scopes,
+                }
+            }
+            (RunnerCapture::Captured { .. }, None) => {
+                anyhow::bail!("Captured runner identity disappeared before purge commit")
+            }
+            (_, Some(identity)) => RunnerCapture::Captured {
+                pid: identity.pid,
+                generation: identity.generation,
+                scopes,
+            },
+            (_, None) => RunnerCapture::Uncaptured {
+                scopes,
+                producer_epoch: target
+                    .lease
+                    .as_ref()
+                    .map(crate::acp::runner_lifecycle::Lease::epoch),
+            },
+        };
+        Ok(())
     }
 
     pub(crate) fn ensure_captured_runner_stopped(&self) -> Result<()> {
@@ -365,25 +485,64 @@ impl PurgeOwner {
 
     pub(crate) fn ensure_retirement_target(
         &self,
-        target: &crate::acp::supervisor::RetirementTarget,
+        target: &mut crate::acp::supervisor::RetirementTarget,
     ) -> Result<()> {
-        match (&self.runner, target.identity) {
-            (RunnerCapture::Captured { pid, generation }, Some(identity)) => {
+        let observed = target.identity.or_else(|| {
+            target
+                .lease
+                .as_ref()
+                .and_then(crate::acp::runner_lifecycle::Lease::spawned_runner)
+        });
+        let scopes = match &self.runner {
+            RunnerCapture::Captured {
+                pid,
+                generation,
+                scopes,
+            } => {
+                if let Some(identity) = observed {
+                    anyhow::ensure!(
+                        identity.pid == *pid && identity.generation == *generation,
+                        "Captured runner was replaced before retirement; purge resources retained"
+                    );
+                } else {
+                    anyhow::ensure!(
+                        target.lease.is_none(),
+                        "A replacement producer appeared before recovery; purge resources retained"
+                    );
+                }
+                target.identity = Some(crate::acp::runner_lifecycle::RunnerIdentity {
+                    pid: *pid,
+                    generation: *generation,
+                });
+                scopes
+            }
+            RunnerCapture::Uncaptured {
+                scopes,
+                producer_epoch,
+            } => {
                 anyhow::ensure!(
-                    identity.pid == *pid && identity.generation == *generation,
-                    "Captured runner was replaced before retirement; purge resources retained"
+                    observed.is_none_or(|identity| Some(identity.generation) == *producer_epoch)
+                        && target
+                            .lease
+                            .as_ref()
+                            .is_none_or(|lease| Some(lease.epoch()) == *producer_epoch),
+                    "Uncaptured runner was replaced before retirement; purge resources retained"
                 );
+                target.identity = observed;
+                scopes
             }
-            (RunnerCapture::Uncaptured, Some(_)) => {
-                anyhow::ensure!(
-                    target.lease.is_some(),
-                    "Uncaptured runner has no owned producer; purge resources retained"
-                );
+            RunnerCapture::Unresolved { error } => {
+                anyhow::bail!("Runner ownership unresolved; purge resources retained: {error}")
             }
-            (RunnerCapture::Unresolved { error }, _) => {
-                anyhow::bail!("Runner ownership unresolved; purge resources retained: {error}");
+        };
+        for scope in scopes {
+            anyhow::ensure!(
+                *scope != crate::process::worker_registry::ScopeOwnership::Unresolved,
+                "Captured scope ownership unresolved; purge resources retained"
+            );
+            if !target.scopes.contains(scope) {
+                target.scopes.push(scope.clone());
             }
-            _ => {}
         }
         Ok(())
     }
@@ -506,7 +665,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn an_absent_journal_is_no_owners_but_a_corrupt_one_is_still_refused() -> Result<()> {
-        // A namespace that predates v036 has no journal at all, and it holds no
+        // A namespace predating pending-purge ownership has no journal at all, and it holds no
         // pending owners. The store reclaim reads this as a sibling, so an
         // absent file must not fail the pass and orphan every store.
         let root = tempfile::tempdir()?;
@@ -605,6 +764,7 @@ mod tests {
         let captured = RunnerCapture::Captured {
             pid: 41,
             generation: 7,
+            scopes: vec![crate::process::worker_registry::ScopeOwnership::Unscoped],
         };
         captured
             .ensure_stopped_with(
@@ -644,20 +804,29 @@ mod tests {
         }
         .ensure_stopped(None)
         .expect_err("unresolved ownership blocks cleanup");
-        RunnerCapture::Uncaptured
-            .ensure_stopped_with(Some("session"), |_| Ok(None), |_| false, |_| Ok(None))
-            .expect("a strict registry absence and inactive sockets prove no runner");
-        RunnerCapture::Uncaptured
-            .ensure_stopped_with(Some("session"), |_| Ok(None), |_| false, |_| Ok(Some(42)))
-            .expect_err("an active socket prevents an absent capture from authorizing cleanup");
-        RunnerCapture::Uncaptured
-            .ensure_stopped_with(
-                Some("session"),
-                |_| Ok(Some(record(42, 1))),
-                |_| false,
-                |_| Ok(None),
-            )
-            .expect_err("a runner published after capture is unresolved");
+        RunnerCapture::Uncaptured {
+            scopes: Vec::new(),
+            producer_epoch: None,
+        }
+        .ensure_stopped_with(Some("session"), |_| Ok(None), |_| false, |_| Ok(None))
+        .expect("a strict registry absence and inactive sockets prove no runner");
+        RunnerCapture::Uncaptured {
+            scopes: Vec::new(),
+            producer_epoch: None,
+        }
+        .ensure_stopped_with(Some("session"), |_| Ok(None), |_| false, |_| Ok(Some(42)))
+        .expect_err("an active socket prevents an absent capture from authorizing cleanup");
+        RunnerCapture::Uncaptured {
+            scopes: Vec::new(),
+            producer_epoch: None,
+        }
+        .ensure_stopped_with(
+            Some("session"),
+            |_| Ok(Some(record(42, 1))),
+            |_| false,
+            |_| Ok(None),
+        )
+        .expect_err("a runner published after capture is unresolved");
         Ok(())
     }
 

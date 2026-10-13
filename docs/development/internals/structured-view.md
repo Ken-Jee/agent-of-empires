@@ -20,6 +20,7 @@ Invariants worth knowing before touching this code:
 - **Native-session admission.** Only lifecycle results select native identity; notification and callback metadata never do. Unrelated updates are ignored and unrelated session callbacks are rejected before any transcript, permission, filesystem, or terminal effect. While identity is pending, retained notifications are bounded by the runner's detach-queue ceiling, so a reattach admits the whole flushed backlog and an overflow fails the connection rather than publishing a partial replay. Stored history is never rewritten by the guard.
 - **Launch authority.** Preparation pins the native profile, title, lifecycle generation and provider under owned namespace, submission and instance exclusion. Startup is reserved before those preparation guards are released; hooks and readiness never run while holding them. Blocking admission owns its namespace guard through native checkpoints, including caller cancellation.
 - **Producer-owned cancellation.** The admitted lease wakes an outstanding socket connection, initialize, or session establishment. Detached spawn records its exact PID and worker generation before the first post-spawn await. The producer waits for its owned connection task to quiesce and proves that runner retired before settling; dropping a launcher waiter or observing an absent registry is not exit proof.
+- **Exact scope retirement.** Scoped runners persist their exact transient unit alongside PID and generation; unscoped and unresolved ownership are distinct. Explicit stop waits for only the captured unit to stop and become empty before settling. Rejected or timed-out scope retirement keeps its lease and retry debt, even after the leader exits. A SID wildcard never authorizes ACP retirement or recovered purge cleanup.
 - **Callback parity and replay accounting.** Session-scoped filesystem, terminal, and permission callbacks wait for that announcement with either named or positional parameters, while request-scoped elicitation stays independent of session authority. Pending replay charges each original control frame, its four-byte prefix included, against the runner's 4096-frame / 128 MiB budget; typed re-serialization can expand native JSON and is not a substitute.
 - **Mid-turn reattach.** `ResumeSession` adopts the runner's committed session identity and never sends ACP `session/new` or `session/load`. A new local prompt supersedes adoption, and only the matching canonical request id may resolve it; a 30-second resume-idle watchdog is the fallback.
 - **Background sub-agents across a restart.** The async-Task tailer (see [Stuck-turn watchdogs](#stuck-turn-watchdogs)) is per connection, so a `BackgroundAgentLaunched` can be left with no completion when its worker dies. The next owner reconciles that: `attach` re-tails every unresolved launch that still carries a transcript path, since the runner it adopted is provably alive; `spawn`, the drain task's respawn, and every terminal drain arm detach unconditionally. `output_file` is persisted for that resume and stripped from every client-facing frame.
@@ -41,6 +42,24 @@ Purge captures the selected row's path, branch and runner references before dest
 After journal ownership and row removal are durable, a committed purge releases identity and instance lifecycle flocks before awaiting its captured lease and runner retirement. The durable journal and frozen retirement target preserve the original cleanup and process authority across that wait. Initial and recovered cleanup reacquire identity then lifecycle exclusion and revalidate store health, row absence, and the exact live journal owner before touching resources. A replacement lease or runner is never adopted as the old purge target; any unproven retirement, reused row, or changed owner keeps the journal and resources.
 
 Recovery freezes that retirement target while its short absent-row and journal-owner preparation exclusions still hold, then releases both before waiting. Native supervisor bookkeeping and event-store projection deletion are cleanup effects too: they run only under the reacquired cleanup fence after process exit, health, live-owner, and row-absence validation, so a reused ID without a replacement worker keeps its transcript and counters.
+
+The schema-45 purge journal retains exact captured scope ownership too, so a
+reaped leader cannot authorize checkout cleanup while its escaped cgroup members
+remain. Legacy unknown scope evidence stays unresolved. Native child birth,
+scope capture and immediate PID/generation recording share the final durable
+launch-admission exclusion; cancellation and the birth publication lock prevent
+a dropped constructor waiter from publishing a child after ownership is released.
+
+Schema 45 also records terminal scope ownership in each instance row before
+physical pane birth, under the existing launch generation and instance lifecycle
+exclusion. A known unscoped start is an empty scope list; missing legacy evidence
+is unresolved, never implicit classic-process proof. Ordinary terminal purge
+freezes that row's exact units and proves their cgroups empty before checkout,
+worktree, sandbox or scratch cleanup. Coordinated stop reloads the authoritative
+row under its lifecycle exclusion so a cached clone cannot omit a newer unit.
+Purge admission returns a stack-owned transaction or a boxed structured lifecycle
+refusal; store and lock failures remain a separate outer error. The admitted path
+does not allocate a wrapper just to balance an enum layout.
 
 Per-ID instance and submission mutex registries follow the same native absence fence. Pruning removes only map-owned entries with no held or queued external references; later lookups retain that single Arc authority through ID reuse. Unused entries deferred by an active holder are reaped on a lookup miss, using the existing strong-reference pruning pattern rather than a second registry protocol.
 

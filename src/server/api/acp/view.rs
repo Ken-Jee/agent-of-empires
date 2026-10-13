@@ -196,6 +196,9 @@ async fn commit_structured_view(
         if let Err(error) = inst_for_transition.kill_ancillary_tmux_sessions_locked() {
             tracing::warn!(target: "acp.switch", session = %inst_for_transition.id, "kill ancillary tmux sessions failed: {error}");
         }
+        // Still the terminal row here, so this stops the pane's scope; the
+        // worker spawns after the transition, under a fresh unit name.
+        inst_for_transition.release_scope()?;
         (&storage as &dyn crate::session::SessionStore).update(|all, _groups| {
             let Some(slot) = all
                 .iter_mut()

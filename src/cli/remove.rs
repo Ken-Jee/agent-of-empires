@@ -238,8 +238,8 @@ pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
         None,
     )?;
     let transaction = match reservation {
-        crate::session::deletion::PurgeReservation::Reserved(transaction) => transaction,
-        crate::session::deletion::PurgeReservation::Rejected(result) => {
+        Ok(transaction) => transaction,
+        Err(result) => {
             let detail = result
                 .errors
                 .first()

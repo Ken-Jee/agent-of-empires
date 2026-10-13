@@ -208,6 +208,9 @@ pub(crate) struct FailedPurge {
 pub struct Instance {
     pub id: String,
     pub title: String,
+    /// Exact terminal launch units retained until physical retirement; None is unresolved legacy authority.
+    #[serde(default)]
+    pub(crate) terminal_scopes: Option<Vec<crate::process::worker_registry::ScopeOwnership>>,
     /// The last title written by the `smart_rename` automatic renamer.
     /// An auto-rename overwrites `title` only while `title` is still a
     /// default civ name or still equals this value, so a forced retry can

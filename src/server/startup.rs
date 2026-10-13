@@ -283,6 +283,8 @@ pub(crate) async fn start_server(
         extra_allowed_origins,
     } = config;
 
+    // Before anything can create a session scope.
+    crate::process::systemd::mark_daemon();
     raise_fd_limit();
 
     // Single live `FileWatchService` per daemon.
@@ -957,6 +959,8 @@ pub(crate) async fn start_server(
             status_poll_loop(poll_state, sandbox_health_rx).await;
         });
 
+    super::systemd_reconcile::spawn(state.clone());
+
     let maintenance_state = state.clone();
     state
         .runtime
@@ -1090,6 +1094,8 @@ pub(crate) async fn start_server(
     };
 
     notify_ready("daemon ready");
+    // Replaces the readiness text, and runs after it so the reconcile task's first push cannot be overwritten.
+    super::systemd_reconcile::push_status(&state).await;
 
     drop(transaction);
     let signal_task = tokio::spawn(shutdown_signal);

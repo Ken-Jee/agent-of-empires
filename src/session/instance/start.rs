@@ -397,6 +397,28 @@ impl Instance {
             );
         }
         self.capture_started_at = Some(SystemTime::now());
+        let scope = crate::process::systemd::scope_prefix_for(&self.id, profile);
+        let generation = self.lifecycle_generation;
+        self.terminal_scopes = Some(storage.update(|rows, _| {
+            let row = rows
+                .iter_mut()
+                .find(|row| row.id == self.id)
+                .ok_or(LifecycleReservationError::Superseded)?;
+            anyhow::ensure!(
+                row.lifecycle_reservation_is_owned(LifecycleOperation::Launch, generation),
+                LifecycleReservationError::Superseded
+            );
+            let scopes = row.terminal_scopes.get_or_insert_with(|| {
+                vec![crate::process::worker_registry::ScopeOwnership::Unresolved]
+            });
+            if let Some(scope) = &scope {
+                let owned = scope.ownership();
+                if !scopes.contains(&owned) {
+                    scopes.push(owned);
+                }
+            }
+            Ok(scopes.clone())
+        })?);
         session.create_with_size_env_and_container_env(
             &self.project_path,
             prepared.command.as_deref(),
@@ -404,6 +426,7 @@ impl Instance {
             profile,
             &prepared.launch_env.pane,
             &prepared.launch_env.container,
+            scope.as_ref(),
         )?;
         if let Some((_, transactions)) = prepared.sandbox_context_reset.as_ref() {
             crate::migrations::v033_isolate_sandbox_content::acknowledge_context_reset(

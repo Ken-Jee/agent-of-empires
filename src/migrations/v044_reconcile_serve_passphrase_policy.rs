@@ -80,7 +80,7 @@ mod tests {
                 None
             };
             crate::migrations::run_migrations()?;
-            assert_eq!(fs::read_to_string(app.join(".schema_version"))?, "44");
+            assert_eq!(fs::read_to_string(app.join(".schema_version"))?, "45");
             let state = AppStateConfig::load()?;
             assert_eq!(state.sort_order, Some(SortOrder::Custom));
             assert_eq!(state.sessions_created, if seeded { 19 } else { 1 });
