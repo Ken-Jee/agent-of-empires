@@ -2142,12 +2142,8 @@ impl Instance {
         }
         let path = value("PATH");
         let omp = if agent.name == "omp" {
-            let args = if self.command.is_empty() {
-                crate::session::config::quote_model_value_in_args(&self.extra_args)
-            } else {
-                self.selected_agent_args()
-            };
-            let options = super::OmpCliCaptureOptions::parse(&args)?;
+            let options =
+                super::OmpCliCaptureOptions::parse_launch(&self.command, &self.extra_args)?;
             if let Some(declared) = &declared {
                 let directory = inputs.canonical_path(declared)?;
                 inputs.environment.insert(

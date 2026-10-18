@@ -91,6 +91,22 @@ fn write_project_omp_dotenv(project: &Path, store: &Path) {
 }
 
 fn install_path_preserving_test_shell(h: &mut TuiTestHarness, path_bin: &Path) {
+    for key in [
+        "NODE_ENV",
+        "OMP_PROFILE",
+        "PI_PROFILE",
+        "PI_CODING_AGENT_DIR",
+        "PI_CODING_AGENT_SESSION_DIR",
+        "PI_CONFIG_DIR",
+        "OMP_CODING_AGENT_DIR",
+        "OMP_CODING_AGENT_SESSION_DIR",
+        "OMP_CONFIG_DIR",
+        "XDG_DATA_HOME",
+        "XDG_STATE_HOME",
+        "AOE_INSTANCE_ID",
+    ] {
+        h.remove_env(key);
+    }
     let shell = h.home_path().join("omp-test-shell");
     write_executable(
         &shell,
@@ -302,6 +318,66 @@ fn install_reconstructing_fake_omp(
 
 #[test]
 #[parallel]
+fn real_omp_extension_observes_identity_during_initialization() {
+    require_tmux!();
+    let Ok(omp) = which::which("omp") else {
+        eprintln!("skipping real OMP launch: omp is not installed");
+        return;
+    };
+    let mut h = TuiTestHarness::new_in_tmp("omp_extension_identity");
+    let project = h.project_path();
+    let nested = project.join("nested");
+    fs::create_dir(&nested).unwrap();
+    fs::write(project.join(".env"), "PI_CONFIG_DIR=isolated-omp\n").unwrap();
+    let bin = h.home_path().join("real-bin");
+    fs::create_dir(&bin).unwrap();
+    std::os::unix::fs::symlink(omp, bin.join("omp")).unwrap();
+    install_path_preserving_test_shell(&mut h, &bin);
+    h.append_config("[session]\nagent_status_hooks = false");
+    let observation = h.home_path().join("extension-identity.json");
+    let extension = h.home_path().join("observe-identity.ts");
+    fs::write(
+        &extension,
+        format!(
+            "import {{ writeFileSync }} from 'node:fs';\n\
+             export default function () {{\n\
+               writeFileSync({}, JSON.stringify({{ id: process.env.AOE_INSTANCE_ID, cwd: process.cwd() }}));\n\
+             }}\n",
+            serde_json::to_string(observation.to_str().unwrap()).unwrap()
+        ),
+    )
+    .unwrap();
+    let title = "RealOmpExtensionIdentity";
+    let extra = format!(
+        "--profile launch-smoke --cwd nested --no-extensions --no-skills --no-rules --no-lsp --extension {}",
+        sh_quote(&extension)
+    );
+    h.run_cli_ok(&[
+        "add",
+        project.to_str().unwrap(),
+        "-c",
+        "omp",
+        "-t",
+        title,
+        "--extra-args",
+        &extra,
+    ]);
+    let _stop = StopSessionOnDrop { h: &h, title };
+    h.run_cli_ok(&["session", "start", title]);
+    wait_for_path(&observation);
+    let observed: Value = serde_json::from_slice(&fs::read(&observation).unwrap()).unwrap();
+    assert_eq!(
+        observed["id"].as_str(),
+        session_field(&h, title, "id").as_deref()
+    );
+    assert_eq!(
+        observed["cwd"].as_str(),
+        nested.canonicalize().unwrap().to_str()
+    );
+}
+
+#[test]
+#[parallel]
 fn omp_routing_restart_generation_and_same_cwd_pane_attribution_are_preserved() {
     require_tmux!();
     let mut h = TuiTestHarness::new_in_tmp("cli_sid_omp_terminal");
@@ -448,8 +524,10 @@ fn declared_omp_wrapper_can_resume_without_gaining_automatic_capture() {
     let project = h.project_path();
     let effective = h.home_path().join("effective");
     fs::create_dir_all(&effective).unwrap();
+    let effective = effective.canonicalize().unwrap();
     let store = h.home_path().join("wrapper-store");
     fs::create_dir_all(&store).unwrap();
+    let store = store.canonicalize().unwrap();
     let control = install_toggling_fake_omp(&mut h, &effective, &store);
     let bin = h.install_path_command("my-omp");
     let recorded = control.join("argv");

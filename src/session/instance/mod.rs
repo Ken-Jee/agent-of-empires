@@ -22,11 +22,10 @@ use crate::tmux;
 use crate::session::capture::{
     capture_omp_session_id, codex_poll_fn_sandboxed_store, gemini_poll_fn_sandboxed_store,
     generate_session_uuid, hermes_poll_fn_sandboxed_store, is_valid_session_id,
-    kimi_poll_fn_sandboxed_store, omp_host_routing_environment, omp_poll_fn, omp_poll_fn_sandboxed,
-    omp_sandbox_launch_marker, prime_agent_poll_fn_sandboxed, reject_omp_secret_args,
-    resolve_omp_store_layout, try_capture_omp_session_id_in_container,
-    validate_omp_capture_metadata, validated_session_id, OmpCaptureMetadata, OmpCapturePlan,
-    OmpCliCaptureOptions, OmpStoreKind, PrimeRootPublication,
+    kimi_poll_fn_sandboxed_store, omp_poll_fn, omp_poll_fn_sandboxed, omp_sandbox_launch_marker,
+    prime_agent_poll_fn_sandboxed, reject_omp_secret_args, resolve_omp_store_layout,
+    try_capture_omp_session_id_in_container, validate_omp_capture_metadata, validated_session_id,
+    OmpCaptureMetadata, OmpCapturePlan, OmpCliCaptureOptions, OmpStoreKind, PrimeRootPublication,
 };
 mod accessors;
 mod container;
@@ -116,7 +115,7 @@ pub(crate) use types::{
 };
 
 // Sibling items the submodules reach through `use super::*`.
-use hooks::status_hook_env_prefix;
+use hooks::host_launch_env_prefix;
 pub(crate) use hooks::{
     host_hook_agent, host_hook_disclosure, host_hook_disclosure_config_with_repo,
     host_hook_post_install_notes,

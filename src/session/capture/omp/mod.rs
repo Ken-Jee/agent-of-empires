@@ -32,8 +32,10 @@ use container::*;
 use layout::*;
 
 pub(crate) use container::{omp_poll_fn_sandboxed, try_capture_omp_session_id_in_container};
+#[cfg(test)]
+pub(crate) use layout::omp_host_routing_environment;
 pub(crate) use layout::{
-    omp_host_routing_environment, read_container_environment, resolve_omp_store_layout,
+    read_container_environment, resolve_omp_store_layout,
     resolve_omp_store_layout_in_container_with_environment,
     resolve_omp_store_layout_with_environment,
 };
