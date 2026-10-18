@@ -44,7 +44,7 @@ The web dashboard's Plugins settings does the same things, with a marketplace se
 
 ## OMP integration
 
-The optional companion package in `plugins/agent-omp/` connects the OMP runtime extension to AoE's terminal session list. It requires an AoE release with plugin API v18 and the separately installed OMP runtime extension. Older AoE hosts reject its manifest; upgrade AoE before installing the package.
+The optional companion package in `plugins/agent-omp/` connects the OMP runtime extension to AoE's terminal session list. It requires an AoE release with plugin API v19 and the separately installed OMP runtime extension. Older AoE hosts reject its manifest; upgrade AoE before installing the package.
 
 The integration reports OMP-native session status and exposes OMP approval and question prompts to the AoE response dialog. AoE sends a user-selected reply to OMP; it does not approve tools automatically. Installing the integration does not restart existing OMP sessions.
 

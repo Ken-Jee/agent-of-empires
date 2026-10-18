@@ -135,18 +135,29 @@ impl AgentQuestionDialog {
                 self.question += 1;
                 DialogResult::Continue
             }
-            KeyCode::Enter => DialogResult::Submit(
-                questions
-                    .iter()
-                    .enumerate()
-                    .map(|(i, q)| AgentIntegrationAnswer {
-                        id: q.id.clone(),
-                        selected_options: self.selected[i].clone(),
-                        custom_input: (!self.custom[i].value().trim().is_empty())
-                            .then(|| self.custom[i].value().to_owned()),
-                    })
-                    .collect(),
-            ),
+            KeyCode::Enter => {
+                if let Some(missing) = questions.iter().enumerate().position(|(i, question)| {
+                    !question.multi
+                        && self.selected[i].len()
+                            + usize::from(!self.custom[i].value().trim().is_empty())
+                            != 1
+                }) {
+                    self.question = missing;
+                    return DialogResult::Continue;
+                }
+                DialogResult::Submit(
+                    questions
+                        .iter()
+                        .enumerate()
+                        .map(|(i, q)| AgentIntegrationAnswer {
+                            id: q.id.clone(),
+                            selected_options: self.selected[i].clone(),
+                            custom_input: (!self.custom[i].value().trim().is_empty())
+                                .then(|| self.custom[i].value().to_owned()),
+                        })
+                        .collect(),
+                )
+            }
             _ => DialogResult::Continue,
         }
     }
@@ -306,5 +317,55 @@ mod tests {
             DialogResult::Submit(answers)
                 if answers[0].selected_options == vec!["SQLite".to_owned(), "Postgres".to_owned()]
         ));
+    }
+
+    #[test]
+    fn incomplete_single_choice_keeps_answers_and_returns_to_the_missing_question() {
+        let key = |code| KeyEvent::new(code, crossterm::event::KeyModifiers::NONE);
+        for cleared_custom in [false, true] {
+            let question = |id: &str, multi, recommended| AgentIntegrationQuestion {
+                id: id.into(),
+                question: id.into(),
+                options: vec![AgentIntegrationOption {
+                    label: "one".into(),
+                    description: None,
+                }],
+                multi,
+                recommended,
+            };
+            let prompt = AgentIntegrationPrompt::Question {
+                id: "prompt".into(),
+                title: "Configure".into(),
+                questions: vec![
+                    question("first", false, cleared_custom.then_some(0)),
+                    question("second", false, Some(0)),
+                    question("optional", true, None),
+                ],
+            };
+            let mut dialog = AgentQuestionDialog::new(prompt);
+            if cleared_custom {
+                dialog.handle_key(key(KeyCode::Char('c')));
+                dialog.handle_paste("   ");
+                dialog.handle_key(key(KeyCode::Esc));
+            }
+            dialog.handle_key(key(KeyCode::Right));
+            dialog.handle_key(key(KeyCode::Right));
+            assert!(matches!(
+                dialog.handle_key(key(KeyCode::Enter)),
+                DialogResult::Continue
+            ));
+            assert_eq!(dialog.question, 0);
+            dialog.handle_key(key(KeyCode::Char(' ')));
+            dialog.handle_key(key(KeyCode::Enter));
+            dialog.handle_key(key(KeyCode::Enter));
+            assert!(matches!(
+                dialog.handle_key(key(KeyCode::Enter)),
+                DialogResult::Submit(answers)
+                    if answers[0].selected_options == ["one"]
+                        && answers[0].custom_input.is_none()
+                        && answers[1].selected_options == ["one"]
+                        && answers[2].selected_options.is_empty()
+            ));
+        }
     }
 }

@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import initialize, { ensurePrivateDirectories, integrationDirectory, isApprovalSelection, nativeApprovalKey, observeApproval, observeApprovalSelect, observeAskDialog, supportedRuntime, validateReply } from "../omp-extension/index.ts";
-import { chmodSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
+import { chmodSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -231,5 +231,79 @@ test("native approval selector recognizes session choices without changing nativ
     const select = observeApprovalSelect(async () => choice, submit => { accept = submit; }, () => {});
     expect(await select("Approve tool", ["Approve", sessionChoice, "Deny"])).toBe(choice);
     expect(accept("Approve")).toBe(false);
+  }
+});
+
+test("status-only lifecycle updates preserve replies to the pending approval", async () => {
+  const previous = process.env.AOE_INSTANCE_ID;
+  const instanceId = `revision_${crypto.randomUUID()}`;
+  const dir = integrationDirectory(process.getuid!(), instanceId);
+  const snapshotPath = path.join(dir, "integration-omp.agent-of-empires.json");
+  const handlers = new Map<string, (...args: unknown[]) => unknown>();
+  let input!: (data: string) => unknown;
+  let settleNative!: (choice: string | undefined) => void;
+  let result: Promise<string | undefined> | undefined;
+  type Report = { revision: number; status: string; prompt: { id: string } | null };
+  const waitForSnapshot = async (ready: (report: Report) => boolean): Promise<Report> => {
+    const deadline = performance.now() + 5000;
+    do {
+      try {
+        const report = JSON.parse(readFileSync(snapshotPath, "utf8")) as Report;
+        if (ready(report)) return report;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      }
+      await new Promise<void>(resolve => setImmediate(resolve));
+    } while (performance.now() < deadline);
+    throw new Error("provider snapshot did not reach the expected state");
+  };
+  process.env.AOE_INSTANCE_ID = instanceId;
+  try {
+    initialize({
+      pi: { VERSION: "18.10.3" },
+      on(event: string, handler: (...args: unknown[]) => unknown) { handlers.set(event, handler); },
+    } as unknown as Parameters<typeof initialize>[0]);
+    const ui = {
+      select(_title: string, _choices: string[], options?: { signal?: AbortSignal }) {
+        return new Promise<string | undefined>(resolve => {
+          settleNative = resolve;
+          options?.signal?.addEventListener("abort", () => resolve(undefined), { once: true });
+        });
+      },
+      onTerminalInput(handler: typeof input) { input = handler; return () => {}; },
+    };
+    await handlers.get("session_start")!({}, {
+      sessionManager: { getSessionId: () => "revision-session" },
+      ui,
+    });
+    handlers.get("tool_approval_requested")!({
+      sessionId: "revision-session", toolCallId: "approval-a", toolName: "bash",
+    });
+    result = ui.select("Allow tool: bash", ["Approve", "Deny"]);
+    const pending = await waitForSnapshot(report => report.status === "waiting" && report.prompt?.id === "approval-a");
+    handlers.get("agent_start")!();
+    const running = await waitForSnapshot(report => report.status === "running");
+    expect(running.revision).toBe(pending.revision);
+    writeFileSync(path.join(dir, "integration-omp.agent-of-empires.reply.json"), JSON.stringify({
+      schema_version: 1,
+      instance_id: instanceId,
+      provider_session_id: "revision-session",
+      writer_pid: process.pid,
+      revision: pending.revision,
+      prompt_id: "approval-a",
+      response_id: crypto.randomUUID(),
+      response: { kind: "approval", choice: "allow" },
+    }), { mode: 0o600 });
+    expect(input("\u001b[24~")).toEqual({ consume: true });
+    expect(await result).toBe("Approve");
+    const completed = await waitForSnapshot(report => report.prompt === null && report.revision > pending.revision);
+    expect(completed.revision).toBe(pending.revision + 1);
+  } finally {
+    settleNative?.(undefined);
+    await result;
+    await handlers.get("session_shutdown")?.();
+    rmSync(dir, { recursive: true, force: true });
+    if (previous === undefined) delete process.env.AOE_INSTANCE_ID;
+    else process.env.AOE_INSTANCE_ID = previous;
   }
 });
