@@ -1,11 +1,11 @@
 {
   "name": "@agent-of-empires/omp-integration",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
   "description": "Provider-native OMP status and native prompt integration for Agent of Empires.",
   "peerDependencies": {
-    "@oh-my-pi/pi-coding-agent": "^18.11.1",
-    "@oh-my-pi/pi-tui": "^18.11.1"
+    "@oh-my-pi/pi-coding-agent": "18.10.3 || 18.10.4 || 18.11.1",
+    "@oh-my-pi/pi-tui": "18.10.3 || 18.10.4 || 18.11.1"
   },
   "scripts": {
     "test": "bun test ../tests",

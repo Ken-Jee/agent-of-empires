@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
-import { ensurePrivateDirectories, integrationDirectory, nativeApprovalKey, observeApproval, observeAskDialog, validateReply } from "../omp-extension/index.ts";
-import { chmodSync, mkdtempSync, rmSync, statSync } from "node:fs";
+import initialize, { ensurePrivateDirectories, integrationDirectory, nativeApprovalKey, observeApproval, observeApprovalSelect, observeAskDialog, supportedRuntime, validateReply } from "../omp-extension/index.ts";
+import { chmodSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -9,6 +9,7 @@ const answer = { kind: "submit" as const, results: [{ id: "q1", question: "Choos
 const snapshot = {
   schema_version: 1 as const,
   instance_id: "instance-a",
+  provider_version: "18.11.1",
   provider_session_id: "session-a",
   writer_pid: 123,
   revision: 7,
@@ -138,5 +139,79 @@ test("provider creates owner-only directories and uses the shared /tmp hook path
     expect(await ensurePrivateDirectories(root, dir, uid)).toBe(false);
   } finally {
     rmSync(scratch, { recursive: true, force: true });
+  }
+});
+
+test("runtime version boundaries and independent plugin metadata stay aligned", () => {
+  const manifest = Bun.TOML.parse(readFileSync(new URL("../aoe-plugin.toml", import.meta.url), "utf8"));
+  const metadata = JSON.parse(readFileSync(new URL("../omp-extension/package.json", import.meta.url), "utf8"));
+  const supported = ["18.10.3", "18.10.4", "18.11.1"];
+  expect(manifest.agent_integrations[0].provider_versions).toEqual(supported.map(version => `=${version}`));
+  expect(metadata.peerDependencies["@oh-my-pi/pi-coding-agent"].split(" || ")).toEqual(supported);
+  for (const version of supported) expect(supportedRuntime(version)).toBe(true);
+  for (const version of [undefined, "", "18.10.2", "18.10.5", "18.11.0", "18.11.2", "19.0.0", "18.11.1-rc.1", "v18.11.1"]) {
+    expect(supportedRuntime(version)).toBe(false);
+  }
+  expect(manifest.version).toBe(metadata.version);
+  expect(supportedRuntime(metadata.version)).toBe(false);
+});
+
+test("unsupported or unidentifiable OMP fails before registering native handlers", () => {
+  const previous = process.env.AOE_INSTANCE_ID;
+  process.env.AOE_INSTANCE_ID = "compatibility-test";
+  try {
+    for (const version of [undefined, "18.10.2", "18.11.2", "19.0.0"]) {
+      let registered = false;
+      const api = { pi: { VERSION: version }, on() { registered = true; } };
+      expect(() => initialize(api as Parameters<typeof initialize>[0])).toThrow("Install a supported OMP runtime or update");
+      expect(registered).toBe(false);
+    }
+  } finally {
+    if (previous === undefined) delete process.env.AOE_INSTANCE_ID;
+    else process.env.AOE_INSTANCE_ID = previous;
+  }
+});
+
+test("legacy native approval selector preserves cancellation and accepts only one explicit reply", async () => {
+  for (const choice of ["Approve", "Deny"]) {
+    let accept!: (choice: string) => boolean;
+    let settled = false;
+    let closed = false;
+    const parent = new AbortController();
+    const select = observeApprovalSelect((_title, _choices, options) => {
+      const { promise, resolve } = Promise.withResolvers<string | undefined>();
+      options?.signal?.addEventListener("abort", () => { settled = true; resolve(undefined); }, { once: true });
+      return promise;
+    }, submit => { accept = submit; }, () => { closed = true; });
+    const result = select("Approve tool", ["Approve", "Deny"], { signal: parent.signal });
+    expect(accept(choice)).toBe(true);
+    expect(await result).toBe(choice);
+    expect(settled).toBe(true);
+    expect(closed).toBe(true);
+    expect(parent.signal.aborted).toBe(false);
+    expect(accept(choice)).toBe(false);
+  }
+  let accept!: (choice: string) => boolean;
+  const select = observeApprovalSelect(async () => "Deny", submit => { accept = submit; }, () => {});
+  expect(await select("Approve tool", ["Approve", "Deny"])).toBe("Deny");
+  expect(accept("Approve")).toBe(false);
+});
+
+test("known runtime with a missing native API rejects startup before publishing", async () => {
+  const previous = process.env.AOE_INSTANCE_ID;
+  process.env.AOE_INSTANCE_ID = "compatibility-shape-test";
+  try {
+    for (const version of ["18.10.3", "18.10.4", "18.11.1"]) {
+      let start!: (_event: unknown, ctx: unknown) => Promise<void>;
+      const api = {
+        pi: { VERSION: version },
+        on(event: string, handler: typeof start) { if (event === "session_start") start = handler; },
+      };
+      initialize(api as unknown as Parameters<typeof initialize>[0]);
+      await expect(start({}, { sessionManager: {}, ui: {} })).rejects.toThrow("lacks the native session/select/input API");
+    }
+  } finally {
+    if (previous === undefined) delete process.env.AOE_INSTANCE_ID;
+    else process.env.AOE_INSTANCE_ID = previous;
   }
 });

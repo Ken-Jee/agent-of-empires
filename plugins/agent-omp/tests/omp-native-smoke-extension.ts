@@ -18,10 +18,14 @@ export default function (pi: ExtensionAPI): void {
         try {
           const report = JSON.parse(readFileSync(reportPath, "utf8")) as {
             instance_id?: string;
+            provider_version?: string;
+            provider_session_id?: string;
             writer_pid?: number;
             status?: string;
           };
           if (report.instance_id === instanceId && report.writer_pid === process.pid &&
+              report.provider_version === pi.pi.VERSION &&
+              report.provider_session_id === ctx.sessionManager.getSessionId() &&
               ["running", "waiting", "idle", "error"].includes(report.status ?? "")) {
             writeFileSync(marker, "integration-snapshot-ok\n", { mode: 0o600 });
             return;

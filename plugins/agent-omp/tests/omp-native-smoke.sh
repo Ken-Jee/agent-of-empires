@@ -34,7 +34,7 @@ if env -i \
   :
 elif [ ! -f "$marker" ]; then
   cat "$log" >&2
-  printf '%s\n' "OMP did not reach session_start; ensure OMP_BIN names an installed OMP 18.11.1 CLI." >&2
+  printf '%s\n' "OMP did not reach session_start; ensure OMP_BIN names a supported OMP CLI (see plugins/agent-omp/README.md)." >&2
   exit 1
 fi
 

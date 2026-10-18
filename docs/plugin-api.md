@@ -47,13 +47,15 @@ capabilities = ["session.integration"]
 
 [[agent_integrations]]
 tool = "omp"
+provider_versions = ["=18.10.3", "=18.10.4", "=18.11.1"]
 ```
 
 | Key | Type | Required | Notes |
 |---|---|---|---|
 | `tool` | string | yes | Lowercase agent id supported by the host. The current host supports `omp`; each tool may appear only once per plugin. |
+| `provider_versions` | array of strings | yes | Nonempty alternative semver requirements for the agent runtime. A report's `provider_version` must match at least one; malformed requirements reject the manifest. |
 
-The host uses this declaration only for matching terminal sessions. The current provider integration is `omp`; its companion package and OMP runtime extension must both be installed. See [OMP integration](plugins.md#omp-integration).
+The host matches this declaration to terminal sessions and rejects missing, malformed, or unsupported runtime versions before consuming status or sending a reply. The runtime extension must also enforce its supported versions before activation. These requirements are independent of the plugin's `version`, the AoE host's `api_version` / `aoe_version`, and report/reply `schema_version`. The current provider integration is `omp`; its companion package and OMP runtime extension must both be installed. See [OMP integration](../plugins/agent-omp/README.md) for the supported native API versions and smoke procedure.
 The provider report's `reply_keys` must contain only function-key names from `F1` through `F12`. AoE sends those keys only after the user submits a response.
 
 ## Plugin id

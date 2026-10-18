@@ -958,6 +958,15 @@ impl PluginManifest {
         let mut integration_tools = std::collections::HashSet::new();
         for (i, integration) in self.agent_integrations.iter().enumerate() {
             check(
+                !integration.provider_versions.is_empty()
+                    && integration.provider_versions.iter().all(|range| {
+                        !range.trim().is_empty() && semver::VersionReq::parse(range).is_ok()
+                    }),
+                format!(
+                    "agent_integrations[{i}].provider_versions must contain valid semver requirements"
+                ),
+            );
+            check(
                 !integration.tool.is_empty()
                     && integration.tool.bytes().all(|c| {
                         c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-' || c == b'_'

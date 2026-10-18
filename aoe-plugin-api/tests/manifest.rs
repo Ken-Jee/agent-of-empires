@@ -44,12 +44,28 @@ api_version = {api_version}
 capabilities = {capabilities}
 [[agent_integrations]]
 tool = "omp"
+provider_versions = ["=18.11.1"]
 "#;
     let valid = base
         .replace("{api_version}", "18")
         .replace("{capabilities}", r#"["session.integration"]"#);
     let parsed = PluginManifest::from_toml_str(&valid).expect("valid integration parses");
     assert_eq!(parsed.agent_integrations[0].tool, "omp");
+    for version in ["18.11.0", "18.11.2", "18.11.1-rc.1", "19.0.0", "unknown"] {
+        assert!(parsed.agent_integrations[0]
+            .provider_compat(version)
+            .is_err());
+    }
+    assert!(parsed.agent_integrations[0]
+        .provider_compat("18.11.1")
+        .is_ok());
+    for ranges in ["[]", "[\"not semver\"]", "[\"\"]"] {
+        let invalid = valid.replace("[\"=18.11.1\"]", ranges);
+        assert!(matches!(
+            PluginManifest::from_toml_str(&invalid),
+            Err(ManifestError::Invalid(_))
+        ));
+    }
 
     let cases = [
         (
@@ -69,7 +85,7 @@ tool = "omp"
             "lowercase agent id",
         ),
         (
-            format!("{valid}\n[[agent_integrations]]\ntool = \"omp\"\n"),
+            format!("{valid}\n[[agent_integrations]]\ntool = \"omp\"\nprovider_versions = [\"=18.11.1\"]\n"),
             "must not repeat tool",
         ),
         (
@@ -87,7 +103,7 @@ tool = "omp"
         (
             base.replace("{api_version}", "17")
                 .replace("{capabilities}", r#"["session.integration"]"#)
-                .replace("\n[[agent_integrations]]\ntool = \"omp\"\n", "\n"),
+                .replace("\n[[agent_integrations]]\ntool = \"omp\"\nprovider_versions = [\"=18.11.1\"]\n", "\n"),
             "session.integration capability requires api_version >= 18",
         ),
     ];

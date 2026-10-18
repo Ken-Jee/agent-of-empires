@@ -3,14 +3,15 @@ import { execFileSync } from "node:child_process";
 import { closeSync, constants, fstatSync, lstatSync, openSync, readFileSync } from "node:fs";
 import { mkdir, open, rename, unlink } from "node:fs/promises";
 import path from "node:path";
-import type { ExtensionAPI, ExtensionAskDialogQuestion, ExtensionAskDialogResult, ExtensionUIDialogOptions } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
+import type { ExtensionAPI, ExtensionAskDialogQuestion, ExtensionAskDialogResult, ExtensionUIDialogOptions, ExtensionUIContext } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
+import metadata from "./package.json";
 
 type Question = { id: string; question: string; options: { label: string; description?: string }[]; multi?: boolean; recommended?: number };
 type Prompt =
   | { kind: "approval"; id: string; title: string; allow_always: boolean }
   | { kind: "question"; id: string; title: string; questions: Question[] };
 type Snapshot = {
-  schema_version: 1; instance_id: string; provider_session_id: string; writer_pid: number;
+  schema_version: 1; instance_id: string; provider_version: string; provider_session_id: string; writer_pid: number;
   revision: number; status: "running" | "waiting" | "idle" | "error"; reply_keys: string[]; prompt: Prompt | null;
 };
 type Reply = {
@@ -27,6 +28,21 @@ const HEARTBEAT_MS = 5_000;
 const MAX_REPLY_BYTES = 1_048_576;
 const KEY = "F12";
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+export function supportedRuntime(version: unknown): version is string {
+  return typeof version === "string" &&
+    metadata.peerDependencies["@oh-my-pi/pi-coding-agent"].split(" || ").includes(version);
+}
+
+function requireRuntime(pi: ExtensionAPI): string {
+  const version = pi.pi?.VERSION;
+  if (!supportedRuntime(version)) {
+    throw new Error(`AoE OMP integration ${metadata.version} disabled: OMP ${version ?? "unknown"} is unsupported. ` +
+      `Supported OMP versions: ${metadata.peerDependencies["@oh-my-pi/pi-coding-agent"]}. ` +
+      "Install a supported OMP runtime or update the integration extension.");
+  }
+  return version;
+}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === "object" && !Array.isArray(value);
@@ -124,16 +140,20 @@ type AskObserver = {
   close: (id: string) => void;
 };
 
-export function observeAskDialog(nativeAsk: AskDialog, observer: AskObserver): AskDialog {
-  return async (questions, options) => {
-    const id = randomUUID();
+function observeDialog<T, A extends unknown[]>(
+  nativeDialog: (...args: [...A, ExtensionUIDialogOptions?]) => Promise<T | undefined>,
+  observer: { open: (accept: (result: T) => boolean, ...args: A) => void; close: () => void },
+): (...args: [...A, ExtensionUIDialogOptions?]) => Promise<T | undefined> {
+  return async (...args) => {
+    const options = args.pop() as ExtensionUIDialogOptions | undefined;
+    const inputs = args as A;
     const controller = new AbortController();
     const childSignal = options?.signal ? AbortSignal.any([options.signal, controller.signal]) : controller.signal;
-    const { promise: external, resolve: resolveExternal } = Promise.withResolvers<ExtensionAskDialogResult>();
+    const { promise: external, resolve: resolveExternal } = Promise.withResolvers<T>();
     const { promise: nativeSettled, resolve: settleNative } = Promise.withResolvers<void>();
     let pending = true;
     let externalAnswer = false;
-    const accept = (result: ExtensionAskDialogResult): boolean => {
+    const accept = (result: T): boolean => {
       if (!pending || externalAnswer) return false;
       externalAnswer = true;
       pending = false;
@@ -141,12 +161,12 @@ export function observeAskDialog(nativeAsk: AskDialog, observer: AskObserver): A
       void nativeSettled.then(() => resolveExternal(result));
       return true;
     };
-    try { observer.open(id, questions, accept); } catch { /* Observation must not disrupt the native dialog. */ }
-    let native: Promise<ExtensionAskDialogResult | undefined>;
-    try { native = Promise.resolve(nativeAsk(questions, { ...options, signal: childSignal })); }
+    try { observer.open(accept, ...inputs); } catch { /* Keep the native dialog available. */ }
+    let native: Promise<T | undefined>;
+    try { native = Promise.resolve(nativeDialog(...inputs, { ...options, signal: childSignal })); }
     catch (error) {
       pending = false;
-      try { observer.close(id); } catch { /* Preserve the native exception. */ }
+      try { observer.close(); } catch { /* Preserve the native exception. */ }
       throw error;
     }
     native.then(() => settleNative(), () => settleNative());
@@ -162,9 +182,31 @@ export function observeAskDialog(nativeAsk: AskDialog, observer: AskObserver): A
       }), external]);
     } finally {
       pending = false;
-      try { observer.close(id); } catch { /* Observation must not replace the native result. */ }
+      try { observer.close(); } catch { /* Preserve the native result. */ }
     }
   };
+}
+
+export function observeAskDialog(nativeAsk: AskDialog, observer: AskObserver): AskDialog {
+  return (questions, options) => {
+    const id = randomUUID();
+    return observeDialog<ExtensionAskDialogResult, [ExtensionAskDialogQuestion[]]>(nativeAsk, {
+      open: (accept, items) => observer.open(id, items, accept),
+      close: () => observer.close(id),
+    })(questions, options);
+  };
+}
+
+type Select = ExtensionUIContext["select"];
+
+export function observeApprovalSelect(
+  nativeSelect: Select,
+  onOpen: (accept: (choice: string) => boolean) => void,
+  onClose: () => void,
+): Select {
+  return (title, choices, options) => observeDialog<string, [string, Parameters<Select>[1]]>(nativeSelect, {
+    open: accept => onOpen(accept), close: onClose,
+  })(title, choices, options);
 }
 export async function observeApproval<T>(nativeApproval: () => Promise<T>, onOpen: () => void, onClose: () => void): Promise<T> {
   try { onOpen(); } catch { /* Observation must not change the native decision. */ }
@@ -205,6 +247,7 @@ export function nativeApprovalKey(choice: "allow" | "deny" | "allow_always", bin
 export default function (pi: ExtensionAPI): void {
   const instanceId = resolveInstanceId();
   if (!instanceId || typeof process.getuid !== "function") return;
+  const providerVersion = requireRuntime(pi);
   const uid = process.getuid();
   const root = path.join("/tmp", `aoe-hooks-${uid}`);
   const dir = integrationDirectory(uid, instanceId);
@@ -218,13 +261,14 @@ export default function (pi: ExtensionAPI): void {
   let unlisten: (() => void) | undefined;
   let currentAsk: AskState | undefined;
   let activeApproval: ApprovalState | undefined;
+  let acceptSelection: ((choice: string) => boolean) | undefined;
   let approvalQueue: { id: string; title: string }[] = [];
   let approvalBindings: string[] = [];
   let cancelBindings: string[] = [];
   let handledPromptId: string | undefined;
 
-  const currentSnapshot = (): Snapshot => ({ schema_version: 1, instance_id: instanceId, provider_session_id: sessionId,
-    writer_pid: process.pid, revision, status, reply_keys: [KEY], prompt });
+  const currentSnapshot = (): Snapshot => ({ schema_version: 1, instance_id: instanceId, provider_version: providerVersion,
+    provider_session_id: sessionId, writer_pid: process.pid, revision, status, reply_keys: [KEY], prompt });
   let writeQueue = Promise.resolve();
   const writeSnapshot = (): Promise<void> => {
     writeQueue = writeQueue.then(async () => {
@@ -265,6 +309,12 @@ export default function (pi: ExtensionAPI): void {
       return true;
     }
     if (reply.response.kind !== "approval" || !activeApproval?.replyable || activeApproval.id !== reply.prompt_id) return false;
+    if (acceptSelection) {
+      if (reply.response.choice === "allow_always" || !acceptSelection(reply.response.choice === "allow" ? "Approve" : "Deny")) return false;
+      handledPromptId = reply.prompt_id;
+      unlink(replyPath).catch(() => undefined);
+      return true;
+    }
     const bindings = reply.response.choice === "allow" ? approvalBindings : cancelBindings;
     const key = nativeApprovalKey(reply.response.choice, bindings);
     const pane = process.env.TMUX_PANE;
@@ -277,6 +327,11 @@ export default function (pi: ExtensionAPI): void {
   };
 
   pi.on("session_start", async (_event, ctx) => {
+    if (typeof ctx.sessionManager?.getSessionId !== "function" ||
+        typeof ctx.ui?.select !== "function" || typeof ctx.ui?.onTerminalInput !== "function") {
+      throw new Error(`AoE OMP integration ${metadata.version} disabled: OMP ${providerVersion} lacks the native session/select/input API. ` +
+        "Install an unmodified supported OMP runtime or update the integration extension.");
+    }
     sessionId = ctx.sessionManager.getSessionId();
     try {
       const [{ appApproveKeys }, { getKeybindings }] = await Promise.all([
@@ -318,6 +373,22 @@ export default function (pi: ExtensionAPI): void {
         );
       };
     }
+    const nativeSelect = ui.select.bind(ui);
+    ui.select = (title, choices, options) => {
+      if (choices.length !== 2 || choices[0] !== "Approve" || choices[1] !== "Deny" || approvalQueue.length !== 1) {
+        return nativeSelect(title, choices, options);
+      }
+      const paired = approvalQueue.shift()!;
+      return observeApprovalSelect(nativeSelect, accept => {
+        activeApproval = { ...paired, replyable: true };
+        acceptSelection = accept;
+        publish({ kind: "approval", id: paired.id, title: paired.title, allow_always: false }, "waiting");
+      }, () => {
+        acceptSelection = undefined;
+        if (activeApproval?.id === paired.id) activeApproval = undefined;
+        publish(currentAsk ? questionPrompt(currentAsk.id, currentAsk.questions) : null, currentAsk ? "waiting" : "running");
+      })(title, choices, options);
+    };
     unlisten = ui.onTerminalInput(data => {
       if (data !== "\u001b[24~" || !safeDirectorySync(root, uid) || !safeDirectorySync(dir, uid)) return;
       const reply = readReply(replyPath, uid, currentSnapshot());

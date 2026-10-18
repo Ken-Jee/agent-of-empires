@@ -76,7 +76,9 @@ pub fn snapshot(instance: &Instance) -> Option<AgentIntegrationSnapshot> {
     }
     let registry = super::registry();
     let plugin = provider(&registry, &instance.tool).ok()??;
-    read_report(&instance.id, plugin).ok().flatten()
+    read_report(&instance.id, &instance.tool, plugin)
+        .ok()
+        .flatten()
 }
 
 pub(crate) fn session_status(status: AgentIntegrationStatus) -> crate::session::Status {
@@ -124,6 +126,7 @@ fn check_file(meta: &std::fs::Metadata) -> Result<SystemTime> {
 
 fn read_report(
     instance_id: &str,
+    tool: &str,
     plugin: &super::LoadedPlugin,
 ) -> Result<Option<AgentIntegrationSnapshot>> {
     let Some(dir) = dir_guard::open_instance_dir_read_only(instance_id)? else {
@@ -143,6 +146,14 @@ fn read_report(
     let mut report: AgentIntegrationSnapshot =
         serde_json::from_slice(&bytes).context("invalid integration report")?;
     validate_report(&report, instance_id)?;
+    plugin
+        .manifest
+        .agent_integrations
+        .iter()
+        .find(|entry| entry.tool == tool)
+        .context("provider integration declaration is unavailable")?
+        .provider_compat(&report.provider_version)
+        .map_err(anyhow::Error::msg)?;
     sanitize_prompt(&mut report);
     ensure!(
         crate::process::worker::is_pid_alive(report.writer_pid),
@@ -240,6 +251,7 @@ fn sanitize_prompt(report: &mut AgentIntegrationSnapshot) {
 
 fn same_prompt(a: &AgentIntegrationSnapshot, b: &AgentIntegrationSnapshot) -> bool {
     a.instance_id == b.instance_id
+        && a.provider_version == b.provider_version
         && a.provider_session_id == b.provider_session_id
         && a.writer_pid == b.writer_pid
         && a.revision == b.revision
@@ -308,8 +320,8 @@ pub fn respond(
     let registry = super::registry();
     let plugin = provider(&registry, &instance.tool)?
         .context("provider integration is not enabled and approved")?;
-    let current =
-        read_report(&instance.id, plugin)?.context("provider integration report is unavailable")?;
+    let current = read_report(&instance.id, &instance.tool, plugin)?
+        .context("provider integration report is unavailable")?;
     ensure!(
         same_prompt(expected, &current),
         "prompt changed; reopen the reply dialog"
@@ -391,6 +403,7 @@ mod tests {
         AgentIntegrationSnapshot {
             schema_version: 1,
             instance_id: "host-test".into(),
+            provider_version: "18.11.1".into(),
             provider_session_id: "provider-session".into(),
             writer_pid: std::process::id(),
             revision: 1,
@@ -497,5 +510,64 @@ mod tests {
             session_status_override(true, true, Some(AgentIntegrationStatus::Running)),
             Some(crate::session::Status::Error)
         );
+    }
+
+    #[test]
+    #[serial_test::serial(hook_base)]
+    fn unavailable_incompatible_and_expired_reports_fail_closed() {
+        let (_guard, base, _tmp) = crate::hooks::test_support::BaseGuard::ready();
+        let manifest = aoe_plugin_api::PluginManifest::from_toml_str(include_str!(
+            "../../plugins/agent-omp/aoe-plugin.toml"
+        ))
+        .unwrap();
+        let plugin = super::super::LoadedPlugin {
+            manifest,
+            enabled: true,
+            trust: aoe_plugin_api::TrustLevel::Community,
+            validation: super::super::registry::ValidationState::Local,
+            source: None,
+            dir: None,
+            manifest_hash: String::new(),
+            granted: true,
+        };
+        assert!(read_report("host-test", "omp", &plugin).unwrap().is_none());
+        let dir = dir_guard::open_instance_dir("host-test").unwrap();
+        let leaf = format!("integration-{}.json", plugin.id());
+        for version in ["18.10.3", "18.10.4", "18.11.1", "18.11.2", "unknown"] {
+            let mut report = snapshot();
+            report.provider_version = version.into();
+            dir_guard::write_atomic(dir.as_fd(), &leaf, &serde_json::to_vec(&report).unwrap())
+                .unwrap();
+            let loaded = read_report("host-test", "omp", &plugin);
+            if matches!(version, "18.11.2" | "unknown") {
+                assert!(loaded.is_err(), "{version}");
+            } else {
+                assert!(loaded.unwrap().is_some(), "{version}");
+            }
+        }
+        dir_guard::write_atomic(
+            dir.as_fd(),
+            &leaf,
+            &serde_json::to_vec(&snapshot()).unwrap(),
+        )
+        .unwrap();
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(base.join("host-test").join(&leaf))
+            .unwrap();
+        file.set_modified(SystemTime::now() - REPORT_MAX_AGE - Duration::from_secs(60))
+            .unwrap();
+        assert!(read_report("host-test", "omp", &plugin)
+            .unwrap_err()
+            .to_string()
+            .contains("expired"));
+        assert_eq!(session_status_override(true, false, None), None);
+        assert!(!base
+            .join("host-test")
+            .join(format!("integration-{}.reply.json", plugin.id()))
+            .exists());
+        let mut changed = snapshot();
+        changed.provider_version = "18.10.3".into();
+        assert!(!same_prompt(&snapshot(), &changed));
     }
 }

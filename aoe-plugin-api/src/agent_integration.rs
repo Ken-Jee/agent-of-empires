@@ -9,6 +9,27 @@ pub const SUPPORTED_AGENT_INTEGRATION_TOOLS: &[&str] = &["omp"];
 #[serde(deny_unknown_fields)]
 pub struct AgentIntegrationContribution {
     pub tool: String,
+    /// Alternative semver requirements for the provider runtime, not the AoE host.
+    pub provider_versions: Vec<String>,
+}
+
+impl AgentIntegrationContribution {
+    pub fn provider_compat(&self, version: &str) -> Result<(), String> {
+        let parsed = semver::Version::parse(version)
+            .map_err(|e| format!("invalid {} runtime version {version:?}: {e}", self.tool))?;
+        for range in &self.provider_versions {
+            let requirement = semver::VersionReq::parse(range)
+                .map_err(|e| format!("invalid provider_versions range {range:?}: {e}"))?;
+            if requirement.matches(&parsed) {
+                return Ok(());
+            }
+        }
+        Err(format!(
+            "{} runtime {version} is unsupported; supported provider_versions: {}; install a supported runtime or update the integration plugin",
+            self.tool,
+            self.provider_versions.join(" or ")
+        ))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -25,6 +46,7 @@ pub enum AgentIntegrationStatus {
 pub struct AgentIntegrationSnapshot {
     pub schema_version: u32,
     pub instance_id: String,
+    pub provider_version: String,
     pub provider_session_id: String,
     pub writer_pid: u32,
     pub revision: u64,
