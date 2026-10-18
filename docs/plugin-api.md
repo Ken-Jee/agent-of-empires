@@ -47,7 +47,7 @@ capabilities = ["session.integration"]
 
 [[agent_integrations]]
 tool = "omp"
-provider_versions = ["=18.10.3", "=18.10.4", "=18.11.1"]
+provider_versions = [">=18.10.3, <=18.10.4", "=18.11.1", "=18.11.3"]
 ```
 
 | Key | Type | Required | Notes |

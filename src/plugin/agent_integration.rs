@@ -533,13 +533,24 @@ mod tests {
         assert!(read_report("host-test", "omp", &plugin).unwrap().is_none());
         let dir = dir_guard::open_instance_dir("host-test").unwrap();
         let leaf = format!("integration-{}.json", plugin.id());
-        for version in ["18.10.3", "18.10.4", "18.11.1", "18.11.2", "unknown"] {
+        for version in [
+            "18.10.2",
+            "18.10.3",
+            "18.10.4",
+            "18.10.5",
+            "18.11.1",
+            "18.11.2",
+            "18.11.3",
+            "18.11.4",
+            "18.11.3-rc.1",
+            "unknown",
+        ] {
             let mut report = snapshot();
             report.provider_version = version.into();
             dir_guard::write_atomic(dir.as_fd(), &leaf, &serde_json::to_vec(&report).unwrap())
                 .unwrap();
             let loaded = read_report("host-test", "omp", &plugin);
-            if matches!(version, "18.11.2" | "unknown") {
+            if !matches!(version, "18.10.3" | "18.10.4" | "18.11.1" | "18.11.3") {
                 assert!(loaded.is_err(), "{version}");
             } else {
                 assert!(loaded.unwrap().is_some(), "{version}");

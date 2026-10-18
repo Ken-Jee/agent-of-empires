@@ -28,10 +28,18 @@ const HEARTBEAT_MS = 5_000;
 const MAX_REPLY_BYTES = 1_048_576;
 const KEY = "F12";
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const RUNTIME_VERSION = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
 
 export function supportedRuntime(version: unknown): version is string {
-  return typeof version === "string" &&
-    metadata.peerDependencies["@oh-my-pi/pi-coding-agent"].split(" || ").includes(version);
+  // Bun's matcher accepts loose prefixes and trailing text; reports use canonical versions.
+  return typeof version === "string" && RUNTIME_VERSION.test(version) &&
+    Bun.semver.satisfies(version, metadata.peerDependencies["@oh-my-pi/pi-coding-agent"]);
+}
+
+export function isApprovalSelection(choices: readonly unknown[]): boolean {
+  return (choices.length === 2 || (choices.length === 3 && typeof choices[1] === "string" &&
+    choices[1].startsWith("Approve ") && choices[1].endsWith(" for this session"))) &&
+    choices[0] === "Approve" && choices.at(-1) === "Deny";
 }
 
 function requireRuntime(pi: ExtensionAPI): string {
@@ -375,7 +383,7 @@ export default function (pi: ExtensionAPI): void {
     }
     const nativeSelect = ui.select.bind(ui);
     ui.select = (title, choices, options) => {
-      if (choices.length !== 2 || choices[0] !== "Approve" || choices[1] !== "Deny" || approvalQueue.length !== 1) {
+      if (!isApprovalSelection(choices) || approvalQueue.length !== 1) {
         return nativeSelect(title, choices, options);
       }
       const paired = approvalQueue.shift()!;
