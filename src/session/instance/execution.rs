@@ -3884,7 +3884,8 @@ mod tests {
         assert!(matches!(
             crate::session::fork::terminal_fork_seed(
                 instance.fork_parent_ref().unwrap(),
-                "child-uuid".into()
+                "child-uuid".into(),
+                false
             ),
             Ok(crate::session::ForkSeed::Terminal { .. })
         ));
@@ -3893,7 +3894,8 @@ mod tests {
         assert_eq!(
             crate::session::fork::terminal_fork_seed(
                 instance.fork_parent_ref().unwrap(),
-                "child-uuid".into()
+                "child-uuid".into(),
+                false
             ),
             Err(crate::session::ForkDenied::UnqualifiedParent {
                 preallocated: false,
@@ -3929,7 +3931,8 @@ mod tests {
         assert_eq!(
             crate::session::fork::terminal_fork_seed(
                 instance.fork_parent_ref().unwrap(),
-                "child-uuid".into()
+                "child-uuid".into(),
+                false
             ),
             Err(crate::session::ForkDenied::UnlaunchedFork)
         );

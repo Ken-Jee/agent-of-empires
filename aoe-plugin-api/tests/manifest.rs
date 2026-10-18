@@ -47,7 +47,7 @@ tool = "omp"
 provider_versions = ["=18.11.1"]
 "#;
     let valid = base
-        .replace("{api_version}", "18")
+        .replace("{api_version}", "19")
         .replace("{capabilities}", r#"["session.integration"]"#);
     let parsed = PluginManifest::from_toml_str(&valid).expect("valid integration parses");
     assert_eq!(parsed.agent_integrations[0].tool, "omp");
@@ -69,17 +69,17 @@ provider_versions = ["=18.11.1"]
 
     let cases = [
         (
-            base.replace("{api_version}", "17")
+            base.replace("{api_version}", "18")
                 .replace("{capabilities}", r#"["session.integration"]"#),
-            "require api_version >= 18",
+            "require api_version >= 19",
         ),
         (
-            base.replace("{api_version}", "18")
+            base.replace("{api_version}", "19")
                 .replace("{capabilities}", "[]"),
             "require the session.integration capability",
         ),
         (
-            base.replace("{api_version}", "18")
+            base.replace("{api_version}", "19")
                 .replace("{capabilities}", r#"["session.integration"]"#)
                 .replace("tool = \"omp\"", "tool = \"OMP\""),
             "lowercase agent id",
@@ -89,22 +89,22 @@ provider_versions = ["=18.11.1"]
             "must not repeat tool",
         ),
         (
-            base.replace("{api_version}", "18")
+            base.replace("{api_version}", "19")
                 .replace("{capabilities}", r#"["session.integration"]"#)
                 .replace("tool = \"omp\"", "tool = \"\""),
             "must be a nonempty lowercase agent id",
         ),
         (
-            base.replace("{api_version}", "18")
+            base.replace("{api_version}", "19")
                 .replace("{capabilities}", r#"["session.integration"]"#)
                 .replace("tool = \"omp\"", "tool = \"claude\""),
             "not supported by this host",
         ),
         (
-            base.replace("{api_version}", "17")
+            base.replace("{api_version}", "18")
                 .replace("{capabilities}", r#"["session.integration"]"#)
                 .replace("\n[[agent_integrations]]\ntool = \"omp\"\nprovider_versions = [\"=18.11.1\"]\n", "\n"),
-            "session.integration capability requires api_version >= 18",
+            "session.integration capability requires api_version >= 19",
         ),
     ];
     for (toml, expected_error) in cases {

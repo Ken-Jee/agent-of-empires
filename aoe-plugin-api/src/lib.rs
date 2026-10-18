@@ -16,5 +16,4 @@ pub use manifest::{
     SettingType, StatusContribution, ThemeContribution, UiContribution, UiSlot, MAX_SCREENSHOTS,
 };
 
-/// Provider-native agent integration status and user-requested prompt replies.
-pub const API_VERSION: u32 = 18;
+pub const API_VERSION: u32 = 19;

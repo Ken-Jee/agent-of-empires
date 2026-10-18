@@ -2,11 +2,11 @@
 
 This directory contains two separately installed components: the AoE plugin declared by `aoe-plugin.toml` and the OMP runtime extension under `omp-extension/`.
 
-The host requires AoE plugin API 18. Installing the integration never approves prompts automatically.
+The host requires AoE plugin API 19. Installing the integration never approves prompts automatically.
 
 ## Runtime compatibility
 
-The independently versioned integration is **0.2.0** in both `aoe-plugin.toml` and `omp-extension/package.json`. This is not an OMP version. `api_version = 18` describes the AoE host API, optional `aoe_version` restricts the AoE application, and report/reply `schema_version = 1` describes the provider wire protocol.
+The independently versioned integration is **0.2.0** in both `aoe-plugin.toml` and `omp-extension/package.json`. This is not an OMP version. `api_version = 19` describes the AoE host API, optional `aoe_version` restricts the AoE application, and report/reply `schema_version = 1` describes the provider wire protocol.
 
 Supported OMP runtimes are **18.10.3 through 18.10.4**, **18.11.1**, and **18.11.3**, not all later releases. Both manifests declare these bounded semver alternatives. The extension evaluates the running host's injected `pi.pi.VERSION` with Bun's built-in semver matcher before registering handlers; unsupported or unknown versions produce an actionable extension-load error and publish nothing. AoE independently checks each report's `provider_version` against `agent_integrations.provider_versions`.
 
