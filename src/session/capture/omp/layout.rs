@@ -237,6 +237,7 @@ fn host_launcher_environment(entries: &[String]) -> HashMap<String, String> {
 }
 /// Host pane routing env matching the resolver's snapshot; explicit unsets stop
 /// tmux's server environment reviving stale values.
+#[cfg(test)]
 pub(crate) fn omp_host_routing_environment(
     entries: &[String],
 ) -> Vec<crate::tmux::PaneEnvMutation> {

@@ -87,6 +87,18 @@ impl OmpCliCaptureOptions {
         }
         Ok(parsed)
     }
+
+    /// Parse the argv used by both built-in and command-overridden launches.
+    pub(crate) fn parse_launch(command: &str, extra_args: &str) -> Result<Self> {
+        let args = if command.is_empty() {
+            crate::session::config::quote_model_value_in_args(extra_args)
+        } else if extra_args.is_empty() {
+            command.to_owned()
+        } else {
+            format!("{command} {extra_args}")
+        };
+        Self::parse(&args)
+    }
 }
 
 /// Rejects `--api-key`, which would persist in the pane's start command and argv.
@@ -271,6 +283,20 @@ mod tests {
             OmpCliCaptureOptions::parse("-- --profile ignored --no-session").unwrap(),
             OmpCliCaptureOptions::default()
         );
+        for (command, extra, profile, cwd) in [
+            ("", "--profile extra", "extra", None),
+            (
+                "omp --profile command",
+                "--cwd ./project",
+                "command",
+                Some("./project"),
+            ),
+            ("omp --profile command", "--profile extra", "extra", None),
+        ] {
+            let parsed = OmpCliCaptureOptions::parse_launch(command, extra).unwrap();
+            assert_eq!(parsed.profile.as_deref(), Some(profile));
+            assert_eq!(parsed.cwd.as_deref(), cwd.map(Path::new));
+        }
         assert_eq!(
             OmpCliCaptureOptions::parse("--system-prompt --profile work")
                 .unwrap()

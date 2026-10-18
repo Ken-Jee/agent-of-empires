@@ -899,10 +899,25 @@ impl Instance {
                 .map(|environment| environment.env)
                 .unwrap_or_default();
         }
-        if omp_capture_plan.is_some() && !self.is_sandboxed() {
-            launch_env.pane.extend(omp_host_routing_environment(
-                &self.resolved_host_environment(),
-            ));
+        if !self.is_sandboxed() {
+            if let Some(context) = execution
+                .as_ref()
+                .and_then(|execution| execution.omp.as_ref())
+            {
+                launch_env
+                    .pane
+                    .extend(
+                        context
+                            .launcher_routing
+                            .iter()
+                            .map(|(key, value)| match value {
+                                Some(value) => {
+                                    tmux::PaneEnvMutation::set(key.clone(), value.clone())
+                                }
+                                None => tmux::PaneEnvMutation::unset(key.clone()),
+                            }),
+                    );
+            }
         }
         let require_conversation_publication = execution
             .as_ref()
@@ -1258,7 +1273,7 @@ impl Instance {
             })
         });
         let mut env_prefix =
-            status_hook_env_prefix(profile, &self.id, self.status_agent(), program.as_deref());
+            host_launch_env_prefix(profile, &self.id, self.status_agent(), program.as_deref());
         // The publisher is pane-scoped, including for safe Default wrappers.
         self.pi_extension_launched = false;
         if let Some((_, ref env)) = identity_extension {
@@ -1514,6 +1529,72 @@ mod tests {
             &config,
         )
         .unwrap();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn omp_launch_preserves_declared_store_and_initial_process_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_home(temp.path());
+        let _routing = EnvGuard::unset(&crate::session::capture::OMP_STORE_ENV_KEYS);
+        let _home_env = EnvGuard::set(&[("HOME", temp.path())]);
+        let _omp = crate::session::test_support::install_login_shell_path_command(
+            temp.path(),
+            "omp",
+            "#!/bin/sh\nprintf '%s\\n%s\\n' \"$AOE_INSTANCE_ID\" \"$PI_CODING_AGENT_DIR\"\n",
+        );
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join(".env"), "PI_CODING_AGENT_DIR=wrong-store\n").unwrap();
+        let store = temp.path().join("configured-store");
+        let profile = "omp-launch-environment";
+        let path =
+            crate::session::config::profile_config::get_profile_config_path(profile).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            path,
+            format!(
+                "[session.agent_config_dir]\nomp = {:?}\n",
+                store.to_str().unwrap()
+            ),
+        )
+        .unwrap();
+        let mut inst = tool_instance("omp", project.to_str().unwrap());
+        inst.source_profile = profile.into();
+        inst.view = crate::session::View::Structured;
+        let prepared = inst
+            .prepare_launch_command(inst.conversation_state())
+            .unwrap();
+        let mut command = std::process::Command::new("sh");
+        command
+            .arg("-c")
+            .arg(prepared.command.unwrap())
+            .current_dir(&project);
+        for mutation in prepared.launch_env.pane {
+            match mutation {
+                tmux::PaneEnvMutation::Set { key, value } => {
+                    command.env(key, value);
+                }
+                tmux::PaneEnvMutation::Unset { key } => {
+                    command.env_remove(key);
+                }
+            }
+        }
+        // No inherited identity or hidden tmux metadata is available to the child.
+        command
+            .env_remove("TMUX")
+            .env_remove("TMUX_PANE")
+            .env_remove("AOE_INSTANCE_ID");
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            format!("{}\n{}\n", inst.id, path_identity(&store).display())
+        );
     }
 
     // The sidecar env var has to survive into the docker argv; no CI container would catch it.
