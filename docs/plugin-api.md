@@ -58,7 +58,7 @@ provider_versions = [">=18.10.3, <=18.10.4", "=18.11.1", "=18.11.3"]
 The host matches this declaration to terminal sessions and rejects missing, malformed, or unsupported runtime versions before consuming status or sending a reply. The runtime extension must also enforce its supported versions before activation. These requirements are independent of the plugin's `version`, the AoE host's `api_version` / `aoe_version`, and report/reply `schema_version`. The current provider integration is `omp`; its companion package and OMP runtime extension must both be installed. See [OMP integration](../plugins/agent-omp/README.md) for the supported native API versions and smoke procedure.
 The provider report's `reply_keys` must contain only function-key names from `F1` through `F12`. AoE sends those keys only after the user submits a response.
 
-A prompt's `revision` changes only when the prompt changes, not when runtime status changes. Single-choice questions require exactly one selected option or a nonblank custom answer; the response dialog stays open for incomplete answers.
+The snapshot's `revision` changes only when the prompt changes, not when runtime status changes. Single-choice questions require exactly one selected option or a nonblank custom answer; the response dialog stays open for incomplete answers.
 
 ## Plugin id
 
