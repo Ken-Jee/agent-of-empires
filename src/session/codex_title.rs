@@ -60,13 +60,13 @@ pub fn import_codex_title(profile: &str, session_id: &str, force: bool) -> anyho
     crate::session::smart_rename::write_title(&storage, session_id, Some(&title), force, false)
 }
 
-/// Idle-edge hook: import in the background, and hand a session that gained no title over to
-/// smart rename.
+/// Idle-edge hook: import in the background. A missing message retries on the next idle edge, so a
+/// failed import never hands the session to smart rename.
 pub fn spawn_auto_import(inst: &Instance) {
-    let (profile, id, fallback) = (inst.source_profile.clone(), inst.id.clone(), inst.clone());
+    let (profile, id) = (inst.source_profile.clone(), inst.id.clone());
     std::thread::spawn(move || {
-        if !matches!(import_codex_title(&profile, &id, false), Ok(true)) {
-            crate::session::smart_rename::spawn_terminal_smart_rename_if_eligible(&fallback);
+        if let Err(error) = import_codex_title(&profile, &id, false) {
+            tracing::debug!(target: "smart_rename", session = %id, "codex title import skipped: {error}");
         }
     });
 }

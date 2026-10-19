@@ -655,11 +655,6 @@ pub fn maybe_spawn_terminal_smart_rename(inst: &crate::session::instance::Instan
         crate::session::codex_title::spawn_auto_import(inst);
         return;
     }
-    spawn_terminal_smart_rename_if_eligible(inst);
-}
-
-/// The smart-rename half of [`maybe_spawn_terminal_smart_rename`], once the cheap gates pass.
-pub(crate) fn spawn_terminal_smart_rename_if_eligible(inst: &crate::session::instance::Instance) {
     if inst.smart_rename_attempted {
         return;
     }
