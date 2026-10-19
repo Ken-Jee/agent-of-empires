@@ -641,7 +641,26 @@ const CONTEXT_TAIL_BYTES: usize = 1024;
 /// still-default-named, non-structured, not-yet-attempted session whose resolved config has smart
 /// rename on.
 pub fn maybe_spawn_terminal_smart_rename(inst: &crate::session::instance::Instance) {
-    if inst.is_structured() || inst.smart_rename_attempted || !is_default_civ_name(&inst.title) {
+    if inst.is_structured() || !is_default_civ_name(&inst.title) {
+        return;
+    }
+    if crate::session::codex_title::skip_reason(inst).is_none()
+        && crate::session::config::repo_config::resolve_config_with_repo_or_warn(
+            &inst.source_profile,
+            Path::new(&inst.project_path),
+        )
+        .session
+        .import_codex_title
+    {
+        crate::session::codex_title::spawn_auto_import(inst);
+        return;
+    }
+    spawn_terminal_smart_rename_if_eligible(inst);
+}
+
+/// The smart-rename half of [`maybe_spawn_terminal_smart_rename`], once the cheap gates pass.
+pub(crate) fn spawn_terminal_smart_rename_if_eligible(inst: &crate::session::instance::Instance) {
+    if inst.smart_rename_attempted {
         return;
     }
     // Resolve config and run the FULL eligibility check on the (rare) turn-completion edge, never
@@ -888,6 +907,19 @@ fn apply_terminal_title(
     new_title: Option<&str>,
     force: bool,
 ) -> anyhow::Result<()> {
+    write_title(storage, id, new_title, force, true).map(drop)
+}
+
+/// Locked title write shared by the one-shot rename and the Codex import. `record_auto` marks the
+/// attempt and records `last_auto_title`, so a later smart rename may replace the title; the
+/// import leaves both alone so its title is not overwritable. Returns whether the title changed.
+pub(crate) fn write_title(
+    storage: &crate::session::storage::Storage,
+    id: &str,
+    new_title: Option<&str>,
+    force: bool,
+    record_auto: bool,
+) -> anyhow::Result<bool> {
     let id = id.to_string();
     let new_title = new_title.map(str::to_string);
     let identity_lock = crate::session::acquire_session_identity_lock()?;
@@ -896,7 +928,7 @@ fn apply_terminal_title(
     let rekey = storage.update(|instances, _groups| {
         let mut rekey = None;
         if let Some(index) = instances.iter().position(|instance| instance.id == id) {
-            instances[index].smart_rename_attempted = true;
+            instances[index].smart_rename_attempted |= record_auto;
             if let Some(title) = &new_title {
                 let should_write = title_is_auto_overwritable(&instances[index], force)
                     && instances[index].title != *title;
@@ -918,19 +950,22 @@ fn apply_terminal_title(
                     rekey = Some((instance.title.clone(), title.clone()));
                     tracing::info!(target: "smart_rename", session = %id, old = %instance.title, new = %title, "auto-renamed terminal session");
                     instance.title = title.clone();
-                    instance.last_auto_title = Some(title.clone());
+                    if record_auto {
+                        instance.last_auto_title = Some(title.clone());
+                    }
                 }
             }
         }
         Ok(rekey)
     })?;
     drop(identity_lock);
+    let written = rekey.is_some();
     if let Some((old_title, new_title)) = rekey {
         if let Err(error) = crate::tmux::rekey_session(&id, &old_title, &new_title) {
             tracing::warn!(target: "smart_rename", session = %id, "tmux rename failed: {error}");
         }
     }
-    Ok(())
+    Ok(written)
 }
 
 /// Entry point for the detached `aoe __smart-rename [--force] <profile> <id>` child.
@@ -2539,6 +2574,39 @@ claude = "repo-wrapper"
             assert_eq!(row.last_auto_title.as_deref(), last_auto, "{title}");
             assert!(row.smart_rename_attempted, "{title}");
         }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn write_title_without_record_auto_leaves_smart_rename_state_alone() {
+        use crate::session::instance::Instance;
+        use crate::session::storage::Storage;
+        let home = tempfile::tempdir().expect("tempdir HOME");
+        let _home_guard = crate::session::test_support::isolate_home(home.path());
+        let storage = Storage::new_unwatched("default").expect("storage");
+        let civ = Instance::new("Vikings", "/tmp/x");
+        let civ_id = civ.id.clone();
+        storage
+            .update(|instances, _groups| {
+                instances.push(civ);
+                Ok(())
+            })
+            .unwrap();
+
+        assert!(write_title(&storage, &civ_id, Some("Fix login bug"), false, false).unwrap());
+        assert!(!write_title(&storage, &civ_id, Some("Fix login bug"), true, false).unwrap());
+
+        let row = storage
+            .load()
+            .unwrap()
+            .into_iter()
+            .find(|i| i.id == civ_id)
+            .unwrap();
+        assert_eq!(row.title, "Fix login bug");
+        assert_eq!(row.last_auto_title, None);
+        assert!(!row.smart_rename_attempted);
+        // Not recorded as auto, so a later non-forced rename must not overwrite it.
+        assert!(!write_title(&storage, &civ_id, Some("Other"), false, true).unwrap());
     }
 
     #[test]

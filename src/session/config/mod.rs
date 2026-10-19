@@ -1173,6 +1173,15 @@ pub struct SessionConfig {
     #[setting(label = "Smart Session Rename", widget = "toggle", category = "Agents")]
     pub smart_rename: bool,
 
+    /// Name a Codex terminal session after its first user message, read from Codex's rollout
+    /// file, the same title the Codex app shows. Applies on the first idle after that message,
+    /// only while the session still carries its auto-generated name, and ahead of Smart Session
+    /// Rename. Title only. Host sessions only; sandboxed sessions are skipped. The "Import Codex
+    /// title" action does this on demand over any name.
+    #[serde(default)]
+    #[setting(label = "Import Codex Titles", widget = "toggle", category = "Agents")]
+    pub import_codex_title: bool,
+
     /// Give a title typed in the TUI's New Session dialog to the agent as its own session name on
     /// the first launch (Claude's `--name`), so it shows in the agent's own apps. Later
     /// launches leave the agent's name alone, so a rename inside the agent survives restarts.
@@ -2014,6 +2023,7 @@ impl Default for SessionConfig {
             merge_hooks_into_selected_agent: true,
             conversation_summary: false,
             smart_rename: true,
+            import_codex_title: false,
             name_agent_session: false,
             scratch_smart_rename: ScratchSmartRenameMode::default(),
             smart_rename_agent: String::new(),

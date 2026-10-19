@@ -161,6 +161,72 @@ pub(crate) fn codex_poll_fn_sandboxed_store(
     }
 }
 
+/// Only the head of a rollout is read for a title, so the file may be far larger than a capture
+/// candidate; the stream is bounded by `CODEX_TITLE_SCAN_MAX_BYTES` instead.
+const CODEX_TITLE_FILE_MAX_BYTES: usize = 1 << 30;
+const CODEX_TITLE_SCAN_MAX_BYTES: u64 = 8 * 1024 * 1024;
+const CODEX_TITLE_MAX_CHARS: usize = 60;
+const CODEX_USER_MESSAGE_MARKER: &str = "[USER_MESSAGE_BEGIN]";
+/// Context AoE or Codex injects as a user turn; never a title.
+const CODEX_INJECTED_PREFIXES: [&str; 2] =
+    ["<environment_context>", "# Prior structured view context"];
+
+/// Codex's own title derivation: text after the marker, trimmed, here cut to its first line.
+fn title_from_user_message(message: &str) -> Option<String> {
+    let message = message
+        .split_once(CODEX_USER_MESSAGE_MARKER)
+        .map_or(message, |(_, rest)| rest)
+        .trim();
+    if CODEX_INJECTED_PREFIXES
+        .iter()
+        .any(|prefix| message.starts_with(prefix))
+    {
+        return None;
+    }
+    let line = message.lines().next()?;
+    Some(
+        line.chars()
+            .take(CODEX_TITLE_MAX_CHARS)
+            .collect::<String>()
+            .trim_end()
+            .to_string(),
+    )
+}
+
+fn first_user_title(reader: impl Read) -> Option<String> {
+    std::io::BufRead::lines(std::io::BufReader::new(
+        reader.take(CODEX_TITLE_SCAN_MAX_BYTES),
+    ))
+    .map_while(|line| line.ok())
+    .find_map(|line| {
+        let event: serde_json::Value = serde_json::from_str(&line).ok()?;
+        let payload = event.get("payload")?;
+        if event.get("type")? != "event_msg" || payload.get("type")? != "user_message" {
+            return None;
+        }
+        title_from_user_message(payload.get("message")?.as_str()?)
+    })
+}
+
+/// The title Codex derives for `session_id`: its first real user message, read from the rollout
+/// under `codex_home`. `None` until that message is written.
+pub(crate) fn codex_rollout_title(codex_home: &Path, session_id: &str) -> Option<String> {
+    let root = AnchoredDir::open(codex_home).ok()?;
+    let mut entries = Vec::new();
+    collect_codex_sessions_anchored(&root, Path::new("sessions"), 0, &mut 0, &mut entries).ok()?;
+    let (relative, _) = entries
+        .into_iter()
+        .find(|(path, _)| extract_codex_uuid_from_filename(path).as_deref() == Some(session_id))?;
+    let file = root
+        .open_regular(&relative, CODEX_TITLE_FILE_MAX_BYTES)
+        .ok()??;
+    if relative.extension().and_then(|e| e.to_str()) == Some("zst") {
+        first_user_title(zstd::stream::read::Decoder::new(file).ok()?)
+    } else {
+        first_user_title(file)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::test_support::{capture_floor, set_mtime_ms};
@@ -235,6 +301,77 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    #[test]
+    fn codex_rollout_title_reads_first_real_user_message() {
+        let id = "abcdef01-2345-6789-abcd-ef0123456789";
+        let user = |message: &str| {
+            let event = serde_json::json!({"type":"event_msg","payload":{"type":"user_message","message":message}});
+            format!("{event}\n")
+        };
+        let long = "x".repeat(100);
+        let cases = [
+            (
+                "plain",
+                user("Fix the login bug"),
+                Some("Fix the login bug".to_string()),
+            ),
+            (
+                "marker stripped",
+                user("[USER_MESSAGE_BEGIN]  Add a table\nmore"),
+                Some("Add a table".to_string()),
+            ),
+            (
+                "preamble skipped",
+                user("# Prior structured view context\nold") + &user("Real ask"),
+                Some("Real ask".to_string()),
+            ),
+            (
+                "only injected",
+                user("<environment_context>\n</environment_context>"),
+                None,
+            ),
+            ("blank", user("   "), None),
+            ("no user event yet", rollout_line(id, "/p"), None),
+            ("truncated by chars", user(&long), Some("x".repeat(60))),
+            ("multibyte", user(&"é".repeat(100)), Some("é".repeat(60))),
+        ];
+        for (name, body, expected) in cases {
+            let tmp = tempfile::tempdir().unwrap();
+            let dir = tmp.path().join("sessions/2026/08/23");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join(format!("rollout-2026-08-23T10-00-00-{id}.jsonl")),
+                rollout_line(id, "/p") + &body,
+            )
+            .unwrap();
+            assert_eq!(codex_rollout_title(tmp.path(), id), expected, "{name}");
+            assert_eq!(
+                codex_rollout_title(tmp.path(), "11111111-2222-4333-8444-555555555555"),
+                None,
+                "{name}: other session id"
+            );
+        }
+    }
+
+    #[test]
+    fn codex_rollout_title_reads_zstd_rollouts() {
+        let id = "abcdef01-2345-6789-abcd-ef0123456789";
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("sessions/2026/08/23");
+        std::fs::create_dir_all(&dir).unwrap();
+        let body = rollout_line(id, "/p")
+            + r#"{"type":"event_msg","payload":{"type":"user_message","message":"Compressed ask"}}"#;
+        std::fs::write(
+            dir.join(format!("rollout-2026-08-23T10-00-00-{id}.jsonl.zst")),
+            zstd::encode_all(body.as_bytes(), 0).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            codex_rollout_title(tmp.path(), id).as_deref(),
+            Some("Compressed ask")
+        );
     }
 
     #[test]
