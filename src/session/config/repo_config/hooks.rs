@@ -54,9 +54,10 @@ impl HooksConfig {
     }
 }
 
-/// Host-side hooks, profile/global only (never from a repo). Each prints
-/// `KEY=VALUE` lines that are injected into the launch; stdout is never logged,
-/// and a non-zero exit aborts the launch.
+/// Host-side hooks, profile/global only (never from a repo). The launch hooks
+/// print `KEY=VALUE` lines that are injected into the launch; stdout is never
+/// logged, and a non-zero exit aborts the launch. `before_destroy` is
+/// best-effort and its output is ignored.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct HostHooksConfig {
     /// Runs before a sandbox container comes up; pairs reach the container as
@@ -75,11 +76,21 @@ pub struct HostHooksConfig {
         deserialize_with = "crate::session::serde_helpers::string_or_vec"
     )]
     pub before_session: Vec<String>,
+    /// Runs on the host when a session is purged, before container and
+    /// worktree cleanup; not when it is moved to trash. Failures are logged.
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "crate::session::serde_helpers::string_or_vec"
+    )]
+    pub before_destroy: Vec<String>,
 }
 
 impl HostHooksConfig {
     pub fn is_empty(&self) -> bool {
-        self.before_start.is_empty() && self.before_session.is_empty()
+        self.before_start.is_empty()
+            && self.before_session.is_empty()
+            && self.before_destroy.is_empty()
     }
 }
 
@@ -594,6 +605,14 @@ pub fn resolve_before_session_hooks(profile: &str) -> Vec<String> {
     profile_config::resolve_config_or_warn(&resolved)
         .host_hooks
         .before_session
+}
+
+/// Global+profile only, so a repo can never contribute host commands.
+pub fn resolve_before_destroy_hooks(profile: &str) -> Vec<String> {
+    let resolved = super::super::effective_profile(profile);
+    profile_config::resolve_config_or_warn(&resolved)
+        .host_hooks
+        .before_destroy
 }
 
 /// `KEY=VALUE` lines, later keys winning; values are kept verbatim.
