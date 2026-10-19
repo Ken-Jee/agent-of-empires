@@ -20,22 +20,32 @@ pub fn skip_reason(inst: &Instance) -> Option<&'static str> {
     }
 }
 
-/// The host Codex home: the configured agent dir, else `CODEX_HOME`, else `~/.codex`.
+/// The host Codex home: the configured agent dir, else `CODEX_HOME`, else `~/.codex`, each read
+/// from the session's effective environment, which is what its Codex was launched with.
 fn codex_home(inst: &Instance) -> Option<std::path::PathBuf> {
-    let home = dirs::home_dir()?;
-    let resolved = crate::session::config::repo_config::resolve_config_with_repo_or_warn(
+    let environment = inst.resolved_host_environment();
+    let home = crate::hooks::resolve_config_dir_override("HOME", &environment)
+        .map(std::path::PathBuf::from)
+        .or_else(dirs::home_dir)?;
+    let declared = crate::session::config::repo_config::resolve_config_with_repo_or_warn(
         &inst.source_profile,
         std::path::Path::new(&inst.project_path),
-    );
-    Some(
-        resolved
-            .session
-            .agent_config_dir_for("codex", &home)
-            .or_else(|| {
-                crate::hooks::resolve_config_dir_override("CODEX_HOME", &[]).map(Into::into)
-            })
-            .unwrap_or_else(|| home.join(".codex")),
     )
+    .session
+    .agent_config_dir_for("codex", &home);
+    Some(codex_home_in(declared, &environment, &home))
+}
+
+fn codex_home_in(
+    declared: Option<std::path::PathBuf>,
+    environment: &[String],
+    home: &std::path::Path,
+) -> std::path::PathBuf {
+    declared
+        .or_else(|| {
+            crate::hooks::resolve_config_dir_override("CODEX_HOME", environment).map(Into::into)
+        })
+        .unwrap_or_else(|| home.join(".codex"))
 }
 
 /// Set the session title to its Codex title. Without `force`, only a still generated name is
@@ -74,6 +84,22 @@ pub fn spawn_auto_import(inst: &Instance) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn codex_home_follows_the_session_environment_over_ambient() {
+        use std::path::{Path, PathBuf};
+        let env = ["CODEX_HOME=/profile/store".to_string()];
+        let home = Path::new("/home/u");
+        let declared = Some(PathBuf::from("/declared"));
+        assert_eq!(
+            codex_home_in(None, &env, home),
+            PathBuf::from("/profile/store")
+        );
+        assert_eq!(
+            codex_home_in(declared, &env, home),
+            PathBuf::from("/declared")
+        );
+    }
 
     #[test]
     fn skip_reason_covers_each_ineligible_session() {
