@@ -251,7 +251,7 @@ pub(super) fn validate_no_shell_injection(value: &str, field_name: &str) -> Resu
 
 /// Bidi override/isolate characters (category Cf, missed by `is_control`);
 /// in a label they can spoof the rendered order (CVE-2021-42574).
-const BIDI_CONTROL_CHARS: &[char] = &[
+pub(crate) const BIDI_CONTROL_CHARS: &[char] = &[
     '\u{202A}', '\u{202B}', '\u{202C}', '\u{202D}', '\u{202E}', // LRE RLE PDF LRO RLO
     '\u{2066}', '\u{2067}', '\u{2068}', '\u{2069}', // LRI RLI FSI PDI
 ];

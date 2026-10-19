@@ -183,14 +183,16 @@ fn title_from_user_message(message: &str) -> Option<String> {
     {
         return None;
     }
-    let line = message.lines().next()?;
-    Some(
-        line.chars()
-            .take(CODEX_TITLE_MAX_CHARS)
-            .collect::<String>()
-            .trim_end()
-            .to_string(),
-    )
+    let title: String = message
+        .lines()
+        .next()?
+        .chars()
+        .filter(|c| !crate::server::api::BIDI_CONTROL_CHARS.contains(c))
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .take(CODEX_TITLE_MAX_CHARS)
+        .collect();
+    let title = title.trim();
+    (!title.is_empty()).then(|| title.to_string())
 }
 
 fn first_user_title(reader: impl Read) -> Option<String> {
@@ -333,6 +335,11 @@ mod tests {
                 None,
             ),
             ("blank", user("   "), None),
+            (
+                "control and bidi chars",
+                user("\tFix\u{202E} the\u{1b} bug"),
+                Some("Fix the  bug".to_string()),
+            ),
             ("no user event yet", rollout_line(id, "/p"), None),
             ("truncated by chars", user(&long), Some("x".repeat(60))),
             ("multibyte", user(&"é".repeat(100)), Some("é".repeat(60))),
