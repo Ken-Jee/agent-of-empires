@@ -312,7 +312,7 @@ before_destroy = ['sync-transcripts "$AOE_SESSION_ID"']                 # any se
 
 A launch runs exactly one of them, chosen by whether the session is sandboxed. `before_start` runs when a container is created or restarted (attaching to a running container reuses the last values); `before_session` runs on every host agent launch, including a restart or a view switch, and persists nothing. A plain tool session is not an agent launch and runs neither.
 
-`before_destroy` is not a launch hook: it runs on the host for every session, sandboxed or not, when the session is purged, before container and worktree cleanup. With `session.delete_to_trash` on (the default), moving a session to trash does not run it; it runs when retention expires, on `empty-trash`, or on `aoe remove --purge`. Its output is ignored and a failure is logged without blocking removal.
+`before_destroy` is not a launch hook: it runs on the host for every session, sandboxed or not, when the session is purged, before container and worktree cleanup. With `session.delete_to_trash` on (the default), moving a session to trash does not run it; it runs when retention expires, on `empty-trash`, or on `aoe remove --purge`. Its output is ignored and never logged. A failure is logged without blocking removal, and a command still running after 2 minutes is killed.
 
 Each `KEY=VALUE` line the command prints to stdout becomes an environment variable for the agent; other lines are ignored, stdout is never logged (so it is safe to print a secret), and a non-zero exit aborts the launch. A key that is a single token but not a valid identifier is dropped with a warning. Minted pairs are applied after the static `environment` list, so they win over a same-keyed entry.
 

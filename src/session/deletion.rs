@@ -1329,6 +1329,8 @@ fn run_destroy_hooks(instance: &Instance, detach: bool) {
     run_on_destroy_hooks(instance, detach);
 }
 
+const BEFORE_DESTROY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
 /// Host-side on every session kind, so it never targets the container.
 fn run_before_destroy_hooks(instance: &Instance, detach: bool) {
     let commands = repo_config::resolve_before_destroy_hooks(&instance.source_profile);
@@ -1336,16 +1338,17 @@ fn run_before_destroy_hooks(instance: &Instance, detach: bool) {
         return;
     }
     tracing::info!(target: "session.delete", "Running before_destroy host hooks for session {}", instance.id);
-    let errors = repo_config::execute_hooks_best_effort(
+    let failures = repo_config::execute_host_hooks_best_effort(
         &commands,
         Path::new(&instance.project_path),
         detach,
         &repo_config::lifecycle_env_vars(instance),
+        BEFORE_DESTROY_TIMEOUT,
     );
-    if !errors.is_empty() {
+    if failures > 0 {
         tracing::warn!(target: "session.delete",
             "before_destroy hooks had {} failure(s) for session {}",
-            errors.len(),
+            failures,
             instance.id
         );
     }

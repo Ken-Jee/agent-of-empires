@@ -77,7 +77,8 @@ pub struct HostHooksConfig {
     )]
     pub before_session: Vec<String>,
     /// Runs on the host when a session is purged, before container and
-    /// worktree cleanup; not when it is moved to trash. Failures are logged.
+    /// worktree cleanup; not when it is moved to trash. Failures and timeouts
+    /// are logged without their output.
     #[serde(
         default,
         skip_serializing_if = "Vec::is_empty",
@@ -763,6 +764,47 @@ fn run_hooks_best_effort(
     errors
 }
 
+/// Runs every host command, each bounded by `timeout` (the process tree is killed on expiry),
+/// and returns the failure count. Output may carry secrets, so failures log only the command
+/// and exit status, never captured stdout or stderr.
+pub fn execute_host_hooks_best_effort(
+    commands: &[String],
+    project_path: &Path,
+    detach_tty: bool,
+    extra_env: &[(&'static str, String)],
+    timeout: std::time::Duration,
+) -> usize {
+    let target = HookTarget::Local { project_path };
+    let opts = HookSpawnOpts {
+        merge_stderr: false,
+        detach_tty,
+    };
+    let mut failures = 0;
+    for cmd in commands {
+        tracing::info!(target: "session.store", "Running host hook (output not logged): {}", cmd);
+        let mut command = build_hook_command(cmd, &target, opts, extra_env);
+        command
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        match run_hook_with_timeout(&mut command, timeout, cmd) {
+            Ok(output) if output.status.success() => {}
+            Ok(output) => {
+                failures += 1;
+                tracing::warn!(target: "session.store",
+                    "Host hook failed with exit code {}: {}",
+                    output.status.code().unwrap_or(-1),
+                    cmd
+                );
+            }
+            Err(error) => {
+                failures += 1;
+                tracing::warn!(target: "session.store", "Host hook failed: {:#}", error);
+            }
+        }
+    }
+    failures
+}
+
 /// `detach_tty`: true from TUI/web contexts, false from the CLI so prompts stay answerable.
 pub fn execute_hooks_best_effort(
     commands: &[String],
@@ -1127,6 +1169,32 @@ mod tests {
     }
 
     /// CLI paths keep the terminal attached; TUI/web best-effort paths detach.
+    #[test]
+    fn host_hooks_best_effort_kill_hung_commands_and_continue() {
+        let _shell = pin_host_shell();
+        let tmp = tempfile::tempdir().unwrap();
+        let marker = tmp.path().join("marker");
+        let commands = vec![
+            "echo leaked-secret; exit 1".to_string(),
+            "sleep 60".to_string(),
+            format!("touch '{}'", marker.display()),
+        ];
+        let started = std::time::Instant::now();
+        let failures = execute_host_hooks_best_effort(
+            &commands,
+            tmp.path(),
+            true,
+            &[],
+            std::time::Duration::from_millis(500),
+        );
+        assert_eq!(failures, 2);
+        assert!(
+            marker.exists(),
+            "hook after a failure and a timeout must run"
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(30));
+    }
+
     #[test]
     #[serial_test::serial]
     fn captured_and_best_effort_hooks_detach_only_when_requested() {
