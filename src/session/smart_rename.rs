@@ -925,8 +925,13 @@ pub(crate) fn write_title(
         if let Some(index) = instances.iter().position(|instance| instance.id == id) {
             instances[index].smart_rename_attempted |= record_auto;
             if let Some(title) = &new_title {
-                let should_write = title_is_auto_overwritable(&instances[index], force)
-                    && instances[index].title != *title;
+                // Imports (`!record_auto`) must not replace a smart-renamed title.
+                let overwritable = if record_auto {
+                    title_is_auto_overwritable(&instances[index], force)
+                } else {
+                    force || is_default_civ_name(&instances[index].title)
+                };
+                let should_write = overwritable && instances[index].title != *title;
                 // Manual and automatic rename paths share one domain predicate; exclude this row
                 // explicitly so the uniqueness contract does not depend on `should_write` remaining
                 // title-sensitive.
@@ -2602,6 +2607,17 @@ claude = "repo-wrapper"
         assert!(!row.smart_rename_attempted);
         // Not recorded as auto, so a later non-forced rename must not overwrite it.
         assert!(!write_title(&storage, &civ_id, Some("Other"), false, true).unwrap());
+
+        // A smart-renamed title is overwritable by smart rename but not by a non-forced import.
+        storage
+            .update(|instances, _groups| {
+                let row = instances.iter_mut().find(|i| i.id == civ_id).unwrap();
+                row.last_auto_title = Some(row.title.clone());
+                Ok(())
+            })
+            .unwrap();
+        assert!(!write_title(&storage, &civ_id, Some("Imported"), false, false).unwrap());
+        assert!(write_title(&storage, &civ_id, Some("Imported"), true, false).unwrap());
     }
 
     #[test]
