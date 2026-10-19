@@ -4356,6 +4356,13 @@
       "components": ["web/src/components/WorkspaceSidebar.tsx"]
     },
     {
+      "id": "sidebar.import-codex-title-action",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": ["tests/sidebar-chrome.spec.ts"],
+      "components": ["web/src/components/WorkspaceSidebar.tsx"]
+    },
+    {
       "id": "sidebar.summarize-action",
       "kind": "mocked-playwright",
       "risk": "medium",

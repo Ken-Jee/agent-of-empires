@@ -174,6 +174,42 @@ test.describe("row chips and naming actions", () => {
   });
 });
 
+test.describe("import codex title action", () => {
+  const session = (id: string, title: string, fields: Record<string, unknown>): MockSessionInput => ({
+    id,
+    title,
+    project_path: "/tmp/repo",
+    branch: null,
+    fields,
+  });
+
+  test("is offered only for host Codex terminal sessions and POSTs its endpoint", async ({ page }) => {
+    const posted: string[] = [];
+    await page.route(/\/api\/sessions\/[^/]+\/import-codex-title$/, (r) => {
+      posted.push(new URL(r.request().url()).pathname);
+      return r.fulfill({ status: 200, json: { changed: true } });
+    });
+    const item = page.getByTestId("sidebar-context-menu-import-codex-title");
+    const openMore = async (title: string) => {
+      await page.locator(ROW).filter({ hasText: title }).first().click({ button: "right" });
+      await page.getByTestId("sidebar-context-menu-more").click();
+    };
+    await openSidebar(page, [
+      session("codex-1", "Codex host", { tool: "codex", view: "terminal", is_sandboxed: false }),
+      session("codex-2", "Codex sandboxed", { tool: "codex", view: "terminal", is_sandboxed: true }),
+      session("claude-1", "Claude host", { tool: "claude", view: "terminal", is_sandboxed: false }),
+    ]);
+    for (const title of ["Codex sandboxed", "Claude host"]) {
+      await openMore(title);
+      await expect(item).toHaveCount(0);
+      await page.keyboard.press("Escape");
+    }
+    await openMore("Codex host");
+    await item.click();
+    await expect.poll(() => posted).toEqual(["/api/sessions/codex-1/import-codex-title"]);
+  });
+});
+
 test.describe("mobile overlay on a notched phone", () => {
   test.use(iPhone13);
 

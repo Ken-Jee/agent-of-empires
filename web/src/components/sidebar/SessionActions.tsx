@@ -4,6 +4,7 @@ import type { SessionResponse, Workspace } from "../../lib/types";
 import {
   attachSessionProject,
   createSession,
+  importCodexTitle,
   setWorktreeName,
   smartRenameSession,
   summarizeSession,
@@ -200,6 +201,10 @@ function buildRowActions(
     autoName: afterTarget("autoName", async (s) => {
       const result = await smartRenameSession(s.id);
       if (!result.ok) reportError(result.message ?? "Could not start auto-name. Please try again.");
+    }),
+    importCodexTitle: afterTarget("importCodexTitle", async (s) => {
+      const result = await importCodexTitle(s.id);
+      if (!result.ok) reportError(result.message ?? "Could not import the Codex title. Please try again.");
     }),
     summarize: afterTarget("summarize", async (s) => {
       const result = await summarizeSession(s.id);

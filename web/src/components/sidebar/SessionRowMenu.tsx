@@ -92,6 +92,7 @@ export interface SingleRowActions {
   switchAgent: (sessionId: string) => void;
   fork: (sessionId: string) => void;
   autoName: (sessionId: string) => void;
+  importCodexTitle: (sessionId: string) => void;
   summarize: (sessionId: string) => void;
   stop: (sessionId: string) => void;
   start: (sessionId: string) => void;
@@ -221,6 +222,13 @@ export function SingleRowMenuItems({
               item("autoName", {
                 label: "Auto-name now",
                 testId: "sidebar-context-menu-auto-name",
+                glyph: icon(Sparkles),
+                indent: true,
+              })}
+            {write &&
+              item("importCodexTitle", {
+                label: "Import Codex title",
+                testId: "sidebar-context-menu-import-codex-title",
                 glyph: icon(Sparkles),
                 indent: true,
               })}
