@@ -195,12 +195,14 @@ fn title_from_user_message(message: &str) -> Option<String> {
     (!title.is_empty()).then(|| title.to_string())
 }
 
-fn first_user_title(reader: impl Read) -> Option<String> {
-    std::io::BufRead::lines(std::io::BufReader::new(
+/// The first user title of a rollout whose metadata line declares `session_id` as a root thread.
+fn first_user_title(reader: impl Read, session_id: &str) -> Option<String> {
+    let mut lines = std::io::BufRead::lines(std::io::BufReader::new(
         reader.take(CODEX_TITLE_SCAN_MAX_BYTES),
     ))
-    .map_while(|line| line.ok())
-    .find_map(|line| {
+    .map_while(|line| line.ok());
+    parse_codex_cwd_from_json(&lines.next()?, session_id)?;
+    lines.find_map(|line| {
         let event: serde_json::Value = serde_json::from_str(&line).ok()?;
         let payload = event.get("payload")?;
         if event.get("type")? != "event_msg" || payload.get("type")? != "user_message" {
@@ -223,9 +225,9 @@ pub(crate) fn codex_rollout_title(codex_home: &Path, session_id: &str) -> Option
         .open_regular(&relative, CODEX_TITLE_FILE_MAX_BYTES)
         .ok()??;
     if relative.extension().and_then(|e| e.to_str()) == Some("zst") {
-        first_user_title(zstd::stream::read::Decoder::new(file).ok()?)
+        first_user_title(zstd::stream::read::Decoder::new(file).ok()?, session_id)
     } else {
-        first_user_title(file)
+        first_user_title(file, session_id)
     }
 }
 
@@ -360,6 +362,22 @@ mod tests {
                 "{name}: other session id"
             );
         }
+    }
+
+    #[test]
+    fn codex_rollout_title_rejects_a_rollout_that_declares_another_session() {
+        let id = "abcdef01-2345-6789-abcd-ef0123456789";
+        let other = "11111111-2222-4333-8444-555555555555";
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("sessions/2026/08/23");
+        std::fs::create_dir_all(&dir).unwrap();
+        let ask = r#"{"type":"event_msg","payload":{"type":"user_message","message":"Not mine"}}"#;
+        std::fs::write(
+            dir.join(format!("rollout-2026-08-23T10-00-00-{id}.jsonl")),
+            rollout_line(other, "/p") + ask,
+        )
+        .unwrap();
+        assert_eq!(codex_rollout_title(tmp.path(), id), None);
     }
 
     #[test]
