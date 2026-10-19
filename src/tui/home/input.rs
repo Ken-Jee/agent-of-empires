@@ -2900,6 +2900,7 @@ impl HomeView {
             ActionId::Fork => self.open_fork_from_selection(),
             ActionId::EmptyTrash => self.prompt_empty_trash(),
             ActionId::AutoName => return self.auto_name_selected(),
+            ActionId::ImportCodexTitle => return self.import_codex_title_selected(),
         }
         None
     }
@@ -3645,6 +3646,36 @@ impl HomeView {
         Some(Action::SetTransientStatus(format!(
             "auto-naming \"{title}\"…"
         )))
+    }
+
+    /// "Import Codex title": name the selected Codex session after its first user message, over
+    /// any title. The rollout read is bounded, so it runs inline and reports the outcome.
+    fn import_codex_title_selected(&mut self) -> Option<Action> {
+        let Some((profile, id)) = self
+            .selected_session
+            .as_ref()
+            .and_then(|id| self.get_instance(id))
+            .map(|inst| (inst.source_profile.clone(), inst.id.clone()))
+        else {
+            self.info_dialog = Some(InfoDialog::new(
+                "No Session Selected",
+                "Select a session to import its Codex title.",
+            ));
+            return None;
+        };
+        match crate::session::codex_title::import_codex_title(&profile, &id, true) {
+            Ok(true) => Some(Action::SetTransientStatus("imported Codex title".into())),
+            Ok(false) => Some(Action::SetTransientStatus(
+                "Codex title already applied or taken by another session".into(),
+            )),
+            Err(error) => {
+                self.info_dialog = Some(InfoDialog::new(
+                    "Can't Import Codex Title",
+                    &error.to_string(),
+                ));
+                None
+            }
+        }
     }
 
     fn open_serve(&mut self) {

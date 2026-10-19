@@ -844,6 +844,69 @@ pub async fn force_smart_rename(
     api_error(status, code, err.to_string())
 }
 
+/// `POST /api/sessions/:id/import-codex-title`. Manual "Import Codex title" for a host Codex
+/// terminal session: sets the title from the first user message in its rollout, over any
+/// title. `200` with `changed`, `409` when the session cannot import or has no message yet.
+pub async fn import_codex_title(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if let Some(resp) = cityhall_block_non_structured(&state, &id).await {
+        return resp;
+    }
+    if let Some(resp) = crate::server::api::read_only_block(&state) {
+        return resp;
+    }
+    let Some(profile) = state
+        .instances
+        .read()
+        .await
+        .iter()
+        .find(|i| i.id == id)
+        .map(|i| i.source_profile.clone())
+    else {
+        return session_not_found();
+    };
+
+    let session_id = id.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let changed = crate::session::codex_title::import_codex_title(&profile, &session_id, true)?;
+        let title = crate::session::Storage::open_unwatched(&profile)?
+            .load()?
+            .into_iter()
+            .find(|i| i.id == session_id)
+            .map(|i| i.title);
+        anyhow::Ok((changed, title))
+    })
+    .await;
+    match result {
+        Ok(Ok((changed, title))) => {
+            if let Some(title) = title {
+                if let Some(inst) = state
+                    .instances
+                    .write()
+                    .await
+                    .iter_mut()
+                    .find(|i| i.id == id)
+                {
+                    inst.title = title;
+                }
+            }
+            Json(serde_json::json!({ "changed": changed })).into_response()
+        }
+        Ok(Err(e)) => api_error(
+            StatusCode::CONFLICT,
+            "codex_title_unavailable",
+            e.to_string(),
+        ),
+        Err(e) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "codex_title_failed",
+            e.to_string(),
+        ),
+    }
+}
+
 /// On-demand "summarize the conversation so far" for a structured-view session.
 /// Preflights the same eligibility gate the spawned task re-applies, then runs
 /// the summary one-shot detached. A `202` means "summary started"; the result

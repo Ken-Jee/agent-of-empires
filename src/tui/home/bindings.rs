@@ -88,6 +88,9 @@ pub enum ActionId {
     /// session, even when auto-rename-on-start is off (#3039). Terminal sessions rename
     /// locally; structured sessions go through the daemon.
     AutoName,
+    /// Name the selected Codex session after its first user message, over any title
+    /// (palette only; no chord).
+    ImportCodexTitle,
     /// Permanently purge every trashed session after a confirm (palette only; no chord).
     EmptyTrash,
 }
@@ -1125,6 +1128,18 @@ pub static BINDINGS: &[Binding] = &[
             group: PaletteGroup::Actions,
         }),
     },
+    Binding {
+        id: ActionId::ImportCodexTitle,
+        non_strict: &[],
+        strict: &[],
+        context: Context::Always,
+        help: None,
+        palette: Some(PaletteMeta {
+            title: "Import Codex title",
+            keywords: &["rename", "title", "name", "codex", "import"],
+            group: PaletteGroup::Actions,
+        }),
+    },
 ];
 
 /// Stable palette/test id for an action (matches the legacy `builtin_commands`
@@ -1178,6 +1193,7 @@ pub fn palette_id(id: ActionId) -> &'static str {
         ActionId::Skills => "skills",
         ActionId::Fork => "fork",
         ActionId::AutoName => "auto-name",
+        ActionId::ImportCodexTitle => "import-codex-title",
         ActionId::EmptyTrash => "empty-trash",
     }
 }

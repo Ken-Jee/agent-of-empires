@@ -131,6 +131,10 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
             "/api/sessions/{id}/smart-rename",
             post(api::force_smart_rename),
         )
+        .route(
+            "/api/sessions/{id}/import-codex-title",
+            post(api::import_codex_title),
+        )
         .route("/api/sessions/{id}/summarize", post(api::summarize_session))
         .route("/api/sessions/{id}/start", post(api::start_session))
         .route(
