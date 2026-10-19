@@ -581,4 +581,132 @@ mod tests {
         changed.provider_version = "18.10.3".into();
         assert!(!same_prompt(&snapshot(), &changed));
     }
+
+    #[test]
+    #[serial_test::serial(hook_base)]
+    fn omp_pending_approval_survives_agent_start_and_host_reply() {
+        use std::os::unix::fs::PermissionsExt;
+
+        use crate::session::{update_config, CapabilityGrant, PluginConfig};
+        use crate::tmux::test_helpers::{require_tmux, TmuxTestSession};
+
+        let _env = crate::session::test_support::EnvGuard::unset(&[
+            crate::tmux::TMUX_SOCKET_ENV,
+            "TMUX",
+            "TMUX_PANE",
+        ]);
+        require_tmux!();
+        let Ok(bun) = which::which("bun") else {
+            eprintln!("Skipping test: Bun not available");
+            return;
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let manifest = include_str!("../../plugins/agent-omp/aoe-plugin.toml");
+        let plugin_dir = crate::plugin::plugins_dir()
+            .unwrap()
+            .join("omp.agent-of-empires");
+        std::fs::create_dir_all(&plugin_dir).unwrap();
+        std::fs::write(plugin_dir.join("aoe-plugin.toml"), manifest).unwrap();
+        update_config(|config| {
+            config.plugins.insert(
+                "omp.agent-of-empires".into(),
+                PluginConfig {
+                    grant: Some(CapabilityGrant {
+                        manifest_hash: aoe_plugin_api::PluginManifest::hash_bytes(
+                            manifest.as_bytes(),
+                        ),
+                        capabilities: vec!["session.integration".into()],
+                        granted_at: chrono::Utc::now(),
+                    }),
+                    ..PluginConfig::default()
+                },
+            );
+        })
+        .unwrap();
+        crate::plugin::reload_registry();
+
+        // The extension uses the shared hook root, but owns only this temporary instance.
+        let root = std::path::PathBuf::from(format!(
+            "/tmp/aoe-hooks-{}",
+            nix::unistd::geteuid().as_raw()
+        ));
+        let _base = crate::hooks::test_support::BaseGuard::with_base(root.clone());
+        dir_guard::with_hook_base(|_| Ok(())).unwrap();
+        let hook_dir = tempfile::Builder::new()
+            .prefix("omp_host_reply_")
+            .tempdir_in(&root)
+            .unwrap();
+        std::fs::set_permissions(hook_dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut instance = Instance::new("OMP host reply", temp.path().to_str().unwrap());
+        instance.id = hook_dir
+            .path()
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .into();
+        instance.tool = "omp".into();
+        let tmux = crate::tmux::Session::new(&instance.id, &instance.title).unwrap();
+        let _session = TmuxTestSession::from_name(tmux.name());
+        let result_path = temp.path().join("native-result");
+        let started_path = temp.path().join("native-result.started");
+        let log_path = temp.path().join("native.log");
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("plugins/agent-omp/tests/omp-host-reply.ts");
+        let quote =
+            |path: &std::path::Path| shell_words::quote(path.to_str().unwrap()).into_owned();
+        let command = format!(
+            "exec env -i PATH={} HOME={} AOE_INSTANCE_ID={} {} {} {} >{} 2>&1",
+            shell_words::quote(&std::env::var("PATH").unwrap()),
+            quote(temp.path()),
+            instance.id,
+            quote(&bun),
+            quote(&fixture),
+            quote(&result_path),
+            quote(&log_path),
+        );
+        tmux.create(temp.path().to_str().unwrap(), Some(&command), "default")
+            .unwrap();
+        let wait_for = |ready: &dyn Fn() -> bool| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while !ready() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "OMP fixture timed out: {}",
+                    std::fs::read_to_string(&log_path).unwrap_or_default()
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+        wait_for(&|| super::snapshot(&instance).is_some_and(|r| r.prompt.is_some()));
+        let pending = super::snapshot(&instance).unwrap();
+        assert_eq!(pending.status, AgentIntegrationStatus::Waiting);
+        assert_eq!(pending.prompt.as_ref().unwrap().id(), "approval-a");
+
+        tmux.send_key_tokens(&[crate::agents::KeyToken::Named("s")])
+            .unwrap();
+        wait_for(&|| started_path.exists());
+        let after_start = super::snapshot(&instance).unwrap();
+        assert_eq!(after_start.status, AgentIntegrationStatus::Waiting);
+        assert_eq!(after_start.revision, pending.revision);
+        assert_eq!(after_start.prompt.as_ref().unwrap().id(), "approval-a");
+        respond(
+            &instance,
+            &pending,
+            AgentIntegrationResponse::Approval {
+                choice: IntegrationApprovalChoice::Allow,
+            },
+        )
+        .unwrap();
+        wait_for(&|| std::fs::read_to_string(&result_path).is_ok_and(|value| value == "Approve"));
+        wait_for(&|| {
+            super::snapshot(&instance).is_some_and(|report| {
+                report.prompt.is_none()
+                    && report.revision == pending.revision + 1
+                    && report.status == AgentIntegrationStatus::Running
+            })
+        });
+    }
 }

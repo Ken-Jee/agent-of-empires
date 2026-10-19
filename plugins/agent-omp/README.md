@@ -18,7 +18,10 @@ Version declarations are intentionally narrow: the published APIs of those relea
 
 ```sh
 bun test plugins/agent-omp/tests
+cargo test --features e2e-tests --lib omp_pending_approval_survives_agent_start_and_host_reply
 OMP_BIN=/path/to/supported/omp sh plugins/agent-omp/tests/omp-native-smoke.sh
 ```
 
 The smoke harness isolates user state and loads the extension into a real OMP process without credentials or a model request. It verifies that `session_start` publishes the running host's version and session identity. Run it for each runtime being added; unit tests cover version boundaries and native dialog completion/cancellation.
+
+Pending prompts remain `waiting` across lifecycle events without changing their revision. The focused Rust regression requires Bun and tmux; it passes extension-emitted reports through the real host snapshot/reply path and delivers the host's reply to the native selection callback in an isolated pane, without executing a tool.

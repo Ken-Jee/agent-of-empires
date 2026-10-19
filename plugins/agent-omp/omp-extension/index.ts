@@ -298,7 +298,7 @@ export default function (pi: ExtensionAPI): void {
   const publish = (nextPrompt: Prompt | null, nextStatus: Snapshot["status"]): void => {
     if (prompt?.id !== nextPrompt?.id) handledPromptId = undefined;
     if (JSON.stringify(prompt) !== JSON.stringify(nextPrompt)) revision++;
-    prompt = nextPrompt; status = nextStatus;
+    prompt = nextPrompt; status = nextPrompt ? "waiting" : nextStatus;
     void writeSnapshot();
   };
 
