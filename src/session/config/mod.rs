@@ -1176,7 +1176,8 @@ pub struct SessionConfig {
     /// Name a terminal session after the title its agent keeps for it, read from the agent's own
     /// store (today Codex's first user message, from its rollout file). Applies on the first idle
     /// after the agent has a title, only while the session still carries its auto-generated name,
-    /// and ahead of Smart Session Rename. Title only. Host sessions only; sandboxed sessions are
+    /// and ahead of Smart Session Rename, which does not run for such a session while this is on, even
+    /// if the agent never produces a title. Title only. Host sessions only; sandboxed sessions are
     /// skipped. The "Import agent title" action does this on demand over any name.
     #[serde(default)]
     #[setting(label = "Import Agent Titles", widget = "toggle", category = "Agents")]
