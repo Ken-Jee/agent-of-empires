@@ -356,6 +356,17 @@ pub enum SidecarFormat {
     KimiToml,
 }
 
+/// How an agent keeps its own title for a session, readable from its store without its CLI.
+#[derive(Clone, Copy)]
+pub struct NativeTitle {
+    /// Environment variable that relocates the agent's store.
+    pub store_env_var: &'static str,
+    /// The store under the home directory when neither the setting nor the variable names one.
+    pub default_store: &'static str,
+    /// The agent's title for `session_id`, read from the store root; `None` until it has one.
+    pub read: fn(store: &std::path::Path, session_id: &str) -> Option<String>,
+}
+
 pub struct AgentDef {
     pub name: &'static str,
     pub binary: &'static str,
@@ -371,6 +382,7 @@ pub struct AgentDef {
     pub instruction_flag: Option<&'static str>,
     /// One argv token placed before the prompt; never contains a `{}` placeholder.
     pub oneshot_flag: Option<&'static str>,
+    pub native_title: Option<NativeTitle>,
     pub set_default_command: bool,
     pub detect_status: fn(&str) -> Status,
     pub container_env: &'static [(&'static str, &'static str)],
@@ -587,6 +599,7 @@ const fn agent(name: &'static str, binary: &'static str, install_hint: &'static 
         spans_agent_generations: false,
         instruction_flag: None,
         oneshot_flag: None,
+        native_title: None,
         set_default_command: false,
         detect_status: status_detection::detect_hook_only_status,
         container_env: &[],
@@ -693,6 +706,11 @@ pub const AGENTS: &[AgentDef] = &[
     },
     AgentDef {
         oneshot_flag: Some("exec"),
+        native_title: Some(NativeTitle {
+            store_env_var: "CODEX_HOME",
+            default_store: ".codex",
+            read: crate::session::capture::codex_rollout_title,
+        }),
         yolo: Some(YoloMode::CliFlag(
             "--dangerously-bypass-approvals-and-sandbox",
         )),

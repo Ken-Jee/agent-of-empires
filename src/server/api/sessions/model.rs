@@ -96,6 +96,7 @@ impl SessionResponse {
             smart_rename: crate::session::smart_rename::SmartRenameState::Inactive,
             // Overlaid in list_sessions; single-session responses stay false.
             default_name: false,
+            can_import_title: false,
             has_terminal: inst.terminal_info.is_some(),
             profile: inst.source_profile.clone(),
             cleanup_defaults: CleanupDefaults {

@@ -844,10 +844,10 @@ pub async fn force_smart_rename(
     api_error(status, code, err.to_string())
 }
 
-/// `POST /api/sessions/:id/import-codex-title`. Manual "Import Codex title" for a host Codex
-/// terminal session: sets the title from the first user message in its rollout, over any
-/// title. `200` with `changed`, `409` when the session cannot import or has no message yet.
-pub async fn import_codex_title(
+/// `POST /api/sessions/:id/import-title`. Manual "Import agent title" for a host terminal
+/// session: sets the title from the one its agent keeps (Codex's first user message), over any
+/// title. `200` with `changed`, `409` when the session cannot import or the agent has no title yet.
+pub async fn import_agent_title(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
@@ -870,7 +870,8 @@ pub async fn import_codex_title(
 
     let session_id = id.clone();
     let result = tokio::task::spawn_blocking(move || {
-        let changed = crate::session::codex_title::import_codex_title(&profile, &session_id, true)?;
+        let changed =
+            crate::session::native_title::import_agent_title(&profile, &session_id, true)?;
         let title = crate::session::Storage::open_unwatched(&profile)?
             .load()?
             .into_iter()
@@ -896,12 +897,12 @@ pub async fn import_codex_title(
         }
         Ok(Err(e)) => api_error(
             StatusCode::CONFLICT,
-            "codex_title_unavailable",
+            "agent_title_unavailable",
             e.to_string(),
         ),
         Err(e) => api_error(
             StatusCode::INTERNAL_SERVER_ERROR,
-            "codex_title_failed",
+            "agent_title_failed",
             e.to_string(),
         ),
     }

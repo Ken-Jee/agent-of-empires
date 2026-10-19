@@ -4356,7 +4356,7 @@
       "components": ["web/src/components/WorkspaceSidebar.tsx"]
     },
     {
-      "id": "sidebar.import-codex-title-action",
+      "id": "sidebar.import-agent-title-action",
       "kind": "mocked-playwright",
       "risk": "medium",
       "specs": ["tests/sidebar-chrome.spec.ts"],

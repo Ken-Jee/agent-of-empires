@@ -2,7 +2,15 @@ import type { SessionResponse } from "../../lib/types";
 import { effectiveArchivedOf, type OptimisticTriage } from "../../lib/sidebarOptimistic";
 
 /** Row menu actions that act on one session, so a row with several siblings must name which. */
-export type SessionAction = "stop" | "start" | "fork" | "switchAgent" | "switchView" | "autoName" | "importCodexTitle" | "summarize";
+export type SessionAction =
+  | "stop"
+  | "start"
+  | "fork"
+  | "switchAgent"
+  | "switchView"
+  | "autoName"
+  | "importAgentTitle"
+  | "summarize";
 
 const isStructured = (s: SessionResponse) => s.view === "structured";
 
@@ -14,7 +22,7 @@ const ELIGIBLE: Record<SessionAction, (s: SessionResponse, archived: boolean) =>
   switchAgent: isStructured,
   switchView: (s) => isStructured(s) || !!s.acp_capable,
   autoName: isStructured,
-  importCodexTitle: (s) => s.tool === "codex" && !isStructured(s) && !s.is_sandboxed,
+  importAgentTitle: (s) => !!s.can_import_title,
   summarize: isStructured,
 };
 
@@ -33,7 +41,7 @@ export function resolveActionTargets(sessions: SessionResponse[], optimistic: Op
     switchAgent: targets("switchAgent"),
     switchView: targets("switchView"),
     autoName: targets("autoName"),
-    importCodexTitle: targets("importCodexTitle"),
+    importAgentTitle: targets("importAgentTitle"),
     summarize: targets("summarize"),
   };
 }

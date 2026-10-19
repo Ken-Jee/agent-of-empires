@@ -49,7 +49,7 @@ pub use projects::{create_project, delete_project, list_projects, update_project
 pub use sessions::{
     attach_session_project, create_session, create_session_progress, delete_session,
     delete_workspace, ensure_container_terminal, ensure_session, ensure_terminal,
-    force_smart_rename, get_recent_projects, import_codex_title, kill_terminal, list_sessions,
+    force_smart_rename, get_recent_projects, import_agent_title, kill_terminal, list_sessions,
     paste_image, preview_volume_ignores_globs, read_output, rename_session, restore_session,
     search_sessions, send_message, serve_session_artifact, session_diff_file,
     session_diff_file_raw, session_diff_files, session_file, session_file_raw, set_worktree_name,
@@ -353,7 +353,7 @@ mod tests {
                 "update_session_unread",
                 "stop_session",
                 "force_smart_rename",
-                "import_codex_title",
+                "import_agent_title",
                 "start_session",
             ],
         ),

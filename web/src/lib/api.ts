@@ -1678,9 +1678,9 @@ export function smartRenameSession(id: string): Promise<{ ok: boolean; message?:
   return okWithMessage(`/api/sessions/${encodeURIComponent(id)}/smart-rename`, { method: "POST" });
 }
 
-/** Set a host Codex terminal session's title from its first user message, over any title. */
-export function importCodexTitle(id: string): Promise<{ ok: boolean; message?: string }> {
-  return okWithMessage(`/api/sessions/${encodeURIComponent(id)}/import-codex-title`, { method: "POST" });
+/** Set a host terminal session's title from the one its agent keeps, over any title. */
+export function importAgentTitle(id: string): Promise<{ ok: boolean; message?: string }> {
+  return okWithMessage(`/api/sessions/${encodeURIComponent(id)}/import-title`, { method: "POST" });
 }
 
 /** Start an on-demand conversation summary; the result arrives as a ConversationSummary event. */

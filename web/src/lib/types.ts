@@ -72,6 +72,8 @@ export interface SessionResponse {
   smart_rename?: "inactive" | "pending" | "running";
   /** Still carries its auto-generated name (more reliable than `smart_rename`). */
   default_name?: boolean;
+  /** The session's agent keeps a title it can import. */
+  can_import_title?: boolean;
   acp_capable?: boolean;
   /** Captured ACP session id; required for a structured fork. */
   acp_session_id?: string;

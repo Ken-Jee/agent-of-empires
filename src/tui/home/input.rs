@@ -2900,7 +2900,7 @@ impl HomeView {
             ActionId::Fork => self.open_fork_from_selection(),
             ActionId::EmptyTrash => self.prompt_empty_trash(),
             ActionId::AutoName => return self.auto_name_selected(),
-            ActionId::ImportCodexTitle => return self.import_codex_title_selected(),
+            ActionId::ImportAgentTitle => return self.import_agent_title_selected(),
         }
         None
     }
@@ -3648,10 +3648,10 @@ impl HomeView {
         )))
     }
 
-    /// "Import Codex title": name the selected Codex session after its first user message, over
+    /// "Import agent title": name the selected session after the title its agent keeps for it, over
     /// any title. Unsupported sessions are refused inline; the rollout scan runs off the input
     /// handler and a failure is logged, like the other on-demand rename.
-    fn import_codex_title_selected(&mut self) -> Option<Action> {
+    fn import_agent_title_selected(&mut self) -> Option<Action> {
         let Some((profile, id, reason)) = self
             .selected_session
             .as_ref()
@@ -3660,27 +3660,28 @@ impl HomeView {
                 (
                     inst.source_profile.clone(),
                     inst.id.clone(),
-                    crate::session::codex_title::skip_reason(inst),
+                    crate::session::native_title::skip_reason(inst),
                 )
             })
         else {
             self.info_dialog = Some(InfoDialog::new(
                 "No Session Selected",
-                "Select a session to import its Codex title.",
+                "Select a session to import its agent title.",
             ));
             return None;
         };
         if let Some(reason) = reason {
-            self.info_dialog = Some(InfoDialog::new("Can't Import Codex Title", reason));
+            self.info_dialog = Some(InfoDialog::new("Can't Import Agent Title", reason));
             return None;
         }
         std::thread::spawn(move || {
-            if let Err(error) = crate::session::codex_title::import_codex_title(&profile, &id, true)
+            if let Err(error) =
+                crate::session::native_title::import_agent_title(&profile, &id, true)
             {
-                tracing::warn!(target: "smart_rename", session = %id, "codex title import failed: {error}");
+                tracing::warn!(target: "smart_rename", session = %id, "agent title import failed: {error}");
             }
         });
-        Some(Action::SetTransientStatus("importing Codex title…".into()))
+        Some(Action::SetTransientStatus("importing agent title…".into()))
     }
 
     fn open_serve(&mut self) {

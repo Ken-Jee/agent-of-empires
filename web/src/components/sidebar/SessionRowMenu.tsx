@@ -92,7 +92,7 @@ export interface SingleRowActions {
   switchAgent: (sessionId: string) => void;
   fork: (sessionId: string) => void;
   autoName: (sessionId: string) => void;
-  importCodexTitle: (sessionId: string) => void;
+  importAgentTitle: (sessionId: string) => void;
   summarize: (sessionId: string) => void;
   stop: (sessionId: string) => void;
   start: (sessionId: string) => void;
@@ -226,9 +226,9 @@ export function SingleRowMenuItems({
                 indent: true,
               })}
             {write &&
-              item("importCodexTitle", {
-                label: "Import Codex title",
-                testId: "sidebar-context-menu-import-codex-title",
+              item("importAgentTitle", {
+                label: "Import agent title",
+                testId: "sidebar-context-menu-import-agent-title",
                 glyph: icon(Sparkles),
                 indent: true,
               })}

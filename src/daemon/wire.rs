@@ -186,6 +186,9 @@ pub struct SessionResponse {
     pub smart_rename: crate::session::smart_rename::SmartRenameState,
     #[serde(default)]
     pub default_name: bool,
+    /// The session's agent keeps a title it can import (see `session::native_title`).
+    #[serde(default)]
+    pub can_import_title: bool,
     #[serde(default)]
     pub has_terminal: bool,
     #[serde(default)]

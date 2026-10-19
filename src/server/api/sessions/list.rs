@@ -221,6 +221,7 @@ pub async fn list_sessions(
             .unwrap_or_default();
         for (resp, inst) in sessions.iter_mut().zip(scoped_instances.iter().copied()) {
             resp.default_name = crate::session::civilizations::is_default_civ_name(&inst.title);
+            resp.can_import_title = crate::session::native_title::skip_reason(inst).is_none();
             if inflight.contains(&inst.id) {
                 resp.smart_rename = SmartRenameState::Running;
                 continue;
@@ -592,6 +593,7 @@ mod workspace_ordering_tests {
             tie_workdir_to_name: false,
             smart_rename: crate::session::smart_rename::SmartRenameState::Inactive,
             default_name: false,
+            can_import_title: false,
             has_terminal: false,
             profile: "default".to_string(),
             cleanup_defaults: CleanupDefaults {

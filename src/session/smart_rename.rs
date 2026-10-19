@@ -644,15 +644,15 @@ pub fn maybe_spawn_terminal_smart_rename(inst: &crate::session::instance::Instan
     if inst.is_structured() || !is_default_civ_name(&inst.title) {
         return;
     }
-    if crate::session::codex_title::skip_reason(inst).is_none()
+    if crate::session::native_title::skip_reason(inst).is_none()
         && crate::session::config::repo_config::resolve_config_with_repo_or_warn(
             &inst.source_profile,
             Path::new(&inst.project_path),
         )
         .session
-        .import_codex_title
+        .import_agent_title
     {
-        crate::session::codex_title::spawn_auto_import(inst);
+        crate::session::native_title::spawn_auto_import(inst);
         return;
     }
     if inst.smart_rename_attempted {

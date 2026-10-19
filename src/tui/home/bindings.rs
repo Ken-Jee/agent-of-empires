@@ -88,9 +88,9 @@ pub enum ActionId {
     /// session, even when auto-rename-on-start is off (#3039). Terminal sessions rename
     /// locally; structured sessions go through the daemon.
     AutoName,
-    /// Name the selected Codex session after its first user message, over any title
+    /// Name the selected session after the title its agent keeps for it, over any title
     /// (palette only; no chord).
-    ImportCodexTitle,
+    ImportAgentTitle,
     /// Permanently purge every trashed session after a confirm (palette only; no chord).
     EmptyTrash,
 }
@@ -1129,14 +1129,14 @@ pub static BINDINGS: &[Binding] = &[
         }),
     },
     Binding {
-        id: ActionId::ImportCodexTitle,
+        id: ActionId::ImportAgentTitle,
         non_strict: &[],
         strict: &[],
         context: Context::Always,
         help: None,
         palette: Some(PaletteMeta {
-            title: "Import Codex title",
-            keywords: &["rename", "title", "name", "codex", "import"],
+            title: "Import agent title",
+            keywords: &["rename", "title", "name", "agent", "import", "codex"],
             group: PaletteGroup::Actions,
         }),
     },
@@ -1193,7 +1193,7 @@ pub fn palette_id(id: ActionId) -> &'static str {
         ActionId::Skills => "skills",
         ActionId::Fork => "fork",
         ActionId::AutoName => "auto-name",
-        ActionId::ImportCodexTitle => "import-codex-title",
+        ActionId::ImportAgentTitle => "import-agent-title",
         ActionId::EmptyTrash => "empty-trash",
     }
 }
