@@ -22,7 +22,8 @@ pub fn skip_reason(inst: &Instance) -> Option<&'static str> {
 
 /// The host store: the configured agent dir, else the agent's store variable, else its default
 /// under the home dir, each read from the session's effective environment, which is what the
-/// agent was launched with.
+/// agent was launched with. A relative store is taken from the launch directory, as the agent
+/// resolves it.
 fn store_dir(inst: &Instance, native: crate::agents::NativeTitle) -> Option<std::path::PathBuf> {
     let environment = inst.resolved_host_environment();
     let home = crate::hooks::resolve_config_dir_override("HOME", &environment)
@@ -34,7 +35,14 @@ fn store_dir(inst: &Instance, native: crate::agents::NativeTitle) -> Option<std:
     )
     .session
     .agent_config_dir_for(&inst.tool, &home);
-    Some(store_dir_in(declared, native, &environment, &home))
+    let launch_dir = crate::session::capture::canonicalize_or_raw(&inst.project_path);
+    Some(store_dir_in(
+        declared,
+        native,
+        &environment,
+        &home,
+        &launch_dir,
+    ))
 }
 
 fn store_dir_in(
@@ -42,13 +50,19 @@ fn store_dir_in(
     native: crate::agents::NativeTitle,
     environment: &[String],
     home: &std::path::Path,
+    launch_dir: &std::path::Path,
 ) -> std::path::PathBuf {
-    declared
+    let store = declared
         .or_else(|| {
             crate::hooks::resolve_config_dir_override(native.store_env_var, environment)
                 .map(Into::into)
         })
-        .unwrap_or_else(|| home.join(native.default_store))
+        .unwrap_or_else(|| home.join(native.default_store));
+    if store.is_absolute() {
+        store
+    } else {
+        crate::git::template::lexical_normalize(&launch_dir.join(store))
+    }
 }
 
 /// Set the session title to its agent's title. Without `force`, only a still generated name is
@@ -98,16 +112,47 @@ mod tests {
             .unwrap()
             .native_title
             .unwrap();
-        let env = ["CODEX_HOME=/profile/store".to_string()];
         let home = Path::new("/home/u");
-        assert_eq!(
-            store_dir_in(None, native, &env, home),
-            PathBuf::from("/profile/store")
-        );
-        assert_eq!(
-            store_dir_in(Some(PathBuf::from("/declared")), native, &env, home),
-            PathBuf::from("/declared")
-        );
+        let launch = Path::new("/repo");
+        let env = |value: &str| [format!("CODEX_HOME={value}")];
+        for (name, declared, environment, expected) in [
+            (
+                "profile store",
+                None,
+                env("/profile/store"),
+                "/profile/store",
+            ),
+            (
+                "declared wins",
+                Some("/declared"),
+                env("/profile/store"),
+                "/declared",
+            ),
+            (
+                "relative store is the session's",
+                None,
+                env("store"),
+                "/repo/store",
+            ),
+            (
+                "relative dot segments",
+                None,
+                env("../other/./store"),
+                "/other/store",
+            ),
+        ] {
+            assert_eq!(
+                store_dir_in(
+                    declared.map(PathBuf::from),
+                    native,
+                    &environment,
+                    home,
+                    launch
+                ),
+                PathBuf::from(expected),
+                "{name}"
+            );
+        }
     }
 
     #[test]
