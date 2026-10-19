@@ -3649,13 +3649,20 @@ impl HomeView {
     }
 
     /// "Import Codex title": name the selected Codex session after its first user message, over
-    /// any title. The rollout read is bounded, so it runs inline and reports the outcome.
+    /// any title. Unsupported sessions are refused inline; the rollout scan runs off the input
+    /// handler and a failure is logged, like the other on-demand rename.
     fn import_codex_title_selected(&mut self) -> Option<Action> {
-        let Some((profile, id)) = self
+        let Some((profile, id, reason)) = self
             .selected_session
             .as_ref()
             .and_then(|id| self.get_instance(id))
-            .map(|inst| (inst.source_profile.clone(), inst.id.clone()))
+            .map(|inst| {
+                (
+                    inst.source_profile.clone(),
+                    inst.id.clone(),
+                    crate::session::codex_title::skip_reason(inst),
+                )
+            })
         else {
             self.info_dialog = Some(InfoDialog::new(
                 "No Session Selected",
@@ -3663,19 +3670,17 @@ impl HomeView {
             ));
             return None;
         };
-        match crate::session::codex_title::import_codex_title(&profile, &id, true) {
-            Ok(true) => Some(Action::SetTransientStatus("imported Codex title".into())),
-            Ok(false) => Some(Action::SetTransientStatus(
-                "Codex title already applied or taken by another session".into(),
-            )),
-            Err(error) => {
-                self.info_dialog = Some(InfoDialog::new(
-                    "Can't Import Codex Title",
-                    &error.to_string(),
-                ));
-                None
-            }
+        if let Some(reason) = reason {
+            self.info_dialog = Some(InfoDialog::new("Can't Import Codex Title", reason));
+            return None;
         }
+        std::thread::spawn(move || {
+            if let Err(error) = crate::session::codex_title::import_codex_title(&profile, &id, true)
+            {
+                tracing::warn!(target: "smart_rename", session = %id, "codex title import failed: {error}");
+            }
+        });
+        Some(Action::SetTransientStatus("importing Codex title…".into()))
     }
 
     fn open_serve(&mut self) {
