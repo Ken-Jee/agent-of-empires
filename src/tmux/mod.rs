@@ -2571,18 +2571,19 @@ impl AvailableTools {
             custom.sort();
             available.extend(custom);
         }
-        for plugin in crate::plugin::registry().active() {
-            for integration in &plugin.manifest.agent_integrations {
-                let Some(command) = integration.command.as_deref() else {
-                    continue;
-                };
-                let installed = shell_words::split(command)
-                    .ok()
-                    .and_then(|words| words.first().cloned())
-                    .is_some_and(|binary| which::which(binary).is_ok());
-                if installed && !available.iter().any(|name| name == &integration.tool) {
-                    available.push(integration.tool.clone());
-                }
+        let registry = crate::plugin::registry();
+        let plugin_agents = crate::plugin::agent_integration::catalog(
+            &registry,
+            agents.iter().map(|agent| agent.name),
+            available.iter().map(String::as_str),
+        );
+        for agent in plugin_agents {
+            let installed = shell_words::split(agent.command)
+                .ok()
+                .and_then(|words| words.first().cloned())
+                .is_some_and(|binary| which::which(binary).is_ok());
+            if installed {
+                available.push(agent.tool.to_string());
             }
         }
 

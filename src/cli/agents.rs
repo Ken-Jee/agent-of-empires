@@ -42,7 +42,10 @@ pub fn run() -> Result<()> {
         config.session.custom_agents.keys().map(String::as_str),
     );
     for agent in &plugin_agents {
-        if available_list.iter().any(|installed| installed == agent.tool) {
+        if available_list
+            .iter()
+            .any(|installed| installed == agent.tool)
+        {
             println!(
                 "  {installed_mark} {:<12} installed (plugin: {})",
                 agent.tool, agent.plugin
@@ -57,7 +60,11 @@ pub fn run() -> Result<()> {
 
     let plugin_installed = plugin_agents
         .iter()
-        .filter(|agent| available_list.iter().any(|installed| installed == agent.tool))
+        .filter(|agent| {
+            available_list
+                .iter()
+                .any(|installed| installed == agent.tool)
+        })
         .count();
     let installed_count = plugin_installed
         + crate::agents::AGENTS

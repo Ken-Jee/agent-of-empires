@@ -1,6 +1,6 @@
 //! Plugin-backed agent launch discovery.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 /// An active plugin-provided agent that does not collide with a built-in or custom agent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -15,18 +15,25 @@ fn unique_candidates<'a, 'b, 'c>(
     builtin_names: impl IntoIterator<Item = &'b str>,
     custom_names: impl IntoIterator<Item = &'c str>,
 ) -> Vec<PluginAgent<'a>> {
-    let mut names: HashSet<&str> = builtin_names.into_iter().collect();
-    names.extend(custom_names);
     let candidates: Vec<_> = candidates.into_iter().collect();
     let mut candidate_counts = HashMap::<&str, usize>::new();
     for (_, tool, _) in &candidates {
         *candidate_counts.entry(tool).or_default() += 1;
     }
+    for name in builtin_names {
+        candidate_counts.remove(name);
+    }
+    for name in custom_names {
+        candidate_counts.remove(name);
+    }
     candidates
         .into_iter()
         .filter_map(|(plugin, tool, command)| {
-            (candidate_counts[tool] == 1 && names.insert(tool))
-                .then_some(PluginAgent { plugin, tool, command })
+            (candidate_counts.get(tool) == Some(&1)).then_some(PluginAgent {
+                plugin,
+                tool,
+                command,
+            })
         })
         .collect()
 }
@@ -43,9 +50,10 @@ pub fn catalog<'a, 'b, 'c>(
             .agent_integrations
             .iter()
             .filter_map(move |entry| {
-                entry.command.as_deref().map(|command| {
-                    (plugin.id(), entry.tool.as_str(), command)
-                })
+                entry
+                    .command
+                    .as_deref()
+                    .map(|command| (plugin.id(), entry.tool.as_str(), command))
             })
     });
     unique_candidates(candidates, builtin_names, custom_names)
@@ -62,7 +70,11 @@ pub fn agent_command(tool: &str) -> Option<String> {
     .into_iter()
     .find(|agent| agent.tool == tool)
     .map(|agent| {
-        tracing::debug!(tool, plugin = agent.plugin, "resolved plugin-provided agent command");
+        tracing::debug!(
+            tool,
+            plugin = agent.plugin,
+            "resolved plugin-provided agent command"
+        );
         agent.command.to_string()
     })
 }
