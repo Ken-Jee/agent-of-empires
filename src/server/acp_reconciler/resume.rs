@@ -387,6 +387,7 @@ async fn build_spawn_request(
         agent_provider,
         claude_store_pin,
         instance,
+        prior_conversation,
     ) = {
         let instances = service.instances.read().await;
         let Some(inst) = instances.iter().find(|i| i.id == target.id) else {
@@ -408,6 +409,8 @@ async fn build_spawn_request(
             inst.agent_provider.clone(),
             inst.selected_claude_store_pin(),
             inst.clone(),
+            target.stored_acp_session_id.is_none()
+                && (inst.agent_session_id.is_some() || inst.pi_session_path.is_some()),
         )
     };
     let agent = supervisor
@@ -468,6 +471,7 @@ async fn build_spawn_request(
         acp_mode_id,
         agent_command_override: command_override_for_spawn(&target.tool, &target.command),
         seed_history_replay,
+        prior_conversation,
         claude_store_pin,
     })
 }

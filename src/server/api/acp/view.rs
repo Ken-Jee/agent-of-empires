@@ -387,6 +387,10 @@ async fn deferred_enable_request(
             }),
             stored_acp_session_id: seed.stored_acp_session_id,
             seed_history_replay: seed.seed_history_replay,
+            prior_conversation: instance.acp_session_id.is_some()
+                || instance.agent_session_id.is_some()
+                || instance.pi_session_path.is_some()
+                || selected_conversation.is_some(),
             sandbox_continuation: if seed.import_terminal {
                 crate::acp::supervisor::SandboxContinuation::ImportTerminal
             } else {

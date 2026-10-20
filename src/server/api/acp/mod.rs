@@ -136,6 +136,7 @@ pub(crate) fn spawn_request_for(
             &instance.command,
         ),
         seed_history_replay: instance.import_pending == Some(true),
+        prior_conversation: false,
         claude_store_pin: instance.selected_claude_store_pin(),
     }
 }

@@ -1495,6 +1495,15 @@ export function fetchBranches(path: string, includeRemote = false): Promise<Bran
   return fetchJson<BranchInfo[]>(`/api/git/branches?${params.toString()}`);
 }
 
+export interface WorktreeInfo {
+  branch: string;
+  path: string;
+}
+
+export function fetchWorktrees(path: string): Promise<WorktreeInfo[] | null> {
+  return fetchJson<WorktreeInfo[]>(`/api/git/worktrees?${new URLSearchParams({ path }).toString()}`);
+}
+
 /** Whether `path` is a git repository, per the same gate the session builder
  *  enforces. Returns the boolean, or null on a transient failure so callers
  *  can stay optimistic rather than misreport a repo as a non-repo. Used by the

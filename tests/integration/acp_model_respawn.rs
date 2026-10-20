@@ -55,6 +55,7 @@ fn spawn_config(
         stored_acp_session_id,
         fork_from: None,
         seed_history_replay: false,
+        prior_conversation: false,
         generation: 0,
         artifact_dir: None,
         sandbox_info: None,

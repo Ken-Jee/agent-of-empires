@@ -32,7 +32,7 @@ pub use acp::{
 pub use queue::{queue_clear, queue_edit, queue_enqueue, queue_list, queue_remove};
 
 pub use client_log::post_client_log;
-pub use git::{clone_repo, is_git_repo, list_branches};
+pub use git::{clone_repo, is_git_repo, list_branches, list_worktrees};
 pub use groups::{collapse_group, create_group, delete_group, move_group, reorder};
 pub use log_level::{get_log_level, patch_log_level};
 pub use mcp::{
