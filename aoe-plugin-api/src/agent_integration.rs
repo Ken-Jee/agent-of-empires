@@ -1,20 +1,30 @@
-//! Provider-native status and user-requested terminal replies, independent of ACP.
+//! Provider-native agent session communication, independent of a specific agent.
 
 use serde::{Deserialize, Serialize};
 
-/// Agent tools whose provider-native status and reply protocol this host implements.
-pub const SUPPORTED_AGENT_INTEGRATION_TOOLS: &[&str] = &["omp"];
-
+/// Agent communication protocol declared by a plugin.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentIntegrationContribution {
     pub tool: String,
-    /// Alternative semver requirements for the provider runtime, not the AoE host.
+    /// Alternative semver requirements for provider-native status reporting.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub provider_versions: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    /// Resume-argument template with `{session_id}` replaced by the host as a quoted word.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_arg: Option<String>,
+    /// Enable provider-native prompt replies; status-only adapters leave this disabled.
+    #[serde(default)]
+    pub replies: bool,
 }
 
 impl AgentIntegrationContribution {
     pub fn provider_compat(&self, version: &str) -> Result<(), String> {
+        if self.provider_versions.is_empty() {
+            return Ok(());
+        }
         let parsed = semver::Version::parse(version)
             .map_err(|e| format!("invalid {} runtime version {version:?}: {e}", self.tool))?;
         for range in &self.provider_versions {
@@ -52,6 +62,7 @@ pub struct AgentIntegrationSnapshot {
     pub revision: u64,
     pub status: AgentIntegrationStatus,
     /// Function-key names sent only to wake the provider extension after a user reply.
+    #[serde(default)]
     pub reply_keys: Vec<String>,
     pub prompt: Option<AgentIntegrationPrompt>,
 }

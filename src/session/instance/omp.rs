@@ -184,7 +184,8 @@ impl Instance {
         if self.resolved_capture_backend() != Some(crate::agents::SessionCaptureBackend::Omp) {
             return None;
         }
-        OmpCliCaptureOptions::parse_launch(&self.command, &self.extra_args).ok()
+        let args = crate::session::config::quote_model_value_in_args(&self.extra_args);
+        OmpCliCaptureOptions::parse(&args).ok()
     }
 
     /// Instrument the already resolved launch without resolving routing again.
@@ -483,9 +484,7 @@ impl Instance {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::capture::{
-        omp_host_routing_environment, resolve_omp_store_layout_with_environment,
-    };
+    use crate::session::capture::resolve_omp_store_layout_with_environment;
     use crate::session::instance::launch_command::wrap_command_ignore_suspend;
     use crate::session::instance::test_helpers::*;
 

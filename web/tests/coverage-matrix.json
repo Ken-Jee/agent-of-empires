@@ -461,6 +461,17 @@
       "components": ["web/src/components/LoginPage.tsx"]
     },
     {
+      "id": "auth.passkey",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": [
+        "src/components/__tests__/LoginPage.test.tsx",
+        "src/components/__tests__/PasskeySettings.test.tsx",
+        "src/lib/api.test.ts"
+      ],
+      "components": ["web/src/components/PasskeySettings.tsx"]
+    },
+    {
       "id": "auth.token-entry",
       "kind": "live-playwright",
       "risk": "medium",
@@ -530,6 +541,17 @@
         "web/src/components/settings/StructuredWidgets.tsx",
         "web/src/components/settings/FormFields.tsx",
         "web/src/components/settings/SchemaSection.tsx"
+      ]
+    },
+    {
+      "id": "settings.mcp-server-toggle",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/components/__tests__/SettingsView.mcpToggle.test.tsx"],
+      "components": [
+        "web/src/components/SettingsView.tsx",
+        "web/src/components/settings/SchemaSection.tsx",
+        "src/server/mcp.rs"
       ]
     },
     {
@@ -671,7 +693,11 @@
       "kind": "live-playwright",
       "risk": "medium",
       "specs": ["tests/live/settings-persistence.spec.ts"],
-      "components": ["web/src/components/SettingsView.tsx", "web/src/components/settings/SchemaSection.tsx"]
+      "components": [
+        "web/src/components/SettingsView.tsx",
+        "web/src/components/settings/SchemaSection.tsx",
+        "web/src/components/settings/customWidgets.tsx"
+      ]
     },
     {
       "id": "settings.tui-shortcut-bar",
@@ -814,6 +840,13 @@
       "risk": "medium",
       "specs": ["src/components/__tests__/PushHealthBanner.test.tsx"],
       "components": ["web/src/components/PushHealthBanner.tsx"]
+    },
+    {
+      "id": "notifications.status-sounds",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/lib/statusSounds.test.ts", "src/hooks/useStatusSounds.test.ts"],
+      "components": ["web/src/lib/statusSounds.ts", "web/src/hooks/useStatusSounds.ts", "web/src/lib/soundPlayer.ts"]
     },
     {
       "id": "settings.security-readonly",
@@ -1084,6 +1117,14 @@
       ]
     },
     {
+      "id": "wizard.attach-existing-worktree",
+      "kind": "vitest",
+      "risk": "low",
+      "specs": ["src/components/session-wizard/__tests__/WorktreePanel.test.tsx", "src/lib/api.test.ts"],
+      "components": ["web/src/components/session-wizard/steps/WorktreePanel.tsx"],
+      "notes": "Attach mode lists the repo's existing worktrees via GET /api/git/worktrees; picking one fills the branch name. Empty and failed listings show distinct messages, and create mode does not fetch."
+    },
+    {
       "id": "wizard.rows-and-panels",
       "kind": "vitest",
       "risk": "medium",
@@ -1133,6 +1174,13 @@
     },
     {
       "id": "wizard.agent-lifecycle",
+      "kind": "vitest",
+      "risk": "low",
+      "specs": ["src/components/session-wizard/__tests__/AgentPanel.test.tsx"],
+      "components": ["web/src/components/session-wizard/steps/AgentPickerEssentials.tsx"]
+    },
+    {
+      "id": "wizard.plugin-agents",
       "kind": "vitest",
       "risk": "low",
       "specs": ["src/components/session-wizard/__tests__/AgentPanel.test.tsx"],
@@ -1390,6 +1438,13 @@
       "components": ["web/src/components/session-wizard/SessionWizard.tsx"]
     },
     {
+      "id": "wizard.scratch-resolves-configured-default-profile",
+      "kind": "live-playwright",
+      "risk": "high",
+      "specs": ["tests/live/session-create.spec.ts"],
+      "components": ["web/src/components/session-wizard/SessionWizard.tsx"]
+    },
+    {
       "id": "wizard.recent-hides-workspaces",
       "kind": "vitest",
       "risk": "medium",
@@ -1592,6 +1647,18 @@
       "components": ["web/src/components/WorkspaceSidebar.tsx"]
     },
     {
+      "id": "sidebar.shared-worktree-actions",
+      "kind": "mocked-playwright",
+      "risk": "high",
+      "specs": ["src/components/__tests__/SessionRowSiblingTargets.test.tsx", "tests/sidebar-multi-session.spec.ts"],
+      "components": [
+        "web/src/components/sidebar/sessionActionTargets.ts",
+        "web/src/components/sidebar/SessionRowMenu.tsx",
+        "web/src/components/sidebar/SessionActions.tsx",
+        "web/src/components/sidebar/rowModel.ts"
+      ]
+    },
+    {
       "id": "sidebar.repo-appearance",
       "kind": "mocked-playwright",
       "risk": "low",
@@ -1623,8 +1690,8 @@
       "id": "sidebar.project-row-header",
       "kind": "vitest",
       "risk": "medium",
-      "specs": ["src/components/__tests__/SidebarGroupHeader.test.tsx"],
-      "components": ["web/src/components/WorkspaceSidebar.tsx"]
+      "specs": ["src/components/__tests__/SidebarGroupHeader.test.tsx", "src/lib/__tests__/githubAvatar.test.ts"],
+      "components": ["web/src/components/WorkspaceSidebar.tsx", "web/src/components/OwnerAvatar.tsx"]
     },
     {
       "id": "sidebar.empty-state",
@@ -2318,11 +2385,13 @@
         "src/hooks/__tests__/useHistoryWindow.test.tsx",
         "src/lib/historyScroll.test.ts",
         "src/hooks/useAcpSession.test.ts",
-        "src/hooks/acpSession/replay.test.ts"
+        "src/hooks/acpSession/replay.test.ts",
+        "src/hooks/acpSession/stateCache.test.ts"
       ],
       "components": [
         "web/src/lib/acpHistoryWindow.ts",
         "web/src/hooks/acpSession/replay.ts",
+        "web/src/hooks/acpSession/stateCache.ts",
         "web/src/lib/historyScroll.ts",
         "web/src/hooks/useHistoryWindow.ts",
         "web/src/hooks/useAcpSession.ts",
@@ -2609,8 +2678,12 @@
       "id": "acp.attention-chime",
       "kind": "vitest",
       "risk": "medium",
-      "specs": ["src/components/acp/__tests__/AttentionChime.test.tsx"],
-      "components": ["web/src/components/acp/AttentionChime.tsx", "web/src/components/acp/StructuredView.tsx"]
+      "specs": ["src/components/acp/__tests__/AttentionChime.test.tsx", "src/hooks/useApprovalSound.test.ts"],
+      "components": [
+        "web/src/components/acp/AttentionChime.tsx",
+        "web/src/components/acp/StructuredView.tsx",
+        "web/src/hooks/useApprovalSound.ts"
+      ]
     },
     {
       "id": "acp.elicitation-card",
@@ -3096,11 +3169,14 @@
         "tests/acp-structured-view.spec.ts",
         "src/components/acp/ToolExpansion.test.tsx",
         "src/components/acp/activityMessages.test.ts",
-        "src/lib/toolAnchor.test.ts"
+        "src/lib/toolAnchor.test.ts",
+        "src/components/acp/useTranscriptScroll.test.tsx"
       ],
       "components": [
+        "web/src/components/acp/StructuredView.tsx",
         "web/src/components/acp/ToolExpansion.tsx",
         "web/src/components/acp/GroupToolCards.tsx",
+        "web/src/components/acp/useTranscriptScroll.ts",
         "web/src/lib/toolAnchor.ts"
       ]
     },
@@ -3180,8 +3256,8 @@
       "id": "acp.mobile-jump-to-bottom",
       "kind": "mocked-playwright",
       "risk": "medium",
-      "specs": ["tests/acp-mobile-jump-to-bottom.spec.ts"],
-      "components": ["web/src/components/acp/StructuredView.tsx"]
+      "specs": ["tests/acp-mobile-jump-to-bottom.spec.ts", "src/components/acp/useTranscriptScroll.test.tsx"],
+      "components": ["web/src/components/acp/StructuredView.tsx", "web/src/components/acp/useTranscriptScroll.ts"]
     },
     {
       "id": "acp.tool-stopped-sweep",

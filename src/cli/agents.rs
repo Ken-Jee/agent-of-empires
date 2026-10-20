@@ -34,17 +34,40 @@ pub fn run() -> Result<()> {
             println!("{}", crate::cli::lifecycle_notice_line("      ", &notice));
         }
     }
+    let plugin_agents: Vec<_> = crate::plugin::registry()
+        .active()
+        .flat_map(|plugin| {
+            plugin
+                .manifest
+                .agent_integrations
+                .iter()
+                .filter(|integration| {
+                    integration.command.is_some()
+                        && crate::agents::get_agent(&integration.tool).is_none()
+                })
+                .map(move |integration| (plugin.id().to_string(), integration.tool.clone()))
+        })
+        .collect();
+    for (plugin, name) in &plugin_agents {
+        if available_list.iter().any(|installed| installed == name) {
+            println!("  {installed_mark} {name:<12} installed (plugin: {plugin})");
+        } else {
+            println!("  {missing_mark} {name:<12} runtime not installed (plugin: {plugin})");
+        }
+    }
 
-    let installed_count = crate::agents::AGENTS
+    let plugin_installed = plugin_agents
         .iter()
-        .filter(|a| available_list.iter().any(|s| s == a.name))
+        .filter(|(_, name)| available_list.iter().any(|installed| installed == name))
         .count();
+    let installed_count = plugin_installed
+        + crate::agents::AGENTS
+            .iter()
+            .filter(|a| available_list.iter().any(|s| s == a.name))
+            .count();
+    let total_count = crate::agents::AGENTS.len() + plugin_agents.len();
 
-    println!(
-        "\n{}/{} agents installed.",
-        installed_count,
-        crate::agents::AGENTS.len()
-    );
+    println!("\n{}/{} agents installed.", installed_count, total_count);
 
     if installed_count == 0 {
         println!("\nInstall at least one agent to get started.");

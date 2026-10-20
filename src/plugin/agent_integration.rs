@@ -41,6 +41,57 @@ fn provider<'a>(
     );
     Ok(selected)
 }
+/// Resolve a plugin-provided agent's launch command.
+pub fn agent_command(tool: &str) -> Option<String> {
+    let registry = super::registry();
+    let mut matches = registry.active().flat_map(|plugin| {
+        plugin
+            .manifest
+            .agent_integrations
+            .iter()
+            .filter(move |entry| entry.tool == tool)
+            .filter_map(move |entry| entry.command.clone().map(|command| (plugin.id(), command)))
+    });
+    let (plugin, command) = matches.next()?;
+    if matches.next().is_some() {
+        tracing::warn!(tool, "multiple plugins provide an agent launch command");
+        return None;
+    }
+    tracing::debug!(tool, plugin, "resolved plugin-provided agent command");
+    Some(command)
+}
+/// Resolve resume flags from the unique active plugin declaring them.
+pub fn resume_argument(tool: &str, session_id: &str) -> Option<String> {
+    let registry = super::registry();
+    let mut matches = registry.active().flat_map(|plugin| {
+        plugin
+            .manifest
+            .agent_integrations
+            .iter()
+            .filter(move |entry| entry.tool == tool)
+            .filter_map(move |entry| {
+                entry
+                    .resume_arg
+                    .as_deref()
+                    .map(|template| (plugin.id(), template))
+            })
+    });
+    let (plugin, template) = matches.next()?;
+    if matches.next().is_some() {
+        tracing::warn!(tool, "multiple plugins provide agent resume arguments");
+        return None;
+    }
+    tracing::debug!(
+        tool,
+        plugin,
+        "resolved plugin-provided agent resume arguments"
+    );
+    Some(resume_argument_from_template(template, session_id))
+}
+
+fn resume_argument_from_template(template: &str, session_id: &str) -> String {
+    template.replace("{session_id}", &shell_words::quote(session_id))
+}
 fn eligible(instance: &Instance) -> bool {
     !instance.is_structured()
         && !instance.is_archived()
@@ -54,6 +105,15 @@ fn eligible(instance: &Instance) -> bool {
 }
 
 pub fn configured(instance: &Instance) -> bool {
+    configured_for(instance, false)
+}
+
+/// Whether an approved integration owns replies, even when its report is unavailable.
+pub fn replies_configured(instance: &Instance) -> bool {
+    configured_for(instance, true)
+}
+
+fn configured_for(instance: &Instance, replies: bool) -> bool {
     eligible(instance)
         && super::registry().active().any(|plugin| {
             plugin
@@ -65,7 +125,7 @@ pub fn configured(instance: &Instance) -> bool {
                     .manifest
                     .agent_integrations
                     .iter()
-                    .any(|entry| entry.tool == instance.tool)
+                    .any(|entry| entry.tool == instance.tool && (!replies || entry.replies))
         })
 }
 
@@ -146,14 +206,18 @@ fn read_report(
     let mut report: AgentIntegrationSnapshot =
         serde_json::from_slice(&bytes).context("invalid integration report")?;
     validate_report(&report, instance_id)?;
-    plugin
+    let integration = plugin
         .manifest
         .agent_integrations
         .iter()
         .find(|entry| entry.tool == tool)
-        .context("provider integration declaration is unavailable")?
+        .context("provider integration declaration is unavailable")?;
+    integration
         .provider_compat(&report.provider_version)
         .map_err(anyhow::Error::msg)?;
+    if !integration.replies {
+        report.prompt = None;
+    }
     sanitize_prompt(&mut report);
     ensure!(
         crate::process::worker::is_pid_alive(report.writer_pid),
@@ -175,10 +239,7 @@ fn validate_report(r: &AgentIntegrationSnapshot, id: &str) -> Result<()> {
         r.writer_pid > 0 && r.writer_pid <= i32::MAX as u32,
         "invalid integration writer PID"
     );
-    ensure!(
-        !r.reply_keys.is_empty() && r.reply_keys.len() <= 8,
-        "invalid integration reply keys"
-    );
+    ensure!(r.reply_keys.len() <= 8, "invalid integration reply keys");
     let mut reply_keys = HashSet::new();
     for key in &r.reply_keys {
         ensure!(
@@ -240,10 +301,11 @@ fn valid_prompt(prompt: &AgentIntegrationPrompt, status: AgentIntegrationStatus)
 }
 
 fn sanitize_prompt(report: &mut AgentIntegrationSnapshot) {
-    if report
-        .prompt
-        .as_ref()
-        .is_some_and(|prompt| !valid_prompt(prompt, report.status))
+    if report.reply_keys.is_empty()
+        || report
+            .prompt
+            .as_ref()
+            .is_some_and(|prompt| !valid_prompt(prompt, report.status))
     {
         report.prompt = None;
     }
@@ -368,6 +430,17 @@ pub fn respond(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plugin_resume_template_keeps_session_id_as_one_shell_argument() {
+        let session_id = "$(touch /tmp/not-executed)";
+        let args = shell_words::split(&resume_argument_from_template(
+            "--resume {session_id}",
+            session_id,
+        ))
+        .unwrap();
+        assert_eq!(args, ["--resume", session_id]);
+    }
     use aoe_plugin_api::agent_integration::{
         AgentIntegrationAnswer, AgentIntegrationOption, AgentIntegrationQuestion,
     };
@@ -421,6 +494,10 @@ mod tests {
     fn report_validation_rejects_wrong_identity_and_unsafe_reply_keys() {
         let mut valid = snapshot();
         assert!(validate_report(&valid, "host-test").is_ok());
+        let mut status_only = valid.clone();
+        status_only.prompt = None;
+        status_only.reply_keys.clear();
+        assert!(validate_report(&status_only, "host-test").is_ok());
         let mut valid_f1 = valid.clone();
         valid_f1.reply_keys = vec!["F1".into()];
         assert!(validate_report(&valid_f1, "host-test").is_ok());
@@ -516,11 +593,21 @@ mod tests {
     #[serial_test::serial(hook_base)]
     fn unavailable_incompatible_and_expired_reports_fail_closed() {
         let (_guard, base, _tmp) = crate::hooks::test_support::BaseGuard::ready();
-        let manifest = aoe_plugin_api::PluginManifest::from_toml_str(include_str!(
-            "../../plugins/agent-omp/aoe-plugin.toml"
-        ))
+        let manifest = aoe_plugin_api::PluginManifest::from_toml_str(
+            r#"
+            id = "acme.agent-integration"
+            name = "Test Agent Integration"
+            version = "0.1.0"
+            api_version = 19
+            capabilities = ["session.integration"]
+
+            [[agent_integrations]]
+            tool = "test-agent"
+            provider_versions = ["^1.2"]
+            "#,
+        )
         .unwrap();
-        let plugin = super::super::LoadedPlugin {
+        let mut plugin = super::super::LoadedPlugin {
             manifest,
             enabled: true,
             trust: aoe_plugin_api::TrustLevel::Community,
@@ -530,45 +617,54 @@ mod tests {
             manifest_hash: String::new(),
             granted: true,
         };
-        assert!(read_report("host-test", "omp", &plugin).unwrap().is_none());
+        assert!(read_report("host-test", "test-agent", &plugin)
+            .unwrap()
+            .is_none());
         let dir = dir_guard::open_instance_dir("host-test").unwrap();
         let leaf = format!("integration-{}.json", plugin.id());
-        for version in [
-            "18.10.2",
-            "18.10.3",
-            "18.10.4",
-            "18.10.5",
-            "18.11.1",
-            "18.11.2",
-            "18.11.3",
-            "18.11.4",
-            "18.11.3-rc.1",
-            "unknown",
-        ] {
+        for version in ["1.1.9", "1.2.0", "1.9.0", "2.0.0", "1.2.3-rc.1", "unknown"] {
             let mut report = snapshot();
             report.provider_version = version.into();
             dir_guard::write_atomic(dir.as_fd(), &leaf, &serde_json::to_vec(&report).unwrap())
                 .unwrap();
-            let loaded = read_report("host-test", "omp", &plugin);
-            if !matches!(version, "18.10.3" | "18.10.4" | "18.11.1" | "18.11.3") {
+            let loaded = read_report("host-test", "test-agent", &plugin);
+            if !matches!(version, "1.2.0" | "1.9.0") {
                 assert!(loaded.is_err(), "{version}");
             } else {
                 assert!(loaded.unwrap().is_some(), "{version}");
             }
         }
-        dir_guard::write_atomic(
-            dir.as_fd(),
-            &leaf,
-            &serde_json::to_vec(&snapshot()).unwrap(),
-        )
-        .unwrap();
+        let mut fresh = snapshot();
+        fresh.provider_version = "1.2.3".into();
+        for (replies, keys) in [
+            (false, vec!["F12".to_string()]),
+            (false, Vec::new()),
+            (true, Vec::new()),
+            (true, vec!["F12".to_string()]),
+        ] {
+            plugin.manifest.agent_integrations[0].replies = replies;
+            fresh.reply_keys = keys;
+            let has_keys = !fresh.reply_keys.is_empty();
+            let mut wire = serde_json::to_value(&fresh).unwrap();
+            if !has_keys {
+                wire.as_object_mut().unwrap().remove("reply_keys");
+            }
+            dir_guard::write_atomic(dir.as_fd(), &leaf, &serde_json::to_vec(&wire).unwrap())
+                .unwrap();
+            let loaded = read_report("host-test", "test-agent", &plugin)
+                .unwrap()
+                .unwrap();
+            assert_eq!(loaded.status, AgentIntegrationStatus::Waiting);
+            assert_eq!(loaded.prompt.is_some(), replies && has_keys);
+        }
+        dir_guard::write_atomic(dir.as_fd(), &leaf, &serde_json::to_vec(&fresh).unwrap()).unwrap();
         let file = std::fs::OpenOptions::new()
             .write(true)
             .open(base.join("host-test").join(&leaf))
             .unwrap();
         file.set_modified(SystemTime::now() - REPORT_MAX_AGE - Duration::from_secs(60))
             .unwrap();
-        assert!(read_report("host-test", "omp", &plugin)
+        assert!(read_report("host-test", "test-agent", &plugin)
             .unwrap_err()
             .to_string()
             .contains("expired"));
@@ -578,135 +674,7 @@ mod tests {
             .join(format!("integration-{}.reply.json", plugin.id()))
             .exists());
         let mut changed = snapshot();
-        changed.provider_version = "18.10.3".into();
+        changed.provider_version = "1.3.0".into();
         assert!(!same_prompt(&snapshot(), &changed));
-    }
-
-    #[test]
-    #[serial_test::serial(hook_base)]
-    fn omp_pending_approval_survives_agent_start_and_host_reply() {
-        use std::os::unix::fs::PermissionsExt;
-
-        use crate::session::{update_config, CapabilityGrant, PluginConfig};
-        use crate::tmux::test_helpers::{require_tmux, TmuxTestSession};
-
-        let _env = crate::session::test_support::EnvGuard::unset(&[
-            crate::tmux::TMUX_SOCKET_ENV,
-            "TMUX",
-            "TMUX_PANE",
-        ]);
-        require_tmux!();
-        let Ok(bun) = which::which("bun") else {
-            eprintln!("Skipping test: Bun not available");
-            return;
-        };
-        let temp = tempfile::tempdir().unwrap();
-        let _reload = crate::plugin::ReloadRegistryOnDrop;
-        let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
-        let manifest = include_str!("../../plugins/agent-omp/aoe-plugin.toml");
-        let plugin_dir = crate::plugin::plugins_dir()
-            .unwrap()
-            .join("omp.agent-of-empires");
-        std::fs::create_dir_all(&plugin_dir).unwrap();
-        std::fs::write(plugin_dir.join("aoe-plugin.toml"), manifest).unwrap();
-        update_config(|config| {
-            config.plugins.insert(
-                "omp.agent-of-empires".into(),
-                PluginConfig {
-                    grant: Some(CapabilityGrant {
-                        manifest_hash: aoe_plugin_api::PluginManifest::hash_bytes(
-                            manifest.as_bytes(),
-                        ),
-                        capabilities: vec!["session.integration".into()],
-                        granted_at: chrono::Utc::now(),
-                    }),
-                    ..PluginConfig::default()
-                },
-            );
-        })
-        .unwrap();
-        crate::plugin::reload_registry();
-
-        // The extension uses the shared hook root, but owns only this temporary instance.
-        let root = std::path::PathBuf::from(format!(
-            "/tmp/aoe-hooks-{}",
-            nix::unistd::geteuid().as_raw()
-        ));
-        let _base = crate::hooks::test_support::BaseGuard::with_base(root.clone());
-        dir_guard::with_hook_base(|_| Ok(())).unwrap();
-        let hook_dir = tempfile::Builder::new()
-            .prefix("omp_host_reply_")
-            .tempdir_in(&root)
-            .unwrap();
-        std::fs::set_permissions(hook_dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-        let mut instance = Instance::new("OMP host reply", temp.path().to_str().unwrap());
-        instance.id = hook_dir
-            .path()
-            .file_name()
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .into();
-        instance.tool = "omp".into();
-        let tmux = crate::tmux::Session::new(&instance.id, &instance.title).unwrap();
-        let _session = TmuxTestSession::from_name(tmux.name());
-        let result_path = temp.path().join("native-result");
-        let started_path = temp.path().join("native-result.started");
-        let log_path = temp.path().join("native.log");
-        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("plugins/agent-omp/tests/omp-host-reply.ts");
-        let quote =
-            |path: &std::path::Path| shell_words::quote(path.to_str().unwrap()).into_owned();
-        let command = format!(
-            "exec env -i PATH={} HOME={} AOE_INSTANCE_ID={} {} {} {} >{} 2>&1",
-            shell_words::quote(&std::env::var("PATH").unwrap()),
-            quote(temp.path()),
-            instance.id,
-            quote(&bun),
-            quote(&fixture),
-            quote(&result_path),
-            quote(&log_path),
-        );
-        tmux.create(temp.path().to_str().unwrap(), Some(&command), "default")
-            .unwrap();
-        let wait_for = |ready: &dyn Fn() -> bool| {
-            let deadline = std::time::Instant::now() + Duration::from_secs(10);
-            while !ready() {
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "OMP fixture timed out: {}",
-                    std::fs::read_to_string(&log_path).unwrap_or_default()
-                );
-                std::thread::sleep(Duration::from_millis(10));
-            }
-        };
-        wait_for(&|| super::snapshot(&instance).is_some_and(|r| r.prompt.is_some()));
-        let pending = super::snapshot(&instance).unwrap();
-        assert_eq!(pending.status, AgentIntegrationStatus::Waiting);
-        assert_eq!(pending.prompt.as_ref().unwrap().id(), "approval-a");
-
-        tmux.send_key_tokens(&[crate::agents::KeyToken::Named("s")])
-            .unwrap();
-        wait_for(&|| started_path.exists());
-        let after_start = super::snapshot(&instance).unwrap();
-        assert_eq!(after_start.status, AgentIntegrationStatus::Waiting);
-        assert_eq!(after_start.revision, pending.revision);
-        assert_eq!(after_start.prompt.as_ref().unwrap().id(), "approval-a");
-        respond(
-            &instance,
-            &pending,
-            AgentIntegrationResponse::Approval {
-                choice: IntegrationApprovalChoice::Allow,
-            },
-        )
-        .unwrap();
-        wait_for(&|| std::fs::read_to_string(&result_path).is_ok_and(|value| value == "Approve"));
-        wait_for(&|| {
-            super::snapshot(&instance).is_some_and(|report| {
-                report.prompt.is_none()
-                    && report.revision == pending.revision + 1
-                    && report.status == AgentIntegrationStatus::Running
-            })
-        });
     }
 }

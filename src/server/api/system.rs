@@ -184,6 +184,32 @@ pub async fn list_agents(State(state): State<Arc<AppState>>) -> Json<Vec<AgentIn
                 }
             })
             .collect::<Vec<_>>();
+        let mut known_agent_names: std::collections::HashSet<String> =
+            agents.iter().map(|agent| agent.name.clone()).collect();
+        for integration in crate::plugin::registry()
+            .active()
+            .flat_map(|plugin| plugin.manifest.agent_integrations.iter())
+            .filter(|integration| integration.command.is_some())
+        {
+            if !known_agent_names.insert(integration.tool.clone()) {
+                continue;
+            }
+            agents.push(AgentInfo {
+                kind: "plugin".to_string(),
+                name: integration.tool.clone(),
+                binary: integration.tool.clone(),
+                host_only: false,
+                installed: available.iter().any(|name| name == &integration.tool),
+                install_hint: "Provided by an enabled AoE plugin".to_string(),
+                oneshot_capable: false,
+                acp_capable: false,
+                acp_installed: false,
+                acp_allowed: policy.allows(&integration.tool),
+                acp_command: None,
+                acp_args: Vec::new(),
+                lifecycle: crate::agents::AgentLifecycle::Active,
+            });
+        }
         agents.extend(build_custom_agent_infos(
             &custom_agents,
             &agent_acp_cmd,

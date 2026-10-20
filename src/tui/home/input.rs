@@ -46,9 +46,6 @@ pub(super) enum SidebarSection {
     Archived,
 }
 
-/// Persist the first-run intro picks: theme name to `config.theme.name`, attach mode to
-/// `default_attach_mode`. Failures are logged and swallowed so a config write hiccup
-/// cannot block startup.
 /// The `aoe.web` plugin serves the dashboard; with it disabled, `R` explains why instead.
 pub(super) fn web_plugin_disabled() -> bool {
     crate::plugin::registry()
@@ -56,6 +53,9 @@ pub(super) fn web_plugin_disabled() -> bool {
         .is_some_and(|p| !p.enabled)
 }
 
+/// Persist the first-run intro picks: theme name to `config.theme.name`, attach mode to
+/// `default_attach_mode`, telemetry opt-in to `config.telemetry.enabled`. Failures are
+/// logged and swallowed so a config write hiccup cannot block startup.
 fn apply_intro_outcome(outcome: &IntroOutcome) {
     if outcome.final_theme.is_none()
         && outcome.final_attach_mode.is_none()
@@ -1496,12 +1496,7 @@ impl HomeView {
             if let Some(DialogResult::Submit(action)) = dialog.handle_click(col, row) {
                 match action {
                     NoAgentsAction::Recheck => {
-                        crate::tmux::invalidate_agent_availability();
-                        let tools = crate::tmux::AvailableTools::detect();
-                        if tools.any_available() {
-                            self.set_available_tools(tools);
-                            self.no_agents_dialog = None;
-                        }
+                        self.pending_dialog_click_action = Some(Action::RecheckAgents);
                     }
                     NoAgentsAction::Quit => {
                         self.no_agents_dialog = None;
@@ -1891,13 +1886,7 @@ impl HomeView {
                     return Some(Action::Quit);
                 }
                 DialogResult::Submit(NoAgentsAction::Recheck) => {
-                    crate::tmux::invalidate_agent_availability();
-                    let tools = crate::tmux::AvailableTools::detect();
-                    if tools.any_available() {
-                        self.set_available_tools(tools);
-                        self.no_agents_dialog = None;
-                    }
-                    // If still no agents, keep dialog open (user can try again)
+                    return Some(Action::RecheckAgents);
                 }
             }
             return None;
@@ -6487,9 +6476,8 @@ impl HomeView {
             });
             return;
         }
-        // An approved integration owns responses. Missing or invalid reports fail closed
-        // rather than falling through to provider-specific terminal keystrokes.
-        if crate::plugin::agent_integration::configured(inst) {
+        // Reply-enabled integrations fail closed instead of falling through to terminal keys.
+        if crate::plugin::agent_integration::replies_configured(inst) {
             let Some(snapshot) = crate::plugin::agent_integration::snapshot(inst) else {
                 self.info_dialog = Some(InfoDialog::new(
                     "Integration Unavailable",

@@ -1840,9 +1840,13 @@ impl AcpConfig {
     }
 
     pub fn acp_defaults_for(&self, agent: &str) -> Option<&AcpAgentDefaults> {
-        self.acp_defaults
-            .get(agent)
-            .filter(|defaults| !defaults.is_empty())
+        let non_empty = |key: &str| self.acp_defaults.get(key).filter(|d| !d.is_empty());
+        non_empty(agent).or_else(|| {
+            // `claude-code` is the legacy alias stored by older session records.
+            (agent == "claude-code")
+                .then(|| non_empty("claude"))
+                .flatten()
+        })
     }
 
     /// The model `agent` is pinned to (`pin_model` with a non-empty `model`).
@@ -2123,22 +2127,19 @@ pub fn is_resolvable_agent_config_dir(dir: &str) -> bool {
 }
 
 impl SessionConfig {
-    /// Resolve the command override for a tool, checking agent_command_override first,
-    /// then falling back to custom_agents. Returns empty string if no override found.
+    /// Resolve the explicit command, custom command, or installed plugin agent command.
     pub fn resolve_tool_command(&self, tool: &str) -> String {
         self.agent_command_override
             .get(tool)
             .filter(|s| !s.is_empty())
             .or_else(|| self.custom_agents.get(tool))
             .cloned()
+            .or_else(|| crate::plugin::agent_integration::agent_command(tool))
             .unwrap_or_default()
     }
 
-    /// The command a launch runs for `tool` when the session carries no
-    /// per-session override: `agent_command_override`, else `custom_agents`,
-    /// else the built-in's binary, else empty. A surface with no session to
-    /// ask names the agent from this, so it describes the launch instead of a
-    /// second derivation of it.
+    /// The launch command when no per-session override is set: explicit
+    /// override, custom command, active plugin agent command, then built-in binary.
     pub fn launch_command_for(&self, tool: &str) -> String {
         let resolved = self.resolve_tool_command(tool);
         if !resolved.is_empty() {
@@ -2326,6 +2327,13 @@ pub struct WebConfig {
     #[serde(default = "default_true")]
     #[setting(label = "Notify on scheduled wake", widget = "toggle", global_only)]
     pub notify_on_wake_fire: bool,
+
+    /// Serve a Model Context Protocol server at `/mcp` on the daemon so MCP
+    /// clients holding the daemon token can list and drive sessions. When
+    /// false the route does not exist. Read at daemon startup.
+    #[serde(default)]
+    #[setting(label = "MCP server", widget = "toggle", global_only)]
+    pub mcp_enabled: bool,
 }
 
 impl Default for WebConfig {
@@ -2336,6 +2344,7 @@ impl Default for WebConfig {
             notify_on_idle: false,
             notify_on_error: true,
             notify_on_wake_fire: true,
+            mcp_enabled: false,
         }
     }
 }
@@ -4488,6 +4497,47 @@ mod tests {
         assert_eq!(config.pinned_model_for("gemini"), None);
     }
 
+    /// The legacy `claude-code` key prefers its own non-empty entry and only
+    /// falls back to `claude` when it has none.
+    #[test]
+    fn acp_defaults_claude_code_alias_prefers_its_own_entry() {
+        let entry = |model: Option<&str>| AcpAgentDefaults {
+            model: model.map(str::to_string),
+            pin_model: model.is_some(),
+            ..Default::default()
+        };
+        let cases: [(&[(&str, Option<&str>)], Option<&str>); 4] = [
+            (&[("claude", Some("canon"))], Some("canon")),
+            (&[("claude-code", Some("alias"))], Some("alias")),
+            (
+                &[("claude", Some("canon")), ("claude-code", Some("alias"))],
+                Some("alias"),
+            ),
+            (
+                &[("claude", Some("canon")), ("claude-code", None)],
+                Some("canon"),
+            ),
+        ];
+        for (entries, want) in cases {
+            let mut config = AcpConfig::default();
+            for (key, model) in entries {
+                config.acp_defaults.insert(key.to_string(), entry(*model));
+            }
+            assert_eq!(
+                config
+                    .acp_defaults_for("claude-code")
+                    .and_then(|d| d.model.as_deref()),
+                want,
+                "{entries:?}"
+            );
+            assert_eq!(
+                config.pinned_model_for("claude-code").as_deref(),
+                want,
+                "{entries:?}"
+            );
+        }
+    }
+
     /// Spawn resolution precedence: a pin replaces the request, an explicit
     /// request otherwise beats the configured default, blank values on either
     /// side are unset, and the per-model effort is keyed on the model that
@@ -4538,6 +4588,7 @@ mod tests {
             (Some(&flat), Some("  "), Some(""), Some("def"), Some("lo")),
             (Some(&keyed), None, None, Some("def"), Some("hi")),
             (Some(&keyed), Some("req"), None, Some("req"), Some("lo")),
+            (Some(&keyed), None, Some("med"), Some("def"), Some("med")),
             (
                 Some(&bare),
                 Some(" def "),

@@ -131,6 +131,7 @@ fn spawn_request_for(
             &instance.command,
         ),
         seed_history_replay: instance.import_pending == Some(true),
+        prior_conversation: false,
         claude_store_pin: instance.selected_claude_store_pin(),
     }
 }
@@ -519,7 +520,7 @@ mod tests {
                         }
                         crate::server::reload::reload_state_instances_from_disk(
                             &state,
-                            vec![fresh],
+                            vec![fresh].into(),
                             Vec::new(),
                             crate::server::state::StatusSource::DiskOnly,
                             state
