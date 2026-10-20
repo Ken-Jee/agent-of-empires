@@ -3,11 +3,12 @@
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
+use std::time::Duration;
 
 use rand::prelude::IndexedRandom;
 
 use super::words::PASSPHRASE_WORDS;
-use super::{ServeMode, TransportStatus, TunnelTransport};
+use super::{Job, JobDone, ServeMode, TransportStatus, TunnelTransport};
 use crate::acp::client::autostart::{initial_log_tail, load_or_generate_port};
 
 const SAVED_PASSPHRASE_FILE: &str = "serve.saved_passphrase";
@@ -255,6 +256,25 @@ pub(super) fn restart_daemon(
 ) -> Result<(), String> {
     stop_daemon()?;
     spawn_daemon(mode, passphrase, transport)
+}
+
+pub(super) fn run_job(job: Job) -> JobDone {
+    match job {
+        Job::Probe => JobDone::Probe(crate::cli::serve::daemon_pid().is_some()),
+        Job::Launch {
+            restart,
+            mode,
+            transport,
+            passphrase,
+        } => JobDone::Launched(if restart {
+            restart_daemon(mode, passphrase.as_deref(), transport).inspect(|()| {
+                // A reused Tailscale tunnel is back almost at once; skip the Starting flash.
+                std::thread::sleep(Duration::from_millis(200));
+            })
+        } else {
+            spawn_daemon(mode, passphrase.as_deref(), transport)
+        }),
+    }
 }
 
 pub(super) fn read_serve_mode() -> Option<ServeMode> {
