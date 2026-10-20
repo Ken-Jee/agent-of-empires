@@ -44,6 +44,8 @@ capabilities = ["runtime.worker"]
 
 An agent integration declares an optional launch command for an agent tool. Active plugins with a command contribute that tool to AoE's agent picker and CLI when the name is unique across plugin declarations and does not collide with a built-in or configured custom agent.
 
+Available plugin agents can be selected with `session.default_tool`. Discovery checks the executable after leading `NAME=value` assignments, using the process PATH and then the user's login shell without running the agent command or its arguments.
+
 
 ```toml
 [[agent_integrations]]
