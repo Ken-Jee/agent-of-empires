@@ -243,8 +243,7 @@ pub(super) fn build_resume_flags(
         return String::new();
     }
     let Some(agent) = get_agent(tool) else {
-        return crate::plugin::agent_integration::resume_argument(tool, session_id)
-            .unwrap_or_default();
+        return String::new();
     };
     let Some(support) = agent.session_support.as_ref() else {
         tracing::info!(target: "session.store",

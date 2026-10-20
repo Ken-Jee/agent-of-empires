@@ -35,104 +35,43 @@ fn minimal_manifest_parses_and_round_trips() {
 }
 
 #[test]
-fn agent_integrations_require_api_capability_and_unique_valid_tools() {
-    let base = r#"
+fn agent_integrations_require_api19_and_validate_unique_launch_tools() {
+    let valid = r#"
 id = "acme.session-agent"
 name = "Session Agent"
 version = "0.1.0"
-api_version = {api_version}
-capabilities = {capabilities}
+api_version = 19
 [[agent_integrations]]
 tool = "session-agent"
-provider_versions = ["=1.2.3"]
 command = "session-agent --"
-resume_arg = "--resume {session_id}"
-replies = true
 "#;
-    let valid = base
-        .replace("{api_version}", "19")
-        .replace("{capabilities}", r#"["session.integration"]"#);
-    let parsed = PluginManifest::from_toml_str(&valid).expect("valid integration parses");
+    let parsed = PluginManifest::from_toml_str(valid).expect("valid launch declaration parses");
+    assert_eq!(parsed.agent_integrations[0].tool, "session-agent");
     assert_eq!(
         parsed.agent_integrations[0].command.as_deref(),
         Some("session-agent --")
     );
-    assert_eq!(parsed.agent_integrations[0].tool, "session-agent");
-    assert_eq!(
-        parsed.agent_integrations[0].resume_arg.as_deref(),
-        Some("--resume {session_id}")
-    );
-    let launch_only = base
-        .replace("{api_version}", "19")
-        .replace("{capabilities}", "[]")
-        .replace("provider_versions = [\"=1.2.3\"]\n", "")
-        .replace("replies = true\n", "replies = false\n");
-    let parsed_launch_only =
-        PluginManifest::from_toml_str(&launch_only).expect("launch-only agent parses");
-    assert!(parsed_launch_only.agent_integrations[0]
-        .provider_versions
-        .is_empty());
-    for version in ["1.2.2", "1.2.4", "1.2.3-rc.1", "2.0.0", "unknown"] {
-        assert!(parsed.agent_integrations[0]
-            .provider_compat(version)
-            .is_err());
-    }
-    assert!(parsed.agent_integrations[0]
-        .provider_compat("1.2.3")
-        .is_ok());
-    for ranges in ["[]", r#"["not semver"]"#, r#"[""]"#] {
-        let invalid = valid.replace(r#"["=1.2.3"]"#, ranges);
-        assert!(matches!(
-            PluginManifest::from_toml_str(&invalid),
-            Err(ManifestError::Invalid(_))
-        ));
-    }
 
     let cases = [
         (
-            base.replace("{api_version}", "18")
-                .replace("{capabilities}", r#"["session.integration"]"#),
-            "require api_version >= 19",
+            valid.replace("api_version = 19", "api_version = 18"),
+            "agent_integrations require api_version >= 19",
         ),
         (
-            base.replace("{api_version}", "19")
-                .replace("{capabilities}", "[]"),
-            "require the session.integration capability",
-        ),
-        (
-            base.replace("{api_version}", "19")
-                .replace("{capabilities}", r#"["session.integration"]"#)
-                .replace("tool = \"session-agent\"", "tool = \"Session-Agent\""),
+            valid.replace("tool = \"session-agent\"", "tool = \"Session-Agent\""),
             "lowercase agent id",
         ),
         (
-            format!("{valid}\n[[agent_integrations]]\ntool = \"session-agent\"\nprovider_versions = [\"=1.2.3\"]\n"),
+            valid.replace("tool = \"session-agent\"", "tool = \"\""),
+            "nonempty lowercase agent id",
+        ),
+        (
+            format!("{valid}\n[[agent_integrations]]\ntool = \"session-agent\"\n"),
             "must not repeat tool",
         ),
         (
-            base.replace("{api_version}", "19")
-                .replace("{capabilities}", r#"["session.integration"]"#)
-                .replace("tool = \"session-agent\"", "tool = \"\""),
-            "must be a nonempty lowercase agent id",
-        ),
-        (
-            base.replace("{api_version}", "19")
-                .replace("{capabilities}", r#"["session.integration"]"#)
-                .replace("{session_id}", "missing"),
-            "must contain one {session_id} placeholder",
-        ),
-        (
-            launch_only.replace("replies = false", "replies = true"),
-            "require the session.integration capability",
-        ),
-        (
-            base.replace("{api_version}", "18")
-                .replace("{capabilities}", r#"["session.integration"]"#)
-                .replace(
-                    "\n[[agent_integrations]]\ntool = \"session-agent\"\nprovider_versions = [\"=1.2.3\"]\ncommand = \"session-agent --\"\nresume_arg = \"--resume {session_id}\"\nreplies = true\n",
-                    "\n",
-                ),
-            "session.integration capability requires api_version >= 19",
+            valid.replace("command = \"session-agent --\"", "command = \"\""),
+            "command must not be blank",
         ),
     ];
     for (toml, expected_error) in cases {
