@@ -57,7 +57,7 @@ replies = true
 |---|---|---|---|
 | `tool` | string | yes | Lowercase agent id; each tool may appear only once per plugin. |
 | `provider_versions` | array of strings | conditional | Required when declaring `session.integration`; nonempty alternative semver requirements for the agent runtime. A report's `provider_version` must match at least one. Omit for launch-only agent declarations. |
-| `command` | string | no | Default launch command for this agent. Active plugins with a command contribute the agent to AoE's agent picker and CLI. |
+| `command` | string | no | Default launch command for this agent. Active plugins with a command contribute the agent to AoE's agent picker and CLI only when the tool name is unique across plugins and does not collide with a built-in or configured custom agent. |
 | `resume_arg` | string | no | Resume argument template containing exactly one `{session_id}` placeholder. AoE shell-quotes the session id before substitution. |
 | `replies` | boolean | no | Explicitly enable provider-native prompt replies; defaults to false. Requires `session.integration`. Status-only integrations do not take over quick-response actions. |
 

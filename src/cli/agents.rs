@@ -34,31 +34,30 @@ pub fn run() -> Result<()> {
             println!("{}", crate::cli::lifecycle_notice_line("      ", &notice));
         }
     }
-    let plugin_agents: Vec<_> = crate::plugin::registry()
-        .active()
-        .flat_map(|plugin| {
-            plugin
-                .manifest
-                .agent_integrations
-                .iter()
-                .filter(|integration| {
-                    integration.command.is_some()
-                        && crate::agents::get_agent(&integration.tool).is_none()
-                })
-                .map(move |integration| (plugin.id().to_string(), integration.tool.clone()))
-        })
-        .collect();
-    for (plugin, name) in &plugin_agents {
-        if available_list.iter().any(|installed| installed == name) {
-            println!("  {installed_mark} {name:<12} installed (plugin: {plugin})");
+    let config = crate::session::Config::load_or_warn();
+    let registry = crate::plugin::registry();
+    let plugin_agents = crate::plugin::agent_integration::catalog(
+        &registry,
+        crate::agents::AGENTS.iter().map(|agent| agent.name),
+        config.session.custom_agents.keys().map(String::as_str),
+    );
+    for agent in &plugin_agents {
+        if available_list.iter().any(|installed| installed == agent.tool) {
+            println!(
+                "  {installed_mark} {:<12} installed (plugin: {})",
+                agent.tool, agent.plugin
+            );
         } else {
-            println!("  {missing_mark} {name:<12} runtime not installed (plugin: {plugin})");
+            println!(
+                "  {missing_mark} {:<12} runtime not installed (plugin: {})",
+                agent.tool, agent.plugin
+            );
         }
     }
 
     let plugin_installed = plugin_agents
         .iter()
-        .filter(|(_, name)| available_list.iter().any(|installed| installed == name))
+        .filter(|agent| available_list.iter().any(|installed| installed == agent.tool))
         .count();
     let installed_count = plugin_installed
         + crate::agents::AGENTS

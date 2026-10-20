@@ -18,48 +18,68 @@ use crate::{hooks::dir_guard, session::Instance};
 const MAX_REPORT_BYTES: usize = 64 * 1024;
 const REPORT_MAX_AGE: Duration = Duration::from_secs(15);
 
-fn provider<'a>(
-    registry: &'a super::PluginRegistry,
-    tool: &str,
-) -> Result<Option<&'a super::LoadedPlugin>> {
-    let mut matches = registry.active().filter(|plugin| {
-        plugin
-            .manifest
-            .capabilities
-            .iter()
-            .any(|c| c.as_str() == "session.integration")
-            && plugin
-                .manifest
-                .agent_integrations
-                .iter()
-                .any(|entry| entry.tool == tool)
-    });
-    let selected = matches.next();
-    ensure!(
-        matches.next().is_none(),
-        "multiple approved integrations claim {tool}"
-    );
-    Ok(selected)
+/// An active plugin-provided agent that does not collide with a built-in or custom agent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PluginAgent<'a> {
+    pub plugin: &'a str,
+    pub tool: &'a str,
+    pub command: &'a str,
 }
-/// Resolve a plugin-provided agent's launch command.
-pub fn agent_command(tool: &str) -> Option<String> {
-    let registry = super::registry();
-    let mut matches = registry.active().flat_map(|plugin| {
+
+fn unique_candidates<'a, 'b, 'c>(
+    candidates: impl IntoIterator<Item = (&'a str, &'a str, &'a str)>,
+    builtin_names: impl IntoIterator<Item = &'b str>,
+    custom_names: impl IntoIterator<Item = &'c str>,
+) -> Vec<PluginAgent<'a>> {
+    let mut names: HashSet<&str> = builtin_names.into_iter().collect();
+    names.extend(custom_names);
+    let mut candidate_counts = std::collections::HashMap::<&str, usize>::new();
+    let candidates: Vec<_> = candidates.into_iter().collect();
+    for (_, tool, _) in &candidates {
+        *candidate_counts.entry(tool).or_default() += 1;
+    }
+    candidates
+        .into_iter()
+        .filter_map(|(plugin, tool, command)| {
+            (candidate_counts[tool] == 1 && names.insert(tool))
+                .then_some(PluginAgent { plugin, tool, command })
+        })
+        .collect()
+}
+
+pub fn catalog<'a, 'b, 'c>(
+    registry: &'a super::PluginRegistry,
+    builtin_names: impl IntoIterator<Item = &'b str>,
+    custom_names: impl IntoIterator<Item = &'c str>,
+) -> Vec<PluginAgent<'a>> {
+    let candidates = registry.active().flat_map(|plugin| {
         plugin
             .manifest
             .agent_integrations
             .iter()
-            .filter(move |entry| entry.tool == tool)
-            .filter_map(move |entry| entry.command.clone().map(|command| (plugin.id(), command)))
+            .filter_map(move |entry| {
+                entry.command.as_deref().map(|command| (plugin.id(), entry.tool.as_str(), command))
+            })
     });
-    let (plugin, command) = matches.next()?;
-    if matches.next().is_some() {
-        tracing::warn!(tool, "multiple plugins provide an agent launch command");
-        return None;
-    }
-    tracing::debug!(tool, plugin, "resolved plugin-provided agent command");
-    Some(command)
+    unique_candidates(candidates, builtin_names, custom_names)
 }
+
+/// Resolve a unique plugin-provided agent launch command.
+pub fn agent_command(tool: &str) -> Option<String> {
+    let registry = super::registry();
+    catalog(
+        &registry,
+        crate::agents::AGENTS.iter().map(|agent| agent.name),
+        std::iter::empty(),
+    )
+    .into_iter()
+    .find(|agent| agent.tool == tool)
+    .map(|agent| {
+        tracing::debug!(tool, plugin = agent.plugin, "resolved plugin-provided agent command");
+        agent.command.to_string()
+    })
+}
+
 /// Resolve resume flags from the unique active plugin declaring them.
 pub fn resume_argument(tool: &str, session_id: &str) -> Option<String> {
     let registry = super::registry();
@@ -430,6 +450,29 @@ pub fn respond(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn catalog_suppresses_duplicate_provider_and_custom_or_builtin_collisions() {
+        let entries = unique_candidates(
+            [
+                ("plugin-a", "duplicate", "a"),
+                ("plugin-b", "duplicate", "b"),
+                ("plugin-c", "builtin-agent", "c"),
+                ("plugin-d", "custom-agent", "d"),
+                ("plugin-e", "unique-agent", "e"),
+            ],
+            ["builtin-agent"],
+            ["custom-agent"],
+        );
+        assert_eq!(
+            entries,
+            [PluginAgent {
+                plugin: "plugin-e",
+                tool: "unique-agent",
+                command: "e",
+            }]
+        );
+    }
+
 
     #[test]
     fn plugin_resume_template_keeps_session_id_as_one_shell_argument() {
