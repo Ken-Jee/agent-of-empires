@@ -25,38 +25,6 @@ fn default_source() -> ReadRequestSource {
 
 #[test]
 #[serial_test::parallel]
-fn scope_namespace_metadata_is_optional_and_cannot_inject_a_unit_pattern() {
-    let frames = pack::application_frames(pack::fixture("uds-list-nominal").wire);
-    let mut frame: serde_json::Value = serde_json::from_slice(frames[1].as_bytes()).unwrap();
-    frame["data"]
-        .as_object_mut()
-        .unwrap()
-        .remove("systemd_scope_namespace");
-    let old = parse_snapshot(&serde_json::to_vec(&frame).unwrap()).unwrap();
-    super::dto::validate_snapshot(&old).unwrap();
-    assert!(old.systemd_scope_namespace.is_none());
-    for namespace in [serde_json::Value::Null, serde_json::json!("ab".repeat(32))] {
-        frame["data"]["systemd_scope_namespace"] = namespace;
-        let decoded = parse_snapshot(&serde_json::to_vec(&frame).unwrap()).unwrap();
-        super::dto::validate_snapshot(&decoded).unwrap();
-    }
-    for namespace in [
-        "debug:agent-of-empires-dev".to_string(),
-        "../replacement".into(),
-        "AB".repeat(32),
-        "a".repeat(65),
-    ] {
-        frame["data"]["systemd_scope_namespace"] = serde_json::json!(namespace);
-        let decoded = parse_snapshot(&serde_json::to_vec(&frame).unwrap());
-        assert!(
-            decoded.is_err()
-                || decoded.is_ok_and(|value| super::dto::validate_snapshot(&value).is_err())
-        );
-    }
-}
-
-#[test]
-#[serial_test::parallel]
 fn required_nullable_fields_reject_omission_but_accept_null() {
     let frames = pack::application_frames(pack::fixture("uds-list-nominal").wire);
     let mut hello: serde_json::Value = serde_json::from_slice(frames[0].as_bytes()).unwrap();

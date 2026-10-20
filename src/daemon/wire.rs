@@ -1,5 +1,6 @@
 //! Shared wire types for the daemon REST API.
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::session::SessionScope;
@@ -643,12 +644,8 @@ where
     })
 }
 
-/// Which ACP `ContentBlock` an attachment maps to. The string form
-/// (`"image"` / `"audio"` / `"resource"`) is the wire contract shared
-/// with the web composer and the prompt-request DTO in `protocol.rs`,
-/// so renaming a variant breaks the build on both sides rather than
-/// silently dropping attachments.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// ACP attachment kind shared with the composer and prompt DTOs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum PromptAttachmentKind {
     Image,
@@ -680,13 +677,9 @@ impl PromptAttachmentKind {
     }
 }
 
-/// Replay-side view of one prompt attachment. Carries metadata only,
-/// never the bytes: the decoded blob lives in the `acp_attachments`
-/// table keyed by `(session_id, id)` and is fetched lazily over
-/// `GET /acp/attachments/{id}`. Keeping bytes out of the event log
-/// is what stops `event_json` (and every WS replay frame) from bloating
-/// to megabytes per screenshot. See #1000 / #965.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// Metadata only: the blob is fetched lazily from `GET /acp/attachments/{id}` so the event
+/// log stays small.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct PromptAttachmentRef {
     pub id: String,
     pub kind: PromptAttachmentKind,
@@ -698,18 +691,8 @@ pub struct PromptAttachmentRef {
     pub size: u64,
 }
 
-/// One entry in a session's server-owned prompt queue: a follow-up the
-/// user lined up while a turn was busy. The daemon is the source of truth
-/// (persisted on the `Instance`), so the queue survives a client reload or
-/// a closed PWA and drains on turn-end with no tab open.
-///
-/// Attachments carry metadata only, exactly like [`PromptAttachmentRef`]
-/// on a live prompt: the bytes live in the event store's pending-attachment
-/// table keyed by `(session_id, prompt_id, attachment_id)` (outside the
-/// seq-keyed retention prune, since a queued prompt has no event seq yet) and
-/// are reloaded at drain time, so a queued screenshot does not bloat the
-/// session file.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// One queued follow-up prompt, owned by the daemon so it drains with no tab open.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct QueuedPromptEntry {
     /// Client-minted stable id, unchanged across edits. Doubles as the
     /// optimistic-echo reconcile key on the client.
@@ -732,13 +715,8 @@ pub struct QueuedPromptEntry {
     pub origin_plugin: Option<String>,
 }
 
-/// Public lifecycle state for a structured view worker, surfaced via
-/// `SessionResponse.acp_worker_state` so the sidebar + structured view
-/// can show a "Resuming…" affordance while the reconciler is mid-spawn
-/// or mid-attach. Deliberately not persisted to the structured view event log:
-/// daemon lifecycle is ephemeral, transcript replay should not carry
-/// it. See #1088.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+/// Ephemeral worker lifecycle; never persisted to the event log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum AcpWorkerState {
     /// No worker for this session and no resume in flight.
@@ -754,7 +732,22 @@ pub enum AcpWorkerState {
     Stopping,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AcpWorkerStartKind {
+    FirstStart,
+    Resume,
+}
+
+/// How the current worker start began; present only while the state is `resuming`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct AcpWorkerStart {
+    pub kind: AcpWorkerStartKind,
+    /// RFC 3339, fixed for one admitted start.
+    pub started_at: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ContextResumeUnavailableReason {
     AgentUnsupported,
@@ -767,16 +760,15 @@ pub enum ContextResumeUnavailableReason {
     NoTarget,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ContextResumeIndeterminateReason {
     RuntimeCheckRequired,
     AgentHandshakeRequired,
 }
 
-/// Whether the daemon can preserve agent context during a future authorized
-/// lifecycle transition. This is not current start eligibility.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// Whether context survives a future lifecycle transition, not current start eligibility.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum ContextResumeAvailability {
     Available,
@@ -788,12 +780,7 @@ pub enum ContextResumeAvailability {
     },
 }
 
-/// One unresolved structured (ACP) approval, projected for the home TUI's
-/// permission-response dialog. The TUI resolves the `nonce` through the ACP
-/// resolver and shows `tool_name` / `target` / `destructive` so the user
-/// sees what they are answering without entering the structured view. No
-/// dashboard surface renders this; the web client ignores the field.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema)]
 pub struct PendingApproval {
     pub nonce: String,
     pub tool_name: String,
@@ -816,7 +803,7 @@ pub enum RestoreOutcome {
 }
 
 /// One session from the daemon. Only `id` is required when decoding.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct SessionResponse {
     pub id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -844,6 +831,8 @@ pub struct SessionResponse {
     pub status: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lifecycle_reservation: Option<crate::session::LifecycleReservation>,
     #[serde(default)]
@@ -1038,11 +1027,8 @@ pub struct SessionResponse {
     /// structured view. See #1088.
     #[serde(default)]
     pub acp_worker_state: AcpWorkerState,
-    /// Unresolved structured approvals in request order, projected only for
-    /// live (`running` worker) structured sessions. The TUI uses these to
-    /// route the existing permission-response dialog through the ACP
-    /// resolver and to show what is being approved; no dashboard surface
-    /// renders them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acp_worker_start: Option<AcpWorkerStart>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pending_approvals: Vec<PendingApproval>,
     /// The provider rate limit this session is parked on, read from the
@@ -1165,7 +1151,7 @@ pub struct SessionResponse {
     pub monitor_description: Option<String>,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema)]
 pub struct PlanSummary {
     /// First non-completed step's title, truncated to ~80 chars so the
     /// sidebar row doesn't overflow.
@@ -1176,7 +1162,7 @@ pub struct PlanSummary {
     pub total: u32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema)]
 pub struct WorkspaceRepoSummary {
     pub name: String,
     pub source_path: String,
@@ -1195,7 +1181,7 @@ pub struct WorkspaceRepoSummary {
     pub base_branch_override: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, JsonSchema)]
 pub struct CleanupDefaults {
     pub delete_worktree: bool,
     pub delete_branch: bool,
@@ -1206,12 +1192,8 @@ pub struct CleanupDefaults {
     pub delete_to_trash: bool,
 }
 
-// Envelope for `GET /api/sessions`. Wraps the sessions list with the
-// user's persisted workspace ordering so the client can render the
-// sidebar in the requested order on the first paint, with no extra
-// round-trip. The order is a list of workspace ids; ids not present
-// fall back to the client's default newest-first ordering. See #1169.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+/// Published session rows and their workspace order.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema)]
 pub struct SessionsEnvelope {
     pub sessions: Vec<SessionResponse>,
     #[serde(default)]
@@ -1240,6 +1222,10 @@ mod tests {
         assert_eq!(row.status, "");
         assert_eq!(row.view, crate::session::View::Terminal);
         assert_eq!(row.acp_worker_state, AcpWorkerState::Absent);
+        assert_eq!(row.acp_worker_start, None);
+        assert!(!serde_json::to_string(&row)
+            .unwrap()
+            .contains("acp_worker_start"));
         assert!(!row.cleanup_defaults.delete_to_trash);
         assert!(row.workspace_repos.is_empty());
         assert_eq!(row.context_resume, None);

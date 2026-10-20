@@ -6,6 +6,7 @@ import type { SchemaSettings } from "./generated/settingsKeys";
 export interface SessionResponse {
   id: string;
   idempotency_key?: string | null;
+  parent_session_id?: string | null;
   title: string;
   project_path: string;
   /** Host path of the session's managed artifact directory. */

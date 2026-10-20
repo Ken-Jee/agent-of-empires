@@ -159,10 +159,7 @@ fn render_list(
         }
         let mut stderr = String::new();
         if args.json {
-            let systemd_namespace = snapshot
-                .systemd_scope_namespace
-                .as_deref()
-                .filter(|_| local_peer && list::systemd_scopes_active());
+            let systemd_active = local_peer && list::systemd_scopes_active();
             let mut rows = Vec::new();
             for profile in snapshot.profiles.iter().filter(|profile| profile.listed) {
                 if !profile_sessions_healthy(profile) {
@@ -176,7 +173,7 @@ fn render_list(
                 for session in sessions_for_profile(snapshot, &profile.name)
                     .filter(|session| matches_state(session.state, state))
                 {
-                    rows.push(session_json(session, &profile.name, systemd_namespace)?);
+                    rows.push(session_json(session, &profile.name, systemd_active)?);
                 }
             }
             let incomplete = !stderr.is_empty();
@@ -245,13 +242,10 @@ fn render_list(
     require_selected_profile_health(snapshot, profile, profile_name)?;
 
     if args.json {
-        let systemd_namespace = snapshot
-            .systemd_scope_namespace
-            .as_deref()
-            .filter(|_| local_peer && list::systemd_scopes_active());
+        let systemd_active = local_peer && list::systemd_scopes_active();
         let rows: Vec<SessionJson> = sessions
             .iter()
-            .map(|session| session_json(session, profile_name, systemd_namespace))
+            .map(|session| session_json(session, profile_name, systemd_active))
             .collect::<Result<_, _>>()?;
         return json_lines(&rows).map(Projection::text);
     }
@@ -308,7 +302,7 @@ fn tree_order<'a>(sessions: &'a [&'a SessionRead]) -> Vec<(&'a SessionRead, usiz
 fn session_json(
     session: &SessionRead,
     profile: &str,
-    systemd_namespace: Option<&str>,
+    systemd_active: bool,
 ) -> Result<SessionJson, ReadFailure> {
     Ok(SessionJson {
         id: session.id.clone(),
@@ -340,12 +334,10 @@ fn session_json(
             base_branch: worktree.base_branch.clone(),
         }),
         parent_session_id: session.parent_session_id.clone(),
-        systemd_unit: systemd_namespace
-            .filter(|_| {
-                session.state.as_str() == "live"
-                    && crate::process::systemd::has_process(session.status.session_status())
-            })
-            .map(|namespace| crate::process::systemd::unit_glob(&session.id, namespace)),
+        systemd_unit: (systemd_active
+            && session.state.as_str() == "live"
+            && crate::process::systemd::has_process(session.status.session_status()))
+        .then(|| crate::process::systemd::unit_glob(&session.id)),
     })
 }
 
@@ -1025,7 +1017,6 @@ mod tests {
         };
         SnapshotData {
             namespace: "debug:agent-of-empires-dev".into(),
-            systemd_scope_namespace: None,
             cursor: Cursor {
                 epoch: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".into(),
                 revision: 1,
@@ -1177,7 +1168,6 @@ mod tests {
         std::fs::write(manager.path().join("systemd/private"), "").unwrap();
         let _env = crate::session::test_support::EnvGuard::unset(&["DBUS_SESSION_BUS_ADDRESS"])
             .and_set("XDG_RUNTIME_DIR", manager.path());
-        crate::session::config::update_config(|config| config.systemd.enabled = true).unwrap();
         let cases = [
             (WireStatus::Running, WireState::Live, true),
             (WireStatus::Stopped, WireState::Live, false),
@@ -1196,116 +1186,40 @@ mod tests {
                 row
             })
             .collect();
-        let mut value = snapshot(rows);
-        value.systemd_scope_namespace = Some(crate::process::systemd::scope_namespace().unwrap());
-        for all in [false, true] {
-            for local in [false, true] {
-                let args = ListArgs {
-                    json: true,
-                    all,
-                    state: StateFilter::All,
-                };
-                let projection = evaluate(
-                    &ScopedCommand::List(&args),
-                    &value,
-                    &source(),
-                    local.then_some(Path::new("/owned-home")),
-                )
+        let value = snapshot(rows);
+        for enabled in [false, true] {
+            crate::session::config::update_config(|config| config.systemd.enabled = enabled)
                 .unwrap();
-                let rendered: serde_json::Value = serde_json::from_str(&projection.stdout).unwrap();
-                for (index, (_, _, eligible)) in cases.iter().enumerate() {
-                    assert_eq!(
-                        rendered[index]
-                            .get("systemd_unit")
-                            .and_then(serde_json::Value::as_str),
-                        value
-                            .systemd_scope_namespace
-                            .as_deref()
-                            .filter(|_| local && *eligible)
-                            .map(|namespace| format!("aoe-session-row{index}-{namespace}-*.scope"))
-                            .as_deref(),
-                        "all={all}, local={local}, row={index}"
-                    );
+            for all in [false, true] {
+                for local in [false, true] {
+                    let args = ListArgs {
+                        json: true,
+                        all,
+                        state: StateFilter::All,
+                    };
+                    let projection = evaluate(
+                        &ScopedCommand::List(&args),
+                        &value,
+                        &source(),
+                        local.then_some(Path::new("/owned-home")),
+                    )
+                    .unwrap();
+                    let rendered: serde_json::Value =
+                        serde_json::from_str(&projection.stdout).unwrap();
+                    for (index, (_, _, eligible)) in cases.iter().enumerate() {
+                        assert_eq!(
+                            rendered[index]
+                                .get("systemd_unit")
+                                .and_then(serde_json::Value::as_str),
+                            (enabled && local && *eligible)
+                                .then(|| format!("aoe-session-row{index}-*.scope"))
+                                .as_deref(),
+                            "all={all}, local={local}, row={index}"
+                        );
+                    }
                 }
             }
         }
-    }
-    #[cfg(target_os = "linux")]
-    #[test]
-    #[serial_test::serial]
-    fn namespaced_scope_hints_follow_the_recorded_daemon_not_the_client_home() {
-        let _daemon = crate::session::test_support::isolate_app_dir();
-        let manager = tempfile::tempdir().unwrap();
-        std::fs::create_dir(manager.path().join("systemd")).unwrap();
-        std::fs::write(manager.path().join("systemd/private"), "").unwrap();
-        let _env = crate::session::test_support::EnvGuard::unset(&["DBUS_SESSION_BUS_ADDRESS"])
-            .and_set("XDG_RUNTIME_DIR", manager.path());
-        crate::session::config::update_config(|config| config.systemd.enabled = true).unwrap();
-        crate::session::Storage::new_unwatched("main").unwrap();
-        let mut row = crate::session::Instance::new("daemon scope hint", "/repo");
-        row.source_profile = "main".into();
-        row.status = crate::session::Status::Running;
-        let mut value = recorded_rows(
-            std::slice::from_ref(&row),
-            crate::server::runtime_ws::RecordedOwner::Local { uid: 0 },
-        );
-        let namespace = crate::process::systemd::scope_namespace().unwrap();
-        assert_eq!(
-            value.systemd_scope_namespace.as_deref(),
-            Some(namespace.as_str())
-        );
-        let client_home = tempfile::tempdir().unwrap();
-        let _client = crate::session::test_support::isolate_app_dir_at(client_home.path());
-        crate::session::config::update_config(|config| config.systemd.enabled = true).unwrap();
-        assert_ne!(
-            crate::process::systemd::scope_namespace().unwrap(),
-            namespace
-        );
-        for all in [false, true] {
-            for local in [false, true] {
-                let args = ListArgs {
-                    json: true,
-                    all,
-                    state: StateFilter::All,
-                };
-                let rendered = evaluate(
-                    &ScopedCommand::List(&args),
-                    &value,
-                    &source(),
-                    local.then_some(Path::new("/daemon-home")),
-                )
-                .unwrap();
-                let rows: serde_json::Value = serde_json::from_str(&rendered.stdout).unwrap();
-                assert_eq!(rows[0]["id"], row.id);
-                assert_eq!(
-                    rows[0]
-                        .get("systemd_unit")
-                        .and_then(serde_json::Value::as_str),
-                    local
-                        .then(|| format!("aoe-session-{}-{namespace}-*.scope", row.id))
-                        .as_deref()
-                );
-            }
-        }
-        value.systemd_scope_namespace = None;
-        let args = ListArgs {
-            json: true,
-            all: false,
-            state: StateFilter::All,
-        };
-        let rendered = evaluate(
-            &ScopedCommand::List(&args),
-            &value,
-            &source(),
-            Some(Path::new("/daemon-home")),
-        )
-        .unwrap();
-        let rows: serde_json::Value = serde_json::from_str(&rendered.stdout).unwrap();
-        assert_eq!(rows[0]["id"], row.id);
-        assert!(
-            rows[0].get("systemd_unit").is_none(),
-            "legacy missing metadata cannot invent a client-home namespace"
-        );
     }
 
     #[test]

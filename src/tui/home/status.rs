@@ -281,6 +281,7 @@ impl HomeView {
                 || instance.project_path != row.project_path
                 || instance.sort_index != row.sort_index
                 || instance.agent_session_id != row.agent_session_id
+                || instance.parent_session_id != row.parent_session_id
                 || instance.lifecycle_generation != row.lifecycle_generation
                 || instance.lifecycle_reservation != row.lifecycle_reservation
                 || instance.trash_lifecycle_id != row.trash_lifecycle_id
@@ -489,6 +490,9 @@ impl HomeView {
                 .base_branch_override
                 .clone_from(&row.base_branch_override);
             instance.agent_session_id.clone_from(&row.agent_session_id);
+            instance
+                .parent_session_id
+                .clone_from(&row.parent_session_id);
             instance.lifecycle_generation = row.lifecycle_generation;
             instance
                 .lifecycle_reservation

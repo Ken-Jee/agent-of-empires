@@ -26,9 +26,10 @@ use super::agent_registry::AgentRegistry;
 pub use super::runner_lifecycle::ResumeKind;
 use super::runner_lifecycle::{
     Lease, LifecycleTable, ProcessControl, RunnerIdentity, SystemProcessControl, WorkerPhase,
+    WorkerStart,
 };
 use super::state::AcpSessionId;
-use crate::daemon::AcpWorkerState;
+use crate::daemon::{AcpWorkerStart, AcpWorkerStartKind, AcpWorkerState};
 use crate::session::SandboxInfo;
 pub(crate) use teardown::RetirementTarget;
 
@@ -129,6 +130,19 @@ struct WorkerHandle {
     launch_epoch: u64,
     lease: Lease,
     native_session_id: Option<String>,
+}
+
+impl From<WorkerStart> for AcpWorkerStart {
+    fn from(start: WorkerStart) -> Self {
+        Self {
+            kind: if start.first_start {
+                AcpWorkerStartKind::FirstStart
+            } else {
+                AcpWorkerStartKind::Resume
+            },
+            started_at: start.started_at.to_rfc3339(),
+        }
+    }
 }
 
 impl From<WorkerPhase> for AcpWorkerState {
@@ -379,11 +393,13 @@ impl<S: BroadcastSink> Supervisor<S> {
         out
     }
 
-    pub async fn worker_states_snapshot(&self) -> HashMap<String, AcpWorkerState> {
+    pub async fn worker_states_snapshot(
+        &self,
+    ) -> HashMap<String, (AcpWorkerState, Option<AcpWorkerStart>)> {
         lock_recover(&self.lifecycle)
             .snapshot()
             .into_iter()
-            .map(|(id, phase)| (id, phase.into()))
+            .map(|(id, (phase, start))| (id, (phase.into(), start.map(Into::into))))
             .collect()
     }
 

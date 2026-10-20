@@ -28,6 +28,9 @@ fn skip_capture(
 const LEGACY_RUNNING_HOOK_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(900);
 
 impl Instance {
+    // Local polling measures from finalization; the Daemon uses persisted pane birth.
+    pub(crate) const STARTUP_GRACE_SECS: u64 = 3;
+
     /// Update status using pre-fetched pane metadata to avoid per-instance subprocess spawns.
     pub fn update_status_with_metadata(
         &mut self,
@@ -169,7 +172,7 @@ impl Instance {
         }
 
         if let Some(start_time) = self.last_start_time {
-            if start_time.elapsed().as_secs() < 3 {
+            if start_time.elapsed().as_secs() < Self::STARTUP_GRACE_SECS {
                 self.status = Status::Starting;
                 return;
             }

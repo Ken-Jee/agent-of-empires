@@ -365,6 +365,11 @@ async fn deferred_enable_request(
         .acp_supervisor
         .reserve_spawn(
             session_id,
+            if seed.stored_acp_session_id.is_some() {
+                crate::acp::supervisor::ResumeKind::Spawn
+            } else {
+                crate::acp::supervisor::ResumeKind::SpawnFirst
+            },
             crate::process::worker_registry::ResumeAuthority::Explicit,
         )
         .await
@@ -695,6 +700,7 @@ mod tests {
             .acp_supervisor
             .reserve_spawn(
                 &row.id,
+                crate::acp::supervisor::ResumeKind::SpawnFirst,
                 crate::process::worker_registry::ResumeAuthority::Explicit,
             )
             .await
@@ -736,6 +742,7 @@ mod tests {
             .acp_supervisor
             .reserve_spawn(
                 &row.id,
+                crate::acp::supervisor::ResumeKind::SpawnFirst,
                 crate::process::worker_registry::ResumeAuthority::Explicit,
             )
             .await?;
@@ -794,6 +801,7 @@ mod tests {
             .acp_supervisor
             .reserve_spawn(
                 &row.id,
+                crate::acp::supervisor::ResumeKind::SpawnFirst,
                 crate::process::worker_registry::ResumeAuthority::Explicit,
             )
             .await?;

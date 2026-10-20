@@ -30,16 +30,22 @@ impl<S: BroadcastSink> Supervisor<S> {
         req: SpawnRequest,
         authority: crate::process::worker_registry::ResumeAuthority,
     ) -> Result<(), SupervisorError> {
-        let reservation = self.reserve_spawn(&req.session_id, authority).await?;
+        let kind = if req.stored_acp_session_id.is_some() {
+            ResumeKind::Spawn
+        } else {
+            ResumeKind::SpawnFirst
+        };
+        let reservation = self.reserve_spawn(&req.session_id, kind, authority).await?;
         self.spawn_inner(req, reservation).await
     }
 
     pub(crate) async fn reserve_spawn(
         &self,
         id: &str,
+        kind: ResumeKind,
         authority: crate::process::worker_registry::ResumeAuthority,
     ) -> Result<ResumeReservation, SupervisorError> {
-        match self.begin_resume(id, ResumeKind::Spawn, authority).await? {
+        match self.begin_resume(id, kind, authority).await? {
             ResumeReservationOutcome::Reserved(reservation) => Ok(reservation),
             ResumeReservationOutcome::AlreadyPresent => {
                 Err(SupervisorError::AlreadyRunning(id.to_owned()))
@@ -78,7 +84,7 @@ impl<S: BroadcastSink> Supervisor<S> {
                 return Err(SupervisorError::SpawnCancelled(session_id.to_string()));
             }
         };
-        if matches!(kind, ResumeKind::Spawn) {
+        if kind != ResumeKind::Attach {
             let registry_count = worker_registry::list()
                 .map(|recs| {
                     recs.into_iter()

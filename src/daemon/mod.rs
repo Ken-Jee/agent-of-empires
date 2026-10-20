@@ -28,21 +28,22 @@ use reqwest::{StatusCode, Url};
 use thiserror::Error;
 
 pub use wire::{
-    AbandonPurgeBody, AcpWorkerState, AttachProjectBody, AttachProjectOutcome, AttachedProject,
-    AttachedWorkerOutcome, CleanupDefaults, CollapseGroupBody, ContextResumeAvailability,
-    ContextResumeIndeterminateReason, ContextResumeUnavailableReason, CreateProfileBody,
-    CreateProjectBody, CreateSessionBody, CreationTrustFingerprint, CreationTrustRequest,
-    CreationTrustReview, DefaultProfileBody, DeleteGroupBody, DeleteGroupMode, DeleteGroupOutcome,
-    DeleteProfileQuery, DeleteSessionBody, EnsureToolBody, GroupLocation, GroupSessionFailure,
-    GroupSessionFailureCode, GroupSessionOutcome, ListSessionsQuery, MoveDirection, MoveGroupBody,
-    PendingApproval, PlanSummary, PromptAttachmentKind, PromptAttachmentRef, PurgeOutcome,
-    QueuedPromptEntry, RenameOutcome, RenameProfileBody, RenameSessionBody, ReorderBody,
-    ReorderOutcome, RepoBaseInput, RestartOutcome, RestartSessionBody, RestoreOutcome,
-    SessionResponse, SessionsEnvelope, SetWorktreeNameBody, StartSessionBody, StopAuxiliaryBody,
-    TerminalSize, TerminalTarget, TerminalTargetStatus, TrashOutcome, TrashRelocationOutcome,
-    TrashSessionBody, Tristate, UpdateArchiveBody, UpdateColorBody, UpdateDiffBaseBody,
-    UpdateFavoriteBody, UpdateGroupBody, UpdateNotificationsBody, UpdatePinBody, UpdateSnoozeBody,
-    UpdateUnreadBody, WorkspaceRepoSummary, WorktreeEditOutcome,
+    AbandonPurgeBody, AcpWorkerStart, AcpWorkerStartKind, AcpWorkerState, AttachProjectBody,
+    AttachProjectOutcome, AttachedProject, AttachedWorkerOutcome, CleanupDefaults,
+    CollapseGroupBody, ContextResumeAvailability, ContextResumeIndeterminateReason,
+    ContextResumeUnavailableReason, CreateProfileBody, CreateProjectBody, CreateSessionBody,
+    CreationTrustFingerprint, CreationTrustRequest, CreationTrustReview, DefaultProfileBody,
+    DeleteGroupBody, DeleteGroupMode, DeleteGroupOutcome, DeleteProfileQuery, DeleteSessionBody,
+    EnsureToolBody, GroupLocation, GroupSessionFailure, GroupSessionFailureCode,
+    GroupSessionOutcome, ListSessionsQuery, MoveDirection, MoveGroupBody, PendingApproval,
+    PlanSummary, PromptAttachmentKind, PromptAttachmentRef, PurgeOutcome, QueuedPromptEntry,
+    RenameOutcome, RenameProfileBody, RenameSessionBody, ReorderBody, ReorderOutcome,
+    RepoBaseInput, RestartOutcome, RestartSessionBody, RestoreOutcome, SessionResponse,
+    SessionsEnvelope, SetWorktreeNameBody, StartSessionBody, StopAuxiliaryBody, TerminalSize,
+    TerminalTarget, TerminalTargetStatus, TrashOutcome, TrashRelocationOutcome, TrashSessionBody,
+    Tristate, UpdateArchiveBody, UpdateColorBody, UpdateDiffBaseBody, UpdateFavoriteBody,
+    UpdateGroupBody, UpdateNotificationsBody, UpdatePinBody, UpdateSnoozeBody, UpdateUnreadBody,
+    WorkspaceRepoSummary, WorktreeEditOutcome,
 };
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(15);

@@ -1018,8 +1018,12 @@ mod tests {
             .unwrap();
         assert!(sup.is_owned(id).await);
         assert!(matches!(
-            sup.reserve_spawn(id, worker_registry::ResumeAuthority::Explicit)
-                .await,
+            sup.reserve_spawn(
+                id,
+                super::super::ResumeKind::Spawn,
+                worker_registry::ResumeAuthority::Explicit
+            )
+            .await,
             Err(super::super::SupervisorError::TeardownPending(_))
         ));
     }

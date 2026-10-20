@@ -92,6 +92,55 @@ test("structured view settings persist through PATCH + reload, node_path is stri
   expect(fetched?.acp?.node_path).not.toBe("/tmp/evil-node");
 });
 
+test("MCP switch persists globally and changes route availability only after restart", async ({ serve, page }) => {
+  const settingsUrl = `${serve.baseUrl}/api/settings`;
+  const machineUrl = `${settingsUrl}?layer=machine`;
+  const mcpList = () =>
+    fetch(`${serve.baseUrl}/mcp`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Accept: "application/json, text/event-stream" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }),
+    });
+  await page.goto(`${serve.baseUrl}/settings/notifications`);
+  const toggle = page.locator('[data-settings-field="web.mcp_enabled"]').getByRole("switch");
+  await expect(toggle).toHaveAttribute("aria-checked", "false");
+  expect([404, 405]).toContain((await mcpList()).status);
+  await toggle.click();
+  await expect.poll(async () => (await getJson(machineUrl)).web.mcp_enabled).toBe(true);
+  expect([404, 405]).toContain((await mcpList()).status);
+  await page.reload();
+  await expect(toggle).toHaveAttribute("aria-checked", "true");
+
+  const created = await fetch(`${serve.baseUrl}/api/profiles`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name: "mcp-other" }),
+  });
+  expect(created.ok).toBe(true);
+  expect((await getJson(`${settingsUrl}?profile=mcp-other`)).web.mcp_enabled).toBe(true);
+  const profileUrl = `${serve.baseUrl}/api/profiles/mcp-other/settings`;
+  expect((await getJson(profileUrl)).web?.mcp_enabled).toBeUndefined();
+  const rejected = await fetch(profileUrl, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ web: { mcp_enabled: false } }),
+  });
+  expect(rejected.status).toBe(400);
+  expect((await getJson(machineUrl)).web.mcp_enabled).toBe(true);
+
+  await serve.restart();
+  const enabled = await mcpList();
+  expect(enabled.status).toBe(200);
+  expect((await enabled.json()).result.tools.map((tool: { name: string }) => tool.name)).toContain("list_sessions");
+  await page.reload();
+  await expect(toggle).toHaveAttribute("aria-checked", "true");
+  await toggle.click();
+  await expect.poll(async () => (await getJson(machineUrl)).web.mcp_enabled).toBe(false);
+  expect((await mcpList()).status).toBe(200);
+  await serve.restart();
+  expect([404, 405]).toContain((await mcpList()).status);
+});
+
 test("theme picker repaints, persists across reload and serve restart (#1510)", async ({ serve, page }) => {
   // The picker writes the global /api/theme endpoint and must dispatch its repaint only after the write.
   const settingsUrl = `${serve.baseUrl}/api/settings`;

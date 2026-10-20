@@ -16,7 +16,7 @@ pub struct TerminalInfo {
     pub created: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum AuxiliaryTarget {
     Host { index: u32 },
@@ -24,7 +24,9 @@ pub enum AuxiliaryTarget {
     Tool { tool_name: String },
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum PanePresence {
     Absent,
@@ -34,7 +36,7 @@ pub enum PanePresence {
     Unknown,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct LegacyToolIdentity {
     pub session_id: String,
@@ -52,7 +54,7 @@ pub struct LegacyToolAdoption {
 }
 
 /// Native handoff requires Alive without a pending ownership adoption.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct PaneObservation {
     #[serde(default)]
     pub state: PanePresence,
@@ -62,18 +64,17 @@ pub struct PaneObservation {
     pub legacy_tool: Option<LegacyToolIdentity>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct AuxiliaryObservation {
     pub target: AuxiliaryTarget,
     #[serde(flatten)]
     pub pane: PaneObservation,
 }
 
-/// How a session is rendered. `Structured` uses the ACP-based native
-/// rendering (plan panels, tool-call cards, approvals); `Terminal` streams
-/// the raw tmux/PTY through xterm.js. `Terminal` is the conservative
-/// deserialization default; session creation sets the value explicitly.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+/// ACP-native structured view or raw tmux terminal.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum View {
     #[default]

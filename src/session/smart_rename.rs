@@ -27,10 +27,11 @@ use std::path::{Path, PathBuf};
 /// sessions each hold a slot for up to `ONESHOT_TIMEOUT`. See #2348.
 pub const MAX_CONCURRENT: usize = 2;
 
-/// Per-session smart-rename state surfaced to the dashboard so the sidebar can
-/// show that a session will be (or is being) auto-named. `Inactive` for
-/// sessions that are not eligible or already renamed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+/// Per-session smart-rename state surfaced to the dashboard so the sidebar can show that a session
+/// will be (or is being) auto-named.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum SmartRenameState {
     #[default]

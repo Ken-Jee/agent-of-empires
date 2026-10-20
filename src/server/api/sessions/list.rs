@@ -63,10 +63,10 @@ pub(crate) async fn project_sessions(state: &Arc<AppState>) -> Vec<SessionRespon
             } else {
                 None
             };
-            let acp_worker_state = worker_states
+            let (acp_worker_state, acp_worker_start) = worker_states
                 .get(&inst.id)
-                .copied()
-                .unwrap_or(crate::daemon::AcpWorkerState::Absent);
+                .cloned()
+                .unwrap_or((crate::daemon::AcpWorkerState::Absent, None));
             let mut session = SessionResponse::from_instance_with_plan(
                 inst,
                 claude_fullscreen,
@@ -76,6 +76,7 @@ pub(crate) async fn project_sessions(state: &Arc<AppState>) -> Vec<SessionRespon
                 next_wakeup_reason,
                 active_monitor,
             );
+            session.acp_worker_start = acp_worker_start;
             if structured_live && acp_worker_state == crate::daemon::AcpWorkerState::Running {
                 // Gate on a live worker: a pending nonce only exists on a
                 // running worker, and spawn/attach sweep orphaned nonces out of
@@ -354,47 +355,103 @@ pub(crate) async fn project_sessions(state: &Arc<AppState>) -> Vec<SessionRespon
     sessions
 }
 
+#[derive(Default)]
+pub(crate) struct SessionFilter {
+    pub scope: Option<crate::session::SessionScope>,
+    pub group: Option<String>,
+    pub children_of: Option<String>,
+}
+
+impl SessionFilter {
+    fn matches(&self, row: &SessionResponse) -> bool {
+        crate::session::SessionScope::matches(
+            self.scope,
+            row.archived_at.is_some(),
+            row.trashed_at.is_some(),
+        ) && self.group.as_deref().is_none_or(|group| {
+            row.group_path == group
+                || row
+                    .group_path
+                    .strip_prefix(group)
+                    .is_some_and(|rest| rest.starts_with('/'))
+        }) && self
+            .children_of
+            .as_deref()
+            .is_none_or(|parent| row.parent_session_id.as_deref() == Some(parent))
+    }
+}
+
 struct ScopedSessions<'a> {
     rows: &'a [SessionResponse],
-    scope: Option<crate::session::SessionScope>,
+    filter: &'a SessionFilter,
 }
 
 impl serde::Serialize for ScopedSessions<'_> {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.collect_seq(self.rows.iter().filter(|row| {
-            crate::session::SessionScope::matches(
-                self.scope,
-                row.archived_at.is_some(),
-                row.trashed_at.is_some(),
-            )
-        }))
+        serializer.collect_seq(self.rows.iter().filter(|row| self.filter.matches(row)))
     }
 }
 
-#[derive(serde::Serialize)]
-struct SessionsView<'a> {
-    sessions: ScopedSessions<'a>,
-    workspace_ordering: &'a [String],
+pub(crate) struct SessionsView {
+    snapshot: Arc<crate::server::runtime::PublishedSnapshot>,
+    filter: SessionFilter,
+}
+
+impl serde::Serialize for SessionsView {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        #[derive(serde::Serialize)]
+        struct Envelope<'a> {
+            sessions: ScopedSessions<'a>,
+            workspace_ordering: &'a [String],
+        }
+        Envelope {
+            sessions: ScopedSessions {
+                rows: &self.snapshot.value.contents.sessions,
+                filter: &self.filter,
+            },
+            workspace_ordering: &self.snapshot.value.contents.workspace_ordering,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl schemars::JsonSchema for SessionsView {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        <crate::daemon::SessionsEnvelope as schemars::JsonSchema>::schema_name()
+    }
+
+    fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        <crate::daemon::SessionsEnvelope as schemars::JsonSchema>::json_schema(generator)
+    }
+}
+
+pub(crate) async fn list_sessions_envelope(
+    state: &Arc<AppState>,
+    filter: SessionFilter,
+) -> anyhow::Result<SessionsView> {
+    Ok(SessionsView {
+        snapshot: state.runtime.snapshot(state).await?,
+        filter,
+    })
 }
 
 pub async fn list_sessions(
     State(state): State<Arc<AppState>>,
     axum::extract::Query(query): axum::extract::Query<ListSessionsQuery>,
 ) -> axum::response::Response {
-    let snapshot = match state.runtime.snapshot(&state).await {
-        Ok(snapshot) => snapshot,
+    let view = match list_sessions_envelope(
+        &state,
+        SessionFilter {
+            scope: query.state,
+            ..SessionFilter::default()
+        },
+    )
+    .await
+    {
+        Ok(view) => view,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
-    crate::server::runtime::mutation_response(
-        &snapshot.value.cursor,
-        Json(SessionsView {
-            sessions: ScopedSessions {
-                rows: &snapshot.value.contents.sessions,
-                scope: query.state,
-            },
-            workspace_ordering: &snapshot.value.contents.workspace_ordering,
-        }),
-    )
+    crate::server::runtime::mutation_response(&view.snapshot.value.cursor, Json(&view))
 }
 // Workspace id derivation. Mirrors the client logic in `useWorkspaces.ts`:
 // a session with a branch collapses to `${repoPath}::${branch}`; a
@@ -602,6 +659,7 @@ mod workspace_ordering_tests {
             project_path: project_path.to_string(),
             artifact_dir: String::new(),
             agent_session_id: None,
+            parent_session_id: None,
             group_path: String::new(),
             tool: "claude".to_string(),
             command: String::new(),
@@ -651,6 +709,7 @@ mod workspace_ordering_tests {
             view: crate::session::View::Terminal,
             pending_approvals: Vec::new(),
             acp_worker_state: crate::daemon::AcpWorkerState::Absent,
+            acp_worker_start: None,
             context_resume: Some(ContextResumeAvailability::Unavailable {
                 reason: ContextResumeUnavailableReason::NoTarget,
             }),

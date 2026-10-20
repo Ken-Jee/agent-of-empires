@@ -60,18 +60,13 @@ pub(crate) fn unit_name(session_id: &str, start_ms: u64, namespace: &str) -> Str
     )
 }
 
-pub(crate) fn unit_glob(session_id: &str, namespace: &str) -> String {
-    format!("{}-{namespace}-*.scope", escaped_id(session_id))
+pub(crate) fn unit_glob(session_id: &str) -> String {
+    format!("{}-*.scope", escaped_id(session_id))
 }
 
 /// Application-directory consistency, not instance authentication or attestation.
 pub(crate) fn scope_namespace() -> anyhow::Result<String> {
     scope_namespace_for(&crate::session::get_app_dir()?)
-}
-
-/// Read an existing namespace without creating application directories.
-pub(crate) fn existing_scope_namespace() -> anyhow::Result<String> {
-    scope_namespace_for(&crate::session::get_app_dir_path()?)
 }
 
 fn scope_namespace_for(app: &Path) -> anyhow::Result<String> {
@@ -803,18 +798,12 @@ esac
             unit_name("abc123", 1_700_000_000_000, "namespace"),
             "concurrent same-SID starts cannot share scope authority"
         );
-        assert_eq!(
-            unit_glob("abc123", "namespace"),
-            "aoe-session-abc123-namespace-*.scope"
-        );
+        assert_eq!(unit_glob("abc123"), "aoe-session-abc123-*.scope");
         assert!(unit_name("a b", 5, "namespace").starts_with("aoe-session-a_20b-namespace-5-"));
         assert!(
             unit_name("a_b/c", 5, "namespace").starts_with("aoe-session-a_5fb_2fc-namespace-5-")
         );
-        assert_eq!(
-            unit_glob("a-b", "namespace"),
-            "aoe-session-a_2db-namespace-*.scope"
-        );
+        assert_eq!(unit_glob("a-b"), "aoe-session-a_2db-*.scope");
         assert!(!unit_name("a-b", 5, "namespace").starts_with("aoe-session-a-"));
         assert_eq!(description("abc123def4567890"), "aoe session abc123de");
     }

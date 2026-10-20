@@ -2301,8 +2301,8 @@ export async function logout(): Promise<void> {
     // same tab does not see the previous user's settings snapshot or
     // hear their cached blob.
     try {
-      const { clearApprovalSoundCache } = await import("../hooks/useApprovalSound");
-      clearApprovalSoundCache();
+      const { clearSoundCache } = await import("./soundPlayer");
+      clearSoundCache();
     } catch {
       // ignore
     }

@@ -27,6 +27,7 @@ pub mod mcp;
 mod move_journal;
 pub(crate) mod path_identity;
 pub mod poller;
+pub(crate) mod projection;
 pub mod projects;
 pub(crate) mod purge_owners;
 pub(crate) mod recovery;

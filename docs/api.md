@@ -35,6 +35,26 @@ stream with one absolute budget, including explicit longer operation timeouts.
 Read-only mode (`aoe serve --read-only`) blocks every write endpoint
 with `403 read_only`. Read endpoints work normally.
 
+## MCP server
+
+Set `[web] mcp_enabled = true` in global `config.toml`, then restart the
+Daemon to enable Streamable HTTP at `/mcp`. The route is absent by default.
+It shares the existing API router and does not expose TCP or web assets when
+running core-only. TCP uses the API's token and login policy; the private
+`daemon/api.sock` accepts the authenticated same-UID owner peer without a token.
+
+| Tool | Arguments | Returns |
+| --- | --- | --- |
+| `list_sessions` | `state` (`live`, default, or `all`), `group` (exact path and descendants), `children_of` (direct parent id) | The `{sessions, workspace_ordering}` envelope from the published canonical snapshot. |
+| `whoami` | none | `null`; no session credential is currently available. |
+
+Both tools declare an `outputSchema` and return `structuredContent`.
+Listing does not persist workspace ordering or rebuild rows from mutable state.
+Read-only mode permits these reads. CityHall rejects `POST /mcp` with `403`,
+as it does other non-allowlisted POST routes, including over the owner socket.
+MCP POST requests remain tracked runtime work: shutdown interrupts them, and a
+long-running request can delay draining. No mutation or automatic replay is added.
+
 ## Skills
 
 AoE discovers Agent Skills packages from its managed store and supported
@@ -199,7 +219,12 @@ Runtime snapshots include stored launch commands on both transports to preserve 
 
 Wire protocol **version 4** sends a `Hello` followed by a `Snapshot`. Profiles carry `name`, `listed` and `aliases`; aliases select the same physical store while preserving the requested spelling. Alias-only external stores are available through scoped reads but excluded from ordinary profile inventories and all-profile lists.
 
-Snapshots may include `systemd_scope_namespace`, the daemon's application-directory namespace for systemd scopes. Eligible local CLI JSON output uses this value for cgroup hints; remote peers and snapshots without the optional value omit the hint. Clients never derive it from their own home directory or the protocol's build namespace. This metadata provides consistency, not authentication or authority to retire resources.
+Eligible verified-local CLI JSON listings include the display-only scope glob
+`aoe-session-<escaped-id>-*.scope` when local systemd scopes are enabled and
+visible. Remote listings omit it. This pattern matches legacy and namespaced
+unit names and may span application namespaces for the same session id. It
+proves neither unit existence nor ownership. The Daemon retires only captured
+exact units; the frozen protocol-4 snapshot does not carry scope metadata.
 
 Runtime-read session identity and parent relationships are scoped to a profile. The same session ID may appear in different profiles without invalidating the snapshot. Stored absolute project paths retain their spelling, including legacy `.` / `..` components and repeated separators; reads do not normalize them or resolve them on the client.
 
@@ -537,6 +562,27 @@ curl -sS \
   -H "Authorization: Bearer $AOE_TOKEN" \
   "http://localhost:7777/api/sessions/abc123/output?lines=80&format=text"
 ```
+
+## Native session freshness and disconnection
+
+The Daemon owns native session status. The experimental TUI consumes its
+published snapshots and does not run a second local status poller.
+Status sampling runs every 500 ms while a native stream has subscribers,
+and every two seconds otherwise. Under healthy local filesystem and tmux
+conditions, the steady-state target is an observed status change within
+two seconds in the TUI. This target excludes startup grace and does not
+bound stalled filesystem or tmux operations.
+
+For a committed launch, the Daemon retains `Starting` for up to three
+seconds from persisted pane creation time. Active lifecycle reservations
+retain their separate ownership timeout. Missing or future-dated pane
+births do not extend presentation grace.
+
+After connection loss, the TUI hides session rows and refuses local
+mutation or input fallback until explicit reconnection supplies a fresh
+snapshot. Retained state serves reconciliation fences, not stale display.
+An independent native tmux client attached before connection loss remains
+attached; stopping the Daemon does not revoke that client's tmux access.
 
 ## Native mutation completion
 

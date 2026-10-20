@@ -16,6 +16,7 @@ pub(crate) mod idle_reap;
 pub(crate) mod ip_discovery;
 pub mod live_ws;
 pub mod login;
+mod mcp;
 mod pane;
 pub(crate) mod peer;
 pub mod plugin_status;

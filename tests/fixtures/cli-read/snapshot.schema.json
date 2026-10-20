@@ -17,11 +17,6 @@
   ],
   "properties": {
     "namespace": { "$ref": "#/$defs/namespace" },
-    "systemd_scope_namespace": {
-      "description": "Optional display-only systemd scope namespace resolved by the daemon. Missing or null omits CLI cgroup hints; this is not authentication or destructive ownership authority.",
-      "type": ["string", "null"],
-      "pattern": "^[0-9a-f]{64}$"
-    },
     "cursor": { "$ref": "#/$defs/cursor" },
     "health": { "$ref": "#/$defs/snapshot_health" },
     "default_profile": {

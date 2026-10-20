@@ -2310,6 +2310,13 @@ pub struct WebConfig {
     #[serde(default = "default_true")]
     #[setting(label = "Notify on scheduled wake", widget = "toggle", global_only)]
     pub notify_on_wake_fire: bool,
+
+    /// Serve a Model Context Protocol server at `/mcp` on the daemon so MCP
+    /// clients holding the daemon token can list and drive sessions. When
+    /// false the route does not exist. Read at daemon startup.
+    #[serde(default)]
+    #[setting(label = "MCP server", widget = "toggle", global_only)]
+    pub mcp_enabled: bool,
 }
 
 impl Default for WebConfig {
@@ -2320,6 +2327,7 @@ impl Default for WebConfig {
             notify_on_idle: false,
             notify_on_error: true,
             notify_on_wake_fire: true,
+            mcp_enabled: false,
         }
     }
 }

@@ -45,6 +45,7 @@ async fn structured_purge_waits_for_a_pending_runner_retirement() -> anyhow::Res
         .acp_supervisor
         .reserve_spawn(
             &row.id,
+            crate::acp::supervisor::ResumeKind::SpawnFirst,
             crate::process::worker_registry::ResumeAuthority::Explicit,
         )
         .await?;
@@ -338,6 +339,7 @@ async fn committed_purge_settles_only_its_live_preconfiguration_producer() -> an
             .acp_supervisor
             .reserve_spawn(
                 &row.id,
+                crate::acp::supervisor::ResumeKind::SpawnFirst,
                 crate::process::worker_registry::ResumeAuthority::Explicit,
             )
             .await?;
@@ -385,6 +387,7 @@ async fn committed_purge_settles_only_its_live_preconfiguration_producer() -> an
                 .acp_supervisor
                 .reserve_spawn(
                     &row.id,
+                    crate::acp::supervisor::ResumeKind::SpawnFirst,
                     crate::process::worker_registry::ResumeAuthority::Explicit,
                 )
                 .await?;
@@ -539,6 +542,7 @@ async fn committed_purge_settles_only_its_live_preconfiguration_producer() -> an
                         .acp_supervisor
                         .reserve_spawn(
                             &row.id,
+                            crate::acp::supervisor::ResumeKind::SpawnFirst,
                             crate::process::worker_registry::ResumeAuthority::Explicit
                         )
                         .await,
@@ -567,6 +571,7 @@ async fn committed_purge_settles_only_its_live_preconfiguration_producer() -> an
             .acp_supervisor
             .reserve_spawn(
                 &row.id,
+                crate::acp::supervisor::ResumeKind::SpawnFirst,
                 crate::process::worker_registry::ResumeAuthority::Explicit,
             )
             .await?;
@@ -631,6 +636,7 @@ async fn committed_structured_purge_releases_admission_exclusion_before_retireme
             .acp_supervisor
             .reserve_spawn(
                 &row.id,
+                crate::acp::supervisor::ResumeKind::SpawnFirst,
                 crate::process::worker_registry::ResumeAuthority::Explicit,
             )
             .await?;
@@ -719,6 +725,7 @@ async fn committed_structured_purge_releases_admission_exclusion_before_retireme
                     .acp_supervisor
                     .reserve_spawn(
                         &row.id,
+                        crate::acp::supervisor::ResumeKind::SpawnFirst,
                         crate::process::worker_registry::ResumeAuthority::Explicit,
                     )
                     .await,
@@ -742,6 +749,7 @@ async fn committed_structured_purge_releases_admission_exclusion_before_retireme
             .acp_supervisor
             .reserve_spawn(
                 &row.id,
+                crate::acp::supervisor::ResumeKind::SpawnFirst,
                 crate::process::worker_registry::ResumeAuthority::Explicit,
             )
             .await?;

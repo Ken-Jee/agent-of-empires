@@ -694,27 +694,15 @@ pub(super) struct SandboxHealth {
     pub running: bool,
 }
 
-/// Whether the launch that left this row `Starting` on disk is still recent
-/// enough for tmux to keep its hands off it.
-///
-/// The reservation arm of the guard this feeds measures a launch from
-/// `lifecycle_reservation.at` against [`Instance::LIFECYCLE_RESERVATION_TTL`],
-/// and this one protects the same object (the launch) after the reservation is
-/// released, which is exactly when a committed launch's row is still
-/// `Starting`. So it uses the same TTL, but the reservation's own stamp is gone
-/// by then and it reads the row's durable launch stamp instead:
-/// `capture_started_at` is stamped by every launch as it creates the pane and
-/// persisted by the commit that publishes the `Starting` status, so it is the
-/// moment this status was earned.
-///
-/// A row with no stamp never reached a pane, so no launch owns it and nothing
-/// would ever move it again. That is the crashed creation, and it is why this
-/// arm cannot be left open-ended.
-fn starting_launch_is_fresh(inst: &Instance, now: chrono::DateTime<chrono::Utc>) -> bool {
+/// Committed launches use the persisted pane birth for their startup grace.
+/// Future wall-clock stamps grant no grace; ownership has its separate TTL.
+fn starting_status_in_grace(inst: &Instance, now: chrono::DateTime<chrono::Utc>) -> bool {
     let Some(started) = inst.capture_started_at else {
         return false;
     };
-    chrono::DateTime::<chrono::Utc>::from(started) + Instance::LIFECYCLE_RESERVATION_TTL > now
+    let started = chrono::DateTime::<chrono::Utc>::from(started);
+    let grace = chrono::Duration::seconds(Instance::STARTUP_GRACE_SECS as i64);
+    started <= now && now < started + grace
 }
 
 /// One tick's per-instance status decision: seed each freshly disk-loaded row's
@@ -733,6 +721,7 @@ pub(super) fn apply_tick_status_decisions(
     pane_metadata: Option<&std::collections::HashMap<String, crate::tmux::PaneMetadata>>,
     sandbox_health: &std::collections::HashMap<String, SandboxHealth>,
 ) {
+    let now = chrono::Utc::now();
     for inst in instances {
         let previous = prev.get_mut(&inst.id);
         let prior_tracking = tracking.get(&inst.id);
@@ -744,6 +733,7 @@ pub(super) fn apply_tick_status_decisions(
             suppressed,
             pane_metadata,
             Some(sandbox_health),
+            now,
         );
         if let (Some(previous), Some(baseline)) = (previous, baseline) {
             *previous = baseline;
@@ -758,6 +748,7 @@ fn apply_tick_status_decision(
     suppressed: bool,
     pane_metadata: Option<&std::collections::HashMap<String, crate::tmux::PaneMetadata>>,
     sandbox_health: Option<&std::collections::HashMap<String, SandboxHealth>>,
+    now: chrono::DateTime<chrono::Utc>,
 ) -> Option<Status> {
     if inst.status == Status::Creating {
         return None;
@@ -788,9 +779,8 @@ fn apply_tick_status_decision(
     if skip_tmux_decision_for_structured(inst) {
         return baseline;
     }
-    let now = chrono::Utc::now();
     if inst.has_fresh_lifecycle_reservation(now)
-        || (inst.status == Status::Starting && starting_launch_is_fresh(inst, now))
+        || (inst.status == Status::Starting && starting_status_in_grace(inst, now))
     {
         return baseline;
     }
@@ -876,6 +866,7 @@ pub(super) fn apply_supplementary_tick(
     prior: &SupplementaryTick,
     pane_metadata: Option<&std::collections::HashMap<String, crate::tmux::PaneMetadata>>,
 ) {
+    let now = chrono::Utc::now();
     for row in &mut cache.alias_only_instances {
         if row.is_structured() {
             continue;
@@ -916,6 +907,7 @@ pub(super) fn apply_supplementary_tick(
             false,
             pane_metadata,
             None,
+            now,
         );
     }
 }
@@ -2176,73 +2168,98 @@ mod tests {
         // the tick still reports transitions it does own.
     }
 
-    /// Launch owns the row until its reservation is committed or rolled back, and a missing pane
-    /// during provisioning must not overwrite `Starting` (or a reserved sampled status) with
-    /// `Error`. Both arms of that guard are bounded by the reservation TTL: the reservation one by
-    /// its own stamp, the `Starting` one by the durable launch stamp the launch leaves behind once
-    /// it releases the reservation.
-    ///
-    /// Driven with no batch pane metadata, so what is under test is the guard alone and not what
-    /// tmux would decide: a held row keeps its status, and a released one adopts the last live
-    /// value. That makes "the guard let the row go" the observable, with no dependence on a live
-    /// pane or on a tmux session cache this unit test never refreshes.
     #[test]
-    fn tick_holds_a_row_only_while_a_launch_owns_it() {
-        let ttl = u64::try_from(Instance::LIFECYCLE_RESERVATION_TTL.num_seconds()).unwrap();
-        let stale = std::time::SystemTime::now() - std::time::Duration::from_secs(ttl + 1);
-        for (case, reserved, launched_at, expected) in [
-            // A launch that is still provisioning: the reservation is held, and the status it
-            // reserved is a sampled `Error` the row must keep.
-            ("reserving", true, None, Status::Error),
-            // A launch that committed and released its reservation: the row is still `Starting`
-            // while the pane settles, and the durable launch stamp still bounds that window.
+    fn tick_distinguishes_launch_ownership_from_startup_grace() {
+        let now = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        let born = std::time::SystemTime::from(now);
+        for (case, reserved, launched_at, initial, expected) in [
             (
-                "just launched",
+                "active construction",
+                true,
+                Some(born),
+                Status::Error,
+                Status::Error,
+            ),
+            (
+                "active construction outlives startup grace",
+                true,
+                Some(born - std::time::Duration::from_secs(30)),
+                Status::Error,
+                Status::Error,
+            ),
+            (
+                "committed birth",
                 false,
-                Some(std::time::SystemTime::now()),
+                Some(born),
+                Status::Starting,
                 Status::Starting,
             ),
-            // A crashed creation: `Starting` with no launch behind it at all. Nothing will ever
-            // move this row again, so the tick must take it back.
-            ("no launch", false, None, Status::Running),
-            // Same, but the launch stamp is older than the TTL the reservation arm uses. The guard
-            // protects a launch, not the spelling of a status, so a stale one no longer holds.
-            ("stale launch", false, Some(stale), Status::Running),
+            (
+                "committed startup grace",
+                false,
+                Some(born - std::time::Duration::from_millis(2_999)),
+                Status::Starting,
+                Status::Starting,
+            ),
+            (
+                "committed grace boundary",
+                false,
+                Some(born - std::time::Duration::from_secs(3)),
+                Status::Starting,
+                Status::Running,
+            ),
+            (
+                "committed launch does not borrow ownership TTL",
+                false,
+                Some(born - std::time::Duration::from_secs(5)),
+                Status::Starting,
+                Status::Running,
+            ),
+            (
+                "unknown birth",
+                false,
+                None,
+                Status::Starting,
+                Status::Running,
+            ),
+            (
+                "future stamp grants no startup hold",
+                false,
+                Some(born + std::time::Duration::from_secs(60)),
+                Status::Starting,
+                Status::Running,
+            ),
+            (
+                "fresh birth does not suppress a non-starting row",
+                false,
+                Some(born),
+                Status::Waiting,
+                Status::Running,
+            ),
         ] {
             let mut instance = Instance::new("launching", "/tmp/launching");
-            instance.status = if reserved {
-                Status::Error
-            } else {
-                Status::Starting
-            };
+            instance.status = initial;
             instance.capture_started_at = launched_at;
             if reserved {
                 instance
                     .try_acquire_lifecycle_reservation(
                         crate::session::LifecycleOperation::Launch,
                         Instance::LIFECYCLE_RESERVATION_TTL,
-                        chrono::Utc::now(),
+                        now,
                     )
                     .unwrap();
             }
-            let id = instance.id.clone();
-            let mut prev = std::collections::HashMap::from([(id, Status::Running)]);
-            let mut instances = vec![instance];
-            let tracking = instances
-                .iter()
-                .map(|row| (row.id.clone(), PriorTickTracking::of(row)))
-                .collect();
-
-            apply_tick_status_decisions(
-                &mut instances,
-                &mut prev,
-                &tracking,
-                &std::collections::HashSet::new(),
+            let tracking = PriorTickTracking::of(&instance);
+            apply_tick_status_decision(
+                &mut instance,
+                Some(Status::Running),
+                Some(&tracking),
+                false,
                 None,
-                &Default::default(),
+                None,
+                now,
             );
-
-            assert_eq!(instances[0].status, expected, "{case}");
+            assert_eq!(instance.status, expected, "{case}");
         }
     }
 

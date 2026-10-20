@@ -176,6 +176,11 @@ pub async fn spawn_acp(
         .acp_supervisor
         .reserve_spawn(
             &id,
+            if request.stored_acp_session_id.is_some() {
+                crate::acp::supervisor::ResumeKind::Spawn
+            } else {
+                crate::acp::supervisor::ResumeKind::SpawnFirst
+            },
             crate::process::worker_registry::ResumeAuthority::Explicit,
         )
         .await
@@ -461,6 +466,7 @@ pub async fn switch_acp_agent(
         .acp_supervisor
         .reserve_spawn(
             &id,
+            crate::acp::supervisor::ResumeKind::SpawnFirst,
             crate::process::worker_registry::ResumeAuthority::Explicit,
         )
         .await
@@ -714,6 +720,11 @@ pub async fn switch_acp_provider(
         .acp_supervisor
         .reserve_spawn(
             &id,
+            if request.stored_acp_session_id.is_some() {
+                crate::acp::supervisor::ResumeKind::Spawn
+            } else {
+                crate::acp::supervisor::ResumeKind::SpawnFirst
+            },
             crate::process::worker_registry::ResumeAuthority::Explicit,
         )
         .await

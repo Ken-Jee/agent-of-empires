@@ -16,7 +16,7 @@ use super::*;
 /// A crashed owner loses both the flock and, after the TTL, its reservation.
 /// Recovery may then acquire a newer generation; exact-generation commits
 /// ensure a late result can never mutate or clear that replacement.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum LifecycleOperation {
     Launch,
@@ -56,7 +56,7 @@ impl std::fmt::Display for LifecycleReservationError {
 
 impl std::error::Error for LifecycleReservationError {}
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 pub struct LifecycleReservation {
     pub op: LifecycleOperation,
     pub generation: u64,
