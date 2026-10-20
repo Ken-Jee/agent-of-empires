@@ -42,6 +42,8 @@ capabilities = ["runtime.worker"]
 
 An agent integration connects a plugin to provider-native status and prompt replies for a terminal agent. Optional launch metadata makes that tool discoverable and launchable from AoE; the host still owns session creation, approvals, and lifecycle. It is separate from ACP and worker RPCs. The user still chooses each response; declaring an integration does not approve tools automatically.
 
+Active plugins with a command contribute that tool to AoE's agent picker and CLI when the name is unique across plugin declarations and does not collide with a built-in or configured custom agent. Available plugin agents can be selected with `session.default_tool`. Discovery checks the executable after leading `NAME=value` assignments, using the process PATH and then the user's login shell without running the agent command or its arguments.
+
 ```toml
 capabilities = ["session.integration"]
 
@@ -62,7 +64,7 @@ replies = true
 The host matches status integrations to terminal sessions and rejects missing, malformed, or unsupported runtime versions before consuming reports or sending replies. The runtime extension must also enforce supported versions before activation. These requirements are independent of the plugin's `version`, AoE host `api_version` / `aoe_version`, and report/reply `schema_version`. Launch-only agent declarations do not enable provider-native status or replies.
 For reply-enabled integrations, the provider report's `reply_keys` must contain only function-key names from `F1` through `F12`. AoE sends those keys only after the user submits a response. A status-only report may omit `reply_keys` or send an empty array. Prompts are ignored unless the integration enables replies and the report supplies wake keys. Missing or invalid reports for reply-enabled integrations never fall back to terminal approval keystrokes.
 
-The snapshot's `revision` changes only when the prompt changes, not when runtime status changes. Single-choice questions require exactly one selected option or a nonblank custom answer; the response dialog stays open for incomplete answers.
+The snapshot's `revision` changes only when the prompt changes, not when runtime status changes. Single-choice questions require exactly one selected option or a nonblank custom answer. Enter selects the highlighted option for an unanswered single-choice question before advancing or submitting; custom answers and multi-choice selections are preserved. The response dialog stays open for incomplete answers.
 
 Shell-hook sidecars and native-plugin reports remain distinct transports. Native reports retain their heartbeat and live-writer checks; shell hooks keep their existing freshness and publisher rules. Both reuse hardened host I/O and the established guarded session-identity persistence path where applicable. Declaring launch or reply metadata does not install hooks or companion extensions.
 
