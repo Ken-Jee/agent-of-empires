@@ -221,8 +221,6 @@ impl Drop for TerminalGuard {
         }
     }
 }
-use crate::session::get_update_settings;
-use crate::update::check_for_update;
 
 /// Clear the screen and force a full redraw on the next frame, without the
 /// `ESC[6n` cursor-position round-trip that ratatui's `Terminal::clear` does.
@@ -315,31 +313,7 @@ pub async fn run(profile: &str, startup_warning: Option<String>) -> Result<()> {
         std::process::exit(1);
     }
 
-    // Check for coding tools (no-agents case is handled inside the TUI)
-    let available_tools = crate::tmux::AvailableTools::detect();
-
-    // If version changed, refresh the update cache before showing TUI.
-    // This ensures we have release notes for the changelog dialog.
-    if check_version_change()?.is_some() {
-        let settings = get_update_settings();
-        if settings.update_check_mode.is_enabled() {
-            let current_version = env!("CARGO_PKG_VERSION");
-            // Don't let a network issue block startup
-            let _ = tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                check_for_update(current_version, true),
-            )
-            .await;
-        }
-    }
-
-    // Opt-in clean-only plugin auto-update sweep (off by default). Spawned
-    // non-blocking so a slow remote or git never delays the TUI; applied updates
-    // take effect on the next launch.
-    tokio::spawn(async {
-        crate::plugin::auto_update::run_if_enabled(&crate::session::Config::load_or_warn(), None)
-            .await;
-    });
+    let available_tools = crate::tmux::AvailableTools::detect_on_path();
 
     // Without a tty the event loop would busy-loop after the parent terminal dies.
     if !io::stdin().is_terminal() {

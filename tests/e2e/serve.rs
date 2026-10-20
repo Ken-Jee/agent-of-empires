@@ -5,7 +5,9 @@ use std::time::{Duration, Instant};
 
 use serial_test::parallel;
 
-use crate::harness::{pick_free_port, require_node, require_tmux, wait_for_port, TuiTestHarness};
+use crate::harness::{
+    app_dir_in, pick_free_port, require_node, require_tmux, wait_for_port, TuiTestHarness,
+};
 
 /// Resolve the daemon's PID file inside the harness's isolated home.
 /// Mirrors `crate::session::get_app_dir`'s platform split.
@@ -3657,4 +3659,57 @@ fn cli_serve_daemon_profile_reaches_the_served_layer() {
     if let Err(e) = result {
         panic!("{e}");
     }
+}
+
+/// A running Daemon stays administrable when pending migrations would fail.
+#[test]
+#[parallel]
+fn cli_serve_controls_skip_migrations_and_lock() {
+    let mut h = TuiTestHarness::new("serve_controls_skip_migrations");
+    h.remove_env("AOE_DAEMON_URL");
+    h.stop_daemon_on_drop();
+    h.start_daemon();
+    let app = app_dir_in(h.home_path());
+    let version = app.join(".schema_version");
+    std::fs::write(&version, "39").unwrap();
+    let workers = app.join("acp-workers");
+    std::fs::remove_dir_all(&workers).unwrap();
+    std::fs::write(&workers, "not a directory").unwrap();
+
+    for flag in ["--status", "--stop"] {
+        h.run_cli(&["serve", flag]);
+        assert_eq!(std::fs::read_to_string(&version).unwrap(), "39", "{flag}");
+        assert_eq!(
+            std::fs::read_to_string(&workers).unwrap(),
+            "not a directory",
+            "{flag}"
+        );
+    }
+}
+
+/// Restart fails when the replacement cannot migrate, leaving no active Daemon.
+#[test]
+#[parallel]
+fn cli_serve_restart_reports_replacement_startup_failure() {
+    let mut h = TuiTestHarness::new("serve_restart_child_fails");
+    h.remove_env("AOE_DAEMON_URL");
+    h.stop_daemon_on_drop();
+    h.start_daemon();
+
+    let app = app_dir_in(h.home_path());
+    std::fs::write(app.join(".schema_version"), "39").unwrap();
+    let workers = app.join("acp-workers");
+    let _ = std::fs::remove_dir_all(&workers);
+    std::fs::write(&workers, "not a directory").unwrap();
+
+    h.run_cli_err(&["serve", "--restart"]);
+    h.run_cli_err(&["serve", "--status"]);
+    assert_eq!(
+        std::fs::read_to_string(app.join(".schema_version")).unwrap(),
+        "39"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&workers).unwrap(),
+        "not a directory"
+    );
 }

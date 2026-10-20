@@ -16,16 +16,15 @@ const MAX_TRACKED_IPS: usize = 10_000;
 // Failures within this window of the last recorded failure collapse into one.
 const COALESCE_WINDOW: std::time::Duration = std::time::Duration::from_millis(500);
 
-/// Which failed-auth budget an attempt spends. Each budget is cleared by the
-/// credential it guards: a valid token or session clears the token budget, a
-/// verified passphrase clears the passphrase one. Sharing a counter would let
-/// a bound device reset an attacker's passphrase budget on a shared IP.
+/// Successful authentication clears only its own credential's failure budget.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AuthBudget {
     /// Rejected or missing token / login session.
     Token,
     /// Rejected passphrase on login or step-up elevation.
     Passphrase,
+    /// Rejected passkey credential.
+    Passkey,
 }
 
 struct FailureRecord {
@@ -173,6 +172,15 @@ impl RateLimiter {
         false
     }
 
+    #[cfg(test)]
+    pub(crate) async fn failure_count(&self, ip: IpAddr, budget: AuthBudget) -> u32 {
+        self.failures
+            .read()
+            .await
+            .get(&(ip, budget))
+            .map_or(0, |r| r.count)
+    }
+
     /// Clear the failure count an IP spent on one budget after the
     /// credential that budget guards was verified. A budget is only ever
     /// cleared by its own success: clearing the token budget proves
@@ -263,43 +271,39 @@ mod tests {
 
     #[tokio::test]
     async fn success_clears_only_its_own_budget() {
-        let limiter = RateLimiter::new();
         let ip: IpAddr = "1.2.3.4".parse().unwrap();
-        let spent = 3;
-        let base = Instant::now();
-
-        for n in 0..spent {
-            record_spaced(&limiter, ip, TOKEN, base, n).await;
-            record_spaced(&limiter, ip, PASSPHRASE, base, n).await;
-        }
-        // A valid token or an authenticated session proves nothing about a
-        // passphrase guess, so it must not reset that budget.
-        limiter.record_success(ip, TOKEN).await;
-        for n in spent..MAX_FAILURES - 1 {
-            assert!(
-                !record_spaced(&limiter, ip, PASSPHRASE, base, n).await,
-                "the passphrase budget survived a token success"
-            );
-        }
-        assert!(
-            record_spaced(&limiter, ip, PASSPHRASE, base, MAX_FAILURES - 1).await,
-            "the passphrase budget still reaches its own threshold"
-        );
-        assert!(limiter.check_locked(ip, PASSPHRASE).await.is_some());
-        assert!(
-            limiter.check_locked_any(ip).await.is_some(),
-            "a spent budget locks the IP out of every credential"
-        );
-
-        // A verified passphrase is the one success that clears that budget.
-        limiter.record_success(ip, PASSPHRASE).await;
-        assert!(limiter.check_locked(ip, PASSPHRASE).await.is_none());
-        assert!(limiter.check_locked_any(ip).await.is_none());
-        for n in MAX_FAILURES..MAX_FAILURES * 2 - 1 {
-            assert!(
-                !record_spaced(&limiter, ip, PASSPHRASE, base, n).await,
-                "a cleared budget counts again from zero"
-            );
+        let budgets = [TOKEN, PASSPHRASE, AuthBudget::Passkey];
+        for reset in budgets {
+            let limiter = RateLimiter::new();
+            let spent = 3;
+            let base = Instant::now();
+            for n in 0..spent {
+                for budget in budgets {
+                    record_spaced(&limiter, ip, budget, base, n).await;
+                }
+            }
+            limiter.record_success(ip, reset).await;
+            for budget in budgets.into_iter().filter(|budget| *budget != reset) {
+                for n in spent..MAX_FAILURES - 1 {
+                    assert!(!record_spaced(&limiter, ip, budget, base, n).await);
+                }
+                assert!(
+                    record_spaced(&limiter, ip, budget, base, MAX_FAILURES - 1).await,
+                    "{reset:?} success must not reset {budget:?} failures"
+                );
+                assert!(limiter.check_locked(ip, budget).await.is_some());
+            }
+            assert!(limiter.check_locked_any(ip).await.is_some());
+            for budget in budgets {
+                limiter.record_success(ip, budget).await;
+            }
+            assert!(limiter.check_locked_any(ip).await.is_none());
+            for n in MAX_FAILURES..MAX_FAILURES * 2 - 1 {
+                assert!(
+                    !record_spaced(&limiter, ip, reset, base, n).await,
+                    "a cleared {reset:?} budget counts again from zero"
+                );
+            }
         }
     }
 

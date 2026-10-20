@@ -58,7 +58,6 @@ const NON_SUFFIX_HOST_STATE: Record<string, string> = {
   AOE_TMUX_SOCKET: "/tmp/tmux-1000/aoe.sock",
   AOE_UPDATE_API_BASE: "https://host.invalid/api",
   AOE_UPDATE_BASE_URL: "https://host.invalid",
-  DBUS_SESSION_BUS_ADDRESS: "unix:path=/host/dev/bus",
   GIT_CONFIG_GLOBAL: `${HOST}/.gitconfig`,
   GIT_CONFIG_SYSTEM: `${HOST}/etc/gitconfig`,
   GIT_SSH_COMMAND: `ssh -i ${HOST}/.ssh/id_ed25519`,

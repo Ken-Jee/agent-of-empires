@@ -118,7 +118,7 @@ export async function mockWizardApis(page: Page, opts: WizardMockOptions = {}) {
   const created: Record<string, unknown>[] = [];
   const projects =
     opts.projects ?? (opts.sessions === undefined ? [{ name: "example", path: "/tmp/example", scope: "global" }] : []);
-  await page.route("**/api/login/status", (r) => r.fulfill({ json: { required: false, authenticated: true } }));
+  await page.route("**/api/login/status*", (r) => r.fulfill({ json: { required: false, authenticated: true } }));
   for (const path of ["themes", "groups", "devices"])
     await page.route(`**/api/${path}`, (r) => r.fulfill({ json: [] }));
   await page.route("**/api/about", (r) => r.fulfill({ json: { profile: opts.servedProfile ?? "default" } }));

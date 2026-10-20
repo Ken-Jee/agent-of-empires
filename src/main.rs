@@ -390,6 +390,12 @@ async fn run(
         Some(Commands::Migrate) => return exit_zero(cli::migrate::run().await),
 
         Some(Commands::Stop { .. }) => return exit_zero(cli::killall::stop_trap()),
+        // Before the startup lock and migrations: see `cli::serve::run_control`.
+        Some(Commands::Serve(ref args)) => {
+            if let Some(result) = cli::serve::run_control(args).await {
+                return exit_zero(result);
+            }
+        }
         _ => {}
     }
 

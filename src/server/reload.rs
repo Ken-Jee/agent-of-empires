@@ -46,14 +46,26 @@ pub(crate) fn selectable_profiles() -> anyhow::Result<Vec<SelectableProfile>> {
         if kind.is_symlink() && !crate::session::valid_profile_name(&name) {
             continue;
         }
-        let metadata = match std::fs::metadata(entry.path()) {
-            Ok(metadata) if metadata.is_dir() => metadata,
-            Ok(_) => continue,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(_) if kind.is_symlink() => continue,
-            Err(error) => return Err(error.into()),
+        let (device, inode) = if kind.is_symlink() {
+            let path = entry.path();
+            let sampled = super::alias_io::sample(&name, "identity", move || {
+                std::fs::metadata(path)
+                    .ok()
+                    .filter(std::fs::Metadata::is_dir)
+                    .map(|metadata| crate::process::metadata_identity(&metadata))
+            });
+            match sampled.value.and_then(|identity| *identity) {
+                Some(identity) => identity,
+                None => continue,
+            }
+        } else {
+            match std::fs::metadata(entry.path()) {
+                Ok(metadata) if metadata.is_dir() => crate::process::metadata_identity(&metadata),
+                Ok(_) => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.into()),
+            }
         };
-        let (device, inode) = crate::process::metadata_identity(&metadata);
         let identity = ProfileIdentity { device, inode };
         if kind.is_dir() {
             directories.push(SelectableProfile {
@@ -113,6 +125,22 @@ pub(super) fn load_all_instances(file_watch: &Arc<FileWatchService>) -> LoadedIn
     load_read_instances(file_watch, None)
 }
 
+fn read_inventory_instances(
+    name: &str,
+    identity: ProfileIdentity,
+    file_watch: Arc<FileWatchService>,
+) -> anyhow::Result<Vec<Instance>> {
+    let storage = Storage::open_inventory_reference(name, file_watch)?;
+    let (device, inode) = storage.bound_profile_identity()?;
+    anyhow::ensure!(
+        identity == ProfileIdentity { device, inode },
+        "Profile identity changed during read"
+    );
+    let instances = storage.load_instances_readonly()?;
+    storage.verify_bound_profile()?;
+    Ok(instances)
+}
+
 fn load_read_instances(
     file_watch: &Arc<FileWatchService>,
     canonical: Option<LoadedInstances>,
@@ -162,17 +190,31 @@ fn load_read_instances(
                 .iter()
                 .any(|accepted| &accepted.name == name)
         });
-        let rows = (|| {
-            let storage = Storage::open_inventory_reference(&profile.name, file_watch.clone())?;
-            let (device, inode) = storage.bound_profile_identity()?;
-            anyhow::ensure!(
-                profile.identity == ProfileIdentity { device, inode },
-                "Profile identity changed during read"
-            );
-            let instances = storage.load_instances_readonly()?;
-            storage.verify_bound_profile()?;
-            Ok::<_, anyhow::Error>(instances)
-        })();
+        let (rows, stale) = if profile.listed {
+            (
+                read_inventory_instances(&profile.name, profile.identity, file_watch.clone())
+                    .map_err(|error| error.to_string()),
+                false,
+            )
+        } else {
+            let name = profile.name.clone();
+            let identity = profile.identity;
+            let file_watch = file_watch.clone();
+            let sampled = super::alias_io::sample(&profile.name, "sessions", move || {
+                read_inventory_instances(&name, identity, file_watch)
+                    .map(|instances| (identity, instances))
+                    .map_err(|error| error.to_string())
+            });
+            let rows = match sampled.value.as_deref() {
+                Some(Ok((identity, instances))) if *identity == profile.identity => {
+                    Ok(instances.clone())
+                }
+                Some(Ok(_)) => Err("Profile identity changed during read".to_owned()),
+                Some(Err(error)) => Err(error.clone()),
+                None => Err("alias read pending".to_owned()),
+            };
+            (rows, !sampled.fresh)
+        };
         match rows {
             Ok(mut instances) => {
                 for instance in &mut instances {
@@ -182,6 +224,13 @@ fn load_read_instances(
                     loaded.instances.extend(instances);
                 } else {
                     loaded.cache.alias_only_instances.extend(instances);
+                }
+                if stale {
+                    loaded
+                        .cache
+                        .health
+                        .unreadable_profiles
+                        .insert(profile.name.clone());
                 }
             }
             Err(error) => {

@@ -1139,23 +1139,22 @@ async fn validate_launch_args(profile: &str, args: &ServeArgs) -> Result<AuthMod
     Ok(auth_mode)
 }
 
+/// Dispatch lifecycle controls before startup migrations and profile validation.
+pub async fn run_control(args: &ServeArgs) -> Option<Result<()>> {
+    if args.stop {
+        Some(stop_daemon().await)
+    } else if args.status {
+        Some(print_status().await)
+    } else if args.restart {
+        Some(restart_daemon().await)
+    } else if args.rollback {
+        Some(rollback_daemon().await)
+    } else {
+        None
+    }
+}
 #[tracing::instrument(target = "cli.serve", skip_all, fields(profile = %profile))]
 pub async fn run(profile: &str, mut args: ServeArgs, startup: Option<ServeStartup>) -> Result<()> {
-    if args.stop {
-        return stop_daemon().await;
-    }
-
-    if args.status {
-        return print_status().await;
-    }
-
-    if args.restart {
-        return restart_daemon().await;
-    }
-
-    if args.rollback {
-        return rollback_daemon().await;
-    }
     let startup = match startup {
         Some(startup) => startup,
         None => lock_for_startup(profile, &mut args)
@@ -1973,26 +1972,6 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn only_a_server_start_takes_the_startup_lock() {
-        use crate::cli::{Cli, Commands};
-        use clap::Parser;
-        for flag in ["--stop", "--status", "--restart"] {
-            let Some(Commands::Serve(mut args)) =
-                Cli::try_parse_from(["aoe", "serve", flag]).unwrap().command
-            else {
-                panic!("expected serve");
-            };
-            assert!(
-                lock_for_startup("default", &mut args)
-                    .await
-                    .unwrap()
-                    .is_none(),
-                "{flag}"
-            );
-        }
-    }
-
     #[test]
     fn serve_and_migrate_exclude_each_other_in_both_orders() {
         let dir = tempfile::tempdir().unwrap();
@@ -2646,7 +2625,7 @@ mod tests {
         }
     }
     mod profile_guard {
-        use super::super::run;
+        use super::super::{run, run_control};
         use crate::cli::{Cli, Commands};
         use clap::Parser;
         use serial_test::serial;
@@ -2674,8 +2653,8 @@ mod tests {
         async fn lifecycle_verbs_never_consult_the_profile() {
             let (_guard, profiles) = armed_profiles_dir();
             for verb in ["--stop", "--status", "--restart"] {
-                let (profile, args) = dispatch_argv(&["aoe", "serve", verb, "-p", "ghost-profile"]);
-                if let Err(e) = run(&profile, args, None).await {
+                let (_, args) = dispatch_argv(&["aoe", "serve", verb, "-p", "ghost-profile"]);
+                if let Some(Err(e)) = run_control(&args).await {
                     let msg = e.to_string();
                     assert!(
                         !msg.contains("does not exist") && !msg.contains("aoe profile create"),
