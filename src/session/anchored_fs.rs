@@ -176,7 +176,7 @@ impl ResolvedDataFile {
     }
 
     pub(crate) fn sync_parent(&self) -> Result<()> {
-        nix::unistd::fsync(&self.parent.fd).context("syncing resolved data-file directory")
+        self.parent.sync()
     }
 }
 

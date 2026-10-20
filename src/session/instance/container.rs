@@ -199,6 +199,7 @@ impl Instance {
                     return Err(error)
                 }
                 Err(error) => tracing::warn!(
+                    target: "session.store",
                     session_id = %self.id,
                     %error,
                     "sandbox store move deferred; session continues on its shared store"

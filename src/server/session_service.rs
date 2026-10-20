@@ -210,7 +210,7 @@ pub struct SessionService {
     /// the other two: the drains hold `prompt_locks` across `send_turn` and
     /// then call this path, so reusing either would self-deadlock.
     persist_locks: RwLock<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
-    /// Shared by mirrored mutations, exclusive for disk sampling and reload application.
+    /// Mirrored mutations share this gate; disk sampling and native snapshot/adoption own it exclusively.
     reload_gate: Arc<RwLock<()>>,
     /// Per-session prompt-submission locks. See
     /// [`SessionService::prompt_submission`].
@@ -763,7 +763,7 @@ impl SessionService {
             let _identity = crate::session::acquire_session_identity_lock()?;
             let _title = crate::session::acquire_session_title_lock(&worker_id)?;
             let native = super::session_store::NativeSessionStore::open(
-                state, &profile, Some(worker_id.clone()),
+                state, &profile, None,
             )?;
             let store: &dyn crate::session::SessionStore = &native;
             let _lifecycle = store.storage().acquire_instance_lifecycle_lock(&worker_id)?;
@@ -1202,7 +1202,7 @@ impl SessionService {
     }
 
     /// Hold through epoch sampling and disk load, or through reload application.
-    pub(super) async fn disk_reload_guard(&self) -> tokio::sync::OwnedRwLockWriteGuard<()> {
+    pub(crate) async fn disk_reload_guard(&self) -> tokio::sync::OwnedRwLockWriteGuard<()> {
         Arc::clone(&self.reload_gate).write_owned().await
     }
 

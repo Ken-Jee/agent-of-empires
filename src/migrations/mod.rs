@@ -428,6 +428,12 @@ pub fn run_migrations_announced(reporter: Option<progress::Reporter>) -> Result<
     run_migrations_inner(reporter, true, None)
 }
 
+pub(crate) fn reconcile_serve_launch_under_transaction(
+    transaction: &crate::daemon::lifecycle::Transaction,
+) -> Result<()> {
+    v044_reconcile_serve_passphrase_policy::run_with_transaction(transaction)
+}
+
 pub(crate) fn run_migrations_under_transaction(
     reporter: Option<progress::Reporter>,
     announce: bool,

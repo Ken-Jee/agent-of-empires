@@ -547,7 +547,25 @@ pub(crate) fn kill_session_if_present(name: &str) -> Result<()> {
                 .lines()
                 .any(|line| line.trim().starts_with("can't find session:"));
         if !absent {
-            bail!("Failed to kill tmux session '{}': {}", name, stderr);
+            let confirmed_missing = stderr
+                .lines()
+                .any(|line| line.trim() == "no current target")
+                && crate::tmux::run_tmux_command_with_timeout(
+                    crate::tmux::tmux_query_command().args([
+                        "list-sessions",
+                        "-F",
+                        "#{session_name}",
+                    ]),
+                )
+                .is_ok_and(|inventory| {
+                    inventory.status.success()
+                        && std::str::from_utf8(&inventory.stdout).is_ok_and(|names| {
+                            !names.split_terminator('\n').any(|session| session == name)
+                        })
+                });
+            if !confirmed_missing {
+                bail!("Failed to kill tmux session '{}': {}", name, stderr);
+            }
         }
     }
     Ok(())
@@ -1069,6 +1087,172 @@ mod tests {
             kill_session_if_present(name).is_ok(),
             "a missing session is not an error"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn kill_session_if_present_proves_absence_on_a_live_empty_server() {
+        if std::env::var_os("AOE_TEST_TMUX_EMPTY_CHILD").is_some() {
+            struct PrivateServer;
+            impl Drop for PrivateServer {
+                fn drop(&mut self) {
+                    let _ = crate::tmux::run_tmux_command_with_timeout(
+                        crate::tmux::tmux_query_command().arg("kill-server"),
+                    );
+                }
+            }
+            let _server = PrivateServer;
+            let started = crate::tmux::run_tmux_command_with_timeout(
+                crate::tmux::tmux_query_command().args([
+                    "-f",
+                    "/dev/null",
+                    "new-session",
+                    "-d",
+                    "-s",
+                    "alive|proof",
+                    "exec /bin/cat",
+                    ";",
+                    "set-option",
+                    "-s",
+                    "exit-empty",
+                    "off",
+                ]),
+            )
+            .unwrap();
+            assert!(
+                started.status.success(),
+                "{}",
+                String::from_utf8_lossy(&started.stderr)
+            );
+            kill_session_if_present("alive|proof").unwrap();
+            let inventory = || {
+                crate::tmux::run_tmux_command_with_timeout(
+                    crate::tmux::tmux_query_command().args([
+                        "list-sessions",
+                        "-F",
+                        "#{session_name}",
+                    ]),
+                )
+                .unwrap()
+            };
+            let empty = inventory();
+            assert!(empty.status.success());
+            assert!(
+                empty.stdout.is_empty(),
+                "the private server must be live and empty"
+            );
+            kill_session_if_present("missing|proof").unwrap();
+            let still_empty = inventory();
+            assert!(still_empty.status.success() && still_empty.stdout.is_empty());
+            return;
+        }
+        if !tmux_available() {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+        child
+            .args([
+                "--exact",
+                "tmux::utils::tests::kill_session_if_present_proves_absence_on_a_live_empty_server",
+                "--nocapture",
+            ])
+            .env("AOE_TEST_TMUX_EMPTY_CHILD", "1")
+            .env("AOE_TMUX_SOCKET", root.path().join("socket"))
+            .env("HOME", root.path())
+            .env("XDG_CONFIG_HOME", root.path().join("config"));
+        let output =
+            crate::process::run_with_timeout(&mut child, crate::tmux::TMUX_COMMAND_TIMEOUT * 3)
+                .unwrap()
+                .expect("private empty-server proof must complete");
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn kill_session_if_present_requires_successful_exact_name_absence_proof() {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(case) = std::env::var("AOE_TEST_TMUX_ABSENCE_CHILD") {
+            let target = if case == "whitespace" {
+                " proof|target "
+            } else {
+                "proof|target"
+            };
+            let result = kill_session_if_present(target);
+            if case == "prefix" {
+                assert!(
+                    result.is_ok(),
+                    "a different exact name must not block absence proof"
+                );
+            } else {
+                let error =
+                    result.expect_err("unproven inventory must retain the original kill failure");
+                assert!(error.to_string().contains("no current target"));
+            }
+            return;
+        }
+        for case in [
+            "present",
+            "whitespace",
+            "nonzero",
+            "invalid-utf8",
+            "exec-error",
+            "prefix",
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let binary = root.path().join("tmux");
+            let listing = match case {
+                "present" => r"printf 'proof|target\n'",
+                "whitespace" => r"printf ' proof|target \n'",
+                "nonzero" => "exit 2",
+                "invalid-utf8" => r"printf '\377\n'",
+                "prefix" => r"printf 'proof|target-other\n'",
+                _ => "exit 3",
+            };
+            let remove = if case == "exec-error" {
+                r#"/bin/rm "$0""#
+            } else {
+                ":"
+            };
+            std::fs::write(
+                &binary,
+                format!(
+                    r#"#!/bin/sh
+case " $* " in
+  *" kill-session "*) printf 'no current target\n' >&2; {remove}; exit 1;;
+  *" list-sessions "*) {listing};;
+  *) exit 42;;
+esac
+"#
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child.args(["--exact", "tmux::utils::tests::kill_session_if_present_requires_successful_exact_name_absence_proof", "--nocapture"])
+                .env("AOE_TEST_TMUX_ABSENCE_CHILD", case)
+                .env("AOE_TMUX_SOCKET", root.path().join("socket"))
+                .env("HOME", root.path())
+                .env("XDG_CONFIG_HOME", root.path().join("config"))
+                .env("PATH", root.path());
+            let output =
+                crate::process::run_with_timeout(&mut child, crate::tmux::TMUX_COMMAND_TIMEOUT * 2)
+                    .unwrap()
+                    .expect("forged inventory client must complete");
+            assert!(
+                output.status.success(),
+                "case={case}\n{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
     }
 
     #[test]

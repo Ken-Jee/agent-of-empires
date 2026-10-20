@@ -114,3 +114,192 @@ fn direct_serve_upgrades_legacy_policy_under_its_existing_transaction() {
         drop(foreground);
     }
 }
+
+#[test]
+#[parallel]
+fn managed_controls_migrate_historical_launch_before_replay() {
+    for (rollback, protected) in [(false, false), (true, false), (false, true), (true, true)] {
+        let mut h = TuiTestHarness::new(&format!("legacy_control_{rollback}_{protected}"));
+        h.stop_daemon_on_drop();
+        let port = crate::harness::pick_free_port();
+        let port_text = port.to_string();
+        let mut args = vec!["serve", "--daemon", "--port", &port_text];
+        if protected {
+            args.extend(["--passphrase", "legacy-auth"]);
+        } else {
+            args.push("--no-auth");
+        }
+        h.run_cli_ok(&args);
+        let app = app_dir_in(h.home_path());
+        let mut launch: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(app.join("serve.launch")).unwrap()).unwrap();
+        let old_pid = launch["pid"].clone();
+        launch["schema"] = 2.into();
+        launch.as_object_mut().unwrap().remove("has_passphrase");
+        let path = if rollback {
+            "serve.rollback.launch"
+        } else {
+            "serve.launch"
+        };
+        std::fs::write(app.join(path), serde_json::to_vec(&launch).unwrap()).unwrap();
+        if rollback {
+            std::fs::write(
+                app.join("serve.rollback.passphrase"),
+                serde_json::to_vec(&serde_json::json!({
+                    "pid": launch["pid"], "instance_id": launch["instance_id"],
+                    "passphrase": if protected { Some("legacy-auth") } else { None },
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        }
+        std::fs::write(app.join(VERSION_FILE), "43").unwrap();
+        h.run_cli_ok(&["serve", if rollback { "--rollback" } else { "--restart" }]);
+        let current: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(app.join("serve.launch")).unwrap()).unwrap();
+        assert_ne!(current["pid"], old_pid);
+        assert_eq!(current["schema"], 4);
+        assert_eq!(current["has_passphrase"], protected);
+        assert_eq!(current["port"], launch["port"]);
+        assert_eq!(current["profile"], launch["profile"]);
+        assert_eq!(
+            std::fs::read_to_string(app.join(VERSION_FILE)).unwrap(),
+            agent_of_empires::migrations::current_schema_version().to_string()
+        );
+        assert!(crate::harness::wait_for_port(
+            port,
+            std::time::Duration::from_secs(10)
+        ));
+        h.run_cli_ok(&["serve", "--stop"]);
+    }
+}
+
+#[test]
+#[parallel]
+fn managed_controls_refuse_future_launch_schema_without_stopping_predecessor() {
+    for control in ["restart", "rollback", "promotion"] {
+        let mut h = TuiTestHarness::new(&format!("future_launch_{control}"));
+        h.stop_daemon_on_drop();
+        let port = crate::harness::pick_free_port();
+        if control == "promotion" {
+            h.run_cli_ok(&["serve", "--core-only", "--daemon"]);
+        } else {
+            h.run_cli_ok(&[
+                "serve",
+                "--daemon",
+                "--port",
+                &port.to_string(),
+                "--no-auth",
+            ]);
+        }
+        let app = app_dir_in(h.home_path());
+        let mut launch: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(app.join("serve.launch")).unwrap()).unwrap();
+        let original = launch.clone();
+        let pid = launch["pid"].as_u64().unwrap();
+        launch["schema"] = 99.into();
+        let record = if control == "rollback" {
+            "serve.rollback.launch"
+        } else {
+            "serve.launch"
+        };
+        let bytes = serde_json::to_vec(&launch).unwrap();
+        std::fs::write(app.join(record), &bytes).unwrap();
+        if control == "rollback" {
+            std::fs::write(
+                app.join("serve.rollback.passphrase"),
+                serde_json::to_vec(&serde_json::json!({
+                    "pid": launch["pid"], "instance_id": launch["instance_id"], "passphrase": null,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        }
+        std::fs::write(app.join(VERSION_FILE), "43").unwrap();
+        let refused = match control {
+            "restart" => h.run_cli(&["serve", "--restart"]),
+            "rollback" => h.run_cli(&["serve", "--rollback"]),
+            _ => h.run_cli(&[
+                "serve",
+                "--daemon",
+                "--port",
+                &port.to_string(),
+                "--no-auth",
+            ]),
+        };
+        assert!(!refused.status.success());
+        assert!(
+            String::from_utf8_lossy(&refused.stderr).contains("Unsupported daemon launch schema"),
+            "{}",
+            String::from_utf8_lossy(&refused.stderr)
+        );
+        assert_eq!(std::fs::read(app.join(record)).unwrap(), bytes);
+        assert!(
+            nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), None).is_ok(),
+            "unsupported schema must not stop the verified predecessor"
+        );
+        let status = h.run_cli(&["serve", "--status"]);
+        assert!(status.status.success());
+        assert!(
+            String::from_utf8_lossy(&status.stdout)
+                .contains(&format!("Daemon: running (PID {pid})")),
+            "{}",
+            String::from_utf8_lossy(&status.stdout)
+        );
+        if control == "rollback" {
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(
+                    &std::fs::read(app.join("serve.launch")).unwrap()
+                )
+                .unwrap(),
+                original
+            );
+        }
+        h.run_cli_ok(&["serve", "--stop"]);
+    }
+}
+
+#[test]
+#[parallel]
+fn managed_core_promotion_migrates_historical_launch_before_replay() {
+    let mut h = TuiTestHarness::new("legacy_core_promotion");
+    h.stop_daemon_on_drop();
+    h.run_cli_ok(&["serve", "--core-only", "--daemon"]);
+    let app = app_dir_in(h.home_path());
+    let mut launch: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(app.join("serve.launch")).unwrap()).unwrap();
+    let old_pid = launch["pid"].clone();
+    launch["schema"] = 2.into();
+    launch.as_object_mut().unwrap().remove("has_passphrase");
+    std::fs::write(
+        app.join("serve.launch"),
+        serde_json::to_vec(&launch).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(app.join(VERSION_FILE), "43").unwrap();
+    let port = crate::harness::pick_free_port();
+    h.run_cli_ok(&[
+        "serve",
+        "--daemon",
+        "--port",
+        &port.to_string(),
+        "--no-auth",
+    ]);
+    let current: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(app.join("serve.launch")).unwrap()).unwrap();
+    assert_ne!(current["pid"], old_pid);
+    assert_eq!(current["schema"], 4);
+    assert_eq!(current["core_only"], false);
+    assert_eq!(current["has_passphrase"], false);
+    assert_eq!(current["profile"], launch["profile"]);
+    assert_eq!(current["port"], port);
+    assert_eq!(
+        std::fs::read_to_string(app.join(VERSION_FILE)).unwrap(),
+        agent_of_empires::migrations::current_schema_version().to_string()
+    );
+    assert!(crate::harness::wait_for_port(
+        port,
+        std::time::Duration::from_secs(10)
+    ));
+    h.run_cli_ok(&["serve", "--stop"]);
+}

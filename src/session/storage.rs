@@ -44,8 +44,9 @@
 //! source profile's per-instance lifecycle flock before any profile Storage
 //! mutex/flock: session title -> lifecycle -> Storage.
 //!
-//! Storage mutations use a locked load/mutate/save cycle. Native callers retain
-//! their transition guard through canonical adoption.
+//! Native whole-profile writers acquire the session-service reload gate after
+//! operation locks, before the storage transition, and retain it through adoption.
+//! Bound registry commits fsync the resolved parent after each atomic replacement.
 //!
 //! Identity-changing writers take app-global identity, optional session title,
 //! then lifecycle and profile storage locks. `aoe add` has no lifecycle lock.
@@ -1212,6 +1213,9 @@ pub(crate) trait SessionStore: Send + Sync {
         backend: crate::agents::SessionCaptureBackend,
         current_store: &Path,
     ) -> Result<bool>;
+    fn sandbox_registry_guard(&self) -> Option<tokio::sync::OwnedRwLockWriteGuard<()>> {
+        None
+    }
     fn commit_sandbox_checkpoint(
         &self,
         checkpoint: crate::migrations::v027_isolate_sandbox_stores::LockedSandboxCheckpoint<'_>,
@@ -1828,15 +1832,28 @@ impl Storage {
         excluded: &[Instance],
         require_match: bool,
     ) -> Result<super::path_identity::CleanupProtection> {
+        fn resolve_registry(path: &Path) -> Result<super::anchored_fs::ResolvedDataFile> {
+            let parent = path
+                .parent()
+                .context("registry directory missing")?
+                .canonicalize()?;
+            super::anchored_fs::ResolvedDataFile::open(
+                &parent.join(path.file_name().context("registry file name missing")?),
+            )
+        }
         let exclusions = excluded
             .iter()
             .map(|row| {
                 let path = if row.source_profile.is_empty() {
                     self.sessions_path.clone()
                 } else {
-                    get_profile_dir(&row.source_profile)?.join("sessions.json")
+                    super::get_profile_dir_path(&row.source_profile)?.join("sessions.json")
                 };
-                Ok((path, row.id.as_str(), row.lifecycle_generation))
+                Ok((
+                    resolve_registry(&path)?,
+                    row.id.as_str(),
+                    row.lifecycle_generation,
+                ))
             })
             .collect::<Result<Vec<_>>>()?;
         let mut matched = require_match.then(|| vec![false; exclusions.len()]);
@@ -1846,35 +1863,45 @@ impl Storage {
             .context("profile directory missing")?;
         let paths =
             super::sandbox_store_reclaim::registry_paths(app_dir_for_profile_dir(profile_dir))?;
-        anyhow::ensure!(
-            paths.iter().any(|path| path == &self.sessions_path),
-            "Selected session registry is unavailable"
-        );
+        let selected = resolve_registry(&self.sessions_path)?;
+        let mut selected_seen = false;
+        let mut seen: Vec<super::anchored_fs::ResolvedDataFile> = Vec::new();
         let mut protection = super::path_identity::CleanupProtection::default();
         for path in paths {
-            let parent = path
-                .parent()
-                .context("registry directory missing")?
-                .canonicalize()?;
-            let bound = super::anchored_fs::ResolvedDataFile::open(
-                &parent.join(path.file_name().context("registry file name missing")?),
-            )?;
+            let bound = resolve_registry(&path)?;
+            selected_seen |= bound.same_target(&selected)?;
+            let mut duplicate = false;
+            for prior in &seen {
+                duplicate |= prior.same_target(&bound)?;
+            }
+            if duplicate {
+                continue;
+            }
             let content = bound
                 .read()?
                 .with_context(|| format!("Registry disappeared: {}", path.display()))?;
             let rows: Vec<Instance> = serde_json::from_str(&content).with_context(|| {
                 format!("Reading complete resource owners in {}", path.display())
             })?;
+            let matching = exclusions
+                .iter()
+                .map(|(registry, _, _)| bound.same_target(registry))
+                .collect::<Result<Vec<_>>>()?;
             protection.extend(rows.iter().filter(|row| {
-                let index = exclusions.iter().position(|(registry, id, generation)| {
-                    path == *registry && row.id == *id && row.lifecycle_generation == *generation
-                });
-                if let (Some(matched), Some(index)) = (&mut matched, index) {
-                    matched[index] = true;
+                let mut excluded = false;
+                for (index, (_, id, generation)) in exclusions.iter().enumerate() {
+                    if matching[index] && row.id == *id && row.lifecycle_generation == *generation {
+                        if let Some(matched) = &mut matched {
+                            matched[index] = true;
+                        }
+                        excluded = true;
+                    }
                 }
-                index.is_none()
+                !excluded
             }))?;
+            seen.push(bound);
         }
+        anyhow::ensure!(selected_seen, "Selected session registry is unavailable");
         anyhow::ensure!(
             matched.is_none_or(|matched| matched.into_iter().all(|found| found)),
             "Selected batch member changed before cleanup"
@@ -1953,7 +1980,7 @@ impl Storage {
             match T::deserialize(&row) {
                 Ok(row) => valid.push(row),
                 Err(error) => {
-                    tracing::warn!(profile = %self.profile, row = index, %error, %kind, path = %path.display(), "skipping corrupt stored row");
+                    tracing::warn!(target: "session.store", profile = %self.profile, row = index, %error, %kind, path = %path.display(), "skipping corrupt stored row");
                     corrupt.push(row);
                 }
             }
@@ -2043,6 +2070,16 @@ impl Storage {
             .verify_current(&self.sessions_path)
     }
 
+    pub(crate) fn confirm_sessions_directory_durable(&self) -> Result<()> {
+        let files = self
+            .files
+            .as_deref()
+            .context("profile store is not bound")?;
+        files.verify_current(&self.sessions_path)?;
+        files.sessions.sync_parent()?;
+        files.verify_current(&self.sessions_path)
+    }
+
     #[allow(clippy::unnecessary_cast)]
     pub(crate) fn bound_profile_identity(&self) -> Result<(u64, u64)> {
         let (device, inode) = self
@@ -2094,11 +2131,13 @@ impl Storage {
     ) -> Result<()> {
         transition.verify_storage(self)?;
         self.verify_bound_profile()?;
-        self.files
+        let sessions = &self
+            .files
             .as_deref()
             .context("profile store is not bound")?
-            .sessions
-            .replace_preserving_permissions(bytes)?;
+            .sessions;
+        sessions.replace_preserving_permissions(bytes)?;
+        sessions.sync_parent()?;
         self.verify_bound_profile()
     }
     fn load_bundle(&self, policy: ReadPolicy<'_>) -> Result<(Vec<Instance>, Vec<Group>)> {
@@ -2238,7 +2277,10 @@ impl Storage {
         if let Some(buf) = groups_buf {
             let groups_path = self.sessions_path.with_file_name("groups.json");
             match self.profile_files(policy) {
-                Some(files) => files.groups.replace_preserving_permissions(&buf)?,
+                Some(files) => {
+                    files.groups.replace_preserving_permissions(&buf)?;
+                    files.groups.sync_parent()?;
+                }
                 None => atomic_write(&groups_path, &buf)?,
             }
             self.file_watch.notify_local_change(&groups_path);
@@ -2249,9 +2291,12 @@ impl Storage {
         }
 
         match self.profile_files(policy) {
-            Some(files) => files
-                .sessions
-                .replace_preserving_permissions(&instances_buf)?,
+            Some(files) => {
+                files
+                    .sessions
+                    .replace_preserving_permissions(&instances_buf)?;
+                files.sessions.sync_parent()?;
+            }
             None => atomic_write(&self.sessions_path, &instances_buf)?,
         }
         self.file_watch.notify_local_change(&self.sessions_path);
@@ -3838,6 +3883,62 @@ mod tests {
     use serial_test::serial;
     use tempfile::tempdir;
 
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn bound_profile_commit_syncs_each_resolved_parent_before_success() -> Result<()> {
+        struct ResetSyncFault;
+        impl Drop for ResetSyncFault {
+            fn drop(&mut self) {
+                super::super::anchored_fs::FAIL_SYNC_ONCE.set(None);
+            }
+        }
+        let _reset_sync_fault = ResetSyncFault;
+        let temp = tempdir()?;
+        let _home = setup_test_home(temp.path());
+        let profile = super::super::get_profile_dir("sync-parents")?;
+        let sessions_parent = temp.path().join("session-target");
+        let groups_parent = temp.path().join("group-target");
+        fs::create_dir_all(&sessions_parent)?;
+        fs::create_dir_all(&groups_parent)?;
+        fs::write(sessions_parent.join("sessions.json"), b"[]")?;
+        fs::write(groups_parent.join("groups.json"), b"[]")?;
+        std::os::unix::fs::symlink(
+            sessions_parent.join("sessions.json"),
+            profile.join("sessions.json"),
+        )?;
+        std::os::unix::fs::symlink(
+            groups_parent.join("groups.json"),
+            profile.join("groups.json"),
+        )?;
+        let storage = Storage::open_unwatched("sync-parents")?;
+        super::super::anchored_fs::FAIL_SYNC_ONCE.set(Some(groups_parent.clone()));
+        assert!(storage
+            .update(|rows, groups| {
+                rows.push(Instance::new("not yet", "/tmp"));
+                groups.push(Group::new("group", "group"));
+                Ok(())
+            })
+            .is_err());
+        assert!(
+            storage.load()?.is_empty(),
+            "groups barrier precedes sessions replacement"
+        );
+        super::super::anchored_fs::FAIL_SYNC_ONCE.set(Some(sessions_parent));
+        assert!(storage
+            .update(|rows, _| {
+                rows.push(Instance::new("applied but unconfirmed", "/tmp"));
+                Ok(())
+            })
+            .is_err());
+        assert_eq!(
+            storage.load()?.len(),
+            1,
+            "rename applied before the failed parent barrier"
+        );
+        Ok(())
+    }
+
     #[test]
     fn registry_read_keeps_validated_file_after_path_replacement() {
         let root = tempdir().unwrap();
@@ -4638,7 +4739,18 @@ mod tests {
         fs::create_dir_all(storage.sessions_path.parent().unwrap())?;
         fs::write(&storage.sessions_path, serde_json::to_vec_pretty(&rows)?)?;
 
-        let loaded = storage.load()?;
+        let load_with_filter = |filter: &str| -> Result<(Vec<Instance>, String)> {
+            let output = tempfile::NamedTempFile::new()?;
+            let subscriber = tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_env_filter(filter)
+                .with_writer(output.reopen()?)
+                .finish();
+            let loaded = tracing::subscriber::with_default(subscriber, || storage.load())?;
+            Ok((loaded, fs::read_to_string(output.path())?))
+        };
+        let (loaded, logs) = load_with_filter("agent_of_empires=off,session.store=warn")?;
+        assert!(logs.contains("skipping corrupt stored row"));
         assert_eq!(loaded.len(), 2);
         assert_eq!(loaded[0].title, "alpha");
         assert_eq!(loaded[1].title, "beta");
@@ -4663,7 +4775,9 @@ mod tests {
         // A second read-only load must not duplicate the row: load() runs on
         // refresh paths that never rewrite sessions.json, so the sidecar is
         // overwritten with the current corrupt set rather than appended to.
-        assert_eq!(storage.load()?.len(), 2);
+        let (again, logs) = load_with_filter("agent_of_empires=off,session.store=off")?;
+        assert_eq!(again.len(), 2);
+        assert!(!logs.contains("skipping corrupt stored row"));
         let q = fs::read_to_string(&quarantine)?;
         assert_eq!(q.lines().count(), 1, "repeated load must not duplicate");
 

@@ -25,6 +25,9 @@ Mouse-enabled full-screen agents copy through OSC 52 instead: AoE forwards the a
 
 Copy relies on the browser Clipboard API, which only works in a secure context: HTTPS (the remote-access tunnel modes) or `http://localhost`. On a plain-HTTP LAN/VPN origin the browser blocks clipboard writes, so the selection stays visible but is not copied. Firefox is best-effort (it lacks the async clipboard write); Chromium and Safari copy reliably.
 
+Agent capture, cursor modes, TTY identity and input stay pinned to the agent pane.
+Focusing or zooming a secondary tmux pane does not retarget them.
+
 ## Paired terminal
 
 Each session can open a **paired terminal**: a host shell (or, for a sandboxed session, one inside the container) rooted at the session's working directory. On desktop it shares the split with the agent terminal; on mobile it is one of the right-panel views. It stays alive in the background when you switch away. Its terminal 1 is the same shell the TUI opens with `T`, in the matching Host or Container mode.

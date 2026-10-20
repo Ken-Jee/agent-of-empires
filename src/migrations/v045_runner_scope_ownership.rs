@@ -26,12 +26,12 @@ pub fn run() -> Result<()> {
         let mut document: Value = match serde_json::from_str(&raw) {
             Ok(document) => document,
             Err(error) => {
-                tracing::warn!(path = %path.display(), %error, "Quarantined unreadable session component; repair it and run aoe migrate");
+                tracing::warn!(target: "migrations.v045", path = %path.display(), %error, "Quarantined unreadable session component; repair it and run aoe migrate");
                 continue;
             }
         };
         let Some(rows) = document.as_array_mut() else {
-            tracing::warn!(path = %path.display(), "Quarantined invalid session component; repair it and run aoe migrate");
+            tracing::warn!(target: "migrations.v045", path = %path.display(), "Quarantined invalid session component; repair it and run aoe migrate");
             continue;
         };
         for row in rows.iter().filter_map(Value::as_object) {
@@ -45,7 +45,7 @@ pub fn run() -> Result<()> {
             .iter()
             .any(|row| crate::session::Instance::deserialize(row).is_err())
         {
-            tracing::warn!(path = %path.display(), "Quarantined invalid session rows; repair them and run aoe migrate");
+            tracing::warn!(target: "migrations.v045", path = %path.display(), "Quarantined invalid session rows; repair them and run aoe migrate");
             continue;
         }
         let mut changed = false;
@@ -59,7 +59,7 @@ pub fn run() -> Result<()> {
             crate::session::backup_before_migration(&path)?;
             file.replace(&serde_json::to_vec(rows)?)?;
             file.sync_parent()?;
-            tracing::info!(path = %path.display(), "Preserved unresolved legacy terminal scope ownership");
+            tracing::info!(target: "migrations.v045", path = %path.display(), "Preserved unresolved legacy terminal scope ownership");
         }
     }
 
@@ -82,12 +82,13 @@ pub fn run() -> Result<()> {
                 let mut record: Value = match serde_json::from_str(&raw) {
                     Ok(record) => record,
                     Err(error) => {
-                        tracing::warn!(session = id, %error, "Quarantined unreadable worker component; repair it and run aoe migrate");
+                        tracing::warn!(target: "migrations.v045", session = id, %error, "Quarantined unreadable worker component; repair it and run aoe migrate");
                         return Ok(());
                     }
                 };
                 let Some(object) = record.as_object_mut() else {
                     tracing::warn!(
+                        target: "migrations.v045",
                         session = id,
                         "Quarantined invalid worker component; repair it and run aoe migrate"
                     );
@@ -112,6 +113,7 @@ pub fn run() -> Result<()> {
                     if crate::process::worker_registry::WorkerRecord::deserialize(&record).is_err()
                     {
                         tracing::warn!(
+                            target: "migrations.v045",
                             session = id,
                             "Quarantined invalid worker fields; repair them and run aoe migrate"
                         );
@@ -120,13 +122,14 @@ pub fn run() -> Result<()> {
                 }
                 object.insert("scope".into(), json!({"state": "unresolved"}));
                 if crate::process::worker_registry::WorkerRecord::deserialize(&record).is_err() {
-                    tracing::warn!(session = id, "Deferred unresolved worker scope; repair the component and run aoe migrate");
+                    tracing::warn!(target: "migrations.v045", session = id, "Deferred unresolved worker scope; repair the component and run aoe migrate");
                     return Ok(());
                 }
                 crate::session::backup_before_migration(&app.join("acp-workers").join(&name))?;
                 file.replace(&serde_json::to_vec(&record)?)?;
                 file.sync_parent()?;
                 tracing::info!(
+                    target: "migrations.v045",
                     session = id,
                     "Preserved unresolved legacy runner scope ownership"
                 );
@@ -207,7 +210,7 @@ pub(super) fn migrate_journal(root: &crate::session::AnchoredDir, app: &Path) ->
         )?;
         file.replace(&encoded)?;
         file.sync_parent()?;
-        tracing::info!("Preserved unresolved legacy purge scope ownership");
+        tracing::info!(target: "migrations.v045", "Preserved unresolved legacy purge scope ownership");
     }
     Ok(())
 }

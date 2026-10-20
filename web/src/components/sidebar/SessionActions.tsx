@@ -2,7 +2,6 @@ import { useState, type ReactNode, type RefObject } from "react";
 import { createPortal } from "react-dom";
 import type { SessionResponse, Workspace } from "../../lib/types";
 import {
-  attachSessionProject,
   createSession,
   setWorktreeName,
   smartRenameSession,
@@ -18,15 +17,15 @@ import { reportError, reportInfo } from "../../lib/toastBus";
 import { ContextMenu } from "../ContextMenu";
 import { SessionGroupModal } from "../SessionGroupModal";
 import { StatusGlyph } from "../StatusGlyph";
-import { AddProjectModal } from "./AddProjectModal";
 import type { RowModel } from "./rowModel";
 import { BulkTriageMenuItems, SingleRowMenuItems, type SingleRowActions } from "./SessionRowMenu";
 import type { SessionAction } from "./sessionActionTargets";
 import { SnoozeModal } from "./SnoozeModal";
 import type { RowBulkApi, RowContextScope } from "./types";
 import { WorkdirNameModal } from "./WorkdirNameModal";
+import { useSessionActions } from "./usePendingSetting";
 
-type Modal = "snooze" | "workdir" | "addProject" | "group" | null;
+type Modal = "snooze" | "workdir" | "group" | null;
 
 /** What a session's actions call back into; the sidebar and a plugin page's host menu both supply them. */
 export interface SessionActionHandlers {
@@ -78,11 +77,14 @@ export function SessionActionsMenu({
   extraItems?: ReactNode;
 }) {
   const [modal, setModal] = useState<Modal>(null);
+  const owner = useSessionActions();
   const colorsEnabled = useSessionColorsEnabled();
   const unreadEnabled = useUnreadIndicatorEnabled();
   const { label } = model;
   const actions = {
-    ...buildRowActions(workspace, handlers, model, closeMenu, setModal),
+    ...buildRowActions(workspace, handlers, model, closeMenu, setModal, () => {
+      if (model.firstSession) owner.openAttach(model.firstSession);
+    }),
     rename: onRename,
     notify: setNotify,
     color: setColor,
@@ -160,6 +162,7 @@ function buildRowActions(
   model: RowModel,
   closeMenu: () => void,
   setModal: (m: Modal) => void,
+  openAttach: () => void,
 ): Omit<SingleRowActions, "rename" | "notify" | "color"> {
   const after = (fn: () => unknown) => () => {
     closeMenu();
@@ -181,7 +184,7 @@ function buildRowActions(
         ? after(() => props.onCreateSession!(model.newSessionRepoPath!))
         : undefined,
     editWorkdir: after(() => setModal("workdir")),
-    addProject: after(() => setModal("addProject")),
+    addProject: after(openAttach),
     editGroup: after(() => setModal("group")),
     switchView: afterTarget("switchView", (s) => props.onSwitchView?.(s.id, s.view !== "structured")),
     // The dialog lives in the session's Composer, so navigate first; a pending latch opens it on mount.
@@ -273,24 +276,6 @@ function RowModals({
             close();
           }
           return res;
-        }}
-      />,
-      document.body,
-    );
-  }
-  if (modal === "addProject") {
-    return createPortal(
-      <AddProjectModal
-        title={label}
-        profile={model.firstSession?.profile || undefined}
-        onCancel={close}
-        onDone={close}
-        onSubmit={async (project, attachExistingBranch) => {
-          const result = await attachSessionProject(sessionId, project, { attachExistingBranch });
-          if (result.ok && result.session && result.cursor) {
-            onSessionMutation({ session: result.session, cursor: result.cursor });
-          }
-          return result;
         }}
       />,
       document.body,

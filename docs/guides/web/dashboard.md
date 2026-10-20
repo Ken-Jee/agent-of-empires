@@ -25,6 +25,9 @@ The **New session** wizard is one screen of one-line rows, like the TUI dialog; 
 - **Structured**, **Auto-approve**, **Worktree**, and **Sandbox** switches; the Worktree and Sandbox rows open their branch, base, image, and env options.
 
 Choosing a profile (the **Profile** row, shown when there is more than one) seeds these defaults; switching profiles after you have edited a field asks first. A create that runs `on_create` hooks shows their output while it runs, and **Continue in background** closes the wizard and reports the result when it finishes.
+Renaming a profile in either Settings surface refreshes the served-profile
+authority before an implicit wizard reads profile settings or projects. Failed
+refreshes keep Launch disabled and offer Retry server profile without discarding edits.
 
 A plain New session opens on the project you launched last; pick another from Recent or Browse to change it.
 
@@ -71,6 +74,12 @@ A grouping toggle (layers icon) next to the sort toggle cycles the axis. Each cl
 The choice is per-browser (localStorage). Collapse state is tracked separately per axis. You can move a session between groups from the web context menu, but group rename, color, and drag-reorder live on the repo axis only.
 
 **Edit group.** Right-click (long-press on touch) a session row and choose **Edit group**: type an existing group to move it, a new path to create that group, or clear the field to drop it back to **Ungrouped**. Group paths use `/` for hierarchy (e.g. `work/projects`). Hidden in read-only mode.
+
+**Add project.** Attachment results stay open through Multi-repo regrouping.
+Warnings and a failed worker restart remain visible until dismissed.
+Accepted color and notification picks also survive collapse, filtering and
+navigation to Settings. They retain exact sessions and runtime epoch, never
+replay against replacement sessions or a replacement daemon.
 
 ## Triage: pin, archive, snooze
 

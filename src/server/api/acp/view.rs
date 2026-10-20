@@ -496,18 +496,23 @@ pub async fn acp_disable(
         }
     }
 
-    if let Err(response) = persist_terminal_view(
-        &state,
-        &instance,
-        &profile,
-        keep_context,
-        memory_expected,
-        disk_expected,
-    )
-    .await
-    {
-        return response;
-    }
+    let handoff = if already_terminal {
+        None
+    } else {
+        match reserve_terminal_handoff(
+            &state,
+            &instance,
+            &profile,
+            keep_context,
+            memory_expected,
+            disk_expected,
+        )
+        .await
+        {
+            Ok(handoff) => Some(handoff),
+            Err(response) => return response,
+        }
+    };
 
     // Keep the transition guard until the matching in-flight launch has retired.
     let shutdown_result = if keep_context {
@@ -523,6 +528,26 @@ pub async fn acp_disable(
     };
     if let Err(error) = shutdown_result {
         return supervisor_error_response("terminal handoff", &error);
+    }
+    if let Some(handoff) = handoff {
+        let saved = tokio::task::spawn_blocking(move || handoff.commit()).await;
+        match saved {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                return (
+                    StatusCode::CONFLICT,
+                    format!("terminal handoff was not saved: {error}"),
+                )
+                    .into_response()
+            }
+            Err(error) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("terminal handoff save failed: {error}"),
+                )
+                    .into_response()
+            }
+        }
     }
     if let Err(error) = state.acp_supervisor.forget_session(&id) {
         return supervisor_error_response("terminal handoff", &error);
@@ -578,15 +603,78 @@ pub async fn acp_disable(
     view_response(&state, id, View::Terminal).await
 }
 
-/// Persist the terminal handoff with compare-and-swap guards on both cache and disk.
-async fn persist_terminal_view(
+struct TerminalHandoff {
+    native: Option<crate::server::session_store::NativeSessionStore>,
+    snapshot: Instance,
+    generation: u64,
+    expected: HandoffSnapshot,
+    keep_context: bool,
+}
+
+impl Drop for TerminalHandoff {
+    fn drop(&mut self) {
+        if let Some(native) = self.native.take() {
+            crate::session::SessionStore::defer_lifecycle_release(
+                native,
+                self.snapshot.id.clone(),
+                crate::session::LifecycleOperation::Launch,
+                self.generation,
+                None,
+            );
+        }
+    }
+}
+
+impl TerminalHandoff {
+    fn commit(mut self) -> anyhow::Result<()> {
+        let native = self.native.as_ref().expect("owned handoff store");
+        let snapshot = &self.snapshot;
+        let _title = crate::session::acquire_session_title_lock(&snapshot.id)?;
+        let _lifecycle = native
+            .storage()
+            .acquire_instance_lifecycle_lock(&snapshot.id)?;
+        (native as &dyn crate::session::SessionStore).update(|rows, _| {
+            let row = rows
+                .iter_mut()
+                .find(|row| row.id == snapshot.id)
+                .ok_or(crate::session::SessionGone)?;
+            anyhow::ensure!(
+                row.view == self.expected.0
+                    && row.acp_session_id == self.expected.1
+                    && self.expected.2.matches(row)
+                    && row.lifecycle_reservation_is_owned(
+                        crate::session::LifecycleOperation::Launch,
+                        self.generation,
+                    ),
+                "ACP identity or launch reservation changed during terminal handoff; retry"
+            );
+            row.view = View::Terminal;
+            row.acp_load_session_capable = None;
+            row.acp_session_id.clone_from(&snapshot.acp_session_id);
+            row.import_pending = snapshot.import_pending;
+            if self.keep_context {
+                row.adopt_conversation_state(snapshot.conversation_state());
+            }
+            row.release_lifecycle_reservation_if_owned(
+                crate::session::LifecycleOperation::Launch,
+                self.generation,
+            );
+            Ok(())
+        })?;
+        self.native.take();
+        Ok(())
+    }
+}
+
+/// Reserve launch authority without publishing Terminal before retirement.
+async fn reserve_terminal_handoff(
     state: &Arc<AppState>,
     instance: &Instance,
     profile: &str,
     keep_context: bool,
     memory_expected: HandoffSnapshot,
     disk_expected: HandoffSnapshot,
-) -> Result<(), Response> {
+) -> Result<TerminalHandoff, Response> {
     let instances = state.instances.write().await;
     let Some(slot) = instances.iter().find(|row| row.id == instance.id) else {
         return Err(session_not_found());
@@ -607,59 +695,59 @@ async fn persist_terminal_view(
     drop(instances);
 
     let snapshot = instance.clone();
-    let persisted_conversation = snapshot.conversation_state();
+    let expected_generation = snapshot.lifecycle_generation;
     let profile_for_save = profile.to_string();
     let commit_state = state.clone();
-    let save_result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-        let storage = crate::server::session_store::NativeSessionStore::open(
+    let save_result = tokio::task::spawn_blocking(move || -> anyhow::Result<TerminalHandoff> {
+        let native = crate::server::session_store::NativeSessionStore::open(
             commit_state,
             &profile_for_save,
-            Some(snapshot.id.clone()),
+            None,
         )?;
-        let _lifecycle = storage
+        let _title = crate::session::acquire_session_title_lock(&snapshot.id)?;
+        let _lifecycle = native
             .storage()
             .acquire_instance_lifecycle_lock(&snapshot.id)?;
-        (&storage as &dyn crate::session::SessionStore).update(|all, _groups| {
-            let Some(slot) = all.iter_mut().find(|candidate| candidate.id == snapshot.id) else {
-                anyhow::bail!("session disappeared during terminal handoff");
-            };
+        let generation = (&native as &dyn crate::session::SessionStore).update(|all, _| {
+            let row = all
+                .iter_mut()
+                .find(|candidate| candidate.id == snapshot.id)
+                .ok_or(crate::session::SessionGone)?;
             anyhow::ensure!(
-                slot.view == disk_expected.0
-                    && slot.acp_session_id == disk_expected.1
-                    && (!keep_context || disk_expected.2.matches(slot)),
+                row.view == disk_expected.0
+                    && row.acp_session_id == disk_expected.1
+                    && disk_expected.2.matches(row)
+                    && row.lifecycle_generation == expected_generation,
                 "ACP identity changed during terminal handoff; retry"
             );
-            slot.view = View::Terminal;
-            slot.acp_load_session_capable = None;
-            slot.acp_session_id = snapshot.acp_session_id.clone();
-            slot.import_pending = snapshot.import_pending;
-            if keep_context {
-                slot.adopt_conversation_state(persisted_conversation.clone());
-            }
-            Ok(())
+            Ok(row.try_acquire_lifecycle_reservation(
+                crate::session::LifecycleOperation::Launch,
+                Instance::LIFECYCLE_RESERVATION_TTL,
+                chrono::Utc::now(),
+            )?)
         })?;
-        Ok(())
+        Ok(TerminalHandoff {
+            native: Some(native),
+            snapshot,
+            generation,
+            expected: disk_expected,
+            keep_context,
+        })
     })
     .await;
     match save_result {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => {
-            return Err((
-                StatusCode::CONFLICT,
-                format!("terminal handoff was not saved: {error}"),
-            )
-                .into_response());
-        }
-        Err(join_error) => {
-            return Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("terminal handoff save failed: {join_error}"),
-            )
-                .into_response());
-        }
+        Ok(Ok(handoff)) => Ok(handoff),
+        Ok(Err(error)) => Err((
+            StatusCode::CONFLICT,
+            format!("terminal handoff was not reserved: {error}"),
+        )
+            .into_response()),
+        Err(error) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("terminal handoff reservation failed: {error}"),
+        )
+            .into_response()),
     }
-
-    Ok(())
 }
 
 #[cfg(test)]
@@ -900,7 +988,7 @@ mod tests {
         )
         .await;
         assert!(
-            !state
+            state
                 .instances
                 .read()
                 .await
@@ -910,12 +998,19 @@ mod tests {
                 .is_structured(),
             "reload respects the actual pending handoff exclusion"
         );
-        assert!(!storage
+        assert!(storage
             .load()?
             .iter()
             .find(|session| session.id == row.id)
             .unwrap()
             .is_structured());
+        assert!(storage
+            .load()?
+            .iter()
+            .find(|session| session.id == row.id)
+            .unwrap()
+            .lifecycle_reservation
+            .is_some());
         gate.open.notify_one();
         let response = disabling.await.into_response();
         if response.status() != StatusCode::OK {
@@ -1050,14 +1145,83 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
+    async fn disable_cancel_releases_only_its_handoff_reservation() -> anyhow::Result<()> {
+        use crate::acp::runner_lifecycle::test_support::FakeProcessControl;
+        let _home = crate::session::test_support::isolate_app_dir();
+        let mut row = Instance::new("cancelled terminal handoff", "/tmp");
+        row.view = View::Structured;
+        row.source_profile = "default".into();
+        let control = Arc::new(FakeProcessControl::default());
+        control.immortal(4749);
+        let (state, gate, spawner, lease, _) =
+            pending_handoff(&row, 4749, control.clone(), None).await;
+        let disabling = tokio::spawn({
+            let state = state.clone();
+            let id = row.id.clone();
+            async move { acp_disable(State(state), Path(id)).await.into_response() }
+        });
+        let storage = crate::session::Storage::open_unwatched("default")?;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !state.acp_supervisor.test_cancel_requested(&lease) {
+            anyhow::ensure!(
+                tokio::time::Instant::now() < deadline,
+                "disable did not enter retirement"
+            );
+            tokio::task::yield_now().await;
+        }
+        let reserved = storage
+            .load()?
+            .into_iter()
+            .find(|session| session.id == row.id)
+            .unwrap();
+        assert!(reserved.is_structured());
+        assert!(reserved.lifecycle_reservation.is_some());
+        disabling.abort();
+        assert!(disabling.await.unwrap_err().is_cancelled());
+        loop {
+            let durable = storage
+                .load()?
+                .into_iter()
+                .find(|session| session.id == row.id)
+                .unwrap();
+            assert!(durable.is_structured());
+            if durable.lifecycle_reservation.is_none() {
+                break;
+            }
+            anyhow::ensure!(
+                tokio::time::Instant::now() < deadline,
+                "cancelled handoff retained its Launch token"
+            );
+            tokio::task::yield_now().await;
+        }
+        gate.open.notify_one();
+        assert!(spawner.await?.is_err());
+        control.exit(4749);
+        state.acp_supervisor.retry_pending_teardowns().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
     async fn disable_refuses_success_and_retains_unproven_retirement() -> anyhow::Result<()> {
         use crate::acp::runner_lifecycle::test_support::FakeProcessControl;
         use crate::process::worker_registry;
         use std::time::Duration;
         let _home = crate::session::test_support::isolate_app_dir();
-        let mut row = Instance::new("unproven terminal handoff", "/tmp");
+        crate::session::config::update_app_state(|state| {
+            state.has_acknowledged_agent_hooks = true
+        })?;
+        let project = tempfile::tempdir()?;
+        let mut row = Instance::new(
+            "unproven terminal handoff",
+            project.path().to_str().unwrap(),
+        );
         row.view = View::Structured;
         row.source_profile = "default".into();
+        row.command = "sleep 60".into();
+        let _pane = crate::tmux::test_helpers::TmuxTestSession::from_name(
+            crate::tmux::Session::generate_name(&row.id, &row.title),
+        );
         let control = Arc::new(FakeProcessControl::default());
         control.immortal(4747);
         let (state, gate, spawner, lease, _) =
@@ -1088,10 +1252,51 @@ mod tests {
         assert!(worker_registry::load(&row.id)?.is_some());
         assert!(control.signals().contains(&(4747, "KILL")));
         assert!(spawner.await?.is_err());
+        assert!(state
+            .instances
+            .read()
+            .await
+            .iter()
+            .find(|session| session.id == row.id)
+            .unwrap()
+            .is_structured());
+        let storage = crate::session::Storage::open_unwatched("default")?;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let durable = storage
+                .load()?
+                .into_iter()
+                .find(|session| session.id == row.id)
+                .unwrap();
+            assert!(
+                durable.is_structured(),
+                "unproven retirement cannot publish Terminal"
+            );
+            if durable.lifecycle_reservation.is_none() {
+                break;
+            }
+            anyhow::ensure!(
+                tokio::time::Instant::now() < deadline,
+                "owned handoff token was not released"
+            );
+            tokio::task::yield_now().await;
+        }
         control.exit(4747);
         state.acp_supervisor.retry_pending_teardowns().await;
         assert!(!state.acp_supervisor.is_owned(&row.id).await);
         assert!(worker_registry::load(&row.id)?.is_none());
+        let response = acp_disable(State(state.clone()), Path(row.id.clone()))
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let rows = state.instances.read().await;
+        let terminal = rows.iter().find(|session| session.id == row.id).unwrap();
+        assert!(!terminal.is_structured());
+        assert!(terminal.lifecycle_reservation.is_none());
+        assert_eq!(
+            terminal.agent_pane.state,
+            crate::session::PanePresence::Alive
+        );
         Ok(())
     }
 

@@ -673,6 +673,7 @@
       "id": "settings.custom-widgets",
       "kind": "vitest",
       "risk": "medium",
+      "description": "Server, migration and systemd area controls preserve unrelated logging overrides when edited or cleared.",
       "specs": ["src/components/settings/__tests__/customWidgets.test.tsx"],
       "components": ["web/src/components/settings/customWidgets.tsx"]
     },
@@ -693,6 +694,7 @@
       "id": "settings.schema-persistence",
       "kind": "live-playwright",
       "risk": "medium",
+      "description": "Server and migration logging overrides survive reload and restart; clearing one retains the other area overrides.",
       "specs": ["tests/live/settings-persistence.spec.ts"],
       "components": [
         "web/src/components/SettingsView.tsx",
@@ -1579,13 +1581,14 @@
       "risk": "high",
       "specs": [
         "src/components/__tests__/SessionRowTriage.test.tsx",
-        "src/components/sidebar/usePendingSetting.test.ts",
         "src/components/__tests__/SessionRowReceipts.test.tsx",
         "src/hooks/__tests__/useSessionsPolling.test.tsx",
         "src/lib/api.test.ts"
       ],
+      "description": "Accepted color and notification resets survive visual unmount; true epoch, target birth, profile and removal invalidation stop unsent work.",
       "components": [
         "web/src/components/WorkspaceSidebar.tsx",
+        "web/src/components/sidebar/SessionActionProvider.tsx",
         "web/src/components/sidebar/usePendingSetting.ts",
         "web/src/components/sidebar/SessionRow.tsx",
         "web/src/hooks/useSessions.ts",
@@ -1598,7 +1601,7 @@
       "risk": "medium",
       "specs": [
         "src/components/__tests__/SessionRowTriage.test.tsx",
-        "src/components/sidebar/usePendingSetting.test.ts"
+        "src/components/__tests__/SessionRowReceipts.test.tsx"
       ],
       "components": [
         "web/src/components/sidebar/SessionRow.tsx",
@@ -1644,12 +1647,15 @@
       "specs": [
         "src/lib/__tests__/sessionColors.test.ts",
         "src/components/__tests__/SessionRowTriage.test.tsx",
-        "src/components/sidebar/usePendingSetting.test.ts"
+        "src/components/__tests__/SessionRowReceipts.test.tsx"
       ],
+      "notes": "Accepted color queues survive visual unmount. Independent canonical values permanently surrender only the optimistic overlay; away-and-back observations cannot resurrect a stale choice or suppress a new pick.",
       "components": [
         "web/src/lib/sessionColors.ts",
         "web/src/components/WorkspaceSidebar.tsx",
-        "web/src/components/sidebar/usePendingSetting.ts"
+        "web/src/components/sidebar/usePendingSetting.ts",
+        "web/src/components/sidebar/SessionActionProvider.tsx",
+        "web/src/components/sidebar/rowModel.ts"
       ]
     },
     {
@@ -4386,13 +4392,22 @@
       "id": "sidebar.add-project",
       "kind": "vitest",
       "risk": "high",
-      "description": "Picker lists saved projects from the session profile and recents; failed reads retry without dropping typed paths. A clicked row or typed path posts to attach with canonical ACK consumption; attach eligibility and worker outcomes; native continuation remains best-effort.",
+      "description": "Profile-scoped picker, canonical attach receipts, retained warnings and restart failures, and explicit unconfirmed results on captured target invalidation.",
       "specs": ["src/components/__tests__/AddProjectAction.test.tsx"],
       "components": [
         "web/src/components/WorkspaceSidebar.tsx",
         "web/src/lib/api.ts",
+        "web/src/components/sidebar/SessionActionProvider.tsx",
         "web/src/components/sidebar/AddProjectModal.tsx"
       ]
+    },
+    {
+      "id": "sidebar.add-project-regrouping",
+      "kind": "mocked-playwright",
+      "risk": "high",
+      "specs": ["tests/native-session-receipts.spec.ts"],
+      "components": ["web/src/App.tsx", "web/src/components/sidebar/SessionActionProvider.tsx"],
+      "description": "Actual canonical Multi-repo regrouping preserves the attach result, moved path, warning and failed restart until Done."
     },
     {
       "id": "sidebar.add-project-daemon",
@@ -4687,7 +4702,7 @@
       "risk": "high",
       "specs": ["tests/served-profile-browser.spec.ts"],
       "components": ["web/src/hooks/useProjects.ts", "web/src/hooks/app/useProjectActions.ts"],
-      "notes": "Browser: focus refresh retains the acknowledged registry on failure and closes writes on served-profile change."
+      "notes": "Focus refresh retains acknowledged registry on failure. Both same-tab rename origins refresh served-profile authority before implicit wizard registry reads."
     },
     {
       "id": "wizard.served-profile-scope.unit",
@@ -4720,7 +4735,7 @@
         "web/src/components/session-wizard/steps/projectPicker.ts",
         "web/src/components/session-wizard/steps/ExtraReposPicker.tsx"
       ],
-      "notes": "Browser: wizard retries failed about without guessing the machine default or overwriting dirty fields; wizard switching explicit Beta back to unresolved Server default resets Beta defaults after about retry."
+      "notes": "Both Settings rename origins invalidate implicit authority until refresh or explicit retry succeeds, without old-profile reads or dirty-field loss. Existing explicit-profile and no-default fallback cases remain."
     },
     {
       "id": "connectivity.poll-abort-deadline.unit",
@@ -4760,13 +4775,13 @@
       "risk": "high",
       "specs": [
         "src/components/__tests__/SessionRowReceipts.test.tsx",
-        "src/components/sidebar/usePendingSetting.test.ts",
         "src/hooks/__tests__/useSessionsPolling.test.tsx",
         "src/lib/api.test.ts"
       ],
       "components": [
         "web/src/App.tsx",
         "web/src/components/WorkspaceSidebar.tsx",
+        "web/src/components/sidebar/SessionActionProvider.tsx",
         "web/src/components/sidebar/SessionRow.tsx",
         "web/src/components/sidebar/usePendingSetting.ts",
         "web/src/hooks/useSessions.ts",
@@ -4781,12 +4796,13 @@
       "components": [
         "web/src/App.tsx",
         "web/src/components/WorkspaceSidebar.tsx",
+        "web/src/components/sidebar/SessionActionProvider.tsx",
         "web/src/components/sidebar/SessionRow.tsx",
         "web/src/components/sidebar/usePendingSetting.ts",
         "web/src/hooks/useSessions.ts",
         "web/src/lib/api.ts"
       ],
-      "notes": "Browser: color cancellation installs a held lower receipt after another row ACK and accepts the next canonical writer; notifications cancellation installs a held lower receipt after another row ACK and accepts the next canonical writer. Revisions exceed Number.MAX_SAFE_INTEGER."
+      "notes": "Color and notification receipt ordering remains exact above Number.MAX_SAFE_INTEGER. Accepted color reset survives Settings navigation before its first ACK; true invalidation never replays queued work."
     },
     {
       "id": "sidebar.canonical-settings-receipts.live",

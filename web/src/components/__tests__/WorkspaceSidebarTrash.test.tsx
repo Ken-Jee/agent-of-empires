@@ -7,6 +7,7 @@ import { WorkspaceSidebar } from "../WorkspaceSidebar";
 import { buildSessionGroups } from "../../lib/sidebarGroups";
 import type { SessionResponse, Workspace } from "../../lib/types";
 import { makeSession, makeWorkspace } from "./fixtures";
+import { SessionActionProvider } from "../sidebar/SessionActionProvider";
 
 type Props = React.ComponentProps<typeof WorkspaceSidebar>;
 const noop = () => {};
@@ -66,7 +67,16 @@ function renderSidebar(workspaces: Workspace[], over: Partial<Props> = {}) {
     onAxisChange: noop,
     ...over,
   };
-  render(<WorkspaceSidebar {...props} />);
+  render(
+    <SessionActionProvider
+      sessions={workspaces.flatMap((ws) => ws.sessions)}
+      runtimeEpoch={props.runtimeEpoch}
+      observedById={props.observedById}
+      onSessionMutation={props.onSessionMutation}
+    >
+      <WorkspaceSidebar {...props} />
+    </SessionActionProvider>,
+  );
   return props;
 }
 const withTrash = (over: Partial<Props> = {}) => {

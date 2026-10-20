@@ -254,10 +254,8 @@ pub(super) fn reap_migrated_container(
 /// Every sandboxed row becomes a `Target` whatever its disposition, because
 /// the liveness gate reasons over whole cohorts: a member missing from its
 /// cohort is a member the gate never asks about, and its peers' store is then
-/// published while that session is still writing to it. Three reviews of this
-/// migration found that same defect three times, each from a different filter
-/// applied before cohorts were assembled. Eligibility is therefore a property
-/// of the target and never a filter on the rows that build one.
+/// published while that session is still writing to it. Eligibility belongs
+/// to the target and never filters the rows that build a cohort.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Disposition {
     /// Copy and publish this store once the cohort is quiescent.
@@ -291,6 +289,10 @@ struct MigrationScope<'a> {
 }
 
 impl MigrationScope<'_> {
+    fn sandbox_registry_guard(self) -> Option<tokio::sync::OwnedRwLockWriteGuard<()>> {
+        self.store.and_then(|store| store.sandbox_registry_guard())
+    }
+
     fn publish(self, checkpoint: LockedSandboxCheckpoint<'_>) -> Result<()> {
         match self.store {
             Some(store) => store.commit_sandbox_checkpoint(checkpoint),
@@ -483,6 +485,7 @@ impl PreparedSandboxCheckpoint<'_> {
                             "legacy registry binding changed"
                         );
                         file.replace_preserving_permissions(bytes)?;
+                        file.sync_parent()?;
                         anyhow::ensure!(
                             file.same_target(&crate::session::ResolvedDataFile::open(path)?)?,
                             "legacy registry binding changed"
@@ -898,6 +901,7 @@ fn run_pass(
 ) -> Result<PassOutcome> {
     scope.check_available()?;
     let only = scope.only;
+    let mut registry_guard = scope.sandbox_registry_guard();
     let mut transition_lock = Some(
         crate::session::StorageTransition::acquire_exclusive(app_dir).map_err(|source| {
             SandboxCheckpointFailure {
@@ -1300,6 +1304,7 @@ fn run_pass(
         // session and group writes for its whole duration.
         registry_locks = None;
         transition_lock = None;
+        registry_guard = None;
     }
     let wait_for = only.and_then(|wanted| {
         cohorts
@@ -1470,6 +1475,7 @@ fn run_pass(
     // liveness again, since a container may have come up during the copy.
     scope.check_available()?;
     if transition_lock.is_none() {
+        registry_guard = scope.sandbox_registry_guard();
         transition_lock = Some(
             crate::session::StorageTransition::acquire_exclusive(app_dir).map_err(|source| {
                 SandboxCheckpointFailure {
@@ -1488,6 +1494,7 @@ fn run_pass(
         registry_dirs = dirs;
         registry_locks = Some(lock_registry_dirs(&registry_dirs)?);
     }
+    let _registry_guard = registry_guard;
     let _cohort_locks = cohort_locks;
     refresh_liveness();
     let mut fresh = load_registries(app_dir)?;

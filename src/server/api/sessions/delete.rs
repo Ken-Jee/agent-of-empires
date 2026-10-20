@@ -63,7 +63,7 @@ pub(crate) async fn purge_session_artifacts(
         let mut cleanup_errors = Vec::new();
         if instance.is_structured() {
             if let Err(error) = finish_structured_purge(state, id, &retirement).await {
-                tracing::warn!(session = %id, %error, "dropped purge structured cleanup failed");
+                tracing::warn!(target: "http.api.sessions", session = %id, %error, "dropped purge structured cleanup failed");
                 cleanup_errors.push("Structured worker cleanup remains unproven".into());
             }
         }

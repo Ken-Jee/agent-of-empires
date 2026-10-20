@@ -396,6 +396,12 @@ does not implicitly cancel admitted work. Read-only mode refuses cancellation;
 CityHall permits only structured targets. Wait for the authoritative snapshot
 before treating the row as removed.
 
+On quit, the TUI gives its original authenticated daemon up to two seconds to
+resolve that creation's exact request key and acknowledge direct cancellation.
+This lane bypasses queued commands but never reconnects, changes epoch, or
+replays the cancellation. An acknowledgement still means admission, not
+completed rollback; an unconfirmed outcome is logged before the TUI exits.
+
 While a creation is in flight the daemon reports its phase, running hook
 command and bounded output tail on the runtime stream
 (`/api/runtime/ws`) as a `creation` frame. It is advisory display state, never
@@ -404,6 +410,12 @@ sources of truth, and an empty list means no creation is in flight. The frame
 goes only to the stream the daemon authorized as the local owner, because hook
 output is the documented channel for session environment secrets; a loopback
 bearer client and a remote client receive canonical snapshots alone.
+
+`GET /api/sessions/create-progress/{key}` also exposes bounded hook progress.
+Browser-created progress remains readable under ordinary HTTP authentication.
+Progress created through the owner Unix socket returns `404` to TCP clients,
+including loopback bearer clients; the Unix owner still receives it.
+This visibility follows creation origin, not secrecy of the public correlation key.
 
 **Query parameters**
 
@@ -619,6 +631,10 @@ With an active local daemon, CLI profile renames and deletions go through its
 namespace epoch. Deleting its served profile returns `409 served_profile` and
 preserves the profile; renaming it retargets the live identity. A daemon refusal
 never falls back to editing the profile directory directly.
+Retained purge owners also refuse rename or delete with `409 pending_purge`.
+This includes supported `sessions.json` or `groups.json` file aliases sharing
+the retained owner's physical registry, even when the owner uses another profile name.
+Complete purge recovery before retrying; this busy refusal does not degrade runtime health.
 
 Purge refuses unresolved runner ownership before committing deletion. The row
 and its resources remain available for repair and retry.

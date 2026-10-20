@@ -418,6 +418,67 @@ pub(super) fn foreign_runner_group_absent(pid: u32) -> anyhow::Result<bool> {
     let ruid = unsafe { libc::getuid() };
     Ok((info.pbsi_uid != uid || info.pbsi_ruid != ruid) && !runner_group_executing(pid)?)
 }
+pub(super) fn process_tree_samples(
+    root: &super::PrimeProcessIdentity,
+) -> anyhow::Result<Vec<super::PrimeProcessSample>> {
+    let mut command = Command::new("ps");
+    command.args(["-A", "-o", "pid=,ppid=,stat="]);
+    let output = crate::session::capture::run_with_timeout_limit(
+        command,
+        std::time::Duration::from_secs(2),
+        "tool process census",
+        1024 * 1024,
+    )?;
+    let mut candidates = Vec::new();
+    for line in std::str::from_utf8(&output)?.lines() {
+        let mut fields = line.split_ascii_whitespace();
+        let pid = fields.next().context("missing process PID")?.parse()?;
+        let parent = fields.next().context("missing process parent")?.parse()?;
+        if !fields
+            .next()
+            .context("missing process state")?
+            .starts_with('Z')
+        {
+            candidates.push(super::PrimeProcessSample {
+                identity: super::PrimeProcessIdentity {
+                    pid,
+                    start_id: if pid == root.pid {
+                        root.start_id.clone()
+                    } else {
+                        String::new()
+                    },
+                },
+                parent,
+                marked: false,
+            });
+        }
+    }
+    let selected = super::prime_selection_mask(&candidates, std::slice::from_ref(root));
+    let mut samples = Vec::new();
+    for (mut sample, selected) in candidates.into_iter().zip(selected) {
+        if !selected {
+            continue;
+        }
+        let pid = sample.identity.pid;
+        let Some(token) = audit_token(pid)? else {
+            continue;
+        };
+        let membership = process_membership(pid)?.context("tool process membership unavailable")?;
+        anyhow::ensure!(
+            audit_token(pid)? == Some(token),
+            "tool process incarnation changed during census"
+        );
+        sample.identity.start_id = audit_start_id(&token);
+        sample.parent = membership.pbi_ppid;
+        samples.push(sample);
+    }
+    anyhow::ensure!(
+        samples.iter().any(|sample| sample.identity == *root),
+        "tool root omitted from census"
+    );
+    Ok(samples)
+}
+
 pub(super) fn prime_processes(
     marker: &str,
     socket: &std::path::Path,

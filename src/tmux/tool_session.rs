@@ -21,6 +21,23 @@ pub struct ToolSession {
     name: String,
 }
 
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ToolStopReceipt {
+    name: String,
+    identity: crate::session::LegacyToolIdentity,
+    owner: String,
+    tree: crate::process::CapturedProcessTreeReceipt,
+}
+
+#[derive(serde::Serialize)]
+struct ToolStopReceiptRef<'a> {
+    name: &'a str,
+    identity: &'a crate::session::LegacyToolIdentity,
+    owner: &'a str,
+    tree: &'a crate::process::CapturedProcessTreeReceipt,
+}
+
 impl ToolSession {
     /// Transport name only; lifecycle operations require verified snapshot ownership.
     pub fn new(session_id: &str, session_title: &str, tool_name: &str) -> Self {
@@ -314,6 +331,47 @@ impl ToolSession {
         Ok(())
     }
 
+    fn read_stop_state(
+        &self,
+        condition: &str,
+        identity: &crate::session::LegacyToolIdentity,
+    ) -> Result<(bool, Option<ToolStopReceipt>)> {
+        let mut command = crate::tmux::tmux_command();
+        command.args([
+            "if-shell",
+            "-t",
+            &identity.pane_id,
+            "-F",
+            condition,
+            "display-message -p 'aoe-tool-stop-state\t#{pane_dead}\t#{@aoe_tool_stop}'",
+        ]);
+        let output = crate::tmux::TmuxCommandDeadline::new().run(&mut command)?;
+        anyhow::ensure!(
+            output.status.success(),
+            LegacyToolUnavailable("captured stop target is unavailable")
+        );
+        let text = String::from_utf8(output.stdout)?;
+        let state = text
+            .lines()
+            .find_map(|line| line.strip_prefix("aoe-tool-stop-state\t"))
+            .ok_or(LegacyToolUnavailable(
+                "captured identity or owner changed before stop",
+            ))?;
+        let (dead, receipt) = state
+            .split_once('\t')
+            .ok_or(LegacyToolUnavailable("captured stop state is malformed"))?;
+        anyhow::ensure!(
+            dead == "0" || dead == "1",
+            LegacyToolUnavailable("captured pane state is unavailable")
+        );
+        let receipt = if receipt.is_empty() {
+            None
+        } else {
+            Some(serde_json::from_str(receipt)?)
+        };
+        Ok((dead == "1", receipt))
+    }
+
     pub(crate) fn kill_verified(
         &self,
         id: &str,
@@ -322,9 +380,53 @@ impl ToolSession {
     ) -> Result<()> {
         let owner = serde_json::to_string(&(id, tool_name))?;
         let condition = Self::snapshot_condition(&self.name, identity, &owner);
+        let (dead, pending) = self.read_stop_state(&condition, identity)?;
+        if let Some(receipt) = pending {
+            anyhow::ensure!(
+                receipt.name == self.name
+                    && receipt.identity == *identity
+                    && receipt.owner == owner,
+                LegacyToolUnavailable("pending retirement belongs to another tool incarnation")
+            );
+            crate::process::CapturedProcessTree::resume(receipt.tree, identity.pane_pid)?
+                .settle(std::time::Duration::from_millis(200))?;
+        } else if !dead {
+            let tree = crate::process::CapturedProcessTree::capture(identity.pane_pid)?;
+            let receipt = serde_json::to_string(&ToolStopReceiptRef {
+                name: &self.name,
+                identity,
+                owner: &owner,
+                tree: tree.receipt(),
+            })?;
+            let live_condition = format!(
+                "#{{&&:#{{&&:{condition},#{{==:#{{pane_dead}},0}}}},#{{==:#{{@aoe_tool_stop}},}}}}"
+            );
+            let quote = crate::tmux::Session::tmux_command_string_literal;
+            let target = quote(&identity.pane_id);
+            let session = quote(&identity.session_id);
+            let effect = format!("set-option -p -t {target} remain-on-exit on ; set-option -t {session} @aoe_tool_stop {} ; display-message -p aoe-tool-verified", quote(&receipt));
+            Self::run_snapshot_command(
+                &identity.pane_id,
+                &live_condition,
+                &effect,
+                "aoe-tool-verified",
+            )?;
+            tree.settle(std::time::Duration::from_millis(200))?;
+        }
         let target = crate::tmux::Session::tmux_command_string_literal(&identity.session_id);
         let effect = format!("kill-session -t {target} ; display-message -p aoe-tool-stopped");
-        Self::run_snapshot_command(&identity.pane_id, &condition, &effect, "aoe-tool-stopped")?;
+        if let Err(error) =
+            Self::run_snapshot_command(&identity.pane_id, &condition, &effect, "aoe-tool-stopped")
+        {
+            let panes = crate::tmux::batch_pane_metadata()?;
+            if dead
+                || panes
+                    .values()
+                    .any(|pane| pane.session_id == identity.session_id)
+            {
+                return Err(error);
+            }
+        }
         refresh_session_cache();
         Ok(())
     }
@@ -592,6 +694,159 @@ mod tests {
             ToolSession::legacy_metadata_in(ID, "New title", "yazi", "work", &panes, &scope)
                 .is_err()
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[serial_test::serial]
+    fn verified_stop_retires_original_tool_and_hup_ignoring_descendant() {
+        if !tmux_available() {
+            return;
+        }
+        let _home = crate::session::test_support::isolate_app_dir();
+        for fail_first in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let pid_file = temp.path().join("descendant.pid");
+            let fifo = temp.path().join("wait.fifo");
+            let start = temp.path().join("start.fifo");
+            nix::unistd::mkfifo(
+                &start,
+                nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+            )
+            .unwrap();
+            nix::unistd::mkfifo(
+                &fifo,
+                nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+            )
+            .unwrap();
+            let script = temp.path().join("tool.sh");
+            std::fs::write(&script, format!(
+            "read -r line < '{}'\ntrap '' HUP TERM\nsetsid sh -c 'trap \"\" HUP TERM; echo $$ > \"$1\"; read -r line < \"$2\"' sh '{}' '{}' &\nwait\n",
+            start.display(), pid_file.display(), fifo.display(),
+        )).unwrap();
+            let unique = TmuxTestSession::new("verified_tree");
+            let name = ToolSession::generate_name(ID, unique.name(), "probe");
+            let guard = TmuxTestSession::from_name(&name);
+            let tool = ToolSession {
+                name: guard.name().into(),
+            };
+            tool.create_with_size(
+                temp.path().to_str().unwrap(),
+                &format!("sh '{}'", script.display()),
+                None,
+                "default",
+                ID,
+                "probe",
+            )
+            .unwrap();
+            let panes = crate::tmux::batch_pane_metadata().unwrap();
+            let identity = ToolSession::legacy_identity(panes.get(guard.name()).unwrap()).unwrap();
+            struct Cleanup {
+                tree: Option<crate::process::CapturedProcessTree>,
+                descendant: Option<crate::process::CapturedProcessTree>,
+                pid: u32,
+                birth: crate::process::ProcessBirthIdentity,
+            }
+            impl Drop for Cleanup {
+                fn drop(&mut self) {
+                    if crate::process::process_birth_identity(self.pid)
+                        .ok()
+                        .flatten()
+                        .as_ref()
+                        == Some(&self.birth)
+                    {
+                        if let Ok(tree) = crate::process::CapturedProcessTree::capture(self.pid) {
+                            let _ = tree.settle(std::time::Duration::ZERO);
+                        }
+                    }
+                    if let Some(tree) = self.tree.take() {
+                        let _ = tree.settle(std::time::Duration::ZERO);
+                    }
+                    if let Some(tree) = self.descendant.take() {
+                        let _ = tree.settle(std::time::Duration::ZERO);
+                    }
+                }
+            }
+            let mut cleanup = Cleanup {
+                tree: Some(
+                    crate::process::CapturedProcessTree::capture(identity.pane_pid).unwrap(),
+                ),
+                descendant: None,
+                pid: identity.pane_pid,
+                birth: crate::process::process_birth_identity(identity.pane_pid)
+                    .unwrap()
+                    .unwrap(),
+            };
+            std::fs::write(&start, "start\n").unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let descendant = loop {
+                if let Ok(pid) = std::fs::read_to_string(&pid_file)
+                    .and_then(|text| text.trim().parse::<u32>().map_err(std::io::Error::other))
+                {
+                    break pid;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "descendant did not enter its barrier"
+                );
+                std::thread::yield_now();
+            };
+            cleanup.tree =
+                Some(crate::process::CapturedProcessTree::capture(identity.pane_pid).unwrap());
+            cleanup.descendant =
+                Some(crate::process::CapturedProcessTree::capture(descendant).unwrap());
+            let descendant_proof = cleanup.descendant.as_ref().unwrap();
+            if fail_first {
+                crate::process::FAIL_CAPTURED_TREE_AFTER_ROOT.set(true);
+                let error = tool.kill_verified(ID, "probe", &identity).unwrap_err();
+                assert!(error
+                    .to_string()
+                    .contains("injected retirement proof failure after root exit"));
+                assert!(
+                    !descendant_proof.all_exited().unwrap(),
+                    "fixture must retain unproven descendant debt"
+                );
+                let owner = serde_json::to_string(&(ID, "probe")).unwrap();
+                let condition = ToolSession::snapshot_condition(&tool.name, &identity, &owner);
+                assert!(tool
+                    .read_stop_state(&condition, &identity)
+                    .unwrap()
+                    .1
+                    .is_some());
+                let foreign_owner = serde_json::to_string(&("replacement", "probe")).unwrap();
+                assert!(crate::tmux::tmux_command()
+                    .args([
+                        "set-option",
+                        "-t",
+                        &identity.session_id,
+                        "@aoe_tool_owner",
+                        &foreign_owner
+                    ])
+                    .status()
+                    .unwrap()
+                    .success());
+                assert!(tool.kill_verified(ID, "probe", &identity).is_err());
+                assert!(
+                    !descendant_proof.all_exited().unwrap(),
+                    "owner mismatch must not signal captured or replacement processes"
+                );
+                assert!(crate::tmux::tmux_command()
+                    .args([
+                        "set-option",
+                        "-t",
+                        &identity.session_id,
+                        "@aoe_tool_owner",
+                        &owner
+                    ])
+                    .status()
+                    .unwrap()
+                    .success());
+            }
+            tool.kill_verified(ID, "probe", &identity).unwrap();
+            assert!(cleanup.tree.as_ref().unwrap().all_exited().unwrap());
+            assert!(descendant_proof.all_exited().unwrap());
+            assert!(!tool.exists());
+        }
     }
 
     #[test]

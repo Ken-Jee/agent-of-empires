@@ -390,8 +390,17 @@ impl DaemonClient {
             self.sessions_url.as_str().trim_end_matches('/'),
             transport::path_segment(session_id)?
         );
-        self.request_mutation_with_outcome(self.http.post(url).json(body), epoch)
-            .await
+        #[derive(serde::Deserialize)]
+        struct Body {
+            outcome: RestartOutcome,
+        }
+        let receipt: MutationReceipt<Body> = self
+            .request_mutation_with_outcome(self.http.post(url).json(body), epoch)
+            .await?;
+        Ok(MutationReceipt {
+            cursor: receipt.cursor,
+            outcome: receipt.outcome.outcome,
+        })
     }
 
     /// Returns only the cursor; row state is adopted from the runtime stream.
@@ -1385,15 +1394,23 @@ mod tests {
                 (RUNTIME_EPOCH_HEADER, "epoch-1"),
                 (RUNTIME_REVISION_HEADER, "2"),
             ],
-            r#"{"lifecycle_generation":1,"profile":"default","target":null}"#,
+            r#"{"id":"sess/a?b","lifecycle_generation":4,"profile":"root-profile","outcome":{"lifecycle_generation":5,"profile":"target-profile","target":{"tmux_session":"prepared-pane","status":"restarted","lifecycle_generation":5,"profile":"target-profile"}}}"#,
             tx,
         )
         .await;
         let client = DaemonClient::new(&base, None).unwrap();
-        client
+        let receipt = client
             .restart_session("sess/a?b", &RestartSessionBody::default(), "epoch-1")
             .await
             .unwrap();
+        assert_eq!(receipt.cursor.epoch, "epoch-1");
+        assert_eq!(receipt.cursor.revision, 2);
+        assert_eq!(receipt.outcome.lifecycle_generation, 5);
+        assert_eq!(receipt.outcome.profile, "target-profile");
+        let target = receipt.outcome.target.unwrap();
+        assert_eq!(target.tmux_session, "prepared-pane");
+        assert_eq!(target.lifecycle_generation, 5);
+        assert_eq!(target.profile, "target-profile");
         let captured = next_request(rx).await;
         assert_eq!(captured.path, "/api/sessions/sess%2Fa%3Fb/restart");
     }

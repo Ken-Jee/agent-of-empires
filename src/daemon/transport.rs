@@ -434,6 +434,70 @@ mod tests {
         }
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn extended_unix_body_keeps_its_operation_deadline() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("api.sock");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let (release, released) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buf = [0; 4096];
+            while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                let count = stream.read(&mut buf).await.unwrap();
+                assert!(count > 0);
+                request.extend_from_slice(&buf[..count]);
+            }
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\n")
+                .await
+                .unwrap();
+            released.await.unwrap();
+            stream.write_all(b"x").await.unwrap();
+        });
+        let http = reqwest::Client::new();
+        let request = http
+            .get("http://localhost/operation")
+            .timeout(Duration::from_secs(30))
+            .build()
+            .unwrap();
+        let start = tokio::time::Instant::now();
+        let response = tokio::spawn(async move { execute(&http, Some(&path), request).await });
+        let wall_deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !response.is_finished() {
+            assert!(
+                std::time::Instant::now() < wall_deadline,
+                "fixture headers did not arrive"
+            );
+            tokio::task::yield_now().await;
+        }
+        let mut response = response.await.unwrap().unwrap();
+        assert_eq!(
+            response_deadline(&response),
+            start + Duration::from_secs(30)
+        );
+        let body = super::super::read_bounded_body(&mut response, 1024);
+        tokio::pin!(body);
+        assert!(futures_util::poll!(&mut body).is_pending());
+        tokio::time::advance(Duration::from_secs(16)).await;
+        assert!(futures_util::poll!(&mut body).is_pending());
+        release.send(()).unwrap();
+        let bytes = loop {
+            if let std::task::Poll::Ready(result) = futures_util::poll!(&mut body) {
+                break result.unwrap();
+            }
+            assert!(
+                std::time::Instant::now() < wall_deadline,
+                "fixture body did not arrive"
+            );
+            tokio::task::yield_now().await;
+        };
+        assert_eq!(bytes.as_slice(), b"x");
+        server.await.unwrap();
+    }
+
     #[tokio::test]
     async fn body_helpers_share_deadlines_without_shortening_long_operations() {
         for unix in [true, false] {
@@ -441,16 +505,8 @@ mod tests {
                 (0, 2, 0, 1000, false),
                 (70, 1, 60, 100, true),
                 (0, 10, 20, 100, true),
-                (0, 1, 16000, 30000, false),
             ] {
-                // One real-clock long-body case is sufficient; both transports share the helpers.
-                if !unix && chunk_ms == 16000 {
-                    continue;
-                }
                 for consumer in 0..3 {
-                    if chunk_ms == 16000 && consumer != 0 {
-                        continue;
-                    }
                     let temp = tempfile::tempdir().unwrap();
                     let path = temp.path().join("api.sock");
                     let (url, server) = if unix {

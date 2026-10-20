@@ -20,7 +20,7 @@ export const SESSION_COLOR_OPTIONS: { key: string; label: string; dotClass: stri
 export type NotifyPreset = "off" | "default" | "all";
 
 /** Mixed per-event overrides read as "default", which resets them cleanly when picked. */
-function detectNotifyPreset(values: (boolean | null | undefined)[]): NotifyPreset {
+export function detectNotifyPreset(values: (boolean | null | undefined)[]): NotifyPreset {
   if (values.every((v) => v === false)) return "off";
   if (values.every((v) => v === true)) return "all";
   return "default";

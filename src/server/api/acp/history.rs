@@ -593,7 +593,8 @@ done
             assert_eq!(status, StatusCode::OK, "{body}");
             assert_eq!(body["sessions"][0]["cwd"], format!("/stores/{name}"));
         }
-        state.rename_served_profile("test", "b");
+        let served_profile = state.served_profile().to_string();
+        state.rename_served_profile(&served_profile, "b");
         for profile in [None, Some("")] {
             let (status, body) = get(profile).await;
             assert_eq!(status, StatusCode::OK, "{body}");

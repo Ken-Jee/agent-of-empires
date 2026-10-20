@@ -430,7 +430,7 @@ const requestCases: RequestCase[] = [
     ] as const
   ).map(([preset, value]): RequestCase => [
     "PATCH /api/sessions/s1/notifications",
-    () => api.setSessionNotifications("s1", preset),
+    () => api.setSessionNotifications("s1", preset, "boot"),
     {
       body: { notify_on_waiting: value, notify_on_idle: value, notify_on_error: value },
       respond: runtimeJson(session),
@@ -454,7 +454,7 @@ const requestCases: RequestCase[] = [
   ],
   [
     "PATCH /api/sessions/s1/color",
-    () => api.setSessionColor("s1", null),
+    () => api.setSessionColor("s1", null, "boot"),
     { body: { color: null }, respond: runtimeJson(session), result: { session, cursor } },
   ],
   [
@@ -493,7 +493,7 @@ const requestCases: RequestCase[] = [
   ],
   [
     "POST /api/sessions/s1/projects",
-    () => api.attachSessionProject("s1", "/r"),
+    () => api.attachSessionProject("s1", "/r", { epoch: "boot" }),
     {
       body: { project: "/r", attach_existing_branch: false },
       respond: runtimeJson({
@@ -792,7 +792,7 @@ const failureCases: [string, () => Promise<unknown>, unknown][] = [
   ["listServerQueue", () => api.listServerQueue("s1"), []],
   ["renameSession", () => api.renameSession("s1", "x"), { ok: false }],
   ["smartRenameSession", () => api.smartRenameSession("s1"), { ok: false }],
-  ["attachSessionProject", () => api.attachSessionProject("s1", "p"), { ok: false }],
+  ["attachSessionProject", () => api.attachSessionProject("s1", "p", { epoch: "boot" }), { ok: false }],
   ["resolveMcpConflict", () => api.resolveMcpConflict("n", "a", "aoe", "fp"), "error"],
   ["invokePluginAction", () => api.invokePluginAction("p", "m"), null],
   ["resolvePluginOptions", () => api.resolvePluginOptions("p", "s", []), []],
@@ -1249,7 +1249,7 @@ describe("session mutation messages", () => {
   it.each([
     ["renameSession", () => api.renameSession("s1", "x")],
     ["smartRenameSession", () => api.smartRenameSession("s1")],
-    ["attachSessionProject", () => api.attachSessionProject("s1", "p")],
+    ["attachSessionProject", () => api.attachSessionProject("s1", "p", { epoch: "boot" })],
   ])("%s surfaces the server message", async (_name, call) => {
     fetchSpy.mockResolvedValueOnce(json({ message: "running" }, 409));
     expect(await call()).toEqual({ ok: false, message: "running" });
@@ -1458,8 +1458,8 @@ describe("runtime snapshots and cancellation", () => {
   ])("rejects unattested session snapshots and mutation ACKs (%s)", async (_name, headers) => {
     for (const call of [
       () => api.fetchSessions(),
-      () => api.setSessionColor("s1", null),
-      () => api.setSessionNotifications("s1", "default"),
+      () => api.setSessionColor("s1", null, "boot"),
+      () => api.setSessionNotifications("s1", "default", "boot"),
       () => api.updateSessionGroup("s1", ""),
     ]) {
       fetchSpy.mockResolvedValueOnce(
@@ -1472,7 +1472,7 @@ describe("runtime snapshots and cancellation", () => {
   it("preserves u64 revision precision and the canonical returned fields, including optional outcome", async () => {
     const canonical = { ...session, color: "green", outcome: { acknowledged: true } };
     fetchSpy.mockResolvedValueOnce(runtimeJson(canonical));
-    expect(await api.setSessionColor("s1", null)).toEqual({ session: canonical, cursor });
+    expect(await api.setSessionColor("s1", null, "boot")).toEqual({ session: canonical, cursor });
     fetchSpy.mockResolvedValueOnce(runtimeJson(sessions));
     expect((await api.fetchSessions())!.cursor.revision).toBe(9007199254740993n);
   });

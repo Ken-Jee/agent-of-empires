@@ -1728,7 +1728,10 @@ fn read_document(
     };
     let text = text.trim_start_matches('\u{feff}');
     let parsed = if yaml {
-        crate::yaml::from_str::<serde_json::Value>(text).map_err(anyhow::Error::from)
+        let mut options = crate::yaml::options();
+        options.duplicate_keys = serde_saphyr::DuplicateKeyPolicy::LastWins;
+        serde_saphyr::from_str_with_options::<serde_json::Value>(text, options)
+            .map_err(anyhow::Error::from)
     } else {
         serde_json::from_str(text).map_err(anyhow::Error::from)
     };
@@ -1920,7 +1923,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn yaml_resource_documents_preserve_scalars_and_skip_undecodable_inputs() {
+    fn yaml_resource_documents_preserve_bytes_and_skip_undecodable_inputs() {
         let temporary = tempfile::tempdir().unwrap();
         let root = AnchoredDir::open(temporary.path()).unwrap();
         let path = Path::new("config.yaml");
@@ -1932,12 +1935,18 @@ mod tests {
             serde_json::json!({"path":"./plugin","enabled":true})
         );
         assert_eq!(
-            document["values"],
-            serde_json::json!([true, false, "on", "001", "true"])
+            fs::read(temporary.path().join(path)).unwrap(),
+            source.as_bytes()
+        );
+        let duplicate = "path: first\npath: second\n";
+        fs::write(temporary.path().join(path), duplicate).unwrap();
+        assert_eq!(
+            read_document(&root, path, true).unwrap().unwrap()["path"],
+            "second"
         );
         assert_eq!(
             fs::read(temporary.path().join(path)).unwrap(),
-            source.as_bytes()
+            duplicate.as_bytes()
         );
         for invalid in [b"plugins: [".as_slice(), b"\xff", b"? [a, b]\n: value\n"] {
             fs::write(temporary.path().join(path), invalid).unwrap();

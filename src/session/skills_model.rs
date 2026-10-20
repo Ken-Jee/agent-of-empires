@@ -208,7 +208,7 @@ pub fn parse_skill_md(content: &str) -> Result<ParsedSkill> {
         .context("SKILL.md must begin with a \"---\" frontmatter fence")?;
     let (frontmatter, body) = split_closing_fence(after_open)
         .context("SKILL.md frontmatter is not closed by a \"---\" line")?;
-    let fm: Frontmatter = crate::yaml::from_str(frontmatter)
+    let fm: Frontmatter = serde_saphyr::from_str_with_options(frontmatter, crate::yaml::options())
         .context("failed to parse SKILL.md frontmatter as YAML")?;
     if fm.name.trim().is_empty() {
         bail!("SKILL.md frontmatter \"name\" is empty");

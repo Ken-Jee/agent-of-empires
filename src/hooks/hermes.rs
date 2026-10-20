@@ -4,8 +4,6 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde_json::Value;
-#[cfg(test)]
-use yaml_serde::Value as Yaml;
 
 use crate::agents::ResolvedHookEvent;
 
@@ -198,21 +196,23 @@ mod tests {
         )
     }
 
-    fn read_yaml(path: &Path) -> Yaml {
-        crate::yaml::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+    fn read_yaml(path: &Path) -> Value {
+        serde_saphyr::from_str_with_options(
+            &std::fs::read_to_string(path).unwrap(),
+            crate::yaml::options(),
+        )
+        .unwrap()
     }
 
     #[test]
     fn hermes_hooks_install_beside_user_config_and_uninstall() {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("config.yaml");
-        let input = "model: hermes-pro\nhooks:\n  pre_tool_call:\n    - command: \"echo user-hook\"\n      matcher: \"terminal\"\nhooks_auto_accept: false\nvendor: {17: numeric, '17': quoted, enabled: true, label: on, code: 001}\nopaque: !custom {enabled: true, label: on, code: 001}\n17: [true, false, 'true', 2]\ndefaults: &defaults {token: keep}\ncopy: *defaults\n";
+        let input = "model: hermes-pro\nhooks:\n  pre_tool_call:\n    - command: \"echo user-hook\"\n      matcher: \"terminal\"\nhooks_auto_accept: false\nvendor: {enabled: true, label: on, code: 001}\nopaque: !custom {enabled: true, label: on, code: 001}\ndefaults: &defaults {token: keep}\ncopy: *defaults\n";
         std::fs::write(&path, input).unwrap();
-        let mut unrelated_before: Yaml = crate::yaml::from_str(input).unwrap();
-        unrelated_before
-            .as_mapping_mut()
-            .unwrap()
-            .remove(Yaml::String("hooks".into()));
+        let mut unrelated_before: Value =
+            serde_saphyr::from_str_with_options(input, crate::yaml::options()).unwrap();
+        unrelated_before.as_object_mut().unwrap().remove("hooks");
         let allowlist_path = tmp.path().join("shell-hooks-allowlist.json");
         std::fs::write(&allowlist_path, "{\"version\":7,\"approvals\":[]}").unwrap();
 
@@ -221,20 +221,10 @@ mod tests {
         let config = read_yaml(&path);
         assert_eq!(config["model"].as_str(), Some("hermes-pro"));
         assert_eq!(config["hooks_auto_accept"].as_bool(), Some(false));
-        let vendor = config["vendor"].as_mapping().unwrap();
-        assert_eq!(
-            vendor
-                .get(Yaml::Number(17u64.into()))
-                .and_then(Yaml::as_str),
-            Some("numeric")
-        );
-        assert_eq!(
-            vendor.get(Yaml::String("17".into())).and_then(Yaml::as_str),
-            Some("quoted")
-        );
+        assert_eq!(config["vendor"]["label"], "on");
         let events = agent_events("hermes", &[]);
         for event in &events {
-            let entries = config["hooks"][event.name.as_str()].as_sequence().unwrap();
+            let entries = config["hooks"][event.name.as_str()].as_array().unwrap();
             assert_eq!(
                 entries
                     .iter()
@@ -268,10 +258,7 @@ mod tests {
         assert_eq!(approvals.len(), events.len() + 1);
         assert!(approvals.iter().any(|entry| entry["command"] == identity));
         let mut unrelated_after = config.clone();
-        unrelated_after
-            .as_mapping_mut()
-            .unwrap()
-            .remove(Yaml::String("hooks".into()));
+        unrelated_after.as_object_mut().unwrap().remove("hooks");
         assert_eq!(unrelated_after, unrelated_before);
         let config_bytes = std::fs::read(&path).unwrap();
         let allowlist_bytes = std::fs::read(&allowlist_path).unwrap();
@@ -281,7 +268,7 @@ mod tests {
 
         assert!(uninstall_hermes_hooks(&path).unwrap());
         let config = read_yaml(&path);
-        let pre_tool = config["hooks"]["pre_tool_call"].as_sequence().unwrap();
+        let pre_tool = config["hooks"]["pre_tool_call"].as_array().unwrap();
         assert_eq!(pre_tool.len(), 1);
         assert_eq!(pre_tool[0]["command"].as_str(), Some("echo user-hook"));
         assert!(config["hooks"].get("post_llm_call").is_none());

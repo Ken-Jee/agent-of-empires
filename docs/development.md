@@ -29,6 +29,11 @@ aoe logs
 
 `cargo xtask dev` runs a dashboard-enabled debug backend on 8081 and Vite with HMR on 5173; `--watch` rebuilds and restarts the backend when Rust inputs change, leaving the previous backend running if a rebuild fails.
 
+Use explicit dotted tracing area targets so per-target logging overrides affect
+native and dashboard failures consistently. Settings > Logging exposes server,
+migration and process areas; clearing one override restores inheritance without
+clearing other targets.
+
 Debug builds are isolated from installed release state:
 
 | Resource | Release and `dev-release` | Debug |

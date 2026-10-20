@@ -171,6 +171,7 @@ pub(super) struct PendingCreation {
     pub(super) daemon_id: Option<String>,
     /// Stable caller identity; never match another session by title/profile.
     pub(super) request_key: String,
+    pub(super) origin_epoch: String,
     pub(super) cancel_requested: bool,
     pub(super) cancel_sent: bool,
     pub(super) outcome_unknown: bool,

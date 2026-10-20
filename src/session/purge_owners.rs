@@ -324,6 +324,54 @@ fn save(file: &ResolvedDataFile, journal: &Journal) -> Result<()> {
     file.sync_parent()
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("Profile '{profile}' has pending purges; complete purge recovery before renaming or deleting it")]
+pub(crate) struct ProfileHasPendingPurges {
+    profile: String,
+}
+
+pub(crate) fn ensure_profile_has_no_pending_purges(root: &Path, profile: &str) -> Result<()> {
+    let file = open(root)?;
+    let (lock, path) = file.open_sidecar()?;
+    let _guard = acquire_open_storage_flock(lock, &path)?;
+    let journal = decode(file.read()?.as_deref())?;
+    if journal.owners.iter().any(|owner| owner.profile == profile) {
+        return Err(ProfileHasPendingPurges {
+            profile: profile.to_owned(),
+        }
+        .into());
+    }
+    if journal.owners.is_empty() {
+        return Ok(());
+    }
+    fn registry_files(root: &Path, profile: &str) -> Result<[ResolvedDataFile; 2]> {
+        let parent = root.join("profiles").join(profile).canonicalize()?;
+        let directory = AnchoredDir::open(&parent)?;
+        Ok([
+            directory.resolve_file(std::ffi::OsStr::new("sessions.json"))?,
+            directory.resolve_file(std::ffi::OsStr::new("groups.json"))?,
+        ])
+    }
+    let selected = registry_files(root, profile)?;
+    let mut seen = HashSet::new();
+    for owner in &journal.owners {
+        if !seen.insert(owner.profile.as_str()) {
+            continue;
+        }
+        for retained in registry_files(root, &owner.profile)? {
+            for candidate in &selected {
+                if retained.same_target(candidate)? {
+                    return Err(ProfileHasPendingPurges {
+                        profile: profile.to_owned(),
+                    }
+                    .into());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn initialize(root: &Path) -> Result<()> {
     let file = open(root)?;
     let (lock, path) = file.open_sidecar()?;
@@ -886,6 +934,133 @@ pub(super) fn release_uncommitted(plan: &RecoveryPlan) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn retained_alias_purge_owner_fences_its_physical_profile_catalogue() -> Result<()> {
+        for leaf in ["sessions.json", "groups.json"] {
+            for delete in [false, true] {
+                let _home = crate::session::test_support::isolate_app_dir();
+                let root = crate::session::get_app_dir()?;
+                initialize(&root)?;
+                for name in ["source", "keep", "distinct"] {
+                    crate::session::create_profile(name)?;
+                }
+                crate::session::set_default_profile("source")?;
+                let source = Storage::new_unwatched("source")?;
+                source.update(|_, _| Ok(()))?;
+                std::fs::write(source.sessions_path().with_file_name("groups.json"), b"[]")?;
+                let alias_dir = root.join("profiles/alias");
+                // Owner admission requires a real profile directory; only its
+                // user-managed registry file aliases the source binding.
+                std::fs::create_dir(&alias_dir)?;
+                if leaf == "groups.json" {
+                    std::fs::write(alias_dir.join("sessions.json"), b"[]")?;
+                }
+                std::os::unix::fs::symlink(
+                    source.sessions_path().with_file_name(leaf),
+                    alias_dir.join(leaf),
+                )?;
+                let alias = Storage::open_unwatched("alias")?;
+                assert_eq!(alias.profile(), "alias");
+                let checkout = root.join("owned-checkout");
+                std::fs::create_dir(&checkout)?;
+                let mut row = Instance::new("alias retained owner", checkout.to_str().unwrap());
+                row.source_profile = "alias".into();
+                row.view = crate::session::View::Terminal;
+                row.terminal_scopes = Some(vec![]);
+                alias.update(|rows, _| {
+                    rows.push(row.clone());
+                    Ok(())
+                })?;
+                if leaf == "sessions.json" {
+                    assert_eq!(
+                        source.load()?[0].id,
+                        row.id,
+                        "owner was admitted through the file alias"
+                    );
+                } else {
+                    assert!(
+                        source.load()?.is_empty(),
+                        "groups alias must retain a distinct session registry"
+                    );
+                    assert_eq!(alias.load()?[0].id, row.id);
+                }
+                let request = DeletionRequest {
+                    session_id: row.id.clone(),
+                    instance: row.clone(),
+                    delete_worktree: false,
+                    delete_branch: false,
+                    delete_sandbox: false,
+                    force_delete: false,
+                    detach_hooks: true,
+                    keep_scratch: true,
+                };
+                let owner = PurgeOwner::record_plan(
+                    &alias,
+                    &row,
+                    row.lifecycle_generation,
+                    Some(&request),
+                    None,
+                    PurgeCapture::new(&row)?,
+                )?;
+                let token = owner.token().to_owned();
+                drop(owner);
+                alias.update(|rows, _| {
+                    rows.clear();
+                    Ok(())
+                })?;
+                let launch = serde_json::json!({
+                    "schema": 4, "pid": 4242, "instance_id": "catalogue-policy-fixture",
+                    "profile": "source", "core_only": false, "host": "127.0.0.1", "port": 7777,
+                    "auth_mode": "none", "has_passphrase": false, "behind_proxy": false,
+                    "read_only": false, "remote": false, "tunnel_name": null, "tunnel_url": null,
+                    "no_tailscale": true,
+                });
+                let _: crate::cli::serve::ServeLaunch = serde_json::from_value(launch.clone())?;
+                let launch_bytes = serde_json::to_vec_pretty(&launch)?;
+                for name in ["serve.launch", "serve.rollback.launch"] {
+                    std::fs::write(root.join(name), &launch_bytes)?;
+                }
+                // A retained owner in another physical registry is not a blanket lock.
+                crate::session::rename_profile("distinct", "distinct-renamed")?;
+                crate::session::delete_profile("distinct-renamed")?;
+                let config_before = std::fs::read(root.join("config.toml"))?;
+                let journal_before = std::fs::read(root.join(FILE_NAME))?;
+                let mutation = if delete {
+                    crate::session::delete_profile("source")
+                } else {
+                    crate::session::rename_profile("source", "renamed")
+                };
+                let error =
+                    mutation.expect_err("catalogue must retain the alias-owned recovery target");
+                assert!(error.is::<ProfileHasPendingPurges>(), "{error:?}");
+                assert!(root.join("profiles/source").is_dir());
+                assert!(alias_dir.is_dir());
+                assert!(!root.join("profiles/renamed").exists());
+                assert_eq!(std::fs::read(root.join("config.toml"))?, config_before);
+                assert_eq!(std::fs::read(root.join(FILE_NAME))?, journal_before);
+                for name in ["serve.launch", "serve.rollback.launch"] {
+                    assert_eq!(std::fs::read(root.join(name))?, launch_bytes);
+                }
+                let recovered = crate::session::deletion::recover_committed_purge(
+                    &mut std::collections::HashSet::new(),
+                )?
+                .expect("the unchanged logical alias must still recover its committed owner");
+                assert_eq!(recovered.owner_token(), token);
+                let result = recovered.finish(|_, _| Ok(()));
+                assert!(result.success, "{result:?}");
+                assert!(recovery_plans()?.is_empty());
+                if delete {
+                    crate::session::delete_profile("source")?;
+                } else {
+                    crate::session::rename_profile("source", "renamed")?;
+                }
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     #[serial_test::serial]

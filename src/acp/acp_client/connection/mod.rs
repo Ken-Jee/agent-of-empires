@@ -163,6 +163,7 @@ pub(super) async fn run_connection_task<W, R>(
             Arc::new(AtomicBool::new(false)),
         ),
     };
+    let _control_shutdown = super::control::ShutdownControlOnDrop(control.clone());
     // A runner owns identity across daemons, so its ingress is the one that
     // already holds the adopted session.
     let ingress = control
@@ -393,11 +394,6 @@ pub(super) async fn run_connection_task<W, R>(
         report_connection_error(e, &shared, &ready_tx).await;
     } else {
         info!(target: "acp.protocol", session = %label, "ACP connection task ended cleanly");
-    }
-    // Bridge tasks hold socket clones, so a runner's accept loop is only
-    // released by shutting the control socket down explicitly.
-    if let Some(control) = control.as_ref() {
-        control.shutdown();
     }
     if let Some(child) = child.as_ref() {
         let mut guard = child.lock().await;

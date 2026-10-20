@@ -77,14 +77,20 @@ function commitText(input: HTMLInputElement, value: string) {
   fireEvent.blur(input);
 }
 
-it("LoggingTargetsWidget removes one runtime override without losing another", () => {
-  const { save, rerender } = mount(LoggingTargetsWidget, "Targets", { "runtime.uds": "warn" });
-  fireEvent.change(control("runtime.ws", "select"), { target: { value: "debug" } });
-  expect(save).toHaveBeenLastCalledWith({ "runtime.uds": "warn", "runtime.ws": "debug" });
-  rerender({ "runtime.uds": "warn", "runtime.ws": "debug" });
-  fireEvent.change(control("runtime.ws", "select"), { target: { value: "" } });
-  expect(save).toHaveBeenLastCalledWith({ "runtime.uds": "warn" });
-});
+it.each(["server", "server.session_store", "migrations.v038", "process.systemd"])(
+  "LoggingTargetsWidget edits %s without losing unrelated overrides",
+  (target) => {
+    const { save, rerender } = mount(LoggingTargetsWidget, "Targets", { "runtime.uds": "warn" });
+    fireEvent.change(control(target, "select"), { target: { value: "warn" } });
+    expect(save).toHaveBeenLastCalledWith({ "runtime.uds": "warn", [target]: "warn" });
+    rerender({ "runtime.uds": "warn", [target]: "warn" });
+    fireEvent.change(control("runtime.ws", "select"), { target: { value: "debug" } });
+    expect(save).toHaveBeenLastCalledWith({ "runtime.uds": "warn", [target]: "warn", "runtime.ws": "debug" });
+    rerender({ "runtime.uds": "warn", [target]: "warn", "runtime.ws": "debug" });
+    fireEvent.change(control(target, "select"), { target: { value: "" } });
+    expect(save).toHaveBeenLastCalledWith({ "runtime.uds": "warn", "runtime.ws": "debug" });
+  },
+);
 
 describe("ThemeNameWidget", () => {
   it.each([

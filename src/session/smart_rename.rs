@@ -562,7 +562,7 @@ impl ReleaseOnDrop<'_> {
 impl Drop for ReleaseOnDrop<'_> {
     fn drop(&mut self) {
         if let Err(error) = self.release() {
-            tracing::warn!(session = self.id, %error, "one-shot scope retirement remains unproven");
+            tracing::warn!(target: "smart_rename", session = self.id, %error, "one-shot scope retirement remains unproven");
         }
     }
 }
@@ -1598,19 +1598,25 @@ mod serve {
             let identity = crate::session::acquire_session_identity_lock()?;
             let title = crate::session::storage::acquire_session_title_lock(&id_owned)?;
             let lifecycle = storage.acquire_instance_lifecycle_lock(&id_owned)?;
-            let transition = storage.acquire_write_transition()?;
-            Ok((storage, identity, title, lifecycle, transition, id_owned))
+            Ok((storage, identity, title, lifecycle, id_owned))
         })
         .await
         .map_err(anyhow::Error::from)
         .and_then(|result| result);
-        let (storage, identity, title, lifecycle, transition, id_owned) = match locked {
+        let (storage, identity, title, lifecycle, id_owned) = match locked {
             Ok(locked) => locked,
             Err(error) => {
                 state.mark_reload_failure(failure_health()).await;
                 return Err(error.into());
             }
         };
+        let reload = state.session_service.disk_reload_guard().await;
+        let (storage, transition, reload) = tokio::task::spawn_blocking(move || {
+            let transition = storage.acquire_write_transition()?;
+            Ok::<_, anyhow::Error>((storage, transition, reload))
+        })
+        .await
+        .map_err(anyhow::Error::from)??;
         let publication = state.publication.write().await;
         if *state.canonical_health.read().await != crate::daemon::RuntimeHealth::Healthy {
             return Err(SmartRenameError::Failed(
@@ -1646,7 +1652,9 @@ mod serve {
                     })();
                     Ok(outcome)
                 })
-                .map(|(rekey, rows, groups)| (rekey, rows, groups, id_owned, (storage, transition)))
+                .map(|(rekey, rows, groups)| {
+                    (rekey, rows, groups, id_owned, (storage, transition, reload))
+                })
         })
         .await
         .map_err(anyhow::Error::from)
@@ -1663,6 +1671,7 @@ mod serve {
             state,
             [(profile, rows, groups)],
             |_| false,
+            &prepared.2,
             &publication,
         )
         .await

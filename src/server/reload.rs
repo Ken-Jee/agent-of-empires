@@ -579,11 +579,12 @@ pub(super) fn replace_committed_profiles<const N: usize>(
     Ok(())
 }
 
-/// Adopt exact storage commits under one snapshot exclusion.
+/// The reload gate must cover disk sampling through canonical adoption.
 pub(crate) async fn adopt_committed_profiles<const N: usize>(
     state: &Arc<AppState>,
     committed: [(&str, Vec<Instance>, Vec<crate::session::Group>); N],
     committed_status: impl Fn(&str) -> bool,
+    _reload: &tokio::sync::OwnedRwLockWriteGuard<()>,
     _publication: &tokio::sync::RwLockWriteGuard<'_, ()>,
 ) -> Result<(), ReloadFailure> {
     let mut metadata = state.canonical_metadata.write().await;
@@ -1845,7 +1846,7 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
-    async fn a_parked_reload_does_not_repeat_a_handlers_move() {
+    async fn a_stale_reload_cannot_undo_or_repeat_an_acknowledged_archive_move() {
         let _home = crate::session::test_support::isolate_app_dir();
         let row = terminal_row(Status::Running);
         let id = row.id.clone();
@@ -1853,42 +1854,61 @@ mod tests {
         crate::server::test_support::seed_instances_on_disk_for_test("default", vec![row.clone()]);
         crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
         let mut rx = state.status_tx.subscribe();
-        // What the poll read from disk once the archive had settled the row to Idle.
-        let mut fresh = row.clone();
-        fresh.status = Status::Idle;
+        // Capture the poll's Running observation before the archive commits Idle.
+        let fresh = row.clone();
         let read_epoch = state
             .mutation_epoch
             .load(std::sync::atomic::Ordering::SeqCst);
+        let metadata = state.canonical_metadata.read().await.clone();
 
-        let gate = state.session_service.disk_reload_guard().await;
-        let mut reload = Box::pin(reload_state_instances_from_disk(
-            &state,
-            vec![fresh].into(),
-            Vec::new(),
-            StatusSource::TmuxApplied,
-            read_epoch,
-            Ok(state.canonical_metadata.read().await.clone()),
-            Default::default(),
-        ));
-        assert!(
-            futures_util::poll!(reload.as_mut()).is_pending(),
-            "the reload must be parked on the gate"
-        );
-
-        crate::server::api::sessions::update_session_archive(
-            axum::extract::State(Arc::clone(&state)),
-            axum::extract::Path(id),
-            Ok(axum::Json(crate::daemon::UpdateArchiveBody {
-                archived: true,
-                kill_pane: false,
-            })),
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            crate::server::api::sessions::update_session_archive(
+                axum::extract::State(Arc::clone(&state)),
+                axum::extract::Path(id),
+                Ok(axum::Json(crate::daemon::UpdateArchiveBody {
+                    archived: true,
+                    kill_pane: false,
+                })),
+            ),
         )
-        .await;
-        drop(gate);
-        reload.await;
+        .await
+        .expect("archive must acknowledge without a test-held reload gate");
+        assert_eq!(
+            axum::response::IntoResponse::into_response(response).status(),
+            axum::http::StatusCode::OK,
+        );
+        assert!(
+            state
+                .mutation_epoch
+                .load(std::sync::atomic::Ordering::SeqCst)
+                > read_epoch,
+            "acknowledged archive must invalidate the captured snapshot",
+        );
 
         let first = rx.try_recv().expect("the handler published its move");
         assert_eq!((first.old, first.new), (Status::Running, Status::Idle));
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            reload_state_instances_from_disk(
+                &state,
+                vec![fresh].into(),
+                Vec::new(),
+                StatusSource::TmuxApplied,
+                read_epoch,
+                Ok(metadata),
+                Default::default(),
+            ),
+        )
+        .await
+        .expect("stale snapshot rejection must complete");
+        let current = state.instances.read().await;
+        assert_eq!(
+            current[0].status,
+            Status::Idle,
+            "stale Running cannot undo archive"
+        );
+        assert!(current[0].archived_at.is_some());
         assert!(rx.try_recv().is_err(), "the reload must not repeat it");
     }
 

@@ -2534,12 +2534,16 @@ export interface AttachProjectResult {
 export async function attachSessionProject(
   id: string,
   project: string,
-  opts: { attachExistingBranch?: boolean } = {},
+  opts: { epoch: string; attachExistingBranch?: boolean },
 ): Promise<AttachProjectResult> {
   try {
     const res = await fetch(
       "/api/sessions/" + id + "/projects",
-      jsonInit("POST", { project, attach_existing_branch: opts.attachExistingBranch ?? false }),
+      jsonInit(
+        "POST",
+        { project, attach_existing_branch: opts.attachExistingBranch ?? false },
+        { "aoe-runtime-epoch": opts.epoch },
+      ),
     );
     if (!res.ok) {
       const payload = (await res.json().catch(() => null)) as Payload | null;
@@ -2595,12 +2599,17 @@ export async function updateSessionGroup(id: string, group: string): Promise<Ses
 export async function setSessionNotifications(
   id: string,
   preset: "off" | "default" | "all",
+  expectedEpoch: string,
 ): Promise<SessionMutation | null> {
   const value = preset === "off" ? false : preset === "all" ? true : null;
   try {
     const res = await fetch(
       `/api/sessions/${id}/notifications`,
-      jsonInit("PATCH", { notify_on_waiting: value, notify_on_idle: value, notify_on_error: value }),
+      jsonInit(
+        "PATCH",
+        { notify_on_waiting: value, notify_on_idle: value, notify_on_error: value },
+        { "aoe-runtime-epoch": expectedEpoch },
+      ),
     );
     return await sessionMutation(res);
   } catch {
@@ -2639,9 +2648,16 @@ export async function setSessionPin(id: string, pinned: boolean): Promise<Sessio
 /** Set (or clear, with `null`) a session's color label. Rendered as a colored
  *  status dot in the sidebar; the palette is `red` / `amber` / `green`. Also
  *  settable from the CLI via `aoe session color`. See #2383. */
-export async function setSessionColor(id: string, color: string | null): Promise<SessionMutation | null> {
+export async function setSessionColor(
+  id: string,
+  color: string | null,
+  expectedEpoch: string,
+): Promise<SessionMutation | null> {
   try {
-    const res = await fetch(`/api/sessions/${id}/color`, jsonInit("PATCH", { color }));
+    const res = await fetch(
+      `/api/sessions/${id}/color`,
+      jsonInit("PATCH", { color }, { "aoe-runtime-epoch": expectedEpoch }),
+    );
     return await sessionMutation(res);
   } catch {
     return null;

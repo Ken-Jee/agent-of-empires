@@ -1054,6 +1054,164 @@ pub(crate) fn runner_birth_identity(pid: u32) -> anyhow::Result<Option<ProcessBi
     birth
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CapturedProcessTreeReceipt {
+    boot_id: String,
+    processes: Vec<PrimeProcessIdentity>,
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static FAIL_CAPTURED_TREE_AFTER_ROOT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub(crate) struct CapturedProcessTree {
+    receipt: CapturedProcessTreeReceipt,
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    handles: Vec<platform::ProcessHandle>,
+}
+
+impl CapturedProcessTree {
+    pub(crate) fn capture(pid: u32) -> anyhow::Result<Self> {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            let start_id = platform::process_start_id(pid)?
+                .ok_or_else(|| anyhow::anyhow!("tool process exited before capture"))?;
+            let root = PrimeProcessIdentity { pid, start_id };
+            let handle = platform::ProcessHandle::capture(&root)?
+                .ok_or_else(|| anyhow::anyhow!("tool process exited before capture"))?;
+            let samples = platform::process_tree_samples(&root)?;
+            let selected = prime_selection_mask(&samples, std::slice::from_ref(&root));
+            let mut handles = vec![handle];
+            let mut identities = vec![root.clone()];
+            for (sample, selected) in samples.into_iter().zip(selected) {
+                if selected && sample.identity != root {
+                    if let Some(handle) = platform::ProcessHandle::capture(&sample.identity)? {
+                        handles.push(handle);
+                        identities.push(sample.identity);
+                    }
+                }
+            }
+            anyhow::ensure!(
+                platform::process_start_id(pid)?.as_ref() == Some(&root.start_id),
+                "tool process incarnation changed during capture"
+            );
+            Ok(Self {
+                handles,
+                receipt: CapturedProcessTreeReceipt {
+                    boot_id: boot_id()
+                        .ok_or_else(|| anyhow::anyhow!("process boot identity unavailable"))?,
+                    processes: identities,
+                },
+            })
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            let _ = pid;
+            anyhow::bail!("incarnation-bound signalling unsupported on this platform")
+        }
+    }
+
+    pub(crate) fn receipt(&self) -> &CapturedProcessTreeReceipt {
+        &self.receipt
+    }
+
+    pub(crate) fn resume(
+        receipt: CapturedProcessTreeReceipt,
+        root_pid: u32,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            boot_id().as_deref() == Some(receipt.boot_id.as_str())
+                && receipt
+                    .processes
+                    .first()
+                    .is_some_and(|root| root.pid == root_pid)
+                && receipt
+                    .processes
+                    .iter()
+                    .all(|identity| identity.pid > 0 && !identity.start_id.is_empty()),
+            "captured tool retirement identity is unavailable"
+        );
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            let mut handles = Vec::with_capacity(receipt.processes.len());
+            for identity in &receipt.processes {
+                if let Some(handle) = platform::ProcessHandle::capture(identity)? {
+                    handles.push(handle);
+                }
+            }
+            Ok(Self { receipt, handles })
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        anyhow::bail!("incarnation-bound signalling unsupported on this platform")
+    }
+
+    #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+    pub(crate) fn all_exited(&self) -> anyhow::Result<bool> {
+        for handle in &self.handles {
+            if !handle.exited()? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    pub(crate) fn settle(self, grace: Duration) -> anyhow::Result<()> {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            #[cfg(test)]
+            if FAIL_CAPTURED_TREE_AFTER_ROOT.replace(false) {
+                let root = self.handles.first().expect("captured root handle");
+                root.signal(libc::SIGKILL)?;
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while !root.exited()? {
+                    anyhow::ensure!(Instant::now() < deadline, "injected root exit unproven");
+                    std::thread::yield_now();
+                }
+                anyhow::bail!("injected retirement proof failure after root exit");
+            }
+            settle_process_handles(&self.handles, grace)
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            let _ = grace;
+            anyhow::bail!("incarnation-bound signalling unsupported on this platform")
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn settle_process_handles(
+    handles: &[platform::ProcessHandle],
+    grace: Duration,
+) -> anyhow::Result<()> {
+    for handle in handles {
+        handle.signal(libc::SIGTERM)?;
+    }
+    let term_deadline = Instant::now() + grace;
+    let kill_deadline = term_deadline + Duration::from_secs(5);
+    let mut killed = false;
+    loop {
+        let mut live = false;
+        for handle in handles {
+            live |= !handle.exited()?;
+        }
+        if !live {
+            return Ok(());
+        }
+        let now = Instant::now();
+        if now >= term_deadline && !killed {
+            for handle in handles {
+                handle.signal(libc::SIGKILL)?;
+            }
+            killed = true;
+        }
+        anyhow::ensure!(now < kill_deadline, "owned process termination unproven");
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
 pub(crate) fn fence_processes(
     identities: &[PrimeProcessIdentity],
     grace: Duration,
@@ -1066,30 +1224,7 @@ pub(crate) fn fence_processes(
                 handles.push(handle);
             }
         }
-        for handle in &handles {
-            handle.signal(libc::SIGTERM)?;
-        }
-        let term_deadline = Instant::now() + grace;
-        let kill_deadline = term_deadline + Duration::from_secs(5);
-        let mut killed = false;
-        loop {
-            let mut live = false;
-            for handle in &handles {
-                live |= !handle.exited()?;
-            }
-            if !live {
-                return Ok(());
-            }
-            let now = Instant::now();
-            if now >= term_deadline && !killed {
-                for handle in &handles {
-                    handle.signal(libc::SIGKILL)?;
-                }
-                killed = true;
-            }
-            anyhow::ensure!(now < kill_deadline, "owned process termination unproven");
-            std::thread::sleep(Duration::from_millis(25));
-        }
+        settle_process_handles(&handles, grace)
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {

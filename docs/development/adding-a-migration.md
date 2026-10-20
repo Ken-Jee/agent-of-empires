@@ -42,4 +42,13 @@ Malformed ownership proofs or purge journals remain fatal without advancing the
 schema marker. Rewrites require backups and repeated reconciliation preserves
 already-migrated bytes.
 
+Managed restart, rollback and Core promotion reconcile historical launch policy
+under their existing daemon lifecycle transaction before decoding the launch.
+Launch-only reconciliation accepts only supported historical schemas or a valid
+current policy. Unknown or malformed schemas leave both records and the live
+predecessor untouched.
+They stop the verified predecessor before full parent migrations under `serve.lock`.
+The replacement child only asserts the current schema; it never reacquires the
+parent's lifecycle transaction or migrates alongside its predecessor.
+
 A migration that retypes a persisted field must call `crate::session::backup_before_migration` before rewriting, so the build that predates the new shape still has bytes it can read. What that build does with a row it cannot decode, and what the migration backup is worth to a user who forces a downgrade, is covered under [Downgrading](../installation.md#downgrading).

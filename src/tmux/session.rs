@@ -782,10 +782,15 @@ impl Session {
     /// OMP uses this device to key its terminal-session breadcrumb. Target the
     /// first window's first pane for the same reason as [`Self::capture_pane`].
     pub fn pane_tty(&self) -> Result<String> {
-        let target = format!("={}:^", self.name);
-        let output = crate::tmux::tmux_command()
-            .args(["display-message", "-t", &target, "-p", "#{pane_tty}"])
-            .output()?;
+        let deadline = crate::tmux::TmuxCommandDeadline::new();
+        let target = self.live_pane_target_with_deadline(&deadline)?;
+        let output = deadline.run(crate::tmux::tmux_command().args([
+            "display-message",
+            "-t",
+            &target,
+            "-p",
+            "#{pane_tty}",
+        ]))?;
         if !output.status.success() {
             bail!("Failed to read pane TTY for tmux session '{}'", self.name);
         }
@@ -820,32 +825,6 @@ impl Session {
         } else {
             Ok(String::new())
         }
-    }
-
-    /// Capture the window's ACTIVE pane (`^`), for the zoomed fallback: the
-    /// zoomed pane is the focused one, while `capture_pane`'s pane-0 bytes
-    /// may be the hidden unzoomed pane.
-    fn active_pane_content(&self, lines: usize) -> Option<String> {
-        if !self.exists() {
-            return None;
-        }
-        let target = format!("={}:^", self.name);
-        let output = crate::tmux::tmux_command()
-            .args([
-                "capture-pane",
-                "-t",
-                &target,
-                "-p",
-                "-e",
-                "-S",
-                &format!("-{}", lines),
-            ])
-            .output()
-            .ok()?;
-        output
-            .status
-            .success()
-            .then(|| String::from_utf8_lossy(&output.stdout).to_string())
     }
 
     /// Wait for a known marker, or for two stable captures when no marker exists.
@@ -1032,18 +1011,9 @@ impl Session {
         if count <= 1 || window_width == 0 || window_height == 0 {
             return Ok((pane0_content, cursor));
         }
-        // A zoomed pane (`C-b z`) keeps `window_panes` at its real count but
-        // reports every pane at the window's full rectangle, so the panes
-        // OVERLAP. The compositor's walk assumes a tiling, and handed overlap it
-        // paints one pane and fills the rest of the row with border glyphs,
-        // hiding the zoomed pane's content, which is the only thing the user is
-        // looking at in tmux. Treat zoomed as unsplit, but on the ACTIVE
-        // pane's bytes (the zoomed one), not pane 0's: `pane0_content` above
-        // was captured from the first pane by id order, which may be the
-        // unzoomed one hidden behind the zoom.
+        // Zoom changes geometry, not the agent pane's capture or input identity.
         if zoomed {
-            let active = self.active_pane_content(lines).unwrap_or(pane0_content);
-            return Ok((active, cursor));
+            return Ok((pane0_content, cursor));
         }
 
         // Any failure in the split path (fork error, unparseable layout) falls
@@ -4697,16 +4667,7 @@ mod tests {
         );
     }
 
-    /// `C-b z` keeps `window_panes` at its real count while reporting every pane
-    /// at the window's FULL rectangle, so the rectangles overlap and the
-    /// compositor's tiling assumption breaks. Compositing that painted pane 0 at
-    /// its unzoomed width and filled the rest of every row with `─`, hiding the
-    /// zoomed pane, which is the only thing the user sees in tmux. The frame was
-    /// strictly worse than the pane-0-only preview it replaced, and permanently
-    /// so, since nothing self-heals a zoom.
-    ///
-    /// Zoomed must therefore be treated as unsplit, byte-for-byte identical to
-    /// the single-pane preview capture.
+    /// Zoom keeps content, cursor and input on the agent pane.
     #[test]
     #[serial_test::serial]
     fn a_zoomed_pane_falls_back_to_the_plain_capture() {
@@ -4767,12 +4728,32 @@ mod tests {
             !zoomed.contains('─') && !zoomed.contains('│'),
             "zoomed frame painted border fill over the window:\n{zoomed}"
         );
+        assert!(zoomed.contains("ALPHA") && !zoomed.contains("BRAVO"));
+        let agent = super::super::utils::first_pane_id_with_deadline(
+            &session.name,
+            &crate::tmux::TmuxCommandDeadline::new(),
+        )
+        .expect("agent pane");
+        let tty = crate::tmux::tmux_command()
+            .args(["display-message", "-p", "-t", &agent, "#{pane_tty}"])
+            .output()
+            .unwrap();
         assert_eq!(
-            zoomed,
-            session
-                .active_pane_content(10)
-                .expect("active pane capture"),
-            "zoomed must be byte-identical to the zoomed (active) pane capture"
+            session.pane_tty().unwrap(),
+            String::from_utf8_lossy(&tty.stdout).trim()
+        );
+        assert_eq!(
+            session.capture_window_composited_with_cursor(10).unwrap().1,
+            session.capture_pane_with_cursor(10).unwrap().1
+        );
+        assert!(crate::tmux::tmux_command()
+            .args(["set-window-option", "-t", &agent, "pane-base-index", "1"])
+            .status()
+            .unwrap()
+            .success());
+        assert_eq!(
+            session.pane_tty().unwrap(),
+            String::from_utf8_lossy(&tty.stdout).trim()
         );
 
         // Unzooming restores the composite rather than latching the fallback.

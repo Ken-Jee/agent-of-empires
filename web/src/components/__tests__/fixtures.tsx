@@ -3,7 +3,7 @@ import { useMemo, useRef, useState, type ReactNode } from "react";
 import { fireEvent, render, screen } from "@testing-library/react";
 import { vi } from "vitest";
 import { useSidebarTriage } from "../../hooks/useSidebarTriage";
-import type { RuntimeCursor } from "../../lib/api";
+import type { RuntimeCursor, SessionMutation } from "../../lib/api";
 import type { SessionResponse, Workspace } from "../../lib/types";
 import { SidebarCompactContext } from "../../lib/sidebarCompact";
 import { SessionColorsContext } from "../../lib/sessionColors";
@@ -12,6 +12,7 @@ import { UnreadIndicatorContext } from "../../lib/unreadIndicator";
 import { DragSuppressContext } from "../sidebar/dnd";
 import { SessionRow } from "../sidebar/SessionRow";
 import type { RowBulkApi } from "../sidebar/types";
+import { SessionActionProvider } from "../sidebar/SessionActionProvider";
 
 export function makeSession(over: Partial<SessionResponse> = {}): SessionResponse {
   return {
@@ -119,36 +120,44 @@ function Row({
     observedById: {} as Record<string, RuntimeCursor>,
   });
   if (canonical.source !== ws) setCanonical({ source: ws, workspace: ws, observedById: {} });
+  const onSessionMutation = ({ session, cursor }: SessionMutation) =>
+    setCanonical((current) => ({
+      ...current,
+      workspace: {
+        ...current.workspace,
+        sessions: current.workspace.sessions.map((row) => (row.id === session.id ? session : row)),
+      },
+      observedById: { ...current.observedById, [session.id]: cursor },
+    }));
   return (
-    <SessionRow
-      workspace={canonical.workspace}
-      observedById={canonical.observedById}
+    <SessionActionProvider
+      sessions={canonical.workspace.sessions}
       runtimeEpoch="boot"
-      onSessionMutation={({ session, cursor }) =>
-        setCanonical((current) => ({
-          ...current,
-          workspace: {
-            ...current.workspace,
-            sessions: current.workspace.sessions.map((row) => (row.id === session.id ? session : row)),
-          },
-          observedById: { ...current.observedById, [session.id]: cursor },
-        }))
-      }
-      isActive={isActive}
-      isSelected={false}
-      onActivate={() => {}}
-      onCreateSession={onCreateSession}
-      onStop={onStop}
-      onStart={onStart}
-      onSwitchView={onSwitchView}
+      observedById={canonical.observedById}
+      onSessionMutation={onSessionMutation}
       readOnly={readOnly}
-      optimistic={triage.optimisticFor(ws.id)}
-      onPinToggle={triage.pinToggle}
-      onArchiveToggle={triage.archiveToggle}
-      onSnooze={triage.snooze}
-      onUnreadToggle={triage.unreadToggle}
-      bulkApi={SINGLE_BULK_API}
-    />
+    >
+      <SessionRow
+        workspace={canonical.workspace}
+        observedById={canonical.observedById}
+        runtimeEpoch="boot"
+        onSessionMutation={onSessionMutation}
+        isActive={isActive}
+        isSelected={false}
+        onActivate={() => {}}
+        onCreateSession={onCreateSession}
+        onStop={onStop}
+        onStart={onStart}
+        onSwitchView={onSwitchView}
+        readOnly={readOnly}
+        optimistic={triage.optimisticFor(ws.id)}
+        onPinToggle={triage.pinToggle}
+        onArchiveToggle={triage.archiveToggle}
+        onSnooze={triage.snooze}
+        onUnreadToggle={triage.unreadToggle}
+        bulkApi={SINGLE_BULK_API}
+      />
+    </SessionActionProvider>
   );
 }
 

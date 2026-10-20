@@ -196,6 +196,27 @@ describe("AddProjectModal", () => {
     expect(screen.getByTestId("add-project-modal").textContent).toContain("did not restart");
   });
 
+  it("retains an unconfirmed result when the captured target is replaced before ACK", async () => {
+    const response = Promise.withResolvers<Response>();
+    const entered = Promise.withResolvers<void>();
+    mockAttach(() => {
+      entered.resolve();
+      return response.promise;
+    });
+    const view = renderRow(ws());
+    fireEvent.contextMenu(screen.getByTestId("sidebar-session-row"));
+    fireEvent.click(screen.getByTestId("sidebar-context-menu-more"));
+    fireEvent.click(screen.getByTestId("sidebar-context-menu-add-project"));
+    fireEvent.change(screen.getByTestId("add-project-modal-input"), { target: { value: "frontend" } });
+    fireEvent.click(screen.getByTestId("add-project-modal-submit"));
+    await entered.promise;
+    view.rerenderRow(ws({ id: "replacement", title: "replacement target" }));
+    response.resolve(jsonResponse(attachOk("restarted")));
+    await waitFor(() => expect(screen.getByTestId("add-project-modal-error").textContent).toContain("unconfirmed"));
+    expect(screen.getByTestId("sidebar-session-row").textContent).toContain("replacement target");
+    expect(screen.queryByTestId("add-project-modal-result")).toBeNull();
+  });
+
   it("surfaces the server's refusal message", async () => {
     mockAttach(() => jsonResponse({ message: "branch 'feature/abc' already exists in the repo being attached" }, 400));
     await submit("frontend");

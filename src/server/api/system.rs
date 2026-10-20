@@ -1478,7 +1478,7 @@ pub async fn get_resolved_theme(
 pub async fn get_current_theme(
     State(state): State<Arc<AppState>>,
 ) -> Json<crate::tui::styles::ResolvedTheme> {
-    tracing::debug!(profile = %*state.served_profile(), "GET /api/theme/current");
+    tracing::debug!(target: "http.api.system", profile = %*state.served_profile(), "GET /api/theme/current");
     let resolved = tokio::task::spawn_blocking(move || {
         let name = crate::session::config::resolve_theme_name();
         crate::tui::styles::resolve_theme(&name)
@@ -2045,12 +2045,22 @@ pub async fn get_update_status(State(state): State<Arc<AppState>>) -> Json<Updat
 
 // --- Profile management ---
 
+#[cfg(test)]
+struct ProfileCommitPause {
+    profile: String,
+    entered: tokio::sync::oneshot::Sender<()>,
+    resume: std::sync::mpsc::Receiver<()>,
+}
+
+#[cfg(test)]
+static PROFILE_COMMIT_PAUSE: std::sync::Mutex<Option<ProfileCommitPause>> =
+    std::sync::Mutex::new(None);
+
 async fn commit_profile(
     state: Arc<AppState>,
     mutation: crate::daemon::ProfileMutation,
 ) -> axum::response::Response {
-    use crate::daemon::{ProfileMutation, ReloadFailureCode, RuntimeHealth};
-    use crate::server::reload::{load_all_profiles, merge_loaded_rows};
+    use crate::daemon::ProfileMutation;
 
     let names = match &mutation {
         ProfileMutation::Create(body) => [Some(body.name.as_str()), None],
@@ -2067,12 +2077,38 @@ async fn commit_profile(
             return api_error(StatusCode::BAD_REQUEST, "validation_failed", error);
         }
     }
+    match state
+        .runtime
+        .work
+        .run(
+            "profile.catalogue",
+            commit_profile_owned(state.clone(), mutation),
+        )
+        .await
+    {
+        Ok(response) => response,
+        Err(crate::server::runtime::RuntimeWorkError::ShuttingDown) => {
+            StatusCode::SERVICE_UNAVAILABLE.into_response()
+        }
+        Err(crate::server::runtime::RuntimeWorkError::Interrupted) => {
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+async fn commit_profile_owned(
+    state: Arc<AppState>,
+    mutation: crate::daemon::ProfileMutation,
+) -> axum::response::Response {
+    use crate::daemon::{ProfileMutation, ReloadFailureCode, RuntimeHealth};
+    use crate::server::reload::{load_all_profiles, merge_loaded_rows};
+
     let transaction = tokio::select! {
         _ = state.shutdown.cancelled() => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
         transaction = crate::daemon::lifecycle::Transaction::acquire() => match transaction {
             Ok(transaction) => transaction,
             Err(error) => {
-                tracing::warn!(%error, "profile catalogue ownership unavailable");
+                tracing::warn!(target: "http.api.system", %error, "profile catalogue ownership unavailable");
                 return (StatusCode::CONFLICT, crate::daemon::ApiErrorCode::LifecycleLocked.header(),
                     Json(serde_json::json!({"error": "lifecycle_busy", "message": "Daemon lifecycle is busy"}))).into_response();
             }
@@ -2107,18 +2143,25 @@ async fn commit_profile(
         ).into_response();
     }
     let file_watch = state.file_watch.clone();
+    let service = state.session_service.clone();
+    let runtime = tokio::runtime::Handle::current();
     let prepared = tokio::task::spawn_blocking(move || {
-        let catalogue = crate::session::ProfileCatalogueTransaction::with_transaction(transaction)?;
+        let identity = crate::session::acquire_session_identity_lock()?;
+        let reload = runtime.block_on(service.disk_reload_guard());
+        let catalogue = crate::session::ProfileCatalogueTransaction::with_locked_identity(
+            transaction,
+            identity,
+        )?;
         let loaded = load_all_profiles(&file_watch).map(|_| ());
-        Ok::<_, anyhow::Error>((catalogue, loaded))
+        Ok::<_, anyhow::Error>((catalogue, loaded, reload))
     })
     .await
     .map_err(anyhow::Error::from)
     .and_then(|result| result);
-    let (catalogue, preflight) = match prepared {
+    let (catalogue, preflight, reload) = match prepared {
         Ok(prepared) => prepared,
         Err(error) => {
-            tracing::warn!(%error, "profile catalogue preparation failed");
+            tracing::warn!(target: "http.api.system", %error, "profile catalogue preparation failed");
             return StatusCode::SERVICE_UNAVAILABLE.into_response();
         }
     };
@@ -2146,13 +2189,27 @@ async fn commit_profile(
             ProfileMutation::SetDefault(body) => catalogue.set_default(&body.name),
         };
         let loaded = load_all_profiles(&file_watch);
-        (catalogue, mutation, directory_moved, result, loaded)
+        #[cfg(test)]
+        {
+            let pause = {
+                let mut slot = PROFILE_COMMIT_PAUSE.lock().unwrap();
+                if slot.as_ref().is_some_and(|pause| matches!(&mutation,
+                    ProfileMutation::Rename { name, .. } | ProfileMutation::Delete { name, .. } if name == &pause.profile)) {
+                    slot.take()
+                } else { None }
+            };
+            if let Some(pause) = pause {
+                let _ = pause.entered.send(());
+                pause.resume.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+            }
+        }
+        (catalogue, mutation, directory_moved, result, loaded, reload)
     })
     .await;
-    let (catalogue, mutation, directory_moved, result, loaded) = match committed {
+    let (catalogue, mutation, directory_moved, result, loaded, reload) = match committed {
         Ok(committed) => committed,
         Err(error) => {
-            tracing::warn!(%error, "profile catalogue commit task failed");
+            tracing::warn!(target: "http.api.system", %error, "profile catalogue commit task failed");
             *state.canonical_health.write().await = RuntimeHealth::Degraded {
                 code: ReloadFailureCode::Metadata,
                 profiles: Vec::new(),
@@ -2190,6 +2247,7 @@ async fn commit_profile(
         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     state.runtime.request_publish();
     drop(publication);
+    drop(reload);
 
     if result.is_ok() {
         match &mutation {
@@ -2210,6 +2268,14 @@ async fn commit_profile(
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
     if let Err(error) = result {
+        if error.is::<crate::session::purge_owners::ProfileHasPendingPurges>() {
+            return (
+                StatusCode::CONFLICT,
+                crate::daemon::ApiErrorCode::LifecycleLocked.header(),
+                Json(serde_json::json!({"error": "pending_purge", "message": error.to_string()})),
+            )
+                .into_response();
+        }
         let code = match mutation {
             ProfileMutation::Create(_) => "create_failed",
             ProfileMutation::Rename { .. } => "rename_failed",
@@ -2518,6 +2584,144 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
+    async fn cancelled_catalogue_waiter_cannot_abandon_rename_adoption() -> anyhow::Result<()> {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let root = crate::session::get_app_dir()?;
+        crate::session::purge_owners::initialize(&root)?;
+        let storage = crate::session::Storage::new_unwatched("source")?;
+        let mut row = crate::session::Instance::new("rename producer", "/tmp");
+        row.source_profile = "source".into();
+        row.view = crate::session::View::Structured;
+        let id = row.id.clone();
+        storage.update(|rows, _| {
+            rows.push(row.clone());
+            Ok(())
+        })?;
+        let state = crate::server::test_support::build_test_app_state(vec![row]);
+        let served_profile = state.served_profile().to_string();
+        state.rename_served_profile(&served_profile, "source");
+        assert_eq!(&*state.served_profile(), "source");
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+        let epoch = state
+            .mutation_epoch
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let (entered, committed) = tokio::sync::oneshot::channel();
+        let (resume, paused) = std::sync::mpsc::channel();
+        *PROFILE_COMMIT_PAUSE.lock().unwrap() = Some(ProfileCommitPause {
+            profile: "source".into(),
+            entered,
+            resume: paused,
+        });
+        let requester = tokio::spawn(commit_profile(
+            state.clone(),
+            crate::daemon::ProfileMutation::Rename {
+                name: "source".into(),
+                body: crate::daemon::RenameProfileBody {
+                    new_name: "renamed".into(),
+                },
+            },
+        ));
+        committed.await?;
+        assert!(root.join("profiles/renamed").is_dir());
+        assert!(!root.join("profiles/source").exists());
+        requester.abort();
+        assert!(requester.await.unwrap_err().is_cancelled());
+        let enqueue = state.session_service.enqueue_prompt(
+            &id,
+            "after-rename".into(),
+            "accepted".into(),
+            vec![],
+            None,
+            None,
+        );
+        tokio::pin!(enqueue);
+        assert!(futures_util::poll!(&mut enqueue).is_pending());
+        resume.send(())?;
+        assert_eq!(enqueue.await.unwrap().seq, 0);
+        assert_eq!(&*state.served_profile(), "renamed");
+        assert!(
+            state
+                .mutation_epoch
+                .load(std::sync::atomic::Ordering::SeqCst)
+                > epoch
+        );
+        assert!(
+            !root.join("profiles/source").exists(),
+            "queue must not recreate the old catalogue"
+        );
+        let rows = crate::session::Storage::open_unwatched("renamed")?.load()?;
+        assert_eq!(rows[0].queued_prompts[0].id, "after-rename");
+        assert_eq!(state.instances.read().await[0].source_profile, "renamed");
+        state.runtime.work.drain().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn retained_purge_owner_refuses_profile_mutation_without_degrading_health(
+    ) -> anyhow::Result<()> {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let root = crate::session::get_app_dir()?;
+        crate::session::purge_owners::initialize(&root)?;
+        let storage = crate::session::Storage::new_unwatched("source")?;
+        crate::session::Storage::new_unwatched("keep")?;
+        let mut row = crate::session::Instance::new("retained owner", "/tmp");
+        row.source_profile = "source".into();
+        row.terminal_scopes = Some(vec![]);
+        let owner = crate::session::purge_owners::PurgeOwner::record(
+            &storage,
+            &row,
+            crate::session::purge_owners::PurgeCapture::new(&row)?,
+        )?;
+        let state = crate::server::test_support::build_test_app_state(vec![]);
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+        for mutation in [
+            crate::daemon::ProfileMutation::Rename {
+                name: "source".into(),
+                body: crate::daemon::RenameProfileBody {
+                    new_name: "renamed".into(),
+                },
+            },
+            crate::daemon::ProfileMutation::Delete {
+                name: "source".into(),
+                query: crate::daemon::DeleteProfileQuery {
+                    replacement_default: Some("keep".into()),
+                },
+            },
+        ] {
+            let response = commit_profile(state.clone(), mutation).await;
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            assert_eq!(
+                response.headers()[crate::daemon::ERROR_CODE_HEADER],
+                "lifecycle_locked"
+            );
+            let body: serde_json::Value =
+                serde_json::from_slice(&to_bytes(response.into_body(), 65536).await?)?;
+            assert_eq!(body["error"], "pending_purge");
+            assert_eq!(
+                *state.canonical_health.read().await,
+                crate::daemon::RuntimeHealth::Healthy
+            );
+            assert!(root.join("profiles/source").is_dir());
+            assert!(!root.join("profiles/renamed").exists());
+        }
+        owner.release()?;
+        let response = commit_profile(
+            state,
+            crate::daemon::ProfileMutation::Rename {
+                name: "source".into(),
+                body: crate::daemon::RenameProfileBody {
+                    new_name: "renamed".into(),
+                },
+            },
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
     async fn profile_catalogue_mutations_publish_before_receipt() -> anyhow::Result<()> {
         use axum::{
             body::Body,
@@ -2529,6 +2733,7 @@ mod tests {
 
         let temp = tempfile::tempdir()?;
         let _guard = crate::session::test_support::isolate_app_dir_at(temp.path());
+        crate::session::purge_owners::initialize(&crate::session::get_app_dir()?)?;
         let state = crate::server::test_support::build_test_app_state(Vec::new());
         crate::session::Storage::new("alpha", state.file_watch.clone())?;
         crate::session::save_profile_config(
@@ -2655,7 +2860,8 @@ mod tests {
                 [expected_default]
             );
         }
-        state.rename_served_profile("test", "alpha");
+        let served_profile = state.served_profile().to_string();
+        state.rename_served_profile(&served_profile, "alpha");
         let response = router
             .clone()
             .oneshot(

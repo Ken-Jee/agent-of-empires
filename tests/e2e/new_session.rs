@@ -96,6 +96,9 @@ has_seen_welcome = true
 has_responded_to_telemetry = true
 last_seen_version = "{version}"
 has_acknowledged_agent_hooks = true
+
+[systemd]
+enabled = false
 "#,
         hook_cmd = hook_cmd,
         version = env!("CARGO_PKG_VERSION"),
@@ -241,6 +244,100 @@ fn test_quit_during_creation_shows_confirm() {
     // Clean up by cancelling creation (stub is selected again).
     h.send_keys("C-c");
     h.wait_for_absent("Creating...", Duration::from_secs(5));
+}
+
+#[tokio::test]
+#[parallel]
+async fn test_quit_creation_waits_for_cancellation_admission_before_exit() {
+    use agent_of_empires::acp::client::DaemonEndpoint;
+    use agent_of_empires::daemon::{RuntimeConnection, RuntimeEvent};
+    require_tmux!();
+    let mut h = TuiTestHarness::new_in_tmp("quit_creation_ack");
+    h.stop_daemon_on_drop();
+    h.set_env("AGENT_OF_EMPIRES_PROFILE", "default");
+    let bin = h.install_path_command("claude");
+    let launched = h.home_path().join("agent-launched");
+    std::fs::write(bin.join("claude"), format!(
+        "#!/bin/sh\ncase \"$1\" in --version|--help) echo '2.1.0'; exit 0;; esac\n: > '{}'\nexec sleep 120\n",
+        launched.display(),
+    )).unwrap();
+    let release = h.home_path().join("quit-hook-release");
+    struct Release(std::path::PathBuf);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            let _ = std::fs::write(&self.0, "");
+        }
+    }
+    let _release_on_failure = Release(release.clone());
+    write_config_with_hooks(
+        &h,
+        &format!(
+            "echo quit-hook-entered; while [ ! -f '{}' ]; do sleep 0.01; done",
+            release.display(),
+        ),
+    );
+    let project = h.project_path();
+    h.spawn_tui();
+    h.wait_for("Runtime ready");
+    let endpoint = DaemonEndpoint::local_unix(app_dir_in(h.home_path()).join("daemon/api.sock"));
+    let mut connection = RuntimeConnection::connect(&endpoint, None).await.unwrap();
+    h.send_keys("n");
+    h.wait_for("Title");
+    h.send_keys("Tab");
+    h.type_text(project.to_str().unwrap());
+    submit_new_session_dialog(&h);
+    let id = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            if let RuntimeEvent::Progress(progress) = connection.next_event().await.unwrap() {
+                if let Some(entry) = progress.iter().find(|entry| {
+                    entry
+                        .output
+                        .iter()
+                        .any(|line| line.contains("quit-hook-entered"))
+                }) {
+                    assert!(entry.request_key.is_some());
+                    break entry.session_id.clone();
+                }
+            }
+        }
+    })
+    .await
+    .expect("hook output must establish creation progress");
+    h.send_keys("q");
+    h.wait_for_timeout("Session Creating", Duration::from_secs(5));
+    h.send_keys("y");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let RuntimeEvent::Progress(progress) = connection.next_event().await.unwrap() {
+                if progress
+                    .iter()
+                    .any(|entry| entry.session_id == id && entry.cancelled)
+                {
+                    break;
+                }
+            }
+        }
+    })
+    .await
+    .expect("quit must admit cancellation while the hook is still held");
+    h.wait_for_exit(Duration::from_secs(5));
+    assert!(
+        !launched.exists(),
+        "quit cancellation must not launch an agent"
+    );
+    std::fs::write(&release, "").unwrap();
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            if let RuntimeEvent::Snapshot(snapshot) = connection.next_event().await.unwrap() {
+                if snapshot.contents.sessions.iter().all(|row| row.id != id) {
+                    break;
+                }
+            }
+        }
+    })
+    .await
+    .expect("daemon must finish the cancelled creation rollback");
+    assert!(!launched.exists());
 }
 
 /// Write a global config that keeps existing-session activation at its

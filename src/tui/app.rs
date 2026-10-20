@@ -2014,7 +2014,7 @@ impl App {
 
         self.tool_detection = None;
         self.home.apply_restart_results();
-        self.home.cleanup_pending_creation();
+        self.home.cleanup_pending_creation().await;
 
         // Bounded and deduped so a dead endpoint or an unchanged launch-then-quit costs nothing.
         if let Some(snapshot) = self.build_telemetry_snapshot() {

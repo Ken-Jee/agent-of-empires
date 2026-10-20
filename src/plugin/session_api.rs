@@ -1016,7 +1016,7 @@ fn map_terminal_error(e: SendKeysError) -> DispatchError {
             DispatchError::internal("terminal send reached a structured session")
         }
         SendKeysError::Tmux(error) => {
-            tracing::warn!(%error, "plugin terminal send failed");
+            tracing::warn!(target: "plugin.host", %error, "plugin terminal send failed");
             DispatchError::internal("terminal send failed")
         }
         SendKeysError::Internal => DispatchError::internal("terminal send failed"),
@@ -2261,6 +2261,7 @@ mod tests {
         let mut already_pending = Instance::new("already-reviving", "/tmp/aoe-4120-plugin");
         already_pending.id = "sess-already-pending".to_string();
         already_pending.created_by_plugin = Some("cron".to_string());
+        already_pending.view = crate::session::View::Structured;
         already_pending.status = Status::Idle;
         already_pending.plugin_revival_pending = true;
         prior.push(already_pending);
@@ -2274,6 +2275,14 @@ mod tests {
         prior.push(resting);
 
         let (deps, state, _dir) = test_deps(prior);
+        seed_native_rows(&state).await;
+        assert!(matches!(
+            state
+                .session_service
+                .touch_and_wake_on_prompt("sess-already-pending", false)
+                .await,
+            crate::server::session_service::PromptTouch::Touched { .. }
+        ));
         let ctx = ctx_with(&["session.prompt"]);
 
         let err = match dispatch(

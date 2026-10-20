@@ -5,6 +5,19 @@ use anyhow::{Context, Result};
 use crate::session::{Instance, NativeStoreUnavailable, SessionMutation, SessionStore, Storage};
 
 use super::state::AppState;
+#[cfg(test)]
+thread_local! {
+    static BEFORE_ADOPTION: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn before_adoption_for_test() {
+    BEFORE_ADOPTION.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook();
+        }
+    });
+}
 
 // The caller retains namespace and operation exclusion on a blocking worker.
 pub(crate) struct NativeSessionStore {
@@ -245,6 +258,9 @@ impl NativeSessionStore {
             "profile move belongs to different runtimes"
         );
         ensure_healthy(&self.state)?;
+        let reload = self
+            .runtime
+            .block_on(self.state.session_service.disk_reload_guard());
         let transition = self.storage.acquire_write_transition();
         let publication = self.state.publication.blocking_write();
         ensure_healthy(&self.state)?;
@@ -302,6 +318,8 @@ impl NativeSessionStore {
                     unavailable(error)
                 }
             })?;
+        #[cfg(test)]
+        before_adoption_for_test();
         self.runtime
             .block_on(super::reload::adopt_committed_profiles(
                 &self.state,
@@ -318,6 +336,7 @@ impl NativeSessionStore {
                     ),
                 ],
                 |_| false,
+                &reload,
                 &publication,
             ))
             .map_err(|error| {
@@ -434,6 +453,9 @@ impl SessionStore for NativeSessionStore {
 
     fn commit(&self, mutation: &mut SessionMutation<'_>) -> Result<()> {
         self.check_source()?;
+        let reload = self
+            .runtime
+            .block_on(self.state.session_service.disk_reload_guard());
         let transition = self.storage.acquire_write_transition();
         let publication = self.state.publication.blocking_write();
         ensure_healthy(&self.state)?;
@@ -459,12 +481,15 @@ impl SessionStore for NativeSessionStore {
                 return Err(error);
             }
         };
+        #[cfg(test)]
+        before_adoption_for_test();
         if let Err(error) = self
             .runtime
             .block_on(super::reload::adopt_committed_profiles(
                 &self.state,
                 [(self.storage.profile(), rows, groups)],
                 |id| self.status_id.as_deref() == Some(id),
+                &reload,
                 &publication,
             ))
         {
@@ -484,6 +509,13 @@ impl SessionStore for NativeSessionStore {
         self.run_sandbox_migration(|| {
             crate::migrations::migrate_sandbox_store_for_with(id, reporter, self, runtime)
         })
+    }
+
+    fn sandbox_registry_guard(&self) -> Option<tokio::sync::OwnedRwLockWriteGuard<()>> {
+        Some(
+            self.runtime
+                .block_on(self.state.session_service.disk_reload_guard()),
+        )
     }
 
     fn commit_sandbox_checkpoint(
@@ -514,6 +546,8 @@ impl SessionStore for NativeSessionStore {
             let (prepared, mut details) = prepared?;
             self.storage.verify_bound_profile()?;
             let committed = prepared.commit()?;
+            #[cfg(test)]
+            before_adoption_for_test();
             self.storage.verify_bound_profile()?;
             let mut metadata = self.state.canonical_metadata.blocking_write();
             let mut current = self.state.instances.blocking_write();
@@ -693,6 +727,183 @@ fn mark_checkpoint_failure(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[serial_test::serial]
+    fn native_profile_adoption_keeps_acknowledged_queue_updates() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap()
+            .block_on(async {
+                for moving in [false, true] {
+                    let mut row = Instance::new("queue race", "/tmp");
+                    row.source_profile = "default".into();
+                    row.view = crate::session::View::Structured;
+                    let id = row.id.clone();
+                    let storage = Storage::new_unwatched("default").unwrap();
+                    storage
+                        .update(|rows, _| {
+                            *rows = vec![row.clone()];
+                            Ok(())
+                        })
+                        .unwrap();
+                    if moving {
+                        Storage::new_unwatched("target")
+                            .unwrap()
+                            .update(|rows, _| {
+                                rows.clear();
+                                Ok(())
+                            })
+                            .unwrap();
+                    }
+                    let state = crate::server::test_support::build_test_app_state(vec![row]);
+                    crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+                    let (entered, observed) = tokio::sync::oneshot::channel();
+                    let (unblock, blocked) = std::sync::mpsc::channel();
+                    let holder = tokio::task::spawn_blocking(move || {
+                        entered.send(()).unwrap();
+                        blocked
+                            .recv_timeout(std::time::Duration::from_secs(10))
+                            .unwrap();
+                    });
+                    observed.await.unwrap();
+                    let (committed, snapshot) = tokio::sync::oneshot::channel();
+                    let (adopt, adoption) = std::sync::mpsc::channel();
+                    let (finished, done) = tokio::sync::oneshot::channel();
+                    let producer_state = state.clone();
+                    let runtime = tokio::runtime::Handle::current();
+                    let producer = std::thread::spawn(move || {
+                        let _runtime = runtime.enter();
+                        BEFORE_ADOPTION.set(Some(Box::new(move || {
+                            committed.send(()).unwrap();
+                            adoption
+                                .recv_timeout(std::time::Duration::from_secs(10))
+                                .unwrap();
+                        })));
+                        let before = producer_state.instances.blocking_read()[0].clone();
+                        let native =
+                            NativeSessionStore::open(producer_state.clone(), "default", None)
+                                .unwrap();
+                        let result = if moving {
+                            let target =
+                                NativeSessionStore::open(producer_state, "target", None).unwrap();
+                            let mut after = before.clone();
+                            after.source_profile = "target".into();
+                            native.move_instances_to(
+                                &target,
+                                &[(before, after)],
+                                &crate::session::GroupMovePlan::single("", ""),
+                                |_, _| Ok(()),
+                            )
+                        } else {
+                            (&native as &dyn SessionStore).update(|rows, _| {
+                                rows[0].favorite();
+                                Ok(())
+                            })
+                        };
+                        BEFORE_ADOPTION.set(None);
+                        finished.send(result).unwrap();
+                    });
+                    snapshot.await.unwrap();
+                    let enqueue = state.session_service.enqueue_prompt(
+                        &id,
+                        "A".into(),
+                        "first".into(),
+                        vec![],
+                        None,
+                        None,
+                    );
+                    tokio::pin!(enqueue);
+                    assert!(futures_util::poll!(&mut enqueue).is_pending());
+                    adopt.send(()).unwrap();
+                    done.await.unwrap().unwrap();
+                    producer.join().unwrap();
+                    unblock.send(()).unwrap();
+                    holder.await.unwrap();
+                    assert_eq!(enqueue.await.unwrap().seq, 0);
+                    assert_eq!(
+                        state
+                            .session_service
+                            .enqueue_prompt(&id, "B".into(), "second".into(), vec![], None, None)
+                            .await
+                            .unwrap()
+                            .seq,
+                        1
+                    );
+                    let memory = state.instances.read().await;
+                    let fresh = Storage::open_unwatched(if moving { "target" } else { "default" })
+                        .unwrap()
+                        .load()
+                        .unwrap();
+                    for row in [&memory[0], &fresh[0]] {
+                        assert_eq!(
+                            row.queued_prompts
+                                .iter()
+                                .map(|prompt| prompt.id.as_str())
+                                .collect::<Vec<_>>(),
+                            ["A", "B"]
+                        );
+                    }
+                    if moving {
+                        assert!(storage.load().unwrap().is_empty());
+                    }
+                }
+            });
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn prompt_touch_preserves_live_structured_status_and_idle_clock() -> Result<()> {
+        let _home = crate::session::test_support::isolate_app_dir();
+        for status in [
+            crate::session::Status::Running,
+            crate::session::Status::Waiting,
+        ] {
+            let mut row = Instance::new("live structured", "/tmp");
+            row.source_profile = "default".into();
+            row.view = crate::session::View::Structured;
+            let prior_access = chrono::Utc::now() - chrono::Duration::days(2);
+            row.last_accessed_at = Some(prior_access);
+            row.idle_entered_at = Some(chrono::Utc::now() - chrono::Duration::hours(3));
+            let storage = Storage::new_unwatched("default")?;
+            storage.update(|rows, _| {
+                *rows = vec![row.clone()];
+                Ok(())
+            })?;
+            row.status = status;
+            row.idle_entered_at = Some(chrono::Utc::now() - chrono::Duration::minutes(7));
+            row.plugin_revival_pending = true;
+            row.last_error = Some("live diagnostic".into());
+            let idle = row.idle_entered_at;
+            let id = row.id.clone();
+            let state = crate::server::test_support::build_test_app_state(vec![row]);
+            crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+            let mut transitions = state.status_tx.subscribe();
+            assert!(matches!(
+                state
+                    .session_service
+                    .touch_and_wake_on_prompt(&id, false)
+                    .await,
+                crate::server::session_service::PromptTouch::Touched { .. }
+            ));
+            let rows = state.instances.read().await;
+            assert_eq!(rows[0].status, status);
+            assert_eq!(rows[0].idle_entered_at, idle);
+            assert_eq!(rows[0].last_error.as_deref(), Some("live diagnostic"));
+            assert!(rows[0].plugin_revival_pending);
+            assert!(matches!(
+                transitions.try_recv(),
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+            ));
+            let persisted = storage.load()?;
+            assert_eq!(persisted[0].status, crate::session::Status::Idle);
+            assert!(persisted[0].last_accessed_at > Some(prior_access));
+        }
+        Ok(())
+    }
 
     async fn profile_move_fixture(
         read_only: bool,
@@ -1586,7 +1797,8 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn sandbox_migration_publishes_planning_and_the_entire_committed_cohort() -> Result<()> {
-        for damage in ["none", "groups", "sessions", "revoked"] {
+        for damage in ["none", "queue", "groups", "sessions", "revoked"] {
+            let queue_race = damage == "queue";
             let _guard = crate::session::test_support::isolate_app_dir();
             let home = dirs::home_dir().unwrap();
             std::fs::create_dir_all(home.join(".gemini/sandbox/history"))?;
@@ -1602,6 +1814,7 @@ mod tests {
                 row.source_profile = profile.to_owned();
                 row.tool = "gemini".to_owned();
                 row.status = crate::session::Status::Stopped;
+                row.view = crate::session::View::Structured;
                 row.sandbox_store_generation = 0;
                 row.sandbox_info = Some(crate::session::SandboxInfo {
                     provider: None,
@@ -1641,42 +1854,134 @@ mod tests {
             }
             let worker_state = state.clone();
             let owner = rows[0].clone();
-            let (outcome, saw_plan) =
-                tokio::task::spawn_blocking(move || -> Result<(Result<()>, bool)> {
-                    let store = NativeSessionStore::open(
-                        worker_state.clone(),
-                        &owner.source_profile,
-                        None,
-                    )?;
-                    let saw_plan = std::cell::Cell::new(false);
-                    let outcome = store.run_sandbox_migration(|| {
-                        crate::migrations::v027_isolate_sandbox_stores::migrate_instance_with(
-                            &owner.id,
-                            &|_| {
-                                if worker_state
-                                    .instances
-                                    .blocking_read()
-                                    .iter()
-                                    .any(|row| !row.sandbox_store_transition_paths.is_empty())
-                                {
-                                    saw_plan.set(true);
-                                    if damage == "revoked" {
-                                        *worker_state.canonical_health.blocking_write() =
-                                            crate::daemon::RuntimeHealth::Degraded {
-                                                code: crate::daemon::ReloadFailureCode::Metadata,
-                                                profiles: Vec::new(),
-                                            };
-                                    }
+            let queued_id = rows[0].id.clone();
+            let queued_profile = rows[0].source_profile.clone();
+            let (copy_entered, copying) = tokio::sync::oneshot::channel();
+            let (resume_copy, copy_paused) = std::sync::mpsc::channel();
+            let (checkpoint_committed, checkpoint) = tokio::sync::oneshot::channel();
+            let (resume_checkpoint, checkpoint_paused) = std::sync::mpsc::channel();
+            let migration = tokio::task::spawn_blocking(move || -> Result<(Result<()>, bool)> {
+                if queue_race {
+                    let entered = std::cell::RefCell::new(Some(copy_entered));
+                    let checkpoint_hook: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+                        std::cell::RefCell::new(Some(Box::new(move || {
+                            checkpoint_committed.send(()).unwrap();
+                            checkpoint_paused
+                                .recv_timeout(std::time::Duration::from_secs(10))
+                                .unwrap();
+                        })));
+                    crate::migrations::v027_isolate_sandbox_stores::COPY_GATE.set(Some(Box::new(
+                        move |_| {
+                            if let Some(entered) = entered.borrow_mut().take() {
+                                entered.send(()).unwrap();
+                                copy_paused
+                                    .recv_timeout(std::time::Duration::from_secs(10))
+                                    .unwrap();
+                                BEFORE_ADOPTION.set(checkpoint_hook.borrow_mut().take());
+                            }
+                        },
+                    )));
+                }
+                let store =
+                    NativeSessionStore::open(worker_state.clone(), &owner.source_profile, None)?;
+                let saw_plan = std::cell::Cell::new(false);
+                let outcome = store.run_sandbox_migration(|| {
+                    crate::migrations::v027_isolate_sandbox_stores::migrate_instance_with(
+                        &owner.id,
+                        &|_| {
+                            if worker_state
+                                .instances
+                                .blocking_read()
+                                .iter()
+                                .any(|row| !row.sandbox_store_transition_paths.is_empty())
+                            {
+                                saw_plan.set(true);
+                                if damage == "revoked" {
+                                    *worker_state.canonical_health.blocking_write() =
+                                        crate::daemon::RuntimeHealth::Degraded {
+                                            code: crate::daemon::ReloadFailureCode::Metadata,
+                                            profiles: Vec::new(),
+                                        };
                                 }
-                                Ok(false)
-                            },
-                            &|_| Ok(true),
-                            Some(&store),
+                            }
+                            Ok(false)
+                        },
+                        &|_| Ok(true),
+                        Some(&store),
+                    )
+                });
+                crate::migrations::v027_isolate_sandbox_stores::COPY_GATE.set(None);
+                BEFORE_ADOPTION.set(None);
+                Ok((outcome, saw_plan.get()))
+            });
+            if queue_race {
+                copying.await?;
+                for original in &rows {
+                    let storage = Storage::open_unwatched(&original.source_profile)?;
+                    let planning: serde_json::Value =
+                        serde_json::from_slice(&std::fs::read(storage.sessions_path())?)?;
+                    assert_eq!(
+                        planning[0]["future_field"],
+                        serde_json::json!({"preserved": true}),
+                        "planning checkpoint must preserve raw fields before ordinary queue writes"
+                    );
+                }
+                let queued = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    state.session_service.enqueue_prompt(
+                        &queued_id,
+                        "during-copy".into(),
+                        "accepted while cohort copy is unlocked".into(),
+                        vec![],
+                        None,
+                        None,
+                    ),
+                )
+                .await
+                .expect("unlocked cohort copy must not retain the reload gate")
+                .unwrap();
+                assert_eq!(queued.seq, 0);
+                resume_copy.send(())?;
+            }
+            let after_checkpoint = state.session_service.enqueue_prompt(
+                &queued_id,
+                "after-checkpoint".into(),
+                "accepted across checkpoint adoption".into(),
+                vec![],
+                None,
+                None,
+            );
+            tokio::pin!(after_checkpoint);
+            if queue_race {
+                checkpoint.await?;
+                assert!(futures_util::poll!(&mut after_checkpoint).is_pending());
+                resume_checkpoint.send(())?;
+            }
+            let (outcome, saw_plan) = if queue_race {
+                let (migration, queued) = tokio::join!(migration, after_checkpoint);
+                assert_eq!(queued.unwrap().seq, 1);
+                migration??
+            } else {
+                migration.await??
+            };
+            if queue_race {
+                assert_eq!(
+                    state
+                        .session_service
+                        .enqueue_prompt(
+                            &queued_id,
+                            "after-adoption".into(),
+                            "accepted after checkpoint".into(),
+                            vec![],
+                            None,
+                            None
                         )
-                    });
-                    Ok((outcome, saw_plan.get()))
-                })
-                .await??;
+                        .await
+                        .unwrap()
+                        .seq,
+                    2
+                );
+            }
             if damage == "revoked" {
                 assert!(outcome
                     .expect_err("revoked authority must stop the copy")
@@ -1698,7 +2003,7 @@ mod tests {
                 );
                 continue;
             }
-            if damage != "none" {
+            if !matches!(damage, "none" | "queue") {
                 let error =
                     outcome.expect_err("partial metadata must reject the entire checkpoint");
                 assert!(error.is::<NativeStoreUnavailable>());
@@ -1740,10 +2045,26 @@ mod tests {
                 let disk: serde_json::Value =
                     serde_json::from_slice(&std::fs::read(storage.sessions_path())?)?;
                 assert_eq!(disk[0]["sandbox_store_generation"], 2);
-                assert_eq!(
-                    disk[0]["future_field"],
-                    serde_json::json!({"preserved": true})
-                );
+                if queue_race && row.id == queued_id {
+                    assert_eq!(
+                        row.queued_prompts
+                            .iter()
+                            .map(|prompt| prompt.id.as_str())
+                            .collect::<Vec<_>>(),
+                        ["during-copy", "after-checkpoint", "after-adoption"]
+                    );
+                    assert_eq!(
+                        disk[0]["queued_prompts"],
+                        serde_json::to_value(&row.queued_prompts)?
+                    );
+                    assert_eq!(row.queued_prompt_next_seq, 3);
+                }
+                if !queue_race || original.source_profile != queued_profile {
+                    assert_eq!(
+                        disk[0]["future_field"],
+                        serde_json::json!({"preserved": true})
+                    );
+                }
                 let private = crate::session::config::container_config::sandbox_store_dir(
                     "gemini", &home, None, &row.id,
                 )?

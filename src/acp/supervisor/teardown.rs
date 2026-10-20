@@ -248,18 +248,20 @@ impl<S: BroadcastSink> Supervisor<S> {
                         lease.record_scope(record.scope);
                     }
                 }
+                if let Some(handle) = workers.get(session_id) {
+                    capture_adapter_route(&lease, &handle.client, identity);
+                }
                 let handle = workers.remove(session_id);
                 drop(workers);
                 worker_registry::clear_restart_marker(session_id);
                 let Some(handle) = handle else {
+                    service_adapter_delete_debt(&self.lifecycle, &lease).await;
                     let settlement =
                         tear_down_runner(&*self.process_control, session_id, identity).await;
                     self.settle_sweeping_if_owed(&lease, settlement).await;
                     return Ok(());
                 };
-                if delete_adapter_state {
-                    try_session_delete(&handle.client, session_id, identity).await;
-                }
+                service_adapter_delete_debt(&self.lifecycle, &lease).await;
                 let close = handle.client.close_session().await;
                 if matches!(
                     close,
@@ -268,7 +270,10 @@ impl<S: BroadcastSink> Supervisor<S> {
                 ) {
                     warn!(target: "acp.supervisor", session = %session_id, ?close, "session close failed; continuing owned runtime cleanup");
                 }
+                service_adapter_delete_debt(&self.lifecycle, &lease).await;
                 let _ = handle.client.shutdown().await;
+                mark_adapter_route_retired(&lease);
+                service_adapter_delete_debt(&self.lifecycle, &lease).await;
                 handle.drain_task.abort();
                 let settlement =
                     tear_down_runner(&*self.process_control, session_id, identity).await;
@@ -404,6 +409,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             let Some(claim) = claim else {
                 continue;
             };
+            service_adapter_delete_debt(&self.lifecycle, &claim.lease).await;
             let identity = claim.identity.or_else(|| claim.lease.spawned_runner());
             let pid = identity.map(|identity| identity.pid);
             let native_unproven = claim.lease.prime() != PrimeOwnership::NotPrime
@@ -607,66 +613,82 @@ fn registry_disowns(session_id: &str, identity: Option<RunnerIdentity>) -> bool 
 pub(super) async fn retire_client(
     lifecycle: &std::sync::Mutex<LifecycleTable>,
     lease: &Lease,
-    client: &AcpClient,
+    client: &Arc<AcpClient>,
     identity: Option<RunnerIdentity>,
 ) {
-    let delete = lock_recover(lifecycle).delete_adapter_state_requested(lease);
-    if delete {
-        try_session_delete(client, lease.session_id(), identity).await;
-    }
+    capture_adapter_route(lease, client, identity);
+    service_adapter_delete_debt(lifecycle, lease).await;
     if let Err(error) = client.shutdown().await {
         warn!(target: "acp.supervisor", session = lease.session_id(), %error, "client shutdown failed; frozen physical ownership must still settle");
     }
+    mark_adapter_route_retired(lease);
+    service_adapter_delete_debt(lifecycle, lease).await;
 }
 
-/// Fire the experimental `session/delete` for the session's stored ACP id.
-/// Every outcome is non-fatal; the caller proceeds to SIGTERM.
-async fn try_session_delete(
-    client: &AcpClient,
-    session_id: &str,
-    identity: Option<RunnerIdentity>,
-) {
-    let Some(identity) = identity.filter(|identity| identity.birth_fingerprint.is_some()) else {
-        debug!(target: "acp.protocol", session = %session_id, "skipping session/delete: original runner birth is unproven");
-        return;
-    };
-    let id = session_id.to_string();
-    let loaded = tokio::task::spawn_blocking(move || worker_registry::load_strict(&id))
-        .await
-        .map_err(|e| format!("registry load task join failed: {e}"))
-        .and_then(|r| r.map_err(|e| format!("worker_registry load failed: {e}")));
-    let record = match loaded {
-        Ok(record) => record,
-        Err(e) => {
-            warn!(
-                target: "acp.protocol",
-                session = %session_id,
-                "skipping session/delete: {e}"
-            );
-            return;
-        }
-    };
-    if !record
-        .as_ref()
-        .is_some_and(|record| identity.owns_record(record))
-    {
-        debug!(target: "acp.protocol", session = %session_id, "skipping session/delete: registry owner changed");
+fn capture_adapter_route(lease: &Lease, client: &Arc<AcpClient>, identity: Option<RunnerIdentity>) {
+    if lease.adapter_route().is_some() {
         return;
     }
-    let (acp_id, adapter) = record.map_or((None, String::new()), |rec| {
-        (rec.stored_acp_session_id, rec.agent_key)
-    });
-    let Some(acp_id) = acp_id else {
-        debug!(
-            target: "acp.protocol",
-            session = %session_id,
-            adapter = %adapter,
-            "skipping session/delete: no stored ACP session id (pre-handshake or never assigned)"
-        );
+    let Some(identity) = identity.filter(|identity| identity.birth_fingerprint.is_some()) else {
         return;
     };
+    let Ok(Some(record)) = worker_registry::load_strict(lease.session_id()) else {
+        return;
+    };
+    if !identity.owns_record(&record) {
+        return;
+    }
+    let Some(acp_id) = record.stored_acp_session_id else {
+        return;
+    };
+    lease.record_adapter_route(crate::acp::runner_lifecycle::AdapterRetirementRoute {
+        client: client.clone(),
+        identity,
+        acp_id,
+        adapter: record.agent_key,
+        gate: tokio::sync::Mutex::new(()),
+        retired: std::sync::atomic::AtomicBool::new(false),
+    });
+}
+
+fn mark_adapter_route_retired(lease: &Lease) {
+    if let Some(route) = lease.adapter_route() {
+        route
+            .retired
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+async fn service_adapter_delete_debt(lifecycle: &std::sync::Mutex<LifecycleTable>, lease: &Lease) {
+    if !lock_recover(lifecycle).adapter_delete_pending(lease) {
+        return;
+    }
+    let Some(route) = lease.adapter_route() else {
+        warn!(target: "acp.protocol", session = lease.session_id(),
+            "session/delete unavailable: original attested adapter route was not captured");
+        lock_recover(lifecycle).adapter_delete_handled(lease);
+        return;
+    };
+    let _attempt = route.gate.lock().await;
+    if !lock_recover(lifecycle).adapter_delete_pending(lease) {
+        return;
+    }
+    let session_id = lease.session_id();
+    let acp_id = &route.acp_id;
+    let adapter = &route.adapter;
     let started = Instant::now();
-    let outcome = client.delete_session(acp_id.clone()).await;
+    let outcome = if route.retired.load(std::sync::atomic::Ordering::SeqCst) {
+        DeleteSessionOutcome::Failed("original adapter connection already retired".into())
+    } else {
+        match worker_registry::load_strict(session_id) {
+            Ok(Some(record)) if route.identity.owns_record(&record) => {
+                route.client.delete_session(acp_id.clone()).await
+            }
+            _ => DeleteSessionOutcome::Failed(
+                "original adapter route is unavailable or its registry owner changed".into(),
+            ),
+        }
+    };
     let elapsed_ms = started.elapsed().as_millis() as u64;
     match outcome {
         DeleteSessionOutcome::Deleted => debug!(
@@ -701,6 +723,7 @@ async fn try_session_delete(
             "session/delete RPC failed: {msg}; proceeding to SIGTERM"
         ),
     }
+    lock_recover(lifecycle).adapter_delete_handled(lease);
 }
 
 /// Signal only the frozen runner identity and prove it gone.
@@ -1654,6 +1677,28 @@ mod tests {
             purge.load(Ordering::SeqCst),
             "permanent removal sends session/delete"
         );
+
+        let (_unused_client, _, identity) = register("s-escalate");
+        let (client, closed, deleted) = AcpClient::fake_for_test_held_close(
+            crate::acp::state::AcpSessionId("s-escalate".into()),
+        );
+        sup.test_install_handle("s-escalate", client, WorkerKind::Stdio, Some(identity))
+            .await;
+        let stopping = sup.shutdown("s-escalate");
+        tokio::pin!(stopping);
+        assert!(futures_util::poll!(&mut stopping).is_pending());
+        let close_response = closed
+            .await
+            .expect("original close entered after workers removal");
+        sup.shutdown_with_reason("s-escalate", "purged", true, None)
+            .await
+            .unwrap();
+        close_response
+            .send(crate::acp::acp_client::CloseSessionOutcome::Unsupported)
+            .unwrap();
+        stopping.await.unwrap();
+        assert_eq!(deleted.await.unwrap(), "acp-test-id");
+        assert!(!sup.is_owned("s-escalate").await);
     }
 
     #[tokio::test]

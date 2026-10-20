@@ -1081,10 +1081,16 @@ pub async fn create_session(
     // at `validation_profile` checked against, so the two cannot disagree.
     // Registered after the idempotency lock, so a retry waiting on it cannot
     // replace the entry the in-flight create is writing to.
-    let progress = body
-        .idempotency_key
-        .as_deref()
-        .map(|key| state.create_progress.register(key));
+    let progress = body.idempotency_key.as_deref().map(|key| {
+        state.create_progress.register(
+            key,
+            if local_owner {
+                crate::server::create_progress::CreateProgressVisibility::UnixOwnerOnly
+            } else {
+                crate::server::create_progress::CreateProgressVisibility::WebReadable
+            },
+        )
+    });
 
     let spec = crate::server::session_spawn::StructuredSessionSpec {
         title: body.title,
@@ -1268,8 +1274,9 @@ fn create_failure(e: &anyhow::Error) -> Option<crate::server::create_progress::C
 pub async fn create_session_progress(
     State(state): State<Arc<AppState>>,
     Path(key): Path<String>,
+    local: Option<axum::Extension<crate::server::auth::LocalAuthorization>>,
 ) -> impl IntoResponse {
-    match state.create_progress.snapshot(&key) {
+    match state.create_progress.snapshot(&key, local.as_deref()) {
         Some(snapshot) => Json(snapshot).into_response(),
         None => bare_not_found(),
     }

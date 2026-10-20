@@ -137,6 +137,7 @@ impl Instance {
         self.last_error = previous.last_error.clone();
         self.last_error_check = previous.last_error_check;
         self.last_start_time = previous.last_start_time;
+        self.plugin_revival_pending = previous.plugin_revival_pending;
         self.adopt_poller(previous);
         self.adopt_poller_repair(previous);
         self.inherit_acp_load_capability(previous);

@@ -27,6 +27,10 @@ impl HomeView {
             ));
             return;
         }
+        let Some(origin_epoch) = self.session_feed.applied_epoch().map(str::to_owned) else {
+            self.flash_status("Wait for the canonical runtime before creating a session");
+            return;
+        };
         // Pre-resolve the title with the same logic the daemon's builder runs,
         // so the placeholder and the committed row agree (otherwise an empty
         // title shows as the path basename here and a civilization name there).
@@ -127,6 +131,7 @@ impl HomeView {
         self.pending_creation = Some(PendingCreation {
             daemon_id: None,
             request_key: stub_id,
+            origin_epoch,
             cancel_requested: false,
             cancel_sent: false,
             outcome_unknown: false,
@@ -427,15 +432,26 @@ impl HomeView {
         Some(row.id.clone())
     }
 
-    /// Clear the placeholder on quit. The daemon keeps admitted work, so this
-    /// only asks for cancellation when the creation already has an id.
-    pub(in crate::tui) fn cleanup_pending_creation(&mut self) {
+    /// Clear the placeholder only after bounded cancellation admission at quit.
+    pub(in crate::tui) async fn cleanup_pending_creation(&mut self) {
         let Some(pending) = self.pending_creation.as_ref() else {
             return;
         };
-        if let Some(id) = pending.daemon_id.clone().filter(|_| !pending.cancel_sent) {
-            if let Err(error) = self.session_feed.cancel_creation(id) {
+        match self
+            .session_feed
+            .cancel_creation_at_quit(
+                &pending.request_key,
+                pending.daemon_id.as_deref(),
+                &pending.origin_epoch,
+            )
+            .await
+        {
+            Ok(_) => {}
+            Err(crate::tui::session_feed::CommandFailure::Rejected(error)) => {
                 tracing::warn!(target: "tui.home", %error, "creation cancellation at quit was refused");
+            }
+            Err(crate::tui::session_feed::CommandFailure::Unknown(error)) => {
+                tracing::warn!(target: "tui.home", %error, "creation cancellation at quit is unconfirmed");
             }
         }
         self.discard_creating_stub();
@@ -458,7 +474,7 @@ impl HomeView {
     pub fn show_quit_during_creation_confirm(&mut self) {
         self.confirm_dialog = Some(ConfirmDialog::new(
             "Session Creating",
-            "A session is still being created. Quit anyway? The hook will be cancelled.",
+            "A session is still being created. Quit anyway? AoE requests cancellation and waits briefly for acknowledgement. The daemon finishes the current phase before rollback.",
             "quit_during_creation",
         ));
     }

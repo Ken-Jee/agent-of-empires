@@ -116,6 +116,76 @@ for (const setting of ["color", "notifications"] as const) {
   });
 }
 
+test("accepted color reset survives navigating Settings before its first ACK", async ({ page }) => {
+  const next = await boot(page);
+  const list = { sessions: [initialA, B], workspace_ordering: [] };
+  await consume(page, await next(), list, 10n);
+  const pending: Route[] = [];
+  await page.route("**/api/sessions/A/color", (route) => {
+    pending.push(route);
+  });
+  await menu(page, "alpha");
+  await page.getByTestId("sidebar-context-menu-color-red").click();
+  await expect.poll(() => pending.length).toBe(1);
+  await page.getByTestId("sidebar-context-menu-color-clear").click();
+  await page.keyboard.press("Escape");
+  await page.getByRole("button", { name: "Settings", exact: true }).click();
+  await expect(row(page, "alpha")).toHaveCount(0);
+  await consume(page, pending.shift()!, { ...initialA, color: "red" }, 11n);
+  await expect.poll(() => pending.length).toBe(1);
+  const reset = pending.shift()!;
+  expect(reset.request().postDataJSON()).toEqual({ color: null });
+  expect(reset.request().headers()["aoe-runtime-epoch"]).toBe("boot");
+  await consume(page, reset, initialA, 12n);
+  await page.getByRole("button", { name: "Go to dashboard" }).click();
+  await expect(row(page, "alpha")).toBeVisible();
+  await row(page, "alpha").click({ button: "right" });
+  await expect(page.getByTestId("sidebar-context-menu-color-clear")).toHaveAttribute("aria-pressed", "true");
+});
+
+test("attach keeps the failed restart result through canonical Multi-repo regrouping", async ({ page }) => {
+  const next = await boot(page);
+  await consume(page, await next(), { sessions: [initialA], workspace_ordering: [] }, 10n);
+  await page.route("**/api/projects**", (route) => route.fulfill({ json: [] }));
+  const pending: Route[] = [];
+  await page.route("**/api/sessions/A/projects", (route) => {
+    pending.push(route);
+  });
+  await menu(page, "alpha");
+  await page.getByTestId("sidebar-context-menu-more").click();
+  await page.getByTestId("sidebar-context-menu-add-project").click();
+  await page.getByTestId("add-project-modal-input").fill("/tmp/frontend");
+  await page.getByTestId("add-project-modal-submit").click();
+  await expect.poll(() => pending.length).toBe(1);
+  const oldGroup = page.getByTestId("sidebar-group-header").filter({ hasText: /^repo/ });
+  await consume(
+    page,
+    pending.shift()!,
+    {
+      ...initialA,
+      project_path: "/tmp/workspace",
+      workspace_repos: [
+        { name: "backend", source_path: "/tmp/repo", branch: "feature/a" },
+        { name: "frontend", source_path: "/tmp/frontend", branch: "feature/a" },
+      ],
+      outcome: {
+        attached: { name: "frontend", branch: "feature/a", branch_created: false, moved_to: "/tmp/workspace" },
+        worker: { status: "restart_failed", message: "original worker restart failed" },
+        warnings: ["attached warning retained"],
+      },
+    },
+    11n,
+  );
+  await expect(page.getByTestId("sidebar-group-header").filter({ hasText: "Multi-repo" })).toBeVisible();
+  await expect(oldGroup).toHaveCount(0);
+  const modal = page.getByTestId("add-project-modal");
+  await expect(modal).toContainText("original worker restart failed");
+  await expect(modal).toContainText("attached warning retained");
+  await expect(modal).toContainText("/tmp/workspace");
+  await page.getByTestId("add-project-modal-done").click();
+  await expect(modal).toHaveCount(0);
+});
+
 for (const staleKind of ["same epoch", "abandoned epoch"] as const) {
   test(`valid stale ${staleKind} polls restore online state without admitting stale rows or settings`, async ({
     page,

@@ -305,7 +305,7 @@ async fn edit_session(
         Ok(Ok(prepared)) => prepared,
         Ok(Err(error)) => return Err(session_edit_error(&error, false)),
         Err(error) => {
-            tracing::error!(%error, "session edit preparation task failed");
+            tracing::error!(target: "http.api.sessions", %error, "session edit preparation task failed");
             return Err(api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "title_lock_failed",
@@ -462,7 +462,7 @@ async fn edit_session(
             return Err(session_edit_error(&error, partial));
         }
         Err(error) => {
-            tracing::error!(%error, "session edit task failed after admission");
+            tracing::error!(target: "http.api.sessions", %error, "session edit task failed after admission");
             state
                 .mark_reload_failure(crate::daemon::RuntimeHealth::Degraded {
                     code: crate::daemon::ReloadFailureCode::ProfileData,
@@ -567,7 +567,7 @@ fn session_edit_error(error: &anyhow::Error, partial: bool) -> axum::response::R
             .to_string(),
         );
     }
-    tracing::error!(%error, "session edit failed");
+    tracing::error!(target: "http.api.sessions", %error, "session edit failed");
     api_error(
         StatusCode::INTERNAL_SERVER_ERROR,
         "persist_failed",

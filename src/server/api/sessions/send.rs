@@ -248,7 +248,7 @@ impl IntoResponse for TerminalSendError {
                 .into_response(),
             SendKeysError::Blocked(blocked) => crate::server::api::start_blocked_response(blocked),
             SendKeysError::Tmux(error) => {
-                tracing::warn!(%error, "terminal send failed");
+                tracing::warn!(target: "http.api.sessions", %error, "terminal send failed");
                 if error.is::<crate::session::NativeStoreUnavailable>() {
                     StatusCode::SERVICE_UNAVAILABLE.into_response()
                 } else {

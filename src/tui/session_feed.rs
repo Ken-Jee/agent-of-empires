@@ -224,6 +224,32 @@ struct PendingTerminal {
     result: tokio::sync::oneshot::Sender<Result<String, String>>,
 }
 
+struct DeferredNativePreparation {
+    request: SessionRequest,
+    native: NativeLease,
+    terminal: PendingTerminal,
+    epoch: String,
+    profile: String,
+    lifecycle_generation: u64,
+    created_at: String,
+}
+
+impl DeferredNativePreparation {
+    fn matches(&self, id: &str, snapshot: &RuntimeSnapshot) -> bool {
+        snapshot.cursor.epoch == self.epoch
+            && snapshot.contents.sessions.iter().any(|row| {
+                row.id == id
+                    && row.profile == self.profile
+                    && row.lifecycle_generation == self.lifecycle_generation
+                    && row.created_at == self.created_at
+            })
+    }
+
+    fn reject(self, message: &str) {
+        let _ = self.terminal.result.send(Err(message.into()));
+    }
+}
+
 struct PendingCommand {
     grant: Arc<AtomicU64>,
     lease: u64,
@@ -231,12 +257,17 @@ struct PendingCommand {
     reply: Option<CommandReply>,
     terminal: Option<PendingTerminal>,
     marks_unread: bool,
+    is_engagement: bool,
+    deferred_native: Option<Box<DeferredNativePreparation>>,
 }
 
 impl PendingCommand {
     fn fail(&mut self, id: &str, failure: CommandFailure, errors: &mut Vec<SessionCommandError>) {
         let unknown = matches!(&failure, CommandFailure::Unknown(_));
         let message = failure.message();
+        if let Some(deferred) = self.deferred_native.take() {
+            deferred.reject(&message);
+        }
         if let Some(terminal) = self.terminal.take() {
             let _ = terminal.result.send(Err(message.clone()));
             if !unknown {
@@ -538,6 +569,13 @@ async fn run_command_writer(
     }
     creations.shutdown().await;
 }
+#[derive(Clone)]
+struct QuitCancellationHandle {
+    client: crate::daemon::DaemonClient,
+    epoch: String,
+    grant: Arc<AtomicU64>,
+}
+
 pub struct SessionFeed {
     sender: tokio::sync::watch::Sender<Option<SessionFeedResult>>,
     receiver: tokio::sync::watch::Receiver<Option<SessionFeedResult>>,
@@ -545,6 +583,7 @@ pub struct SessionFeed {
     /// overwrite an unapplied canonical snapshot.
     progress: tokio::sync::watch::Sender<Option<Vec<CreationProgress>>>,
     progress_receiver: tokio::sync::watch::Receiver<Option<Vec<CreationProgress>>>,
+    quit_control: tokio::sync::watch::Sender<Option<QuitCancellationHandle>>,
     task: Option<tokio::task::JoinHandle<()>>,
     grant: Arc<AtomicU64>,
     native_grant: Arc<AtomicU64>,
@@ -571,11 +610,13 @@ impl SessionFeed {
     pub fn new() -> Self {
         let (sender, receiver) = tokio::sync::watch::channel(None);
         let (progress, progress_receiver) = tokio::sync::watch::channel(None);
+        let (quit_control, _) = tokio::sync::watch::channel(None);
         Self {
             sender,
             receiver,
             progress,
             progress_receiver,
+            quit_control,
             task: None,
             grant: Arc::new(AtomicU64::new(0)),
             native_grant: Arc::new(AtomicU64::new(0)),
@@ -596,6 +637,7 @@ impl SessionFeed {
     pub fn connect(&mut self, profile: String) {
         set_grant(&self.grant, false);
         set_grant(&self.native_grant, false);
+        self.quit_control.send_replace(None);
         if let Some(task) = self.task.take() {
             task.abort();
         }
@@ -615,6 +657,7 @@ impl SessionFeed {
         self.progress = progress.clone();
         self.progress_receiver = progress_receiver;
         let sender = self.sender.clone();
+        let quit_control = self.quit_control.clone();
         self.task = Some(tokio::spawn(async move {
             let result: anyhow::Result<()> = async {
                 let endpoint = crate::acp::client::daemon_manager::ensure_daemon(&profile).await?;
@@ -630,6 +673,11 @@ impl SessionFeed {
                 cityhall.store(connection.info().cityhall_mode, Ordering::SeqCst);
                 set_grant(&grant, connection.mutations_allowed());
                 set_grant(&native_grant, connection.native_interaction_allowed());
+                quit_control.send_replace(Some(QuitCancellationHandle {
+                    client: client.clone(),
+                    epoch: epoch.clone(),
+                    grant: grant.clone(),
+                }));
                 sender.send_replace(Some(SessionFeedResult::Snapshot(
                     connection.snapshot().clone(),
                 )));
@@ -671,6 +719,7 @@ impl SessionFeed {
             .await;
             set_grant(&grant, false);
             set_grant(&native_grant, false);
+            quit_control.send_replace(None);
             if let Err(error) = result {
                 sender.send_replace(Some(SessionFeedResult::Unavailable(error.to_string())));
             }
@@ -986,6 +1035,91 @@ impl SessionFeed {
         self.enqueue(id, SessionRequest::CancelCreation, None, None)
     }
 
+    /// Await cancellation admission on the original authenticated runtime, not the writer queue.
+    pub(crate) async fn cancel_creation_at_quit(
+        &mut self,
+        request_key: &str,
+        daemon_id: Option<&str>,
+        origin_epoch: &str,
+    ) -> Result<RuntimeCursor, CommandFailure> {
+        let control = self
+            .quit_control
+            .borrow()
+            .clone()
+            .filter(|control| control.epoch == origin_epoch)
+            .ok_or_else(|| {
+                CommandFailure::Rejected("Original creation runtime is unavailable".into())
+            })?;
+        let lease = control.grant.load(Ordering::SeqCst);
+        if lease & 1 == 0 {
+            return Err(CommandFailure::Rejected(
+                "Creation cancellation permission was revoked".into(),
+            ));
+        }
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut snapshots = self.receiver.clone();
+        let mut progresses = self.progress_receiver.clone();
+        let cancellation = async {
+            let id = loop {
+                if control.grant.load(Ordering::SeqCst) != lease {
+                    return Err(CommandFailure::Rejected(
+                        "Creation cancellation authority changed".into(),
+                    ));
+                }
+                let latest = snapshots.borrow().clone();
+                let same_epoch = matches!(&latest, Some(SessionFeedResult::Snapshot(snapshot))
+                    if snapshot.cursor.epoch == origin_epoch);
+                if !same_epoch {
+                    return Err(CommandFailure::Rejected(
+                        "Original creation runtime is unavailable".into(),
+                    ));
+                }
+                if let Some(id) = daemon_id {
+                    break id.to_owned();
+                }
+                if let Some(id) = progresses.borrow().as_ref().and_then(|progress| {
+                    progress
+                        .iter()
+                        .find(|entry| entry.request_key.as_deref() == Some(request_key))
+                        .map(|entry| entry.session_id.clone())
+                }) {
+                    break id;
+                }
+                if let Some(SessionFeedResult::Snapshot(snapshot)) = latest {
+                    if let Some(row) = snapshot
+                        .contents
+                        .sessions
+                        .iter()
+                        .find(|row| row.idempotency_key.as_deref() == Some(request_key))
+                    {
+                        break row.id.clone();
+                    }
+                }
+                tokio::select! {
+                    changed = snapshots.changed() => changed.map_err(|_| CommandFailure::Unknown("Runtime closed before creation identity resolved".into()))?,
+                    changed = progresses.changed() => changed.map_err(|_| CommandFailure::Unknown("Progress closed before creation identity resolved".into()))?,
+                }
+            };
+            if control.grant.load(Ordering::SeqCst) != lease {
+                return Err(CommandFailure::Rejected(
+                    "Creation cancellation authority changed".into(),
+                ));
+            }
+            control
+                .client
+                .cancel_creation(&id, origin_epoch)
+                .await
+                .map_err(CommandFailure::submitted)
+        };
+        tokio::time::timeout_at(deadline, cancellation)
+            .await
+            .unwrap_or_else(|_| {
+                Err(CommandFailure::Unknown(
+                    "Creation cancellation acknowledgement timed out".into(),
+                ))
+            })
+    }
+
     /// Settled creations, each with the daemon's receipt or its refusal.
     pub(crate) fn drain_creation_results(
         &mut self,
@@ -1223,10 +1357,6 @@ impl SessionFeed {
             "The previous runtime change has an unknown outcome; explicitly resolve its quarantine before retrying"
         );
         anyhow::ensure!(
-            !self.pending.contains_key(&id),
-            "This session already has a pending runtime change"
-        );
-        anyhow::ensure!(
             self.pending.len() < COMMAND_CAPACITY,
             "Runtime command queue is full"
         );
@@ -1238,8 +1368,53 @@ impl SessionFeed {
             .commands
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("Runtime disconnected"))?;
+        anyhow::ensure!(
+            !commands.is_closed(),
+            "Runtime command queue unavailable; no change submitted"
+        );
+        if let Some(pending) = self.pending.get_mut(&id) {
+            anyhow::ensure!(
+                pending.is_engagement
+                    && pending.deferred_native.is_none()
+                    && matches!(
+                        &request,
+                        SessionRequest::EnsureAgent { .. } | SessionRequest::EnsureAuxiliary { .. }
+                    ),
+                "This session already has a pending runtime change"
+            );
+            let native = native
+                .ok_or_else(|| anyhow::anyhow!("Native preparation requires original authority"))?;
+            let terminal = terminal
+                .ok_or_else(|| anyhow::anyhow!("Native preparation requires a continuation"))?;
+            anyhow::ensure!(
+                native.is_valid() && pending.grant.load(Ordering::SeqCst) == pending.lease,
+                "Runtime permission changed before native preparation"
+            );
+            let snapshot = self
+                .applied
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("Runtime snapshot is unavailable"))?;
+            let row = snapshot
+                .contents
+                .sessions
+                .iter()
+                .find(|row| row.id == id)
+                .ok_or_else(|| anyhow::anyhow!("Session is unknown to the applied runtime"))?;
+            pending.deferred_native = Some(Box::new(DeferredNativePreparation {
+                request,
+                native,
+                terminal,
+                epoch: snapshot.cursor.epoch.clone(),
+                profile: row.profile.clone(),
+                lifecycle_generation: row.lifecycle_generation,
+                created_at: row.created_at.clone(),
+            }));
+            return Ok(());
+        }
         let (result, receiver) = tokio::sync::oneshot::channel();
         let marks_unread = matches!(&request, SessionRequest::Mutation(SessionMutation::Unread(body)) if body.unread);
+        let is_engagement = matches!(&request, SessionRequest::Mutation(SessionMutation::Access))
+            || matches!(&request, SessionRequest::Mutation(SessionMutation::Unread(body)) if !body.unread);
         commands
             .try_send(SessionCommand {
                 request: CommandRequest::Session {
@@ -1262,6 +1437,8 @@ impl SessionFeed {
                 reply: None,
                 terminal,
                 marks_unread,
+                is_engagement,
+                deferred_native: None,
             },
         );
         Ok(())
@@ -1312,8 +1489,21 @@ impl SessionFeed {
         let snapshot = self.applied.as_ref();
         let mut errors = Vec::new();
         let mut unknown_ids = Vec::new();
+        let latest_receiver = self.receiver.clone();
+        let latest = latest_receiver.borrow();
+        let namespace_blocked = self.namespace_blocked();
+        let native_available = self.native_interaction_available();
+        let mut deferred = Vec::new();
         let outcomes = &mut self.row_outcomes;
+        let quarantined = &self.quarantined;
         self.pending.retain(|id, pending| {
+            if pending.deferred_native.as_ref().is_some_and(|child| {
+                !child.native.is_valid() || !native_available || namespace_blocked || quarantined.contains(id)
+                    || snapshot.is_none_or(|snapshot| !child.matches(id, snapshot))
+                    || !matches!(latest.as_ref(), Some(SessionFeedResult::Snapshot(snapshot)) if child.matches(id, snapshot))
+            }) {
+                pending.deferred_native.take().unwrap().reject("Native preparation authority or session identity changed");
+            }
             if pending.reply.is_none() {
                 match pending.result.try_recv() {
                     Ok(Ok(reply)) => pending.reply = Some(reply),
@@ -1359,6 +1549,11 @@ impl SessionFeed {
                         }
                         pending.fail(id, failure, &mut errors);
                         return false;
+                    }
+                    if pending.deferred_native.is_some()
+                        && !matches!(latest.as_ref(), Some(SessionFeedResult::Snapshot(latest)) if latest.cursor == snapshot.cursor)
+                    {
+                        return true;
                     }
                     if let Some(terminal) = pending.terminal.take() {
                         if terminal.cancelled.load(Ordering::SeqCst) {
@@ -1448,12 +1643,37 @@ impl SessionFeed {
                         };
                         if let Some(outcome) = outcome { outcomes.push((id.clone(), outcome)); }
                     }
+                    if let Some(child) = pending.deferred_native.take() {
+                        deferred.push((id.clone(), child));
+                    }
                     return false;
                 }
             }
             true
         });
         self.quarantined.extend(unknown_ids);
+        for (id, child) in deferred {
+            if !child.native.is_valid()
+                || !self.native_interaction_available()
+                || self
+                    .applied
+                    .as_ref()
+                    .is_none_or(|snapshot| !child.matches(&id, snapshot))
+            {
+                child.reject("Native preparation authority or session identity changed");
+                continue;
+            }
+            let DeferredNativePreparation {
+                request,
+                native,
+                terminal,
+                ..
+            } = *child;
+            // A refused enqueue drops its readiness sender; the existing native
+            // continuation reports that closure rather than treating it as success.
+            let _ = self.enqueue(id, request, Some(native), Some(terminal));
+        }
+        drop(latest);
         self.pump_batch();
         errors.append(&mut self.bulk_errors);
         errors
@@ -1478,6 +1698,38 @@ impl SessionFeed {
                 Ok(SessionFeedResult::Snapshot(snapshot.clone()))
             }
             _ => Err(TryRecvError::Empty),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn engagement_native_driver_for_test(
+        &mut self,
+    ) -> impl FnMut(Result<RuntimeCursor, String>, Option<TerminalTarget>) -> Option<SessionRequest>
+    {
+        let (sender, mut receiver) = tokio::sync::mpsc::channel::<SessionCommand>(COMMAND_CAPACITY);
+        self.commands = Some(sender);
+        set_grant(&self.grant, true);
+        set_grant(&self.native_grant, true);
+        move |cursor, target| {
+            let command = receiver.try_recv().ok()?;
+            let CommandRequest::Session { request, .. } = command.request else {
+                panic!("expected a row command");
+            };
+            assert_eq!(
+                target.is_some(),
+                matches!(
+                    &request,
+                    SessionRequest::EnsureAgent { .. } | SessionRequest::EnsureAuxiliary { .. }
+                )
+            );
+            let reply = cursor
+                .map(|cursor| match target {
+                    Some(outcome) => CommandReply::Terminal(MutationReceipt { cursor, outcome }),
+                    None => CommandReply::Mutation(cursor),
+                })
+                .map_err(CommandFailure::Rejected);
+            assert!(command.result.send(reply).is_ok());
+            Some(request)
         }
     }
 
@@ -2067,6 +2319,298 @@ mod tests {
         (feed, requests)
     }
 
+    fn native_identity_snapshot(revision: u64) -> Arc<RuntimeSnapshot> {
+        let mut snapshot = snapshot("test", revision);
+        Arc::make_mut(&mut snapshot).contents.sessions.push(serde_json::from_value(serde_json::json!({
+            "id": "session", "profile": "test", "lifecycle_generation": 4,
+            "created_at": "2026-01-01T00:00:00Z", "status": "Idle",
+            "agent_pane": {"state": "alive", "tmux_session": "native-owned"},
+            "auxiliary": [{"target": {"kind": "host", "index": 0}, "state": "alive", "tmux_session": "native-owned"}],
+        })).unwrap());
+        snapshot
+    }
+
+    #[test]
+    fn native_ensure_waits_for_engagement_and_current_applied_authority() {
+        for unread in [false, true] {
+            for agent in [false, true] {
+                let (mut feed, mut requests) = feed_with_native_lane();
+                let initial = native_identity_snapshot(1);
+                feed.publish_for_test(SessionFeedResult::Snapshot(initial.clone()));
+                feed.mark_snapshot_applied(initial);
+                let engagement = if unread {
+                    SessionMutation::Unread(crate::daemon::UpdateUnreadBody { unread: false })
+                } else {
+                    SessionMutation::Access
+                };
+                feed.submit("session".into(), engagement).unwrap();
+                let parent = requests.try_recv().unwrap();
+                let mut prepared = if agent {
+                    feed.ensure_agent("session".into(), Some((80, 24)))
+                } else {
+                    feed.ensure_auxiliary(
+                        "session".into(),
+                        AuxiliaryTarget::Host { index: 0 },
+                        Some((80, 24)),
+                        None,
+                    )
+                }
+                .unwrap();
+                assert!(feed.ensure_agent("session".into(), None).is_err());
+                assert!(feed.start_agent("session".into(), None).is_err());
+                assert!(feed
+                    .restart_agent("session".into(), Default::default())
+                    .is_err());
+                assert!(feed
+                    .submit("session".into(), SessionMutation::Stop)
+                    .is_err());
+                assert!(
+                    requests.try_recv().is_err(),
+                    "native transport must wait behind engagement"
+                );
+                assert!(prepared.result.try_recv().is_err());
+                parent
+                    .result
+                    .send(Ok(CommandReply::Mutation(RuntimeCursor {
+                        epoch: "test".into(),
+                        revision: 2,
+                    })))
+                    .unwrap();
+                assert!(feed.drain_command_errors().is_empty());
+                assert!(requests.try_recv().is_err());
+                let committed = native_identity_snapshot(2);
+                feed.publish_for_test(SessionFeedResult::Snapshot(committed.clone()));
+                assert!(feed.drain_command_errors().is_empty());
+                assert!(
+                    requests.try_recv().is_err(),
+                    "receipt alone is not canonical application"
+                );
+                let latest = native_identity_snapshot(3);
+                feed.publish_for_test(SessionFeedResult::Snapshot(latest.clone()));
+                feed.mark_snapshot_applied(committed);
+                for _ in 0..2 {
+                    assert!(feed.drain_command_errors().is_empty());
+                    assert!(
+                        requests.try_recv().is_err(),
+                        "latest snapshot still awaits application"
+                    );
+                    assert!(prepared.result.try_recv().is_err());
+                }
+                feed.mark_snapshot_applied(latest);
+                assert!(feed.drain_command_errors().is_empty());
+                let native = requests
+                    .try_recv()
+                    .expect("one original native ensure must be promoted");
+                assert!(
+                    matches!(
+                        &native.request,
+                        CommandRequest::Session {
+                            request: SessionRequest::EnsureAgent { .. },
+                            ..
+                        }
+                    ) == agent
+                );
+                assert!(native.native.as_ref().unwrap().is_valid());
+                assert!(requests.try_recv().is_err());
+                assert!(prepared.result.try_recv().is_err());
+                native
+                    .result
+                    .send(Ok(CommandReply::Terminal(MutationReceipt {
+                        cursor: RuntimeCursor {
+                            epoch: "test".into(),
+                            revision: 4,
+                        },
+                        outcome: TerminalTarget {
+                            tmux_session: "native-owned".into(),
+                            status: crate::daemon::TerminalTargetStatus::Exists,
+                            lifecycle_generation: 4,
+                            profile: "test".into(),
+                        },
+                    })))
+                    .unwrap();
+                assert!(feed.drain_command_errors().is_empty());
+                assert!(prepared.result.try_recv().is_err());
+                let ready = native_identity_snapshot(4);
+                feed.publish_for_test(SessionFeedResult::Snapshot(ready.clone()));
+                feed.mark_snapshot_applied(ready);
+                assert!(feed.drain_command_errors().is_empty());
+                assert_eq!(prepared.result.try_recv().unwrap().unwrap(), "native-owned");
+                assert!(requests.try_recv().is_err());
+                assert!(feed.can_submit("session"));
+            }
+        }
+    }
+
+    #[test]
+    fn deferred_native_ensure_never_replays_after_failure_or_authority_loss() {
+        for change in [
+            "rejected",
+            "unknown",
+            "closed",
+            "committed-failure",
+            "cancel",
+            "permission",
+            "epoch",
+            "namespace",
+            "profile",
+            "generation",
+            "birth",
+            "deleted",
+        ] {
+            let (mut feed, mut requests) = feed_with_native_lane();
+            let initial = native_identity_snapshot(1);
+            feed.publish_for_test(SessionFeedResult::Snapshot(initial.clone()));
+            feed.mark_snapshot_applied(initial);
+            feed.submit("session".into(), SessionMutation::Access)
+                .unwrap();
+            let parent = requests.try_recv().unwrap();
+            let mut prepared = feed
+                .ensure_auxiliary(
+                    "session".into(),
+                    AuxiliaryTarget::Host { index: 0 },
+                    None,
+                    None,
+                )
+                .unwrap();
+            let mut next = native_identity_snapshot(2);
+            match change {
+                "cancel" => prepared.lease.cancel_continuation(),
+                "permission" => {
+                    set_grant(&feed.native_grant, false);
+                    set_grant(&feed.native_grant, true);
+                }
+                "epoch" => {
+                    Arc::make_mut(&mut next).cursor.epoch = "replacement".into();
+                    set_grant(&feed.grant, false);
+                    set_grant(&feed.grant, true);
+                    set_grant(&feed.native_grant, false);
+                    set_grant(&feed.native_grant, true);
+                }
+                "namespace" => feed.namespace_quarantined = true,
+                "profile" => {
+                    Arc::make_mut(&mut next).contents.sessions[0].profile = "replacement".into()
+                }
+                "generation" => {
+                    Arc::make_mut(&mut next).contents.sessions[0].lifecycle_generation += 1
+                }
+                "birth" => {
+                    Arc::make_mut(&mut next).contents.sessions[0].created_at =
+                        "2026-02-01T00:00:00Z".into()
+                }
+                "deleted" => Arc::make_mut(&mut next).contents.sessions.clear(),
+                _ => {}
+            }
+            if change == "closed" {
+                drop(parent);
+            } else {
+                let cursor = RuntimeCursor {
+                    epoch: "test".into(),
+                    revision: 2,
+                };
+                let reply = match change {
+                    "rejected" => Err(CommandFailure::Rejected("refused".into())),
+                    "unknown" => Err(CommandFailure::Unknown("transport lost".into())),
+                    "committed-failure" => Ok(CommandReply::CommittedFailure {
+                        cursor,
+                        failure: CommandFailure::Rejected("committed failure".into()),
+                    }),
+                    _ => Ok(CommandReply::Mutation(cursor)),
+                };
+                parent.result.send(reply).unwrap();
+            }
+            feed.publish_for_test(SessionFeedResult::Snapshot(next.clone()));
+            feed.mark_snapshot_applied(next);
+            feed.drain_command_errors();
+            assert!(matches!(prepared.result.try_recv(), Ok(Err(_))), "{change}");
+            assert!(
+                requests.try_recv().is_err(),
+                "{change}: no native request may be sent"
+            );
+            if matches!(change, "unknown" | "closed" | "epoch") {
+                assert!(feed.quarantined.contains("session"));
+            }
+            feed.namespace_quarantined = false;
+            let restored = native_identity_snapshot(3);
+            feed.publish_for_test(SessionFeedResult::Snapshot(restored.clone()));
+            feed.mark_snapshot_applied(restored);
+            feed.drain_command_errors();
+            assert!(
+                requests.try_recv().is_err(),
+                "{change}: discarded work must not replay"
+            );
+        }
+    }
+
+    #[test]
+    fn native_deferral_does_not_bypass_other_pending_or_queued_commands() {
+        for parent in [
+            SessionMutation::Stop,
+            SessionMutation::Unread(crate::daemon::UpdateUnreadBody { unread: true }),
+        ] {
+            let (mut feed, mut requests) = feed_with_native_lane();
+            let current = native_identity_snapshot(1);
+            feed.publish_for_test(SessionFeedResult::Snapshot(current.clone()));
+            feed.mark_snapshot_applied(current);
+            feed.submit("session".into(), parent).unwrap();
+            let _parent = requests.try_recv().unwrap();
+            assert!(feed.ensure_agent("session".into(), None).is_err());
+            assert!(requests.try_recv().is_err());
+        }
+        for parent in 0..3 {
+            let (mut feed, mut requests) = feed_with_native_lane();
+            let current = native_identity_snapshot(1);
+            feed.publish_for_test(SessionFeedResult::Snapshot(current.clone()));
+            feed.mark_snapshot_applied(current);
+            let _preparation = match parent {
+                0 => feed.start_agent("session".into(), None),
+                1 => feed.restart_agent("session".into(), Default::default()),
+                _ => feed.ensure_agent("session".into(), None),
+            }
+            .unwrap();
+            let _parent = requests.try_recv().unwrap();
+            assert!(feed
+                .ensure_auxiliary(
+                    "session".into(),
+                    AuxiliaryTarget::Host { index: 0 },
+                    None,
+                    None
+                )
+                .is_err());
+            assert!(requests.try_recv().is_err());
+        }
+        let (mut feed, mut requests) = feed_with_native_lane();
+        let current = native_identity_snapshot(1);
+        feed.publish_for_test(SessionFeedResult::Snapshot(current.clone()));
+        feed.mark_snapshot_applied(current);
+        feed.submit("session".into(), SessionMutation::Access)
+            .unwrap();
+        let _parent = requests.try_recv().unwrap();
+        feed.bulk_queue.push_back((
+            "session".into(),
+            SessionRequest::Mutation(SessionMutation::Stop),
+        ));
+        assert!(feed.ensure_agent("session".into(), None).is_err());
+        assert!(requests.try_recv().is_err());
+    }
+
+    #[test]
+    fn dropping_the_feed_rejects_its_deferred_native_child() {
+        let (mut feed, mut requests) = feed_with_native_lane();
+        let current = native_identity_snapshot(1);
+        feed.publish_for_test(SessionFeedResult::Snapshot(current.clone()));
+        feed.mark_snapshot_applied(current);
+        feed.submit("session".into(), SessionMutation::Access)
+            .unwrap();
+        let _parent = requests.try_recv().unwrap();
+        let mut prepared = feed.ensure_agent("session".into(), None).unwrap();
+        drop(feed);
+        assert!(matches!(
+            prepared.result.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+        ));
+        assert!(requests.try_recv().is_err());
+    }
+
     /// A native command carries a terminal, so its failure is reported to the
     /// attachment. An unknown outcome is a second fact: the row is quarantined
     /// until an operator resolves it, and the queued error is the only path to
@@ -2520,6 +3064,198 @@ mod tests {
             Ok(SessionFeedResult::Unavailable(_))
         ));
         assert!(matches!(feed.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    #[tokio::test]
+    async fn quit_cancellation_bypasses_a_blocked_writer_and_waits_for_ack() {
+        use std::sync::Mutex;
+        let (entered, blocked) = tokio::sync::oneshot::channel();
+        let entered = Arc::new(Mutex::new(Some(entered)));
+        let stop_release = Arc::new(tokio::sync::Notify::new());
+        let (cancel_seen, cancel_received) = tokio::sync::oneshot::channel();
+        let cancel_seen = Arc::new(Mutex::new(Some(cancel_seen)));
+        let ack = Arc::new(tokio::sync::Notify::new());
+        let app = axum::Router::new()
+            .route(
+                "/api/sessions/other/stop",
+                axum::routing::post({
+                    let entered = entered.clone();
+                    let release = stop_release.clone();
+                    move || {
+                        let entered = entered.clone();
+                        let release = release.clone();
+                        async move {
+                            entered.lock().unwrap().take().unwrap().send(()).unwrap();
+                            release.notified().await;
+                            axum::http::StatusCode::CONFLICT
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/api/sessions/creation/creation/cancel",
+                axum::routing::post({
+                    let seen = cancel_seen.clone();
+                    let ack = ack.clone();
+                    move || {
+                        let seen = seen.clone();
+                        let ack = ack.clone();
+                        async move {
+                            seen.lock().unwrap().take().unwrap().send(()).unwrap();
+                            ack.notified().await;
+                            (
+                                [
+                                    (crate::daemon::RUNTIME_EPOCH_HEADER, "test"),
+                                    (crate::daemon::RUNTIME_REVISION_HEADER, "2"),
+                                ],
+                                "",
+                            )
+                        }
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = crate::daemon::DaemonClient::new(
+            &format!("http://{}", listener.local_addr().unwrap()),
+            None,
+        )
+        .unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut feed =
+            SessionFeed::seeded_for_test(SessionFeedResult::Snapshot(snapshot("test", 1)));
+        feed.mark_snapshot_applied(snapshot("test", 1));
+        set_grant(&feed.grant, true);
+        set_grant(&feed.grant, false);
+        set_grant(&feed.grant, true);
+        feed.quit_control.send_replace(Some(QuitCancellationHandle {
+            client: client.clone(),
+            epoch: "test".into(),
+            grant: feed.grant.clone(),
+        }));
+        let (sender, requests) = tokio::sync::mpsc::channel(COMMAND_CAPACITY);
+        feed.commands = Some(sender);
+        let writer = tokio::spawn(run_command_writer(
+            client,
+            "test".into(),
+            feed.grant.clone(),
+            requests,
+            None,
+        ));
+        feed.enqueue(
+            "other".into(),
+            SessionRequest::Mutation(SessionMutation::Stop),
+            None,
+            None,
+        )
+        .unwrap();
+        blocked.await.unwrap();
+        let mut cancellation =
+            Box::pin(feed.cancel_creation_at_quit("key", Some("creation"), "test"));
+        assert!(futures_util::poll!(&mut cancellation).is_pending());
+        tokio::select! {
+            result = &mut cancellation => panic!("quit cancellation answered before ACK: {result:?}"),
+            result = cancel_received => result.unwrap(),
+        }
+        assert!(
+            futures_util::poll!(&mut cancellation).is_pending(),
+            "request arrival is not ACK"
+        );
+        ack.notify_one();
+        assert_eq!(cancellation.await.unwrap().revision, 2);
+        assert!(matches!(
+            feed.cancel_creation_at_quit("key", Some("creation"), "old")
+                .await,
+            Err(CommandFailure::Rejected(_))
+        ));
+        let grant = feed.grant.clone();
+        let progress = feed.progress.clone();
+        let mut cancellation = Box::pin(feed.cancel_creation_at_quit("key", None, "test"));
+        assert!(futures_util::poll!(&mut cancellation).is_pending());
+        set_grant(&grant, false);
+        set_grant(&grant, true);
+        progress.send_replace(Some(vec![]));
+        assert!(matches!(
+            cancellation.await,
+            Err(CommandFailure::Rejected(_))
+        ));
+        stop_release.notify_one();
+        writer.abort();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn quit_cancellation_resolves_only_its_exact_progress_key() {
+        let (seen, received) = tokio::sync::oneshot::channel();
+        let seen = Arc::new(std::sync::Mutex::new(Some(seen)));
+        let app = axum::Router::new().route(
+            "/api/sessions/{id}/creation/cancel",
+            axum::routing::post({
+                let seen = seen.clone();
+                move |axum::extract::Path(id): axum::extract::Path<String>| {
+                    let seen = seen.clone();
+                    async move {
+                        seen.lock().unwrap().take().unwrap().send(id).unwrap();
+                        (
+                            [
+                                (crate::daemon::RUNTIME_EPOCH_HEADER, "test"),
+                                (crate::daemon::RUNTIME_REVISION_HEADER, "3"),
+                            ],
+                            "",
+                        )
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = crate::daemon::DaemonClient::new(
+            &format!("http://{}", listener.local_addr().unwrap()),
+            None,
+        )
+        .unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut feed =
+            SessionFeed::seeded_for_test(SessionFeedResult::Snapshot(snapshot("test", 1)));
+        set_grant(&feed.grant, true);
+        feed.quit_control.send_replace(Some(QuitCancellationHandle {
+            client,
+            epoch: "test".into(),
+            grant: feed.grant.clone(),
+        }));
+        let progress = feed.progress.clone();
+        let mut cancelling = Box::pin(feed.cancel_creation_at_quit("exact-key", None, "test"));
+        assert!(futures_util::poll!(&mut cancelling).is_pending());
+        let entry = |key: &str, id: &str| {
+            serde_json::from_value(serde_json::json!({
+                "request_key": key, "session_id": id, "title": "same title", "profile": "test",
+                "phase": "create_hooks", "command": null, "output": [], "cancelled": false,
+            }))
+            .unwrap()
+        };
+        progress.send_replace(Some(vec![entry("unrelated", "wrong")]));
+        assert!(futures_util::poll!(&mut cancelling).is_pending());
+        progress.send_replace(Some(vec![
+            entry("unrelated", "wrong"),
+            entry("exact-key", "original"),
+        ]));
+        assert_eq!(cancelling.await.unwrap().revision, 3);
+        assert_eq!(received.await.unwrap(), "original");
+        server.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn quit_cancellation_bounds_unresolved_creation_identity() {
+        let mut feed =
+            SessionFeed::seeded_for_test(SessionFeedResult::Snapshot(snapshot("test", 1)));
+        set_grant(&feed.grant, true);
+        feed.quit_control.send_replace(Some(QuitCancellationHandle {
+            client: crate::daemon::DaemonClient::new("http://127.0.0.1:1", None).unwrap(),
+            epoch: "test".into(),
+            grant: feed.grant.clone(),
+        }));
+        let mut cancelling = Box::pin(feed.cancel_creation_at_quit("missing-key", None, "test"));
+        assert!(futures_util::poll!(&mut cancelling).is_pending());
+        tokio::time::advance(std::time::Duration::from_secs(2)).await;
+        assert!(matches!(cancelling.await, Err(CommandFailure::Unknown(_))));
     }
 
     #[tokio::test]

@@ -10,6 +10,12 @@ Press a hotkey to preview the tool in the home view. `Enter` follows your
 default attach mode, including [live mode](live-mode.md); `Tab` opens a
 full tmux client. Leaving the preview does not stop the tool.
 
+A targeted stop captures the original pane's process tree and proves those
+processes exited before reporting success. Before signaling, it retains that
+pane and its captured process incarnations in tmux. An unproven stop retries
+only those incarnations, including after daemon restart or the pane leader's
+exit. Changed ownership refuses the stop without signaling a replacement.
+
 ## Configuring tools
 
 Tool sessions are defined in your global `config.toml` under

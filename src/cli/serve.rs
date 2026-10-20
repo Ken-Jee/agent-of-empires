@@ -456,7 +456,7 @@ pub async fn lock_for_startup(profile: &str, args: &mut ServeArgs) -> Result<Opt
     if args.stop || args.status || args.restart || args.rollback {
         return Ok(None);
     }
-    let transaction = if args.daemon_child {
+    let mut transaction = if args.daemon_child {
         crate::daemon::lifecycle::Transaction::receive()?
     } else {
         crate::daemon::lifecycle::Transaction::acquire().await?
@@ -467,6 +467,7 @@ pub async fn lock_for_startup(profile: &str, args: &mut ServeArgs) -> Result<Opt
     args.cityhall = args.cityhall || std::env::var_os("AOE_CITYHALL_MODE").is_some();
     match daemon_status() {
         DaemonStatus::Verified(pid) if pid != std::process::id() => {
+            transaction = migrate_managed_launch(transaction, false).await?;
             let launch = managed_launch(pid)?;
             if !launch.core_only || args.core_only || args.daemon_child {
                 return Err(daemon_running_error(pid));
@@ -672,6 +673,7 @@ fn complete_rollback_after(result: Result<()>) -> Result<()> {
 
 async fn rollback_daemon() -> Result<()> {
     let transaction = crate::daemon::lifecycle::Transaction::acquire().await?;
+    let transaction = migrate_managed_launch(transaction, false).await?;
     let launch: ServeLaunch = serde_json::from_str(
         &launch_file("serve.rollback.launch")?
             .read()?
@@ -704,6 +706,7 @@ async fn rollback_daemon() -> Result<()> {
         DaemonStatus::Unverified => bail!("Cannot verify the existing daemon; refusing rollback"),
         DaemonStatus::Absent => {}
     }
+    let transaction = migrate_managed_launch(transaction, true).await?;
     complete_rollback_after(start_daemon(&launch.profile, &args, &transaction, true).await)
 }
 
@@ -1676,6 +1679,26 @@ async fn start_daemon(
     Ok(())
 }
 
+async fn migrate_managed_launch(
+    transaction: crate::daemon::lifecycle::Transaction,
+    full: bool,
+) -> Result<crate::daemon::lifecycle::Transaction> {
+    tokio::task::spawn_blocking(move || {
+        if full {
+            let _serve = try_lock_serve()?.context("serve or migration is still running")?;
+            crate::migrations::run_migrations_under_transaction(
+                Some(crate::cli::migrate::stderr_reporter()),
+                false,
+                &transaction,
+            )?;
+        } else {
+            crate::migrations::reconcile_serve_launch_under_transaction(&transaction)?;
+        }
+        Ok(transaction)
+    })
+    .await?
+}
+
 /// Replay the managed launch with the current executable, retaining it before stop.
 #[tracing::instrument(target = "serve.lifecycle", skip_all)]
 pub async fn restart_daemon() -> Result<()> {
@@ -1686,6 +1709,7 @@ pub async fn restart_daemon() -> Result<()> {
              Start one with: aoe serve --daemon"
         );
     };
+    let transaction = migrate_managed_launch(transaction, false).await?;
 
     let launch = managed_launch(pid)?;
     let passphrase = recall_serve_passphrase(&launch)?;
@@ -1695,6 +1719,7 @@ pub async fn restart_daemon() -> Result<()> {
 
     println!("Restarting aoe serve daemon (PID {pid})…");
     stop_daemon_locked(&transaction).await?;
+    let transaction = migrate_managed_launch(transaction, true).await?;
     complete_rollback_after(start_daemon(&launch.profile, &args, &transaction, true).await)
 }
 

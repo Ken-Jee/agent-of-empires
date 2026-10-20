@@ -627,6 +627,144 @@ pub(crate) async fn publish_loop(state: Arc<AppState>) {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn shutdown_drains_an_abandoned_routed_native_commit() -> anyhow::Result<()> {
+        use crate::session::{Instance, Storage};
+        use anyhow::Context;
+        use fs2::FileExt;
+        use tower::ServiceExt;
+
+        let _guard = crate::session::test_support::isolate_app_dir();
+        let mut row = Instance::new("retained-commit", "/repo");
+        row.source_profile = "test".into();
+        let id = row.id.clone();
+        let state = crate::server::test_support::build_test_app_state_with_policy(
+            Vec::new(),
+            vec!["localhost".into()],
+            Vec::new(),
+            None,
+        );
+        let storage = Storage::new("test", state.file_watch.clone())?;
+        let (_, committed, _) = storage.update_with_snapshot(|rows, _| {
+            rows.push(row);
+            Ok(())
+        })?;
+        *state.instances.write().await = committed;
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+        let router = crate::server::test_support::build_router_for_test(state.clone());
+        let work = &state.runtime.work;
+        assert!(
+            work.tasks.lock().unwrap().is_empty(),
+            "the isolated fixture must not register background producers"
+        );
+        let transition_probe = std::fs::OpenOptions::new().read(true).write(true).open(
+            crate::session::get_app_dir()?
+                .join(crate::migrations::v027_isolate_sandbox_stores::LOCK),
+        )?;
+        transition_probe.try_lock_exclusive()?;
+        fs2::FileExt::unlock(&transition_probe)?;
+        let request = |color: &str| {
+            axum::http::Request::builder()
+                .method(axum::http::Method::PATCH)
+                .uri(format!("/api/sessions/{id}/color"))
+                .header(axum::http::header::HOST, "localhost")
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .extension(axum::extract::ConnectInfo(
+                    crate::server::peer::ConnectionPeer::UnixOwner {
+                        uid: nix::unistd::geteuid().as_raw(),
+                    },
+                ))
+                .body(axum::body::Body::from(
+                    serde_json::json!({ "color": color }).to_string(),
+                ))
+                .unwrap()
+        };
+        let publication = state.publication.write().await;
+        let mut requester = tokio::spawn(router.clone().oneshot(request("red")));
+        // The native writer takes the shared migration transition before
+        // publication, but the profile flock only afterwards. Observe that
+        // physical transition rather than inferring admission from a read.
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if requester.is_finished() {
+                    let response = (&mut requester)
+                        .await
+                        .context("color PATCH requester failed before native admission")??;
+                    let status = response.status();
+                    let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+                    anyhow::bail!(
+                        "color PATCH completed before native transition admission: status {status}, body {}",
+                        String::from_utf8_lossy(&body)
+                    );
+                }
+                match transition_probe.try_lock_exclusive() {
+                    Ok(()) => fs2::FileExt::unlock(&transition_probe)?,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert_eq!(
+                            work.tasks.lock().unwrap().len(),
+                            1,
+                            "the real mutation middleware must own the sole producer"
+                        );
+                        return Ok::<_, anyhow::Error>(());
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .context("native color writer did not acquire its shared storage transition")??;
+        requester.abort();
+        let cancelled = tokio::time::timeout(Duration::from_secs(3), requester)
+            .await
+            .context("aborted HTTP requester did not finish cancellation")?;
+        assert!(matches!(cancelled, Err(error) if error.is_cancelled()));
+        work.shutdown.cancel();
+        let mut drain = Box::pin(work.drain());
+        assert!(
+            futures_util::poll!(&mut drain).is_pending(),
+            "shutdown must retain the admitted writer while publication is held"
+        );
+        let refused =
+            tokio::time::timeout(Duration::from_secs(3), router.oneshot(request("green")))
+                .await
+                .context("shutdown admission fence did not answer the second color PATCH")??;
+        assert_eq!(
+            refused.status(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "shutdown must close the actual mutation admission path"
+        );
+        drop(publication);
+        tokio::time::timeout(Duration::from_secs(3), drain)
+            .await
+            .context("admitted native color writer did not drain after publication was released")?;
+        assert_eq!(
+            storage
+                .load()?
+                .iter()
+                .find(|row| row.id == id)
+                .unwrap()
+                .color
+                .as_deref(),
+            Some("red")
+        );
+        assert_eq!(
+            state
+                .instances
+                .read()
+                .await
+                .iter()
+                .find(|row| row.id == id)
+                .unwrap()
+                .color
+                .as_deref(),
+            Some("red")
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     #[serial_test::serial]
     async fn net_zero_commits_do_not_acknowledge_an_older_snapshot() -> anyhow::Result<()> {

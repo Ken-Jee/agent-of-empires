@@ -774,8 +774,15 @@ impl ProfileCatalogueTransaction {
     pub(crate) fn with_transaction(
         transaction: crate::daemon::lifecycle::Transaction,
     ) -> Result<Self> {
-        let root = get_app_dir()?;
         let identity = storage::acquire_session_identity_lock()?;
+        Self::with_locked_identity(transaction, identity)
+    }
+
+    pub(crate) fn with_locked_identity(
+        transaction: crate::daemon::lifecycle::Transaction,
+        identity: storage::StorageFlock,
+    ) -> Result<Self> {
+        let root = get_app_dir()?;
         let storage = storage::StorageTransition::acquire_exclusive(&root)?;
         Ok(Self {
             root,
@@ -818,6 +825,7 @@ impl ProfileCatalogueTransaction {
         } else {
             remaining[0].clone()
         };
+        purge_owners::ensure_profile_has_no_pending_purges(&self.root, name)?;
         let launches =
             crate::cli::serve::LaunchProfileUpdates::prepare(&self.lifecycle, name, &replacement)?;
         fs::remove_dir_all(&profile_dir)?;
@@ -839,6 +847,7 @@ impl ProfileCatalogueTransaction {
                 "Profile '{}' already exists",
                 new_name
             );
+            purge_owners::ensure_profile_has_no_pending_purges(&self.root, old_name)?;
             Config::load()?;
             let launches = crate::cli::serve::LaunchProfileUpdates::prepare(
                 &self.lifecycle,
@@ -1516,6 +1525,7 @@ mod tests {
     fn delete_profile_validates_names_but_removes_strays_and_keeps_the_last() {
         let temp = isolate_app_dir();
         let dir = app_dir(&temp);
+        purge_owners::initialize(&dir).unwrap();
         let profiles = dir.join("profiles");
         let stray = "work 0123456789abcdef Some Title";
         fs::create_dir_all(profiles.join(stray)).unwrap();
@@ -1556,6 +1566,7 @@ mod tests {
         ] {
             let temp = isolate_app_dir();
             let dir = app_dir(&temp);
+            purge_owners::initialize(&dir).unwrap();
             for name in ["default", "alpha", "zeta"] {
                 fs::create_dir_all(dir.join("profiles").join(name)).unwrap();
             }
@@ -1583,6 +1594,7 @@ mod tests {
         for rename in [true, false] {
             let temp = isolate_app_dir();
             let dir = app_dir(&temp);
+            purge_owners::initialize(&dir).unwrap();
             create_profile("source").unwrap();
             create_profile("keep").unwrap();
             let storage = Storage::new_unwatched("source").unwrap();
@@ -1764,6 +1776,7 @@ mod tests {
     fn rename_profile_gates_the_destination_but_repairs_a_stray_source() {
         let temp = isolate_app_dir();
         let dir = app_dir(&temp);
+        purge_owners::initialize(&dir).unwrap();
         fs::create_dir_all(dir.join("profiles").join("real")).unwrap();
 
         let too_long = "a".repeat(65);

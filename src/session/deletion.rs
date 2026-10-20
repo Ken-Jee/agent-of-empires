@@ -1009,6 +1009,9 @@ pub(crate) fn recover_committed_purge(
                 !store.load()?.iter().any(|row| row.id == request.session_id),
                 "session identity was reused before pending purge recovery"
             );
+            // A visible absent row may follow a rename whose directory sync failed.
+            // Recovery cannot authorize teardown until this exact binding is durable.
+            store.confirm_sessions_directory_durable()?;
             let owner = super::purge_owners::PurgeOwner::recover(&store, &owner_token)?;
             let profile = store.profile().to_owned();
             let mut request = request_plan
@@ -2291,6 +2294,67 @@ mod tests {
     #[cfg(unix)]
     #[test]
     #[serial_test::serial]
+    fn terminal_purge_excludes_only_its_resolved_registry_and_generation() {
+        for (real_peer, file_alias) in [(false, false), (true, false), (false, true), (true, true)]
+        {
+            let _home = crate::session::test_support::isolate_app_dir();
+            let root = crate::session::get_app_dir().unwrap();
+            super::super::purge_owners::initialize(&root).unwrap();
+            let (_temp, repo, worktree, mut row) = test_worktree_fixture("alias-owner");
+            row.source_profile = "source".into();
+            row.terminal_scopes = Some(vec![]);
+            let storage = Storage::new_unwatched("source").unwrap();
+            storage
+                .update(|rows, _| {
+                    rows.push(row.clone());
+                    Ok(())
+                })
+                .unwrap();
+            if file_alias {
+                std::fs::create_dir(root.join("profiles/account")).unwrap();
+                std::os::unix::fs::symlink(
+                    storage.sessions_path(),
+                    root.join("profiles/account/sessions.json"),
+                )
+                .unwrap();
+            } else {
+                std::os::unix::fs::symlink(
+                    root.join("profiles/source"),
+                    root.join("profiles/account"),
+                )
+                .unwrap();
+            }
+            let mut stale = row.clone();
+            stale.lifecycle_generation = stale.lifecycle_generation.saturating_add(1);
+            assert!(
+                storage.cleanup_protection_excluding(&[stale]).is_err(),
+                "a reused ID at another generation cannot match the cleanup exclusion"
+            );
+            assert!(worktree.exists());
+            if real_peer {
+                let peer = Storage::new_unwatched("peer").unwrap();
+                peer.update(|rows, _| {
+                    rows.push(row.clone());
+                    Ok(())
+                })
+                .unwrap();
+            }
+            let mut request = test_request(row);
+            request.delete_worktree = true;
+            request.delete_branch = true;
+            let transaction = PurgeTransaction::reserve(storage, request, None)
+                .unwrap()
+                .unwrap_or_else(|result| panic!("purge refused: {result:?}"));
+            let result = transaction.complete();
+            assert!(result.success, "{result:?}");
+            assert_eq!(worktree.exists(), real_peer);
+            assert_eq!(test_branch_exists(&repo, "alias-owner"), real_peer);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
     fn terminal_scope_refusal_retains_physical_scratch_and_the_durable_row() {
         use std::os::unix::fs::PermissionsExt;
         let home = tempfile::tempdir().unwrap();
@@ -3095,6 +3159,13 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn a_commit_that_fails_after_the_row_left_keeps_the_purge_owner() {
+        struct ResetSyncFault;
+        impl Drop for ResetSyncFault {
+            fn drop(&mut self) {
+                super::super::anchored_fs::FAIL_SYNC_ONCE.set(None);
+            }
+        }
+        let _reset_sync_fault = ResetSyncFault;
         let _home = crate::session::test_support::isolate_app_dir();
         let root = crate::session::get_app_dir().unwrap();
         super::super::purge_owners::initialize(&root).unwrap();
@@ -3147,6 +3218,27 @@ mod tests {
             "the recorded plan is the only remaining proof the teardown is owed, \
              so it must survive a failure that landed after the row left"
         );
+        crate::session::create_profile("keep").unwrap();
+        let before = std::fs::read(root.join(super::super::purge_owners::FILE_NAME)).unwrap();
+        let rename = crate::session::rename_profile(profile, "renamed-purge-owner").unwrap_err();
+        assert!(rename.is::<super::super::purge_owners::ProfileHasPendingPurges>());
+        let delete = crate::session::delete_profile(profile).unwrap_err();
+        assert!(delete.is::<super::super::purge_owners::ProfileHasPendingPurges>());
+        assert!(root.join("profiles").join(profile).is_dir());
+        assert!(!root.join("profiles/renamed-purge-owner").exists());
+        assert_eq!(
+            std::fs::read(root.join(super::super::purge_owners::FILE_NAME)).unwrap(),
+            before
+        );
+        super::super::anchored_fs::FAIL_SYNC_ONCE.set(Some(root.join("profiles").join(profile)));
+        assert!(recover_committed_purge(&mut HashSet::new())
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            std::fs::read(root.join(super::super::purge_owners::FILE_NAME)).unwrap(),
+            before,
+            "a failed recovery durability barrier must retain the owner before cleanup"
+        );
 
         // And it is still actionable: a later recovery pass finishes the work.
         let committed = recover_committed_purge(&mut HashSet::new())
@@ -3158,6 +3250,8 @@ mod tests {
         assert!(recover_committed_purge(&mut HashSet::new())
             .unwrap()
             .is_none());
+        crate::session::rename_profile(profile, "renamed-purge-owner").unwrap();
+        crate::session::delete_profile("renamed-purge-owner").unwrap();
     }
 
     #[test]

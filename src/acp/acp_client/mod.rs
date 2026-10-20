@@ -86,6 +86,26 @@ use self::runner::spawn_runner_detached;
 #[cfg(debug_assertions)]
 use self::runner::take_injected_fresh_handshake_failure;
 use self::spawn::spawn_subprocess;
+const CONNECTION_SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+struct ShutdownTask<'a> {
+    task: Option<tokio::task::JoinHandle<()>>,
+    slot: &'a std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+}
+
+impl Drop for ShutdownTask<'_> {
+    fn drop(&mut self) {
+        if let Some(task) = self.task.take() {
+            task.abort();
+            if !task.is_finished() {
+                let mut slot = self.slot.lock().expect("connection task mutex poisoned");
+                if slot.is_none() {
+                    *slot = Some(task);
+                }
+            }
+        }
+    }
+}
 
 pub struct AcpClient {
     pub session_id: AcpSessionId,
@@ -107,6 +127,14 @@ pub struct AcpClient {
 impl Drop for AcpClient {
     fn drop(&mut self) {
         self.connection_shutdown.cancel();
+        if let Some(task) = self
+            .connection_task
+            .get_mut()
+            .expect("connection task mutex poisoned")
+            .take()
+        {
+            task.abort();
+        }
     }
 }
 
@@ -265,6 +293,38 @@ impl AcpClient {
             }
         });
         Self::fake(session_id, Some(cmd_tx))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fake_for_test_held_close(
+        session_id: AcpSessionId,
+    ) -> (
+        Self,
+        oneshot::Receiver<oneshot::Sender<CloseSessionOutcome>>,
+        oneshot::Receiver<String>,
+    ) {
+        let (entered, close) = oneshot::channel();
+        let (deleted, deletion) = oneshot::channel();
+        let mut entered = Some(entered);
+        let mut deleted = Some(deleted);
+        let (client, _) = Self::fake_with_consumer(session_id, move |cmd| match cmd {
+            ClientCmd::CloseSession(response) => {
+                if let Some(entered) = entered.take() {
+                    let _ = entered.send(response);
+                }
+            }
+            ClientCmd::DeleteSession {
+                acp_session_id,
+                respond_to,
+            } => {
+                if let Some(deleted) = deleted.take() {
+                    let _ = deleted.send(acp_session_id);
+                }
+                let _ = respond_to.send(DeleteSessionOutcome::UnsupportedMethod);
+            }
+            _ => {}
+        });
+        (client, close, deletion)
     }
 
     #[cfg(test)]
@@ -872,11 +932,36 @@ impl AcpClient {
             .expect("connection task mutex poisoned")
             .take();
         let connection_result = if let Some(task) = task {
-            task.await
-                .map_err(|error| AcpError::Spawn(format!("connection task failed: {error}")))
+            let mut owned = ShutdownTask {
+                task: Some(task),
+                slot: &self.connection_task,
+            };
+            let task = owned.task.as_mut().expect("taken connection task");
+            match tokio::time::timeout(CONNECTION_SHUTDOWN_GRACE, &mut *task).await {
+                Ok(result) => {
+                    owned.task.take();
+                    result.map_err(|error| {
+                        AcpError::Spawn(format!("connection task failed: {error}"))
+                    })
+                }
+                Err(_) => {
+                    task.abort();
+                    if tokio::time::timeout(CONNECTION_SHUTDOWN_GRACE, &mut *task)
+                        .await
+                        .is_ok()
+                    {
+                        owned.task.take();
+                    }
+                    Err(AcpError::Spawn("connection shutdown timed out".into()))
+                }
+            }
         } else {
             if let Some(cmd_tx) = &self.cmd_tx {
-                let _ = cmd_tx.send(ClientCmd::Shutdown).await;
+                let _ = tokio::time::timeout(
+                    CONNECTION_SHUTDOWN_GRACE,
+                    cmd_tx.send(ClientCmd::Shutdown),
+                )
+                .await;
             }
             Ok(())
         };
@@ -905,5 +990,57 @@ impl AcpClient {
 
     pub fn take_inbound(&mut self) -> Option<mpsc::Receiver<Event>> {
         self.inbound.take()
+    }
+}
+
+#[cfg(test)]
+mod shutdown_tests {
+    use super::*;
+
+    struct OnDrop(Option<oneshot::Sender<()>>);
+    impl Drop for OnDrop {
+        fn drop(&mut self) {
+            if let Some(tx) = self.0.take() {
+                let _ = tx.send(());
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_bounds_a_full_event_queue_and_abort_on_waiter_drop() {
+        for cancel_waiter in [false, true] {
+            let (client, events) = AcpClient::fake(AcpSessionId("blocked".into()), None);
+            for _ in 0..64 {
+                events
+                    .send(Event::Stopped {
+                        reason: "filled".into(),
+                    })
+                    .await
+                    .unwrap();
+            }
+            let (entered, blocked) = oneshot::channel();
+            let (dropped, observed_drop) = oneshot::channel();
+            let task = tokio::spawn(async move {
+                let _drop = OnDrop(Some(dropped));
+                entered.send(()).unwrap();
+                events
+                    .send(Event::Stopped {
+                        reason: "blocked".into(),
+                    })
+                    .await
+                    .unwrap();
+            });
+            *client.connection_task.lock().unwrap() = Some(task);
+            blocked.await.unwrap();
+            let mut shutdown = Box::pin(client.shutdown());
+            assert!(futures_util::poll!(&mut shutdown).is_pending());
+            if cancel_waiter {
+                drop(shutdown);
+            } else {
+                tokio::time::advance(CONNECTION_SHUTDOWN_GRACE).await;
+                assert!(shutdown.await.is_err());
+            }
+            observed_drop.await.unwrap();
+        }
     }
 }

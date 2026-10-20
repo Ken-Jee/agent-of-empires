@@ -971,6 +971,7 @@ async fn adopt_lifecycle_commit<R>(
     profile: String,
     id: &str,
     result: anyhow::Result<(R, Vec<Instance>, Vec<crate::session::Group>)>,
+    reload: &tokio::sync::OwnedRwLockWriteGuard<()>,
     publication: &tokio::sync::RwLockWriteGuard<'_, ()>,
 ) -> Result<R, axum::response::Response> {
     if let Err(error) = &result {
@@ -981,8 +982,15 @@ async fn adopt_lifecycle_commit<R>(
     let result = result.map_err(|error| {
         tracing::warn!(target: "http.api.sessions", session = %id, "lifecycle commit failed: {error}");
     });
-    super::update::adopt_profile_update(state, profile, result, |row_id| row_id == id, publication)
-        .await
+    super::update::adopt_profile_update(
+        state,
+        profile,
+        result,
+        |row_id| row_id == id,
+        reload,
+        publication,
+    )
+    .await
 }
 
 // The caller retains namespace, submission, and instance exclusion.
@@ -998,19 +1006,31 @@ async fn stop_with_commit(
         let storage = Storage::open(&stop_profile, file_watch)?;
         let title = crate::session::acquire_session_title_lock(&stop_id)?;
         let lifecycle = storage.acquire_instance_lifecycle_lock(&stop_id)?;
-        let transition = storage.acquire_write_transition()?;
-        Ok((storage, title, lifecycle, transition))
+        Ok((storage, title, lifecycle))
     })
     .await
     .map_err(anyhow::Error::from)
     .and_then(|result| result);
-    let (storage, title, lifecycle, transition) = match opened {
+    let reload = state.session_service.disk_reload_guard().await;
+    let (storage, title, lifecycle) = match opened {
         Ok(opened) => opened,
         Err(error) => {
             let publication = state.publication.write().await;
-            return adopt_lifecycle_commit(state, profile, id, Err(error), &publication).await;
+            return adopt_lifecycle_commit(state, profile, id, Err(error), &reload, &publication)
+                .await;
         }
     };
+    let prepared = tokio::task::spawn_blocking(move || {
+        let transition = storage.acquire_write_transition();
+        (storage, title, lifecycle, reload, transition)
+    })
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())?;
+    let (storage, title, lifecycle, reload, transition) = prepared;
+    let transition = transition.map_err(|error| {
+        tracing::warn!(target: "http.api.sessions", %error, "stop storage transition failed");
+        StatusCode::SERVICE_UNAVAILABLE.into_response()
+    })?;
 
     let publication = state.publication.write().await;
     if *state.canonical_health.read().await != crate::daemon::RuntimeHealth::Healthy {
@@ -1049,20 +1069,21 @@ async fn stop_with_commit(
             }
             Ok(Some(generation))
         });
-        (storage, lifecycle, transition, result)
+        (storage, lifecycle, reload, transition, result)
     })
     .await;
-    let (storage, lifecycle, transition, result) = match reserved {
+    let (storage, lifecycle, reload, transition, result) = match reserved {
         Ok(reserved) => reserved,
         Err(error) => {
-            return adopt_lifecycle_commit(state, profile, id, Err(error.into()), &publication)
-                .await
+            tracing::warn!(target: "http.api.sessions", %error, "stop reservation task failed");
+            return Err(StatusCode::SERVICE_UNAVAILABLE.into_response());
         }
     };
     let generation =
-        adopt_lifecycle_commit(state, profile.clone(), id, result, &publication).await?;
+        adopt_lifecycle_commit(state, profile.clone(), id, result, &reload, &publication).await?;
     drop(publication);
     drop(transition);
+    drop(reload);
     let Some(generation) = generation else {
         return Ok(());
     };
@@ -1106,19 +1127,28 @@ async fn stop_with_commit(
                 None
             }
         };
-        let transition = storage.acquire_write_transition()?;
-        Ok((storage, lifecycle, transition, panes))
+        Ok((storage, lifecycle, panes))
     })
     .await
     .map_err(anyhow::Error::from)
     .and_then(|result| result);
-    let publication = state.publication.write().await;
-    let (storage, lifecycle, transition, panes) = match prepared {
+    let reload = state.session_service.disk_reload_guard().await;
+    let (storage, lifecycle, panes) = match prepared {
         Ok(prepared) => prepared,
         Err(error) => {
-            return adopt_lifecycle_commit(state, profile, id, Err(error), &publication).await
+            let publication = state.publication.write().await;
+            return adopt_lifecycle_commit(state, profile, id, Err(error), &reload, &publication)
+                .await;
         }
     };
+    let (storage, lifecycle, panes, reload, transition) = tokio::task::spawn_blocking(move || {
+        let transition = storage.acquire_write_transition()?;
+        Ok::<_, anyhow::Error>((storage, lifecycle, panes, reload, transition))
+    })
+    .await
+    .map_err(|_| StatusCode::SERVICE_UNAVAILABLE.into_response())?
+    .map_err(|_| StatusCode::SERVICE_UNAVAILABLE.into_response())?;
+    let publication = state.publication.write().await;
     if *state.canonical_health.read().await != crate::daemon::RuntimeHealth::Healthy {
         return Err(StatusCode::SERVICE_UNAVAILABLE.into_response());
     }
@@ -1148,17 +1178,21 @@ async fn stop_with_commit(
             }
             Ok(())
         });
-        ((storage, lifecycle, transition), result)
+        Ok::<_, anyhow::Error>(((storage, lifecycle, reload, transition), result))
     })
     .await;
     let (prepared, result) = match finished {
-        Ok(finished) => finished,
+        Ok(Ok(finished)) => finished,
+        Ok(Err(error)) => {
+            tracing::warn!(target: "http.api.sessions", %error, "stop finalization failed");
+            return Err(StatusCode::SERVICE_UNAVAILABLE.into_response());
+        }
         Err(error) => {
-            return adopt_lifecycle_commit(state, profile, id, Err(error.into()), &publication)
-                .await
+            tracing::warn!(target: "http.api.sessions", %error, "stop finalization task failed");
+            return Err(StatusCode::SERVICE_UNAVAILABLE.into_response());
         }
     };
-    adopt_lifecycle_commit(state, profile, id, result, &publication).await?;
+    adopt_lifecycle_commit(state, profile, id, result, &prepared.2, &publication).await?;
     {
         let metadata = state.canonical_metadata.read().await;
         let mut rows = state.instances.write().await;
@@ -1177,12 +1211,7 @@ async fn stop_with_commit(
             .map(Vec::as_slice)
             .unwrap_or_default();
         crate::server::pane::sample_panes(row, tools, panes.as_ref(), legacy_scope.as_ref());
-        // A direct stop settles the row without going through
-        // `apply_status_intent`, which normally releases a plugin's pending revival
-        // mark on reaching a terminal status; release it here instead, on the same
-        // in-memory row a concurrent cap count reads. The committed row that was
-        // just adopted is a fresh disk load, where the `#[serde(skip)]` field is
-        // false whatever this row carried.
+        // Direct stop bypasses the status-intent path that clears revival debt.
         row.plugin_revival_pending = false;
         state
             .mutation_epoch
@@ -1594,7 +1623,7 @@ async fn finish_structured_restart(
                             )
                             .await;
                         if let Err(error) = result {
-                            tracing::warn!(session = %id, %error, "structured restart wake failed");
+                            tracing::warn!(target: "http.api.sessions", session = %id, %error, "structured restart wake failed");
                         }
                     }
                 });
@@ -1619,7 +1648,7 @@ async fn finish_structured_restart(
             if let Some(response) = lifecycle_rejection(state, &error) {
                 return response;
             }
-            tracing::warn!(session = %id, %error, "structured restart failed");
+            tracing::warn!(target: "http.api.sessions", session = %id, %error, "structured restart failed");
             api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "start_failed",
@@ -1798,7 +1827,7 @@ async fn prepare_agent_session_inner(
             _ => return StatusCode::CONFLICT.into_response(),
         };
         if let Err(error) = stopped {
-            tracing::warn!(session = %id, %error, "structured restart did not prove teardown");
+            tracing::warn!(target: "http.api.sessions", session = %id, %error, "structured restart did not prove teardown");
             return StatusCode::CONFLICT.into_response();
         }
     }

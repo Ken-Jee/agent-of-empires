@@ -33,22 +33,41 @@ fn reconcile(transaction: Option<&crate::daemon::lifecycle::Transaction>) -> Res
     migrate_records(&root)
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("Unsupported daemon launch schema: {0:?}")]
+struct UnsupportedLaunchSchema(Option<u64>);
+
+fn validate_record_schema(object: &serde_json::Map<String, serde_json::Value>) -> Result<()> {
+    let schema = object.get("schema").and_then(serde_json::Value::as_u64);
+    anyhow::ensure!(
+        matches!(schema, Some(1..=4)),
+        UnsupportedLaunchSchema(schema)
+    );
+    if schema == Some(u64::from(crate::cli::serve::SERVE_LAUNCH_SCHEMA)) {
+        anyhow::ensure!(
+            is_migrated(object),
+            "Invalid current daemon passphrase policy"
+        );
+    }
+    Ok(())
+}
+
 /// `true` when every launch record already carries this migration's outcome,
 /// so there is nothing to write and no need for exclusive access. A migrated
 /// record has also had its rollback credential written, since
 /// `migrate_records` persists the credential before the record itself.
 fn records_are_migrated(root: &crate::session::AnchoredDir) -> Result<bool> {
+    let mut migrated = true;
     for name in ["serve.launch", "serve.rollback.launch"] {
         let Some(raw) = root.bind_file(std::ffi::OsStr::new(name))?.read()? else {
             continue;
         };
         let launch: serde_json::Value = serde_json::from_str(&raw)?;
         let object = launch.as_object().context("Invalid daemon launch record")?;
-        if !is_migrated(object) {
-            return Ok(false);
-        }
+        validate_record_schema(object)?;
+        migrated &= is_migrated(object);
     }
-    Ok(true)
+    Ok(migrated)
 }
 
 /// Whether one persisted launch record already carries this migration's
@@ -64,6 +83,8 @@ fn is_migrated(object: &serde_json::Map<String, serde_json::Value>) -> bool {
 }
 
 fn migrate_records(root: &crate::session::AnchoredDir) -> Result<()> {
+    // Validate both records before rewriting either, including under held ownership.
+    records_are_migrated(root)?;
     let current = root
         .bind_file(std::ffi::OsStr::new("serve.launch"))?
         .read()?
@@ -79,6 +100,7 @@ fn migrate_records(root: &crate::session::AnchoredDir) -> Result<()> {
         let object = launch
             .as_object_mut()
             .context("Invalid daemon launch record")?;
+        validate_record_schema(object)?;
         if is_migrated(object) {
             continue;
         }
@@ -119,7 +141,7 @@ fn migrate_records(root: &crate::session::AnchoredDir) -> Result<()> {
                 .replace(&serde_json::to_vec(&credential)?)?;
         }
         file.replace(&serde_json::to_vec_pretty(&launch)?)?;
-        tracing::info!(name, "Migrated persisted daemon passphrase policy");
+        tracing::info!(target: "migrations.v044", name, "Migrated persisted daemon passphrase policy");
     }
     Ok(())
 }
@@ -458,6 +480,34 @@ mod tests {
             fs::read_to_string(app.join("serve.rollback.passphrase"))?,
             credential
         );
+        Ok(())
+    }
+    #[test]
+    #[serial_test::serial]
+    fn launch_only_reconciliation_refuses_unknown_and_malformed_schemas_without_writes(
+    ) -> Result<()> {
+        for invalid in [json!(99), json!(0), json!(-1), json!("4"), Value::Null] {
+            let _home = crate::session::test_support::isolate_app_dir();
+            let app = crate::session::get_app_dir()?;
+            let current =
+                json!({"schema":2,"pid":42,"instance_id":"current","auth_mode":"none"}).to_string();
+            let retained =
+                json!({"schema":invalid,"pid":42,"instance_id":"current","auth_mode":"none"})
+                    .to_string();
+            fs::write(app.join("serve.launch"), &current)?;
+            fs::write(app.join("serve.rollback.launch"), &retained)?;
+            let transaction =
+                crate::daemon::lifecycle::Transaction::acquire_blocking_for(LOCK_WAIT)?;
+            assert!(run_with_transaction(&transaction)
+                .unwrap_err()
+                .is::<UnsupportedLaunchSchema>());
+            assert_eq!(fs::read_to_string(app.join("serve.launch"))?, current);
+            assert_eq!(
+                fs::read_to_string(app.join("serve.rollback.launch"))?,
+                retained
+            );
+            assert!(!app.join("serve.rollback.passphrase").exists());
+        }
         Ok(())
     }
 }

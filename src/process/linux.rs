@@ -434,6 +434,44 @@ pub(super) fn runner_group_identities(
     Ok(result)
 }
 
+pub(super) fn process_tree_samples(
+    root: &super::PrimeProcessIdentity,
+) -> anyhow::Result<Vec<super::PrimeProcessSample>> {
+    let mut samples = Vec::new();
+    for entry in fs::read_dir("/proc")? {
+        let entry = entry?;
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+            continue;
+        };
+        let stat = match fs::read_to_string(entry.path().join("stat")) {
+            Ok(stat) => stat,
+            Err(error) if process_disappeared(&error) => continue,
+            Err(error) if pid == root.pid => return Err(error.into()),
+            Err(_) => continue,
+        };
+        let (_, tail) = stat.rsplit_once(") ").context("invalid process stat")?;
+        let mut fields = tail.split_ascii_whitespace();
+        let state = fields.next().context("missing process state")?;
+        let parent = fields.next().context("missing process parent")?.parse()?;
+        let start = fields.nth(17).context("missing process start identity")?;
+        if state != "Z" {
+            samples.push(super::PrimeProcessSample {
+                identity: super::PrimeProcessIdentity {
+                    pid,
+                    start_id: format!("proc:{start}"),
+                },
+                parent,
+                marked: false,
+            });
+        }
+    }
+    anyhow::ensure!(
+        samples.iter().any(|sample| sample.identity == *root),
+        "tool root omitted from census"
+    );
+    Ok(samples)
+}
+
 pub(super) fn prime_processes(
     marker: &str,
     socket: &Path,

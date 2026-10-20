@@ -19,13 +19,13 @@ Invariants worth knowing before touching this code:
 - **Detach buffer.** Only agent notifications and `PromptCompleted` survive a detach, in a queue bounded by frame count and encoded bytes that sheds the oldest first. Delivery is best effort, not durable or exactly once. Reverse calls outstanding at detach are cancelled toward the agent and queued replies are dropped; within the admitted native session `terminal/release` is idempotent cleanup, so it needs no tombstone.
 - **Native-session admission.** Only lifecycle results select native identity; notification and callback metadata never do. Unrelated updates are ignored and unrelated session callbacks are rejected before any transcript, permission, filesystem, or terminal effect. While identity is pending, retained notifications are bounded by the runner's detach-queue ceiling, so a reattach admits the whole flushed backlog and an overflow fails the connection rather than publishing a partial replay. Stored history is never rewritten by the guard.
 - **Launch authority.** Preparation pins the native profile, title, lifecycle generation and provider under owned namespace, submission and instance exclusion. Startup is reserved before those preparation guards are released; hooks and readiness never run while holding them. Blocking admission owns its namespace guard through native checkpoints, including caller cancellation.
-- **Producer-owned cancellation.** The admitted lease wakes an outstanding socket connection, initialize, or session establishment. Detached spawn records its exact PID and worker generation before the first post-spawn await. The producer waits for its owned connection task to quiesce and proves that runner retired before settling; dropping a launcher waiter or observing an absent registry is not exit proof.
+- **Producer-owned cancellation.** The admitted lease wakes outstanding connection and handshake work. Spawn records its exact process identity before awaiting; attach transfers the recorded scope at the same boundary. Connection shutdown has a bounded join and abort-on-drop ownership, and abort closes its captured control socket. Physical runner and scope retirement remains the supervisor's responsibility.
 - **Exact scope retirement.** Scoped runners persist their exact transient unit alongside PID and generation; unscoped and unresolved ownership are distinct. Explicit stop waits for only the captured unit to stop and become empty before settling. Rejected or timed-out scope retirement keeps its lease and retry debt, even after the leader exits. A SID wildcard never authorizes ACP retirement or recovered purge cleanup.
 - **Callback parity and replay accounting.** Session-scoped filesystem, terminal, and permission callbacks wait for that announcement with either named or positional parameters, while request-scoped elicitation stays independent of session authority. Pending replay charges each original control frame, its four-byte prefix included, against the runner's 4096-frame / 128 MiB budget; typed re-serialization can expand native JSON and is not a substitute.
 - **Mid-turn reattach.** `ResumeSession` adopts the runner's committed session identity and never sends ACP `session/new` or `session/load`. A new local prompt supersedes adoption, and only the matching canonical request id may resolve it; a 30-second resume-idle watchdog is the fallback.
 - **Background sub-agents across a restart.** The async-Task tailer (see [Stuck-turn watchdogs](#stuck-turn-watchdogs)) is per connection, so a `BackgroundAgentLaunched` can be left with no completion when its worker dies. The next owner reconciles that: `attach` re-tails every unresolved launch that still carries a transcript path, since the runner it adopted is provably alive; `spawn`, the drain task's respawn, and every terminal drain arm detach unconditionally. `output_file` is persisted for that resume and stripped from every client-facing frame.
 
-Terminal handoff retains the session transition lock until an in-flight spawn or respawn has settled and its matching runner and registry record have retired. Cancellation alone is not retirement, and active or unproven teardown ownership cannot be forgotten. The terminal view and launch lifecycle commit through the native store; successful enable and disable responses carry the canonical runtime receipt, including idempotent responses. A failed retirement returns an error without discarding its owner, and purge retains its cleanup ownership until the same barrier succeeds. A CLI-resumable handoff keeps the adapter transcript; permanent discard also requests best-effort `session/delete` when a cancelled launch completes its handshake.
+Terminal handoff retains the session transition lock until its matching runner has retired. It first reserves the existing durable Launch generation while leaving the row Structured, then releases storage and publication guards before waiting. Proven retirement permits an exact reservation and ACP identity CAS to Terminal. Failure or cancellation releases only that Launch token, preserves Structured for retry, and retains unproven process or scope debt. Successful enable and disable responses carry canonical runtime receipts. A CLI-resumable handoff keeps the adapter transcript.
 
 The ACP load-session capability belongs to structured runtime state: same-view reloads retain it, while terminal handoff and a later enable clear it rather than resurrecting the previous adapter observation.
 
@@ -35,15 +35,42 @@ The shared start core distinguishes admission from a no-op: native start require
 
 `session/delete` fires only on permanent removal (a purge or a terminal handoff that discards the conversation). Reversible teardown (`aoe acp stop`, snooze, archive, trash, idle auto-stop) and CLI-resumable terminal handoff deliberately do not fire it, so the transcript stays on disk and the next respawn resumes through `session/load`.
 
+An in-flight reversible stop can gain permanent deletion debt at any await.
+The lease retains only its original attested adapter route until settlement.
+The best-effort request runs before close when possible; a retired or unavailable
+original route is classified as failure, never as successful adapter deletion.
+Physical proof cannot settle an unhandled request, and retries never borrow a replacement route.
+
 Trash is the reversible middle state: a delete moves the session there by default (`session.delete_to_trash`), keeping its transcript, worktree, branch, and container until it is restored, purged, or auto-purged after `session.trash_retention_minutes`. Retention is enforced by the daemon (a startup sweep, then one every tenth of the shortest window, between a minute and an hour), so without one, expired trash waits for the next daemon start or a manual purge. When the daemon permanently deletes a structured session it sends a best-effort `session/delete` (2s timeout) so adapters that implement it can release their own state, then proceeds with cancel, SIGTERM, and on-disk cleanup. CLI purges have no running worker, so they delete the local transcript only.
 
 Purge captures the selected row's path, branch and runner references before destroy hooks. Before irreversible row removal, it adds fresh row references and persists ownership in `pending-purge-owners.json`. Failed cleanup retains ownership across requests and daemon restart; success releases only its own token. Missing, malformed or unsupported journals refuse cleanup. Both ordinary and irreversible purges require a captured process group to exit before host cleanup, even if its worker record disappeared. Ordinary purge retains the row and releases its reservation when that check fails. Uncaptured evidence is not proof of runtime absence. A refused irreversible commit settles its durable purge reservation before returning when the row remains on disk, so an immediate retry is not blocked b…
+
+An ambiguous tmux `no current target` failure is not absence proof. Teardown
+accepts it only after a bounded successful query on the same socket reports
+raw session names excluding the exact target. Failed or undecodable inventory
+keeps the teardown error and resources.
 
 After journal ownership and row removal are durable, a committed purge releases identity and instance lifecycle flocks before awaiting its captured lease and runner retirement. The durable journal and frozen retirement target preserve the original cleanup and process authority across that wait. Initial and recovered cleanup reacquire identity then lifecycle exclusion and revalidate store health, row absence, and the exact live journal owner before touching resources. A replacement lease or runner is never adopted as the old purge target; any unproven retirement, reused row, or changed owner keeps the journal and resources.
 
 A committed purge marks its frozen constructor for journal acknowledgement only after durable owner validation. If that constructor is cancelled before child birth, its exact lifecycle entry remains until completion proof is durably recorded and acknowledged. The producer epoch and construction UUID prevent a reused session ID or numeric epoch from borrowing that authority. Recovery can finish after every request-owned target was dropped, including interruptions before or after the durable completion write. Ordinary cancellation and adapter deletion do not arm journal debt. Historical uncaptured ownership remains unresolved; a missing record alone never proves that no child was born.
 
 Recovery freezes that retirement target while its short absent-row and journal-owner preparation exclusions still hold, then releases both before waiting. Native supervisor bookkeeping and event-store projection deletion are cleanup effects too: they run only under the reacquired cleanup fence after process exit, health, live-owner, and row-absence validation, so a reused ID without a replacement worker keeps its transcript and counters.
+
+Retained purge owners prevent profile rename and deletion until recovery settles.
+The fence includes both resolved sessions and groups bindings, so a retained
+owner reached through a supported registry-file alias protects the physical
+profile too. An unrelated registry remains mutable.
+Admitted catalogue mutations retain their namespace and publication ownership
+through canonical adoption even when the HTTP waiter disconnects.
+Ordinary native HTTP mutations are owned by the runtime mutation scope too.
+Shutdown closes new admissions and drains admitted producers through disk commit
+and canonical adoption before lifetime ownership is released. The shared storage
+transition precedes publication exclusion; admission and completion must not be
+inferred from whether a snapshot read blocks.
+Canonical registry durability includes the resolved target parent, even when the
+profile's registry is a symlink outside the application directory.
+Recovered absent-row purges confirm that same directory barrier before accepting
+the retained owner as cleanup authority; another sync failure keeps the owner.
 
 The schema-45 purge journal retains exact captured scope ownership too, so a
 reaped leader cannot authorize checkout cleanup while its escaped cgroup members

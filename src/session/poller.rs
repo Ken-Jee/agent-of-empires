@@ -605,9 +605,10 @@ impl SessionPoller {
         let thread_label = format!("aoe-poller/{}", instance_id);
         let result_tx = self.result_tx.clone();
 
+        // Full instance deserialization includes nested execution metadata;
+        // keep the standard thread stack rather than imposing a smaller cap.
         let handle = std::thread::Builder::new()
             .name(thread_label.clone())
-            .stack_size(128 * 1024)
             .spawn(move || {
                 // Rebind so the closure captures `_guard` and the counter only decrements when the
                 // thread exits (including via panic).

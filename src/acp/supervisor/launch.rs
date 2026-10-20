@@ -185,6 +185,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         if let Err(refused) =
             admit_durable_launch(req.launch_admission.as_ref(), &req.session_id).await
         {
+            let client = Arc::new(client);
             super::teardown::retire_client(&self.lifecycle, &lease, &client, identity).await;
             drop(client);
             self.reap_failed_launch(&lease).await;
@@ -722,6 +723,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         reservation.lease().record_prime(
             crate::acp::runner_lifecycle::PrimeOwnership::from_record(&record),
         );
+        reservation.lease().record_scope(record.scope.clone());
         let client = AcpClient::attach(
             record.socket_path.clone(),
             cwd,
@@ -746,6 +748,7 @@ impl<S: BroadcastSink> Supervisor<S> {
 
         if let Err(refused) = admit_durable_launch(admission.as_ref(), &session_id).await {
             let lease = reservation.lease().clone();
+            let client = Arc::new(client);
             super::teardown::retire_client(&self.lifecycle, &lease, &client, Some(identity)).await;
             drop(client);
             lock_recover(&self.lifecycle).convert_to_stopping(&lease);
@@ -1937,6 +1940,87 @@ mod tests {
             let _ = self.fake_runner.kill();
             let _ = self.fake_runner.wait();
         }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn cancelled_attach_retires_only_its_recorded_scope() {
+        use crate::acp::control_protocol::{self, ControlBody};
+        let (_home, tmp) = isolate_home();
+        let child = tokio::process::Command::new("sleep")
+            .arg("60")
+            .process_group(0)
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let pid = child.id().unwrap();
+        let id = "cancelled-scope-attach";
+        let socket = tmp.path().join("attach.sock");
+        let listener =
+            tokio::net::UnixListener::bind(crate::process::worker::control_socket_sibling(&socket))
+                .unwrap();
+        let (entered, observed) = tokio::sync::oneshot::channel();
+        let peer = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            control_protocol::write_frame(
+                &mut stream,
+                &ControlBody::Hello {
+                    control_protocol_version: control_protocol::CONTROL_PROTOCOL_VERSION,
+                    session_id: id.into(),
+                },
+            )
+            .await
+            .unwrap();
+            loop {
+                if matches!(
+                    control_protocol::read_frame(&mut stream).await.unwrap(),
+                    Some(ControlBody::Initialize { .. })
+                ) {
+                    entered.send(()).unwrap();
+                    break;
+                }
+            }
+            let _ = control_protocol::read_frame(&mut stream).await;
+        });
+        let mut record = worker_registry::WorkerRecord::new(
+            id.into(),
+            pid,
+            socket,
+            "test-agent-acp".into(),
+            "test-agent".into(),
+            tmp.path().to_path_buf(),
+            None,
+            vec![],
+            vec![],
+            Some("original-native-id".into()),
+            None,
+        );
+        record.runner_identity = crate::process::process_birth_identity(pid).unwrap();
+        let unit = "aoe-original-attach.scope";
+        record.scope = crate::process::worker_registry::ScopeOwnership::Owned { unit: unit.into() };
+        worker_registry::save(&record).unwrap();
+        let control = Arc::new(FakeProcessControl::default());
+        control.alive(pid);
+        control.fail_scope(unit);
+        let sup = Arc::new(Supervisor::new(VecSink::new()).with_process_control(control.clone()));
+        let attaching = tokio::spawn({
+            let sup = sup.clone();
+            let cwd = tmp.path().to_path_buf();
+            async move { sup.attach(id.into(), cwd, vec![], false, None).await }
+        });
+        observed.await.unwrap();
+        sup.shutdown(id).await.unwrap();
+        assert!(attaching.await.unwrap().is_err());
+        assert!(control.scope_units().iter().any(|scope| scope == unit));
+        assert!(
+            sup.is_owned(id).await,
+            "failed original scope release retains its lease"
+        );
+        control.exit_scope(unit);
+        sup.retry_pending_teardowns().await;
+        assert!(!sup.is_owned(id).await);
+        peer.abort();
+        drop(child);
     }
 
     /// One `attach` fixture for the survivor and untrackable cases below: a

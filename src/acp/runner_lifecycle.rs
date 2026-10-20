@@ -136,6 +136,8 @@ struct Construction {
     admission: Mutex<Option<crate::acp::supervisor::LaunchAdmission>>,
     prime: Mutex<PrimeOwnership>,
     cancelled_before_birth: std::sync::atomic::AtomicBool,
+    adapter_route: Mutex<Option<Arc<AdapterRetirementRoute>>>,
+    adapter_delete_handled: std::sync::atomic::AtomicBool,
 }
 
 impl Default for Construction {
@@ -148,6 +150,8 @@ impl Default for Construction {
             admission: Mutex::default(),
             prime: Mutex::default(),
             cancelled_before_birth: std::sync::atomic::AtomicBool::new(false),
+            adapter_route: Mutex::default(),
+            adapter_delete_handled: std::sync::atomic::AtomicBool::new(false),
         }
     }
 }
@@ -167,7 +171,35 @@ impl PartialEq for Lease {
 }
 
 impl Eq for Lease {}
+pub(crate) struct AdapterRetirementRoute {
+    pub(crate) client: Arc<crate::acp::acp_client::AcpClient>,
+    pub(crate) identity: RunnerIdentity,
+    pub(crate) acp_id: String,
+    pub(crate) adapter: String,
+    pub(crate) gate: tokio::sync::Mutex<()>,
+    pub(crate) retired: std::sync::atomic::AtomicBool,
+}
+
 impl Lease {
+    pub(crate) fn record_adapter_route(&self, route: AdapterRetirementRoute) {
+        let mut slot = self
+            .construction
+            .adapter_route
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if slot.is_none() {
+            *slot = Some(Arc::new(route));
+        }
+    }
+
+    pub(crate) fn adapter_route(&self) -> Option<Arc<AdapterRetirementRoute>> {
+        self.construction
+            .adapter_route
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
     pub fn session_id(&self) -> &str {
         &self.session_id
     }
@@ -795,6 +827,24 @@ impl LifecycleTable {
         };
         match settlement {
             Settlement::Proven => {
+                if entry.delete_adapter_state
+                    && !entry
+                        .construction
+                        .adapter_delete_handled
+                        .load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    entry.phase = Phase::TeardownRetry {
+                        identity: lease.spawned_runner(),
+                        attempts: attempts + 1,
+                    };
+                    return;
+                }
+                entry
+                    .construction
+                    .adapter_route
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .take();
                 if entry.journal_ack_required {
                     entry.phase = Phase::RetirementComplete;
                 } else {
@@ -920,6 +970,23 @@ impl LifecycleTable {
                 && Arc::ptr_eq(&entry.construction, &lease.construction)
                 && entry.delete_adapter_state
         })
+    }
+
+    pub(crate) fn adapter_delete_pending(&self, lease: &Lease) -> bool {
+        self.delete_adapter_state_requested(lease)
+            && !lease
+                .construction
+                .adapter_delete_handled
+                .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub(crate) fn adapter_delete_handled(&mut self, lease: &Lease) {
+        if let Some(entry) = self.current(lease) {
+            entry
+                .construction
+                .adapter_delete_handled
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
     }
 
     /// Claim a parked teardown for another attempt, or one still marked
@@ -1219,6 +1286,25 @@ mod tests {
     use super::*;
 
     const ID: &str = "s-1";
+
+    #[test]
+    fn late_permanent_stop_debt_blocks_proven_settlement_until_classified() {
+        let mut table = LifecycleTable::new(1);
+        let lease = table.admit(ID, ResumeKind::SpawnFirst).unwrap();
+        table.install(&lease, None).unwrap();
+        table.begin_stop(ID, "stop", false);
+        table.begin_stop(ID, "purge", true);
+        table.settle(&lease, Settlement::Proven);
+        assert!(
+            table.is_owned(ID),
+            "physical proof cannot erase unhandled adapter deletion"
+        );
+        let retry = table.claim_retry(ID, Duration::ZERO).unwrap();
+        assert!(table.adapter_delete_pending(&retry.lease));
+        table.adapter_delete_handled(&retry.lease);
+        table.settle(&retry.lease, Settlement::Proven);
+        assert!(!table.is_owned(ID));
+    }
 
     fn identity(pid: u32, generation: u64) -> RunnerIdentity {
         RunnerIdentity::unattested(pid, generation)

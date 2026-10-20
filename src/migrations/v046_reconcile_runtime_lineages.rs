@@ -45,7 +45,7 @@ fn migrate_config_file(path: &Path) -> Result<()> {
         crate::session::backup_before_migration(path)?;
         crate::session::atomic_write(path, config.to_string().as_bytes())
             .with_context(|| format!("Writing {}", path.display()))?;
-        tracing::info!(path = %path.display(), "Removed session.daemon_sidebar");
+        tracing::info!(target: "migrations.v046", path = %path.display(), "Removed session.daemon_sidebar");
     }
     Ok(())
 }

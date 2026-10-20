@@ -7363,20 +7363,99 @@ fn run_create_hooks_forwards_the_running_hook_and_its_output_to_progress() {
     )
     .expect("a matching reviewed fingerprint approves trust");
     let registry = crate::server::create_progress::CreateProgressRegistry::default();
-    let registration = registry.register("key");
+    let registration = registry.register(
+        "key",
+        crate::server::create_progress::CreateProgressVisibility::WebReadable,
+    );
     let mut instance = Instance::new("hooked", project.path().to_str().unwrap());
 
     let storage = crate::session::Storage::new_unwatched("default").unwrap();
     let record = |event| registration.progress.record(event);
     run_create_hooks(&mut instance, &plan, &storage, Some(&record)).unwrap();
 
-    let snapshot = registry.snapshot("key").unwrap();
+    let snapshot = registry.snapshot("key", None).unwrap();
     assert_eq!(snapshot.hook.as_deref(), Some("echo from-the-hook"));
     assert!(
         snapshot.output.iter().any(|l| l.contains("from-the-hook")),
         "{:?}",
         snapshot.output
     );
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn creation_progress_http_preserves_web_access_and_hides_unix_owner_entries(
+) -> anyhow::Result<()> {
+    use crate::server::create_progress::CreateProgressVisibility;
+    use crate::server::peer::ConnectionPeer;
+    use crate::session::config::repo_config::HookProgress;
+    use tower::ServiceExt;
+    let _home = crate::session::test_support::isolate_app_dir();
+    let state = crate::server::test_support::build_test_app_state_impl(
+        vec![],
+        vec!["localhost".into()],
+        vec![],
+        Some("progress-test-token".into()),
+        false,
+        |_| {},
+        |supervisor| supervisor,
+    );
+    let app = crate::server::test_support::build_router_for_test(state.clone());
+    for visibility in [
+        CreateProgressVisibility::WebReadable,
+        CreateProgressVisibility::UnixOwnerOnly,
+    ] {
+        let registration = state.create_progress.register("visible-key", visibility);
+        registration
+            .progress
+            .record(HookProgress::Started("synthetic command".into()));
+        registration
+            .progress
+            .record(HookProgress::Output("synthetic-progress-marker".into()));
+        for (owner, peer) in [
+            (
+                true,
+                ConnectionPeer::UnixOwner {
+                    uid: nix::unistd::geteuid().as_raw(),
+                },
+            ),
+            (false, ConnectionPeer::Tcp("127.0.0.1:4521".parse()?)),
+            (false, ConnectionPeer::Tcp("192.0.2.1:4521".parse()?)),
+        ] {
+            let request = axum::http::Request::builder()
+                .uri("/api/sessions/create-progress/visible-key")
+                .header("host", "localhost")
+                .header("authorization", "Bearer progress-test-token")
+                .extension(axum::extract::ConnectInfo(peer))
+                .body(axum::body::Body::empty())?;
+            let response = app.clone().oneshot(request).await?;
+            let visible = owner || visibility == CreateProgressVisibility::WebReadable;
+            assert_eq!(
+                response.status(),
+                if visible {
+                    StatusCode::OK
+                } else {
+                    StatusCode::NOT_FOUND
+                }
+            );
+            let bytes = axum::body::to_bytes(response.into_body(), 65536).await?;
+            assert_eq!(
+                String::from_utf8_lossy(&bytes).contains("synthetic-progress-marker"),
+                visible
+            );
+        }
+        drop(registration);
+        assert!(state
+            .create_progress
+            .snapshot(
+                "visible-key",
+                Some(&crate::server::auth::LocalAuthorization::UnixOwner(
+                    nix::unistd::geteuid().as_raw()
+                ))
+            )
+            .is_none());
+    }
+    Ok(())
 }
 
 /// None of these refuse a create. A scratch session has no repo config anchor,
@@ -8087,64 +8166,133 @@ async fn wait_for(what: &str, mut ready: impl FnMut() -> bool) {
 #[serial_test::serial]
 async fn a_dropped_create_finishes_and_its_retry_returns_the_same_session() {
     use crate::server::test_support as support;
-    let _home = crate::session::test_support::isolate_app_dir();
-    crate::session::config::update_app_state(|state| {
-        state.has_acknowledged_agent_hooks = true;
-    })
-    .expect("acknowledge the agent hook paths");
-    let gate = tempfile::tempdir().unwrap();
-    let (ready, release) = (gate.path().join("ready"), gate.path().join("release"));
-    let hook = format!(
-        ": > '{}'; while [ ! -e '{}' ]; do sleep 0.01; done; echo hook-done",
+    for native_origin in [false, true] {
+        let _home = crate::session::test_support::isolate_app_dir();
+        crate::session::config::update_app_state(|state| {
+            state.has_acknowledged_agent_hooks = true;
+        })
+        .expect("acknowledge the agent hook paths");
+        let gate = tempfile::tempdir().unwrap();
+        let (ready, release) = (gate.path().join("ready"), gate.path().join("release"));
+        struct ReleaseHook(std::path::PathBuf);
+        impl Drop for ReleaseHook {
+            fn drop(&mut self) {
+                let _ = std::fs::write(&self.0, "");
+            }
+        }
+        let _release_on_failure = ReleaseHook(release.clone());
+        let hook = format!(
+        "echo origin-progress-marker; : > '{}'; while [ ! -e '{}' ]; do sleep 0.01; done; echo hook-done",
         ready.display(),
         release.display()
     );
-    let project = project_with_on_create_hooks(&[hook.as_str()]);
-    support::seed_instances_on_disk_for_test("test", Vec::new());
-    let (launcher, _launches) = support::counting_failing_launcher();
-    let state = support::build_test_app_state_with_launcher(Vec::new(), launcher);
-    support::refresh_canonical_metadata_for_test(&state).await;
-    let review = reviewed_creation_trust("test", project.path());
-    let body = serde_json::json!({
-        "title": "detached-create", "path": project.path(), "tool": "claude",
-        "view": "structured", "profile": "test", "trust_hooks": true,
-        "trust_review": review,
-        "idempotency_key": "drop-me",
-    });
+        let project = project_with_on_create_hooks(&[hook.as_str()]);
+        support::seed_instances_on_disk_for_test("test", Vec::new());
+        let (launcher, _launches) = support::counting_failing_launcher();
+        let state = support::build_test_app_state_with_launcher(Vec::new(), launcher);
+        support::refresh_canonical_metadata_for_test(&state).await;
+        let review = reviewed_creation_trust("test", project.path());
+        let body = serde_json::json!({
+            "title": "detached-create", "path": project.path(), "tool": "claude",
+            "view": "structured", "profile": "test", "trust_hooks": true,
+            "trust_review": review,
+            "idempotency_key": "drop-me",
+        });
 
-    let first = tokio::spawn({
-        let (state, body) = (state.clone(), body.clone());
-        async move { post_create(&state, body).await }
-    });
-    wait_for("the on_create hook to start", || ready.exists()).await;
-    let progress = state
-        .create_progress
-        .snapshot("drop-me")
-        .expect("progress while running");
-    assert_eq!(progress.hook.as_deref(), Some(hook.as_str()));
-    first.abort();
-    assert!(first.await.unwrap_err().is_cancelled());
+        let first = tokio::spawn({
+            let (state, body) = (state.clone(), body.clone());
+            async move {
+                create_session(
+                    State(state),
+                    axum::extract::Query(CreateSessionQuery { wait: None }),
+                    native_origin.then_some(axum::Extension(
+                        crate::server::auth::LocalAuthorization::UnixOwner(
+                            nix::unistd::geteuid().as_raw(),
+                        ),
+                    )),
+                    Ok(Json(serde_json::from_value(body).unwrap())),
+                )
+                .await
+                .into_response()
+            }
+        });
+        wait_for("the on_create hook to start", || ready.exists()).await;
+        let local =
+            crate::server::auth::LocalAuthorization::UnixOwner(nix::unistd::geteuid().as_raw());
+        wait_for("hook output to reach the progress registry", || {
+            state
+                .create_progress
+                .snapshot("drop-me", Some(&local))
+                .is_some_and(|snapshot| {
+                    snapshot
+                        .output
+                        .iter()
+                        .any(|line| line.contains("origin-progress-marker"))
+                })
+        })
+        .await;
+        let snapshot = state.runtime.publish(&state).await.unwrap();
+        let public_key = snapshot
+            .value
+            .contents
+            .sessions
+            .iter()
+            .find(|row| row.idempotency_key.as_deref() == Some("drop-me"))
+            .and_then(|row| row.idempotency_key.as_ref())
+            .expect("public Creating correlation key");
+        for owner in [false, true] {
+            let response = super::create::create_session_progress(
+                State(state.clone()),
+                Path(public_key.clone()),
+                owner.then_some(axum::Extension(
+                    crate::server::auth::LocalAuthorization::UnixOwner(
+                        nix::unistd::geteuid().as_raw(),
+                    ),
+                )),
+            )
+            .await
+            .into_response();
+            let visible = !native_origin || owner;
+            assert_eq!(
+                response.status(),
+                if visible {
+                    StatusCode::OK
+                } else {
+                    StatusCode::NOT_FOUND
+                }
+            );
+            let bytes = axum::body::to_bytes(response.into_body(), 65536)
+                .await
+                .unwrap();
+            assert_eq!(
+                String::from_utf8_lossy(&bytes).contains("origin-progress-marker"),
+                visible
+            );
+        }
+        first.abort();
+        assert!(first.await.unwrap_err().is_cancelled());
 
-    let retry = tokio::spawn({
-        let state = state.clone();
-        async move { post_create(&state, body).await }
-    });
-    std::fs::write(&release, "").unwrap();
-    let (status, session) = retry.await.unwrap();
+        let retry = tokio::spawn({
+            let state = state.clone();
+            async move { post_create(&state, body).await }
+        });
+        std::fs::write(&release, "").unwrap();
+        let (status, session) = retry.await.unwrap();
 
-    assert_eq!(status, axum::http::StatusCode::OK, "{session}");
-    let rows = support::load_instances_from_disk_for_test("test");
-    let created: Vec<_> = rows
-        .iter()
-        .filter(|r| r.title == "detached-create")
-        .collect();
-    assert_eq!(
-        created.len(),
-        1,
-        "the retry must not create a second session"
-    );
-    assert_eq!(session["id"], created[0].id.as_str());
-    assert!(state.create_progress.snapshot("drop-me").is_none());
+        assert_eq!(status, axum::http::StatusCode::OK, "{session}");
+        let rows = support::load_instances_from_disk_for_test("test");
+        let created: Vec<_> = rows
+            .iter()
+            .filter(|r| r.title == "detached-create")
+            .collect();
+        assert_eq!(
+            created.len(),
+            1,
+            "the retry must not create a second session"
+        );
+        assert_eq!(session["id"], created[0].id.as_str());
+        assert!(state.create_progress.snapshot("drop-me", None).is_none());
+    }
 }
 
 /// A retry whose first response was lost gets that failure back rather than
@@ -8312,6 +8460,7 @@ async fn a_retry_across_a_daemon_restart_never_reruns_a_failed_create() {
 async fn a_retry_across_a_restart_is_fenced_before_profile_validation() {
     use crate::server::test_support as support;
     let _home = crate::session::test_support::isolate_app_dir();
+    crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
     crate::session::config::update_app_state(|state| {
         state.has_acknowledged_agent_hooks = true;
     })

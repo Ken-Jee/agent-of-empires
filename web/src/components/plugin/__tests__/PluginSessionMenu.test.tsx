@@ -1,12 +1,27 @@
 // @vitest-environment jsdom
 
-import { useState } from "react";
+import { useState, type ComponentProps } from "react";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { makeSession, makeWorkspace, stubFetch } from "../../__tests__/fixtures";
-import { PluginSessionMenu, type SessionMenuRequest } from "../PluginSessionMenu";
+import { PluginSessionMenu as MenuContent, type SessionMenuRequest } from "../PluginSessionMenu";
 import { useSessions } from "../../../hooks/useSessions";
 import type { SessionMutation } from "../../../lib/api";
+import { SessionActionProvider } from "../../sidebar/SessionActionProvider";
+
+function PluginSessionMenu(props: ComponentProps<typeof MenuContent>) {
+  return (
+    <SessionActionProvider
+      sessions={props.workspaces.flatMap((ws) => ws.sessions)}
+      runtimeEpoch={props.runtimeEpoch}
+      observedById={props.observedById}
+      onSessionMutation={props.handlers.onSessionMutation}
+      readOnly={props.readOnly}
+    >
+      <MenuContent {...props} />
+    </SessionActionProvider>
+  );
+}
 
 const workspaces = [makeWorkspace("w1", [makeSession({ id: "s1", title: "Ethiopians" })])];
 

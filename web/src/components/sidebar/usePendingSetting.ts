@@ -1,77 +1,54 @@
-import { useLayoutEffect, useRef, useState } from "react";
-import type { RuntimeCursor, SessionReceipt } from "../../lib/api";
+import { createContext, useContext } from "react";
+import type { SessionResponse } from "../../lib/types";
 
-interface Pending<T> {
-  identity: string;
-  value: T;
-  from: T;
-  /** Every pick since the overlay opened; consulted only while a save is in flight. */
-  sent: T[];
-  receipts: SessionReceipt[] | null;
+export interface SettingValues {
+  color: string | null;
+  notifications: "off" | "default" | "all";
 }
 
-/** Holds the latest pick until every row's canonical mutation result is observed. */
-export function usePendingSetting<T>(
-  server: T,
-  save: (next: T) => Promise<SessionReceipt[] | null>,
-  onError: () => void,
-  observedById: Record<string, RuntimeCursor>,
-  identity: string,
+export interface SessionActionTarget {
+  id: string;
+  profile: string;
+  createdAt: string;
+  epoch: string;
+}
+
+export function sessionActionTarget(row: SessionResponse, epoch: string | null): SessionActionTarget {
+  return { id: row.id, profile: row.profile, createdAt: row.created_at, epoch: epoch ?? "" };
+}
+
+export interface SessionActionsOwner {
+  openAttach: (session: SessionResponse) => void;
+  value: <K extends keyof SettingValues>(
+    kind: K,
+    targets: SessionActionTarget[],
+    server: SettingValues[K],
+  ) => SettingValues[K];
+  set: <K extends keyof SettingValues>(
+    kind: K,
+    targets: SessionActionTarget[],
+    next: SettingValues[K],
+    server: SettingValues[K],
+  ) => void;
+}
+
+export const SessionActionContext = createContext<SessionActionsOwner | null>(null);
+
+export function useSessionActions(): SessionActionsOwner {
+  const owner = useContext(SessionActionContext);
+  if (!owner) throw new Error("Session actions require their App-owned provider");
+  return owner;
+}
+
+/** Visual rows bind to accepted work; unmounting a row does not revoke its targets. */
+export function usePendingSetting<K extends keyof SettingValues>(
+  kind: K,
+  targets: SessionActionTarget[],
+  server: SettingValues[K],
 ) {
-  const [pending, setPending] = useState<Pending<T> | null>(null);
-  const latest = useRef(0);
-  const lifetime = useRef(identity);
-  const mounted = useRef(true);
-  const queue = useRef<Promise<void>>(Promise.resolve());
-  useLayoutEffect(() => {
-    const sequence = latest;
-    lifetime.current = identity;
-    mounted.current = true;
-    queue.current = Promise.resolve();
-    return () => {
-      mounted.current = false;
-      sequence.current++;
-    };
-  }, [identity]);
-  const activePending = pending?.identity === identity ? pending : null;
-
-  if (activePending) {
-    const observed =
-      activePending.receipts !== null &&
-      activePending.receipts.every(({ id, cursor }) => {
-        const row = observedById[id];
-        return row?.epoch === cursor.epoch && row.revision >= cursor.revision;
-      });
-    const otherWriter =
-      activePending.receipts === null &&
-      !Object.is(server, activePending.from) &&
-      !activePending.sent.some((value) => Object.is(value, server));
-    if (observed || otherWriter) setPending(null);
-  }
-
-  const value = activePending ? activePending.value : server;
-  const set = (next: T) => {
-    if (Object.is(next, value)) return;
-    const seq = ++latest.current;
-    const owner = identity;
-    setPending((previous) => ({
-      identity,
-      value: next,
-      from: previous?.identity === identity ? previous.from : server,
-      sent: [...(previous?.identity === identity ? previous.sent : []), next],
-      receipts: null,
-    }));
-    queue.current = queue.current.then(async () => {
-      if (!mounted.current || owner !== lifetime.current) return;
-      const receipts = await save(next).catch(() => null);
-      if (!mounted.current || owner !== lifetime.current || seq !== latest.current) return;
-      if (receipts === null) {
-        setPending(null);
-        onError();
-      } else {
-        setPending((current) => (current ? { ...current, receipts } : null));
-      }
-    });
-  };
-  return [value, set] as const;
+  const owner = useSessionActions();
+  return [
+    owner.value(kind, targets, server),
+    (next: SettingValues[K]) => owner.set(kind, targets, next, server),
+  ] as const;
 }

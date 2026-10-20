@@ -169,6 +169,7 @@ pub(super) async fn adopt_profile_update<R>(
     profile: String,
     result: Result<(R, Vec<Instance>, Vec<crate::session::Group>), ()>,
     committed_status: impl Fn(&str) -> bool,
+    reload: &tokio::sync::OwnedRwLockWriteGuard<()>,
     publication: &tokio::sync::RwLockWriteGuard<'_, ()>,
 ) -> Result<R, axum::response::Response> {
     let committed = match result {
@@ -176,6 +177,7 @@ pub(super) async fn adopt_profile_update<R>(
             state,
             [(&profile, rows, groups)],
             committed_status,
+            reload,
             publication,
         )
         .await

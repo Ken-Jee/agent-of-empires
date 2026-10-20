@@ -131,7 +131,10 @@ fn entry_end(src: &str, end: usize, key_col: usize) -> usize {
 
 /// Plain keys that YAML would read as numbers, booleans or null are not strings.
 fn is_string_key(text: &str) -> bool {
-    matches!(crate::yaml::from_str::<Value>(text), Ok(Value::String(_)))
+    matches!(
+        serde_saphyr::from_str_with_options::<Value>(text, crate::yaml::options()),
+        Ok(Value::String(_))
+    )
 }
 
 fn parse_layout(src: &str) -> Result<Layout> {
@@ -292,7 +295,8 @@ fn hooks_entry(src: &str, key: Range<usize>, end: usize, indent: usize) -> Resul
         "`hooks` key is not at the start of its line"
     );
     let range = start..entry_end(src, end.max(key.end), indent);
-    let parsed: Value = crate::yaml::from_str(&src[range.clone()])?;
+    let parsed: Value =
+        serde_saphyr::from_str_with_options(&src[range.clone()], crate::yaml::options())?;
     let value = match parsed.get("hooks") {
         Some(Value::Object(map)) => map.clone(),
         _ => Hooks::new(),
