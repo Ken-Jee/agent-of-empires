@@ -1629,6 +1629,18 @@
       "components": ["web/src/components/WorkspaceSidebar.tsx"]
     },
     {
+      "id": "sidebar.shared-worktree-actions",
+      "kind": "mocked-playwright",
+      "risk": "high",
+      "specs": ["src/components/__tests__/SessionRowSiblingTargets.test.tsx", "tests/sidebar-multi-session.spec.ts"],
+      "components": [
+        "web/src/components/sidebar/sessionActionTargets.ts",
+        "web/src/components/sidebar/SessionRowMenu.tsx",
+        "web/src/components/sidebar/SessionActions.tsx",
+        "web/src/components/sidebar/rowModel.ts"
+      ]
+    },
+    {
       "id": "sidebar.repo-appearance",
       "kind": "mocked-playwright",
       "risk": "low",
@@ -2362,11 +2374,13 @@
         "src/hooks/__tests__/useHistoryWindow.test.tsx",
         "src/lib/historyScroll.test.ts",
         "src/hooks/useAcpSession.test.ts",
-        "src/hooks/acpSession/replay.test.ts"
+        "src/hooks/acpSession/replay.test.ts",
+        "src/hooks/acpSession/stateCache.test.ts"
       ],
       "components": [
         "web/src/lib/acpHistoryWindow.ts",
         "web/src/hooks/acpSession/replay.ts",
+        "web/src/hooks/acpSession/stateCache.ts",
         "web/src/lib/historyScroll.ts",
         "web/src/hooks/useHistoryWindow.ts",
         "web/src/hooks/useAcpSession.ts",
@@ -3141,11 +3155,14 @@
         "tests/acp-structured-view.spec.ts",
         "src/components/acp/ToolExpansion.test.tsx",
         "src/components/acp/activityMessages.test.ts",
-        "src/lib/toolAnchor.test.ts"
+        "src/lib/toolAnchor.test.ts",
+        "src/components/acp/useTranscriptScroll.test.tsx"
       ],
       "components": [
+        "web/src/components/acp/StructuredView.tsx",
         "web/src/components/acp/ToolExpansion.tsx",
         "web/src/components/acp/GroupToolCards.tsx",
+        "web/src/components/acp/useTranscriptScroll.ts",
         "web/src/lib/toolAnchor.ts"
       ]
     },
@@ -3225,8 +3242,8 @@
       "id": "acp.mobile-jump-to-bottom",
       "kind": "mocked-playwright",
       "risk": "medium",
-      "specs": ["tests/acp-mobile-jump-to-bottom.spec.ts"],
-      "components": ["web/src/components/acp/StructuredView.tsx"]
+      "specs": ["tests/acp-mobile-jump-to-bottom.spec.ts", "src/components/acp/useTranscriptScroll.test.tsx"],
+      "components": ["web/src/components/acp/StructuredView.tsx", "web/src/components/acp/useTranscriptScroll.ts"]
     },
     {
       "id": "acp.tool-stopped-sweep",

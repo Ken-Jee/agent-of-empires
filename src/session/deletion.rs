@@ -465,9 +465,7 @@ impl<S: SessionStore + 'static> PurgeTransaction<S> {
         let config = self
             .store()
             .configuration(Some(self.store().storage().profile()))?;
-        Ok(self.run_hooks_with(|instance, detach| {
-            run_on_destroy_hooks(instance, detach, &config.hooks.on_destroy)
-        }))
+        Ok(self.run_hooks_with(|instance, detach| run_destroy_hooks(instance, detach, &config)))
     }
 
     fn run_hooks_with<F>(mut self, run_hooks: F) -> Self
@@ -1301,11 +1299,7 @@ pub fn perform_deletion(request: &DeletionRequest) -> DeletionResult {
     let config = crate::session::config::profile_config::resolve_config_or_warn(
         &request.instance.effective_profile(),
     );
-    run_on_destroy_hooks(
-        &request.instance,
-        request.detach_hooks,
-        &config.hooks.on_destroy,
-    );
+    run_destroy_hooks(&request.instance, request.detach_hooks, &config);
     perform_deletion_core(
         request,
         false,
@@ -2122,6 +2116,36 @@ fn deletion_messages_for(
         Teardown::Removed => messages.push("Container removed".to_string()),
         Teardown::AlreadyGone => {}
         Teardown::Failed(e) => errors.push(format!("Container: {}", e)),
+    }
+}
+
+/// Run `host_hooks.before_destroy`, then `on_destroy`, for an instance.
+fn run_destroy_hooks(instance: &Instance, detach: bool, config: &crate::session::Config) {
+    run_before_destroy_hooks(instance, detach, &config.host_hooks.before_destroy);
+    run_on_destroy_hooks(instance, detach, &config.hooks.on_destroy);
+}
+
+const BEFORE_DESTROY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Host-side on every session kind, so it never targets the container.
+fn run_before_destroy_hooks(instance: &Instance, detach: bool, commands: &[String]) {
+    if commands.is_empty() {
+        return;
+    }
+    tracing::info!(target: "session.delete", "Running before_destroy host hooks for session {}", instance.id);
+    let failures = repo_config::execute_host_hooks_best_effort(
+        commands,
+        Path::new(&instance.project_path),
+        detach,
+        &repo_config::lifecycle_env_vars(instance),
+        BEFORE_DESTROY_TIMEOUT,
+    );
+    if failures > 0 {
+        tracing::warn!(target: "session.delete",
+            "before_destroy hooks had {} failure(s) for session {}",
+            failures,
+            instance.id
+        );
     }
 }
 
@@ -4019,6 +4043,44 @@ mod tests {
         assert!(acquired, "on_destroy hook held the lifecycle flock");
         assert_eq!(result.disposition, DeletionDisposition::Removed);
         assert!(storage.load().unwrap().is_empty());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn before_destroy_runs_on_host_for_sandboxed_session_and_survives_failures() {
+        let temp = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let marker = temp.path().join("marker");
+        let marker = crate::session::environment::shell_escape(&marker.to_string_lossy());
+        crate::session::config::update_config(|global| {
+            global.host_hooks.before_destroy = vec![
+                "exit 1".to_string(),
+                format!("printf %s \"$AOE_SESSION_ID\" > {marker}"),
+            ];
+        })
+        .unwrap();
+        let mut instance = Instance::new("purge", temp.path().to_str().unwrap());
+        instance.sandbox_info = Some(crate::session::SandboxInfo {
+            provider: None,
+            enabled: true,
+            container_id: None,
+            image: "alpine".to_string(),
+            container_name: "aoe-sandbox-hook".to_string(),
+            extra_env: None,
+            custom_instruction: None,
+            before_start_env: Vec::new(),
+            container_workdir: None,
+        });
+
+        let config = crate::session::Config::load().unwrap();
+        crate::session::config::update_config(|global| {
+            global.host_hooks.before_destroy.clear();
+        })
+        .unwrap();
+        run_destroy_hooks(&instance, true, &config);
+
+        let written = std::fs::read_to_string(temp.path().join("marker")).unwrap();
+        assert_eq!(written, instance.id);
     }
 
     /// #4107: a purge keeps a shared worktree when another profile cannot be read, and a session

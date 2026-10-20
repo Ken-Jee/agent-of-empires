@@ -10,6 +10,8 @@ fn skip_capture(
     last_capture_second: Option<i64>,
     has_hook: bool,
     pending: bool,
+    observation_key: Option<tmux::ObservationKey>,
+    last_observation_key: Option<tmux::ObservationKey>,
 ) -> bool {
     let Some(activity) = activity else {
         return false;
@@ -18,6 +20,7 @@ fn skip_capture(
         && last_capture_second.is_some_and(|taken| taken > activity)
         && !has_hook
         && !pending
+        && observation_key == last_observation_key
 }
 
 /// How long a `running` hook write keeps its authority for an agent that is still on a hand-written
@@ -242,9 +245,7 @@ impl Instance {
             .map(|m| m.pane_dead)
             .unwrap_or_else(|| session.is_pane_dead());
 
-        let pane_cmd = metadata
-            .and_then(|m| m.pane_current_command.clone())
-            .or_else(|| tmux::utils::pane_current_command(session.name()));
+        let pane_cmd = metadata.and_then(|m| m.pane_current_command.as_deref());
 
         tracing::trace!(target: "session.store",
             "status '{}': exists=true, is_dead={}, pane_cmd={:?}, tool={}, cmd_override={}",
@@ -404,6 +405,35 @@ impl Instance {
             .unwrap_or_else(|| session.is_pane_running_shell())
     }
 
+    pub(crate) fn live_pane_owned(
+        &self,
+        session: &tmux::Session,
+        metadata: Option<&tmux::PaneMetadata>,
+        is_dead: bool,
+    ) -> bool {
+        if is_dead {
+            return false;
+        }
+        if self.expects_shell() || self.has_command_override() {
+            return true;
+        }
+        let fetched_command;
+        let command = match metadata.and_then(|m| m.pane_current_command.as_deref()) {
+            Some(command) => command,
+            None => {
+                fetched_command = tmux::utils::pane_current_command(session.name());
+                let Some(command) = fetched_command.as_deref() else {
+                    return true;
+                };
+                command
+            }
+        };
+        !tmux::utils::is_shell_command(command)
+            || metadata
+                .map(|m| m.pane_start_command_is_protected)
+                .unwrap_or_else(|| tmux::utils::pane_start_command_is_protected(session.name()))
+    }
+
     /// Resolve status from the agent's detection manifest.
     fn update_status_from_manifest(
         &mut self,
@@ -415,15 +445,30 @@ impl Instance {
         is_dead: bool,
     ) {
         let activity = metadata.and_then(|m| m.window_activity);
-        let osc_title = metadata
-            .and_then(|m| m.pane_title.as_deref())
-            .unwrap_or_default();
+        let plan = tmux::DetectionPlan::for_manifest(&self.source_profile, rules_tool, agent)
+            .expect("manifest was resolved before polling");
+        let policy = plan.capture_policy();
+        let fetched_title;
+        let osc_title = match metadata.and_then(|m| m.pane_title.as_deref()) {
+            Some(title) => title,
+            None if policy.fetch_missing_title => {
+                fetched_title = tmux::utils::pane_title(session.name()).unwrap_or_default();
+                &fetched_title
+            }
+            None => "",
+        };
+        let live_owned =
+            !policy.observe_ownership || self.live_pane_owned(session, metadata, is_dead);
+        let observation = tmux::Observation::new(osc_title, hook, live_owned);
+        let observation_key = plan.observation_key(&observation);
         let screen_unchanged = skip_capture(
             activity,
             self.detection.activity,
             self.detection.captured_at,
             hook.is_some(),
             self.detection.pending.is_some(),
+            observation_key,
+            self.detection.observation_key,
         );
 
         if screen_unchanged {
@@ -435,17 +480,11 @@ impl Instance {
 
         // Stamped before the capture, never after.
         let captured_at = Utc::now().timestamp();
-        let pane_content = session.capture_pane(50).unwrap_or_default();
+        let pane_content = session
+            .capture_pane(policy.scope.lines())
+            .unwrap_or_default();
         let clean = tmux::utils::strip_ansi(&pane_content);
-        let detection = tmux::detect_with_rules(
-            &self.source_profile,
-            rules_tool,
-            agent,
-            &clean,
-            osc_title,
-            hook,
-        )
-        .unwrap_or_else(tmux::detect::Detection::idle_by_default);
+        let detection = plan.detect(&clean, &observation);
 
         let Some(candidate) = detection.status else {
             // The screen is an agent-owned viewer; the last known status
@@ -453,6 +492,7 @@ impl Instance {
             self.detection.activity = activity;
             self.detection.captured_at = Some(captured_at);
             self.detection.rule = Some(detection.rule);
+            self.detection.observation_key = observation_key;
             return;
         };
 
@@ -463,7 +503,11 @@ impl Instance {
             || (candidate == Status::Waiting && !detection.visible))
             && !has_command_override
             && !is_dead
-            && self.pane_is_stale_shell(metadata, session);
+            && if policy.observe_ownership {
+                !live_owned
+            } else {
+                self.pane_is_stale_shell(metadata, session)
+            };
         let candidate = resolve_detected_status(
             candidate,
             is_dead,
@@ -478,7 +522,12 @@ impl Instance {
             self.status = status;
             if status == Status::Error {
                 if self.last_error.is_none() {
-                    self.last_error = Some(summarize_error_from_pane(&pane_content));
+                    self.last_error = Some(
+                        detection
+                            .diagnostic
+                            .map(pane_status::summarize_error_diagnostic)
+                            .unwrap_or_else(|| summarize_error_from_pane(&pane_content)),
+                    );
                 }
             } else {
                 self.last_error = None;
@@ -487,6 +536,7 @@ impl Instance {
         self.detection.activity = activity;
         self.detection.captured_at = Some(captured_at);
         self.detection.rule = Some(detection.rule);
+        self.detection.observation_key = observation_key;
         tracing::trace!(target: "session.store",
             "status '{}': manifest rule={} candidate={:?} visible={} -> {:?}",
             self.title, detection.rule, candidate, detection.visible, self.status);
@@ -537,9 +587,48 @@ mod tests {
         ] {
             let (activity, last, taken, hook, pending) = args;
             assert_eq!(
-                skip_capture(activity, last, taken, hook, pending),
+                skip_capture(activity, last, taken, hook, pending, None, None),
                 skip,
                 "{args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn observation_changes_invalidate_cached_status_in_both_directions() {
+        let plan =
+            tmux::DetectionPlan::for_manifest("observation-cache-test", "omp", "omp").unwrap();
+        let unmarked = plan.observation_key(&tmux::Observation::new("", None, true));
+        let working = plan.observation_key(&tmux::Observation::new("π ⠋ Task", None, true));
+        let next_frame =
+            plan.observation_key(&tmux::Observation::new("π / Other title", None, true));
+        let unowned = plan.observation_key(&tmux::Observation::new("π ⠋ Task", None, false));
+        for (current, previous, skip) in [
+            (unmarked, unmarked, true),
+            (working, working, true),
+            (next_frame, working, true),
+            (unowned, unowned, true),
+            (working, unmarked, false),
+            (unmarked, working, false),
+            (unowned, working, false),
+            (working, unowned, false),
+            (unowned, unmarked, false),
+            (unmarked, unowned, false),
+            (unmarked, None, false),
+            (None, working, false),
+        ] {
+            assert_eq!(
+                skip_capture(
+                    Some(100),
+                    Some(100),
+                    Some(101),
+                    false,
+                    false,
+                    current,
+                    previous
+                ),
+                skip,
+                "{previous:?} -> {current:?}",
             );
         }
     }
@@ -876,19 +965,23 @@ mod tests {
     /// Start a detached 120x40 tmux session running `launch`; killed when the guard drops.
     fn spawn_pane(name: &str, launch: &str) -> KillTmuxOnDrop {
         let guard = KillTmuxOnDrop(name.to_string());
+        let mut args = [
+            "new-session",
+            "-d",
+            "-s",
+            name,
+            "-x",
+            "120",
+            "-y",
+            "40",
+            launch,
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        tmux::utils::append_pane_base_index_args(&mut args, name);
         let created = crate::tmux::tmux_command()
-            .args([
-                "new-session",
-                "-d",
-                "-s",
-                name,
-                "-x",
-                "120",
-                "-y",
-                "40",
-                launch,
-            ])
-            .args([";", "set-option", "-t", name, "pane-base-index", "0"])
+            .args(args)
             .output()
             .expect("spawn tmux");
         assert!(
@@ -1241,5 +1334,231 @@ Esc to cancel \u{b7} Tab to amend \u{b7} ctrl+e to explain\n\
             "one observation is all this caller gets, so its proposal decides (#3712)"
         );
         assert_eq!(once.detection.pending, None);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn omp_pinned_error_keeps_provider_diagnostic_above_plugin_rows() {
+        if !tmux_available() {
+            eprintln!("skipping: tmux not available");
+            return;
+        }
+
+        const PROVIDER_ERROR: &str = "Provider rejected this request: quota exceeded";
+        const WRAPPED_CAPTION: &str = " Dismissed when you\n send your next\n message.";
+        const MULTILINE_ERROR: &str =
+            "Provider rejected this request:\n  quota exceeded\n\n  retry after reset\n  account remains blocked";
+        for (message, caption, footer_rows) in [
+            (
+                PROVIDER_ERROR,
+                " Dismissed when you send your next message.",
+                12,
+            ),
+            (PROVIDER_ERROR, WRAPPED_CAPTION, 12),
+            (PROVIDER_ERROR, WRAPPED_CAPTION, 16),
+            (MULTILINE_ERROR, WRAPPED_CAPTION, 12),
+            (
+                PROVIDER_ERROR,
+                " Dismissed when you send your next message.",
+                0,
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let pane_file = dir.path().join("pane.txt");
+            let footer = if footer_rows == 0 {
+                String::new()
+            } else {
+                format!("{}PLUGIN_READY\n", "PLUGIN\n".repeat(footer_rows - 1))
+            };
+            let pane = format!(
+                "--------------------\n {message}\n{caption}\n--------------------\n\n\
+                 ╭── pi > model ──╮\n╰────────────────╯\n{footer}"
+            );
+            std::fs::write(&pane_file, pane).unwrap();
+
+            let mut inst = Instance::new("aoe_test_omp_error_diagnostic", "/tmp");
+            inst.tool = "omp".to_owned();
+            inst.source_profile = format!("omp-error-diagnostic-{}", inst.id);
+            inst.status = Status::Running;
+            let session_name = tmux::Session::generate_name(&inst.id, &inst.title);
+            let _guard = spawn_pane(
+                &session_name,
+                &format!("cat {}; exec sleep 300", shell_quote(&pane_file)),
+            );
+            let ready = if footer_rows == 0 {
+                "╰────────────────╯"
+            } else {
+                "PLUGIN_READY"
+            };
+            assert!(
+                wait_for_pane(&session_name, ready),
+                "error pane never painted: footer_rows={footer_rows}, caption={caption:?}"
+            );
+            let cache = crate::tmux::SessionCacheGuard::capture();
+            cache.force_present(&[session_name.as_str()]);
+            let mut metadata = agent_pane_metadata("omp", None);
+            metadata.pane_title = Some(String::new());
+
+            inst.update_status_with_metadata_inner(Some(&metadata), Some(&session_name));
+
+            assert_eq!(
+                inst.status,
+                Status::Error,
+                "footer_rows={footer_rows}, caption={caption:?}"
+            );
+            assert_eq!(
+                inst.last_error.as_deref(),
+                Some(message),
+                "footer_rows={footer_rows}, caption={caption:?}"
+            );
+            inst.last_error = Some("Earlier failure remains latched".to_owned());
+            inst.update_status_with_metadata_inner(Some(&metadata), Some(&session_name));
+            assert_eq!(
+                inst.last_error.as_deref(),
+                Some("Earlier failure remains latched"),
+                "an existing explanation survives another Error observation"
+            );
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn omp_newer_activity_and_dialog_clear_retained_error_diagnostics() {
+        if !tmux_available() {
+            eprintln!("skipping: tmux not available");
+            return;
+        }
+        for (current, expected) in [
+            (
+                " ⠋ Auto server compaction…\n pi > model\n╰─",
+                Status::Running,
+            ),
+            (
+                "╭─ Tool approval ─────╮\n│ ❯ Approve │\n│   Deny │\n\
+                 │ up/down navigate enter select esc cancel │\n╰─────────────────────╯",
+                Status::Waiting,
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let pane_file = dir.path().join("pane.txt");
+            std::fs::write(
+                &pane_file,
+                format!(
+                    "--------------------\n Provider request denied\n\
+                     Dismissed when you send your next message.\n--------------------\n\n\
+                     {current}\n{}PLUGIN_READY\n",
+                    "PLUGIN\n".repeat(11)
+                ),
+            )
+            .unwrap();
+            let mut inst = Instance::new("aoe_test_omp_error_cleared", "/tmp");
+            inst.tool = "omp".to_owned();
+            inst.source_profile = format!("omp-error-cleared-{}", inst.id);
+            inst.status = Status::Error;
+            inst.last_error = Some("Earlier provider request denied".to_owned());
+            let session_name = tmux::Session::generate_name(&inst.id, &inst.title);
+            let _guard = spawn_pane(
+                &session_name,
+                &format!("cat {}; exec sleep 300", shell_quote(&pane_file)),
+            );
+            assert!(wait_for_pane(&session_name, "PLUGIN_READY"));
+            let cache = crate::tmux::SessionCacheGuard::capture();
+            cache.force_present(&[session_name.as_str()]);
+            let mut metadata = agent_pane_metadata("omp", None);
+            metadata.pane_title = Some(String::new());
+
+            inst.update_status_with_metadata_inner(Some(&metadata), Some(&session_name));
+
+            assert_eq!(inst.status, expected, "{current}");
+            assert_eq!(inst.last_error, None, "{current}");
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn omp_title_only_transitions_and_ownership_loss_do_not_reuse_cached_status() {
+        if !tmux_available() {
+            eprintln!("skipping: tmux not available");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let pane_file = dir.path().join("pane.txt");
+        std::fs::write(&pane_file, "OMP_CAPTURE_READY\n$ ").unwrap();
+        let mut inst = Instance::new("aoe_test_omp_cues", "/tmp");
+        inst.tool = "omp".to_owned();
+        inst.source_profile = format!("omp-cues-{}", inst.id);
+        let session_name = tmux::Session::generate_name(&inst.id, &inst.title);
+        let _guard = spawn_pane(
+            &session_name,
+            &format!("cat {}; exec sleep 300", shell_quote(&pane_file)),
+        );
+        assert!(wait_for_pane(&session_name, "OMP_CAPTURE_READY"));
+        assert!(crate::tmux::tmux_command()
+            .args(["select-pane", "-t", &session_name, "-T", "π / Task"])
+            .status()
+            .unwrap()
+            .success());
+        let cache = crate::tmux::SessionCacheGuard::capture();
+        cache.force_present(&[&session_name]);
+        inst.update_status_once(None, Some(&session_name));
+        assert_eq!(
+            inst.status,
+            Status::Running,
+            "metadata-free readers fetch the title"
+        );
+
+        let mut metadata = agent_pane_metadata("omp", Some(1));
+        metadata.pane_title = Some("π: Task".to_owned());
+        inst.update_status_with_metadata_inner(Some(&metadata), Some(&session_name));
+        assert_eq!(
+            inst.status,
+            Status::Running,
+            "unwitnessed idle needs confirmation"
+        );
+        inst.update_status_with_metadata_inner(Some(&metadata), Some(&session_name));
+        assert_eq!(inst.status, Status::Idle);
+
+        metadata.pane_title = Some("π ⠋ Task".to_owned());
+        inst.update_status_with_metadata_inner(Some(&metadata), Some(&session_name));
+        assert_eq!(
+            inst.status,
+            Status::Running,
+            "title-only work invalidates cached idle"
+        );
+        metadata.pane_title = Some(String::new());
+        inst.update_status_with_metadata_inner(Some(&metadata), Some(&session_name));
+        assert_eq!(inst.status, Status::Running);
+        inst.update_status_with_metadata_inner(Some(&metadata), Some(&session_name));
+        assert_eq!(
+            inst.status,
+            Status::Idle,
+            "losing a title invalidates cached running"
+        );
+
+        metadata.pane_title = Some("π ⠋ Task".to_owned());
+        inst.update_status_with_metadata_inner(Some(&metadata), Some(&session_name));
+        assert_eq!(inst.status, Status::Running);
+        metadata.pane_current_command = Some("bash".to_owned());
+        inst.update_status_with_metadata_inner(Some(&metadata), Some(&session_name));
+        assert_eq!(
+            inst.status,
+            Status::Error,
+            "a stale title cannot own a bare shell"
+        );
+
+        metadata.pane_start_command_is_protected = true;
+        inst.update_status_with_metadata_inner(Some(&metadata), Some(&session_name));
+        assert_eq!(
+            inst.status,
+            Status::Running,
+            "protected launch wrappers keep ownership"
+        );
+        metadata.pane_dead = true;
+        inst.update_status_with_metadata_inner(Some(&metadata), Some(&session_name));
+        assert_eq!(
+            inst.status,
+            Status::Error,
+            "death outranks a protected wrapper and title"
+        );
     }
 }

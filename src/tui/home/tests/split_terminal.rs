@@ -174,6 +174,11 @@ fn passive_split_follows_captured_cursor_without_discarding_history_or_clear_fra
     let (mut env, agent, _term) = split_env(false, true);
     present.force_present(&[agent.as_str()]);
     render_home_to_string(&mut env.view, 100, 30);
+    env.view
+        .split_capture_worker
+        .as_mut()
+        .expect("passive observer exists")
+        .stop_for_test();
     let cursor = crate::tmux::PaneCursor {
         x: 33,
         y: 2,

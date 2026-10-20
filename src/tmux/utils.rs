@@ -421,9 +421,9 @@ pub(crate) fn pane_title(session_name: &str) -> Option<String> {
         .args(["display-message", "-t", &target, "-p", "#{pane_title}"])
         .output()
         .ok()
+        .filter(|output| output.status.success())
         .and_then(|o| String::from_utf8(o.stdout).ok())
         .map(|s| strip_display_delimiter(&s).to_string())
-        .filter(|s| !s.is_empty())
 }
 
 /// Drop the single newline `display-message -p` appends, and only that one.
@@ -434,7 +434,7 @@ fn strip_display_delimiter(raw: &str) -> &str {
     raw.strip_suffix('\n').unwrap_or(raw)
 }
 
-fn pane_start_command_is_protected(session_name: &str) -> bool {
+pub(crate) fn pane_start_command_is_protected(session_name: &str) -> bool {
     let Some(first) = first_pane_id(session_name) else {
         return false;
     };

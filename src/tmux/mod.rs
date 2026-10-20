@@ -18,13 +18,11 @@ pub(crate) mod utils;
 pub(crate) mod vt;
 
 pub use composite::PaneGeom;
+pub use detect::{HookObservation, Observation, ObservationKey};
 pub(crate) use session::{peel_trailing_semicolons, submit_text, SubmitText};
 pub use session::{PaneCursor, PaneEnvMutation, Session, SIZE_OWNER_HEARTBEAT, SIZE_OWNER_TTL};
 pub use status_bar::{get_session_info_for_current, get_status_for_current_session};
-pub use status_detection::{
-    detect_claude, detect_status_from_content, detect_status_from_content_in, detect_via_manifest,
-    detect_with_rules,
-};
+pub use status_detection::{detect_status_from_content_in, DetectionPlan};
 pub use terminal_session::{ContainerTerminalSession, TerminalSession};
 pub use tool_session::ToolSession;
 pub(crate) use tool_session::{LegacyToolScope, LegacyToolUnavailable};
@@ -329,9 +327,7 @@ pub struct PaneMetadata {
     pub pane_current_command: Option<String>,
     pub pane_start_command_is_protected: bool,
     pub pane_pid: Option<u32>,
-    /// The terminal title the pane's program published over OSC 0/2. Several
-    /// agent CLIs put their own state in it, which is the one signal that does
-    /// not depend on what the transcript happens to contain.
+    /// OSC 0/2 title: None is unavailable; Some("") is observed empty.
     pub pane_title: Option<String>,
     /// tmux's last-output timestamp for the pane's window, used to skip a
     /// capture when nothing has been drawn since the last one.
@@ -1564,7 +1560,6 @@ fn parse_pane_metadata(output: &str) -> HashMap<String, PaneMetadata> {
             },
         };
         let window_activity = activity.and_then(|a| a.trim().parse::<i64>().ok());
-        let pane_title = pane_title.unwrap_or("");
         let mut parts = line.splitn(10, FIELD_SEP);
         let (
             Some(session_name),
@@ -1641,7 +1636,7 @@ fn parse_pane_metadata(output: &str) -> HashMap<String, PaneMetadata> {
                 },
                 pane_start_command_is_protected: pane_start_command
                     .contains(utils::PANE_ENV_FILE_PREFIX),
-                pane_title: (!pane_title.is_empty()).then(|| pane_title.to_string()),
+                pane_title: pane_title.map(str::to_owned),
                 window_activity,
                 window_size,
             },
@@ -4519,7 +4514,6 @@ mod tests {
             .remove(&format!("{P}proj_def67890"))
             .unwrap();
         assert_eq!(meta.window_activity, None);
-        assert_eq!(meta.pane_title, None);
         assert_eq!(meta.window_size, None);
         let id = "abc12345full";
         let name = ToolSession::generate_name(id, "T", "git|log");
@@ -4534,6 +4528,49 @@ mod tests {
                 name
             );
             assert!(ToolSession::from_snapshot(id, "T", "git_log", &panes).is_err());
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn omp_cached_poll_only_fetches_unobserved_titles() {
+        let mut instance = crate::session::Instance::new("empty-title-cache", "/tmp");
+        instance.tool = "omp".to_owned();
+        instance.source_profile = format!("empty-title-{}", instance.id);
+        instance.status = crate::session::Status::Idle;
+        let name = Session::generate_name(&instance.id, &instance.title);
+        let cache = SessionCacheGuard::capture();
+        cache.force_present(&[&name]);
+
+        for (tail, expected_title, expected_forks) in [
+            (format!("{TAIL_SEP}1{TAIL_SEP}{TAIL_SEP}"), Some(""), 0),
+            (format!("{TAIL_SEP}1{TAIL_SEP}"), None, 1),
+        ] {
+            let metadata =
+                parse_pane_metadata(&format!("{name}|$42|%42||0|0|100|40|omp|omp|42{tail}\n"))
+                    .remove(&name)
+                    .unwrap();
+            assert_eq!(metadata.pane_title.as_deref(), expected_title);
+            instance.detection = crate::session::DetectionState {
+                activity: Some(1),
+                captured_at: Some(2),
+                observation_key: DetectionPlan::for_manifest(
+                    &instance.source_profile,
+                    "omp",
+                    "omp",
+                )
+                .unwrap()
+                .observation_key(&Observation::new("", None, true)),
+                ..Default::default()
+            };
+            let _ = fork_probe::take();
+            let probe = fork_probe::arm();
+            instance.update_status_once(Some(&metadata), Some(&name));
+            let forks = fork_probe::take();
+            drop(probe);
+            assert_eq!(instance.detection.rule, Some("screen_unchanged"));
+            assert_eq!(instance.status, crate::session::Status::Idle);
+            assert_eq!(forks, expected_forks, "metadata tail: {tail:?}");
         }
     }
 

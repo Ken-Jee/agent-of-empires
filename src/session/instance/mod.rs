@@ -174,6 +174,7 @@ pub struct DetectionState {
     /// frames are otherwise indistinguishable from real transitions, and they
     /// flipped parked sessions between Idle and Running every few seconds.
     pub pending: Option<Status>,
+    pub observation_key: Option<tmux::ObservationKey>,
 }
 
 /// A turn queued for delivery once the (resumed) worker is live. See

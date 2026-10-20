@@ -162,12 +162,6 @@ test("custom agent with agent_acp_cmd runs in structured view", async ({ spawnSe
       );
     },
   });
-  // Guards against the master atomic not seeding from config at boot.
-  await fetch(`${serve.baseUrl}/api/acp/master`, {
-    method: "PATCH",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ enabled: true }),
-  });
 
   const agentsRes = await fetch(`${serve.baseUrl}/api/agents`);
   expect(agentsRes.ok).toBeTruthy();

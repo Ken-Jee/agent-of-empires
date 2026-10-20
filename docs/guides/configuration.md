@@ -307,6 +307,27 @@ regex = "esc to interrupt|thinking"
 
 Rules are checked in order against the last screenful of ANSI-stripped pane text every status poll; the first match wins and no match reports `idle`. Put the more specific states (`waiting`, `error`) before the broad `running` matchers. When an agent has rules, they take precedence over its `agent_detect_as` alias, over a built-in detector of the same name, and over a status hook the agent writes.
 
+#### OMP terminal status
+
+Built-in OMP detection reads the visible pane and locates activity, pinned errors,
+and blocking dialogs relative to the current composer. Question dialogs remain
+waiting when paging hides the selected option; session pickers accept bracketed
+key legends. Extension status rows, including plugin badges, do not need
+agent-specific matching rules.
+Editable composer text is excluded from dialog controls, even without status segments.
+
+A recognized working terminal title supplements visible controls; it does not
+override a blocking dialog or pinned error. Visible retry and compaction controls
+can indicate activity even when the turn timer is stopped. Disabling OMP title
+updates or terminal program-status reports does not disable visible-control detection.
+
+Untimed interrupt hints must start in the native two-space key column; alignment
+padding alone does not supply activity evidence.
+Custom editors or widgets can hide or replace these controls. Without a recognizable
+turn timer or working title, passive text that exactly reproduces a loader row
+remains indistinguishable from that control. Use the explicit status rules above
+for such interfaces; they remain authoritative, including their no-match behavior.
+
 #### Running a custom agent in the structured view
 
 Give an agent an ACP launch command in `agent_acp_cmd` to run it in the structured view UI instead of tmux. The agent must speak the [Agent Client Protocol](https://agentclientprotocol.com); the command is what AoE execs to start the ACP server.
@@ -359,6 +380,11 @@ Keys must match `[A-Za-z_][A-Za-z0-9_]*` (an ASCII letter or `_` first, then ASC
 In the terminal view every form resolves to a literal `KEY=value` prefix on the pane command and is therefore visible in `ps`; for secrets you want hidden from argv there, use [`sandbox.environment`](#sandbox-docker) instead. The structured view applies the same list to the agent process's environment rather than its argv, so values do not appear in `ps`. Host and sandbox sessions take disjoint code paths: a sandboxed session reads only `sandbox.environment`, an unsandboxed session reads only the top-level `environment`. Set both lists if you want a variable available regardless of how the session launches.
 
 Profile-scoped `environment` replaces the global list entirely (matching the `sandbox.environment` override semantics).
+
+Native host Codex launches add `--no-daemon` only when the attested direct
+executable advertises it. The probe uses that frozen executable and environment,
+including the profile's `PATH`; it does not resolve another installation.
+Wrappers, sandboxed launches and unattested executables are not probed for this flag.
 
 ### What host sessions inherit automatically
 
@@ -476,9 +502,12 @@ The `[host_hooks]` block declares hooks that run on the **host** (not inside the
 [host_hooks]
 before_start   = ['echo "GH_TOKEN=$(my-mint-tool "$AOE_REPO_SLUG")"']  # sandboxed sessions
 before_session = ['my-account-switcher env']                            # host sessions
+before_destroy = ['sync-transcripts "$AOE_SESSION_ID"']                 # any session, at purge
 ```
 
 The two fields mirror the split the static env lists already make: `before_start` serves sandboxed sessions (the dynamic counterpart of `sandbox.environment`), `before_session` serves host sessions (the counterpart of the top-level [`environment`](#host-environment)). A launch runs exactly one of them, chosen by whether the session is sandboxed, so the same key is never minted twice.
+
+`before_destroy` is not a launch hook: it runs on the host for every session, sandboxed or not, when the session is purged, before container and worktree cleanup. With `session.delete_to_trash` on (the default), moving a session to trash does not run it; it runs when retention expires, on `empty-trash`, or on `aoe remove --purge`. Its output is ignored and never logged. A failure is logged without blocking removal, and a command still running after 2 minutes is killed.
 
 `before_start` runs each time a sandbox container comes up (on create and on restart, so short-lived values are refreshed before the agent launches). It re-mints when the container is created fresh or restarted from a stopped state (including after a Docker daemon restart leaves it stopped); attaching to an already-running container reuses the values from the last run and only backfills if none are stashed yet, so it is not re-run on every reattach. Each `KEY=VALUE` line the command prints to stdout is injected into the container environment as an **inherited** variable: the value is passed to the `docker` invocation through the process environment, never in argv, so it does not appear in `ps`. Lines that are not `KEY=VALUE` are ignored, and the hook's stdout is never logged, so it is safe to print a secret. A non-zero exit aborts bringing the container up. A line whose key is a single token but does not match `[A-Za-z_][A-Za-z0-9_]*` (e.g. `FOO-BAR=x`) is dropped with a warning; a diagnostic line whose key contains spaces (e.g. `fetching token from url=https://...`) is ignored silently.
 
