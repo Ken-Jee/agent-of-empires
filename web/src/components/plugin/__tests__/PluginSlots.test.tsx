@@ -7,6 +7,7 @@ import { PluginPaneBody } from "../PluginPane";
 import {
   PluginComposerActions,
   PluginDetailBadges,
+  PluginHeaderStartSegments,
   PluginHomePanes,
   PluginRowBadges,
   PluginStatusBarSegments,
@@ -243,6 +244,19 @@ describe("plugin slots", () => {
       expect(container.querySelector("button, span")).toBeNull();
     });
 
+    it("detail-badge orders by payload order, then snapshot order", () => {
+      const badge = (id: string, order?: number): PluginUiEntry => ({
+        plugin_id: "acme.kit",
+        slot: "detail-badge",
+        id,
+        session_id: "s1",
+        payload: { text: id, ...(order === undefined ? {} : { order }) },
+      });
+      entriesRef.current = [badge("a"), badge("b", -1), badge("c", 5)];
+      const { container } = render(<PluginDetailBadges sessionId="s1" />);
+      expect([...container.querySelectorAll("[data-plugin-slot]")].map((n) => n.textContent)).toEqual(["b", "a", "c"]);
+    });
+
     it("resets a detail group's position when the addressed session changes", () => {
       const badge = (session_id: string): PluginUiEntry => ({
         plugin_id: "acme.kit",
@@ -260,6 +274,32 @@ describe("plugin slots", () => {
       expect(invokeMock).not.toHaveBeenCalled();
       expect(pokeMock).not.toHaveBeenCalled();
     });
+  });
+
+  it("header-start and status-bar chips order by payload order, then snapshot order", () => {
+    const chip = (slot: "header-start" | "status-bar", id: string, order?: number): PluginUiEntry => ({
+      plugin_id: "acme.kit",
+      slot,
+      id,
+      payload: { text: id, ...(order === undefined ? {} : { order }) },
+    });
+    entriesRef.current = [
+      chip("header-start", "a"),
+      chip("header-start", "b", -1),
+      chip("header-start", "c", 5),
+      chip("status-bar", "d", -9),
+      chip("status-bar", "e", 5),
+      chip("status-bar", "f"),
+    ];
+    const { container } = render(<PluginHeaderStartSegments />);
+    const texts = [...container.querySelectorAll("[data-plugin-slot]")].map((n) => n.textContent);
+    expect(texts).toEqual(["b", "a", "c"]);
+    const statusBar = render(<PluginStatusBarSegments />);
+    expect([...statusBar.container.querySelectorAll("[data-plugin-slot]")].map((n) => n.textContent)).toEqual([
+      "d",
+      "f",
+      "e",
+    ]);
   });
 
   it("home-pane renders blocks, and the simple form's title only once", () => {
@@ -457,6 +497,19 @@ describe("pane blocks", () => {
     refreshingRef.current = false;
     rerender(<PluginPaneBody entry={{ ...entry, payload: { ...entry.payload } }} />);
     expect(screen.queryByTestId("plugin-pane-refreshing")).toBeNull();
+  });
+
+  it("overlays the refresh indicator outside the scroll flow so content does not shift", () => {
+    refreshingRef.current = true;
+    renderBlocks({ kind: "heading", text: "GitHub" });
+    const indicator = screen.getByTestId("plugin-pane-refreshing");
+    expect(screen.getByRole("status", { name: "Refreshing" })).toBe(indicator);
+    expect(indicator.textContent).toBe("");
+    const scroller = screen.getByText("GitHub").closest(".overflow-auto");
+    expect(scroller).toBeTruthy();
+    expect(scroller?.contains(indicator)).toBe(false);
+    expect(indicator.parentElement?.className).toContain("relative");
+    expect(indicator.parentElement?.contains(scroller)).toBe(true);
   });
 
   it("renders heading, linked row, note, divider and skips unknown kinds", () => {

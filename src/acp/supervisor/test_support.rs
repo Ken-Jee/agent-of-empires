@@ -156,6 +156,18 @@ impl<S: BroadcastSink> Supervisor<S> {
             let lease = table
                 .admit(session_id, ResumeKind::Spawn)
                 .expect("test fixture admits a fresh session");
+            let prime = crate::process::worker_registry::load(session_id)
+                .ok()
+                .flatten()
+                .filter(|record| identity.is_some_and(|identity| identity.owns_record(record)))
+                .map(|record| crate::acp::runner_lifecycle::PrimeOwnership::from_record(&record))
+                .unwrap_or_else(|| match &kind {
+                    WorkerKind::Runner { spawn_config } if spawn_config.uses_native_prime() => {
+                        crate::acp::runner_lifecycle::PrimeOwnership::Unresolved
+                    }
+                    _ => crate::acp::runner_lifecycle::PrimeOwnership::NotPrime,
+                });
+            lease.record_prime(prime);
             table
                 .install(&lease, identity)
                 .expect("test fixture installs its own lease");
@@ -335,8 +347,9 @@ pub(super) fn worker_record(session_id: &str, pid: u32, socket: PathBuf) -> Work
 
 pub(crate) fn save_record(session_id: &str, pid: u32, generation: u64) {
     let socket = worker_registry::socket_path_for(session_id).unwrap();
-    worker_registry::save(&worker_record(session_id, pid, socket).with_generation(generation))
-        .unwrap();
+    let mut record = worker_record(session_id, pid, socket).with_generation(generation);
+    record.runner_identity = None;
+    worker_registry::save(&record).unwrap();
 }
 
 /// Holds a gated launch until the test opens it.
@@ -373,6 +386,7 @@ pub(crate) fn recording_gated_launcher(
     pid: u32,
     session_id: &str,
     native_id: &str,
+    runner_identity: Option<crate::process::ProcessBirthIdentity>,
 ) -> (Launcher, Arc<std::sync::atomic::AtomicBool>) {
     let (client, sender, deleted) =
         AcpClient::fake_for_test_recording(AcpSessionId(session_id.into()));
@@ -386,6 +400,7 @@ pub(crate) fn recording_gated_launcher(
         let open = open.clone();
         let native_id = native_id.clone();
         let sender = sender.clone();
+        let runner_identity = runner_identity.clone();
         Box::pin(async move {
             let _sender = sender;
             let socket = worker_registry::socket_path_for(&session_id.0).unwrap();
@@ -393,6 +408,7 @@ pub(crate) fn recording_gated_launcher(
                 .with_generation(config.generation);
             record.stored_acp_session_id = Some(native_id);
             record.source_profile = config.source_profile;
+            record.runner_identity = runner_identity;
             worker_registry::save(&record).unwrap();
             worker_registry::touch_live_socket(&socket);
             entered.notify_one();

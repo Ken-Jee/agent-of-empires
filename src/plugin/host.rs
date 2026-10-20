@@ -20,6 +20,7 @@ use crate::plugin::launch::{resolve_launch, OsLaunchResolver};
 use crate::plugin::protocol::{self, codes, RpcResponse};
 use crate::plugin::registry::PluginRegistry;
 use crate::plugin::sandbox::{NoSandbox, SandboxBackend};
+use crate::plugin::worker_logs;
 use crate::process::worker;
 use crate::server::push::StatusChange;
 
@@ -118,6 +119,7 @@ impl PluginHost {
         let workers_dir = app_dir.join("plugin-workers");
         worker::ensure_dir(&workers_dir)
             .with_context(|| format!("prepare {}", workers_dir.display()))?;
+        worker_logs::prune_legacy(&workers_dir);
         let api = HostApiState::open(
             &app_dir.join("plugin_events.db"),
             profile,
@@ -192,16 +194,23 @@ impl PluginHost {
     /// when it next starts). Revision-only by design: the settings snapshot is
     /// not inlined (size, secret exposure). Notification failure is logged,
     /// never rolls back the already-committed write.
-    pub async fn emit_settings_changed(&self, changes: &[(String, Vec<String>)]) {
+    pub async fn emit_settings_changed(
+        &self,
+        changes: &[(String, Vec<String>)],
+        project_path: Option<&str>,
+    ) {
         if changes.is_empty() {
             return;
         }
         let revision = self.api.bump_settings_revision();
         for (plugin_id, changed_keys) in changes {
-            let params = serde_json::json!({
+            let mut params = serde_json::json!({
                 "revision": revision,
                 "changed_keys": changed_keys,
             });
+            if let Some(path) = project_path {
+                params["project_path"] = serde_json::json!(path);
+            }
             let delivered = self
                 .notify_worker(plugin_id, "plugin.settings.changed", params)
                 .await;
@@ -588,7 +597,7 @@ impl PluginHost {
         let prepared = self.sandbox.prepare(&launch)?;
 
         let worker_id = uuid::Uuid::new_v4().to_string();
-        let log_path = worker::log_path(&self.workers_dir, &worker_id)?;
+        let log_path = worker_logs::log_path(&self.workers_dir, plugin_id, &worker_id)?;
         let log = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -616,9 +625,20 @@ impl PluginHost {
             });
         }
 
-        let mut child = cmd
-            .spawn()
-            .with_context(|| format!("spawn worker for {plugin_id}"))?;
+        let mut child = match cmd.spawn() {
+            Ok(child) => child,
+            Err(e) => {
+                // Keep the previous log as the newest one rather than an empty file.
+                let _ = std::fs::remove_file(&log_path);
+                return Err(e).with_context(|| format!("spawn worker for {plugin_id}"));
+            }
+        };
+        worker_logs::prune_plugin(
+            &self.workers_dir,
+            plugin_id,
+            &log_path,
+            worker_logs::KEEP_PER_PLUGIN,
+        );
         let pid = child.id().unwrap_or(0);
 
         let stdin = child.stdin.take().context("worker stdin missing")?;
@@ -1153,7 +1173,9 @@ mod tests {
     /// fake-agent e2e; the capability refusal happens before any storage access,
     /// so this needs no profile isolation.
     #[tokio::test]
+    #[serial_test::parallel]
     async fn worker_subprocess_round_trip_and_capability_gate() {
+        let _env = crate::session::test_support::EnvGuard::read_lock();
         if which::which("node").is_err() {
             eprintln!("skipping: node not found on PATH");
             return;
@@ -1222,6 +1244,71 @@ process.stdout.write(JSON.stringify({jsonrpc:"2.0",id:1,method:"session.meta.set
         );
     }
 
+    #[tokio::test]
+    #[serial_test::parallel]
+    async fn host_initiated_notification_reaches_worker() {
+        let _env = crate::session::test_support::EnvGuard::read_lock();
+        if which::which("node").is_err() {
+            eprintln!("skipping: node not found on PATH");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let api = Arc::new(
+            HostApiState::open(&tmp.path().join("plugin_events.db"), "default", 100).unwrap(),
+        );
+        let ctx = Arc::new(PluginRpcContext {
+            plugin_id: "acme.worker".into(),
+            granted_capabilities: vec!["runtime.worker".into()],
+            ui_contributions: std::collections::HashSet::new(),
+            ui_generation: 0,
+        });
+
+        const WORKER: &str = r#"
+const rl = require('readline').createInterface({ input: process.stdin });
+rl.on('line', (line) => {
+  const m = JSON.parse(line);
+  if (m.method === 'host.ping') {
+    process.stdout.write(JSON.stringify({jsonrpc:"2.0",id:1,method:"events.publish",params:{topic:"pinged",payload:{ok:true}}}) + "\n");
+  } else if (m.id === 1) {
+    process.exit(0);
+  }
+});
+"#;
+
+        let mut child = tokio::process::Command::new("node")
+            .arg("-e")
+            .arg(WORKER)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let stdin = child.stdin.take().unwrap();
+        let stdout = child.stdout.take().unwrap();
+
+        let tx = stdin_writer(stdin);
+        tx.send(
+            json!({ "jsonrpc": "2.0", "method": "host.ping", "params": {} }).to_string() + "\n",
+        )
+        .unwrap();
+
+        let work = crate::server::runtime::RuntimeWork::default();
+        serve_connection(&api, &ctx, stdout, tx, None, &work).await;
+        let _ = child.wait().await;
+
+        let published = dispatch(
+            &api,
+            &ctx,
+            "events.subscribe",
+            &json!({ "topics": ["pinged"], "after_seq": 0 }),
+        )
+        .unwrap();
+        let events = &published["events"];
+        let events = events.as_array().unwrap();
+        assert_eq!(events.len(), 1, "worker should react to the host push");
+        assert_eq!(events[0]["payload"]["ok"], json!(true));
+    }
     async fn worker_pid(host: &PluginHost, plugin_id: &str) -> Option<u32> {
         let table = host.state.lock().await;
         table

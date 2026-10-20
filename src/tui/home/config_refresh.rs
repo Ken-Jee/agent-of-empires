@@ -44,11 +44,7 @@ impl HomeView {
     pub(in crate::tui) fn refresh_from_config(&mut self, origin: ConfigRefreshOrigin) {
         let profile = self.config_profile();
         let config = resolve_config_or_warn(&profile);
-        // The lenient resolver returns defaults when only the profile is malformed.
-        let sidebar_position = crate::session::Config::load_or_warn()
-            .session
-            .sidebar_position;
-        self.apply_config_to_state(config, sidebar_position, origin);
+        self.apply_config_to_state(config, origin);
     }
 
     /// Watcher-path counterpart of `refresh_from_config`. Returns Err on
@@ -72,16 +68,30 @@ impl HomeView {
         self.maybe_export_watcher_refresh_count(new_count);
         let profile = self.config_profile();
         let config = crate::session::resolve_config(&profile)?;
-        let sidebar_position = config.session.sidebar_position;
-        self.apply_config_to_state(config, sidebar_position, ConfigRefreshOrigin::Watcher);
+        self.apply_config_to_state(config, ConfigRefreshOrigin::Watcher);
         Ok(())
+    }
+
+    /// Re-read only `session.preview_link_prefixes`; true when it changed. A read
+    /// failure is left to the full reload, which reports it.
+    pub(in crate::tui) fn refresh_link_policy(&mut self) -> bool {
+        let Ok(config) = crate::session::resolve_config(&self.config_profile()) else {
+            return false;
+        };
+        let changed = self.preview_link_prefixes != config.session.preview_link_prefixes;
+        self.set_link_prefixes(&config.session.preview_link_prefixes);
+        changed
+    }
+
+    fn set_link_prefixes(&mut self, prefixes: &[String]) {
+        crate::session::set_preview_link_prefixes(prefixes);
+        self.preview_link_prefixes = prefixes.to_vec();
     }
 
     /// Apply a snapshot, reporting interactive warnings without interrupting watcher reloads.
     fn apply_config_to_state(
         &mut self,
         config: crate::session::Config,
-        sidebar_position: crate::session::config::SidebarPosition,
         origin: ConfigRefreshOrigin,
     ) {
         self.default_terminal_mode = match config.sandbox.default_terminal_mode {
@@ -94,9 +104,10 @@ impl HomeView {
         self.host_tab_title = config.session.host_tab_title;
         self.row_tag_mode = config.session.row_tag;
         self.show_activity_age = config.session.show_activity_age;
-        self.set_sidebar_position(sidebar_position);
+        self.set_sidebar_position(config.session.sidebar_position);
         self.show_diagnostics = config.session.show_diagnostics_pane;
         self.show_shortcut_bar = config.session.show_shortcut_bar;
+        self.set_link_prefixes(&config.session.preview_link_prefixes);
         self.agent_clipboard_forward =
             config.tmux.clipboard != crate::session::config::TmuxSettingMode::Disabled;
         self.vt_live_enabled = config.tmux.vt_live;

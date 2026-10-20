@@ -1,14 +1,44 @@
 //! Linux-specific process utilities
 
 pub(crate) const HAS_CODEX_MANAGED_PREFERENCES: bool = false;
+use anyhow::Context as _;
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Stdio};
 
 pub(super) use super::unix::{
-    configure_process_group, kill_process_group, terminate_process_group, try_wait_status_hook,
+    close_frozen_payload, configure_process_group, exec_command, kill_process_group,
+    restore_environment_value, terminate_process_group, try_wait_status_hook,
 };
+pub(super) fn open_read_nonblocking(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+}
+pub(super) fn launch_executable(
+    executable: std::path::PathBuf,
+) -> std::io::Result<std::path::PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    if executable.try_exists()? {
+        return Ok(executable);
+    }
+    let replacement = executable
+        .as_os_str()
+        .as_bytes()
+        .strip_suffix(b" (deleted)")
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "AoE executable is unavailable",
+            )
+        })?;
+    which::which(Path::new(std::ffi::OsStr::from_bytes(replacement)))
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::NotFound, error))
+}
 pub(super) fn rename_exclusive(
     source_dir: &std::os::fd::OwnedFd,
     source: &std::ffi::OsStr,
@@ -36,6 +66,19 @@ pub(super) fn rename_exclusive(
         })
     })??;
     result.map_err(std::io::Error::from)
+}
+
+pub(super) fn connect_systemd_socket(
+    socket: &std::os::unix::net::UnixDatagram,
+    destination: &std::ffi::OsStr,
+) -> std::io::Result<()> {
+    use std::os::linux::net::SocketAddrExt;
+    use std::os::unix::ffi::OsStrExt;
+    if let Some(name) = destination.as_bytes().strip_prefix(b"@") {
+        socket.connect_addr(&std::os::unix::net::SocketAddr::from_abstract_name(name)?)
+    } else {
+        socket.connect(destination)
+    }
 }
 
 pub(crate) fn unix_peer_uid(stream: &tokio::net::UnixStream) -> std::io::Result<u32> {
@@ -162,6 +205,324 @@ pub(super) fn processes_matching(
         }
     }
     found
+}
+
+fn process_disappeared(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::NotFound || error.raw_os_error() == Some(libc::ESRCH)
+}
+
+fn foreign_process_permission_error(error: &std::io::Error, owner: Option<u32>, euid: u32) -> bool {
+    matches!(error.raw_os_error(), Some(libc::EACCES | libc::EPERM))
+        && owner.is_some_and(|uid| uid != euid)
+}
+
+pub(super) fn runner_group_executing(group: u32) -> anyhow::Result<bool> {
+    use std::io::Read as _;
+    let mut bytes = [0u8; 1024];
+    for entry in fs::read_dir("/proc")? {
+        let entry = entry?;
+        if entry.file_name().to_string_lossy().parse::<u32>().is_err() {
+            continue;
+        }
+        let size = match fs::File::open(entry.path().join("stat"))
+            .and_then(|mut file| file.read(&mut bytes))
+        {
+            Ok(size) => size,
+            Err(error) if process_disappeared(&error) => continue,
+            Err(error) => {
+                use std::os::unix::fs::MetadataExt as _;
+                let owner = entry.metadata().ok().map(|metadata| metadata.uid());
+                if foreign_process_permission_error(&error, owner, unsafe { libc::geteuid() }) {
+                    continue;
+                }
+                return Err(error).context("runner group census unavailable");
+            }
+        };
+        let offset = bytes[..size]
+            .windows(2)
+            .rposition(|pair| pair == b") ")
+            .context("invalid process stat")?;
+        let mut fields = std::str::from_utf8(&bytes[offset + 2..size])?.split_ascii_whitespace();
+        let state = fields.next().context("missing process state")?;
+        let process_group = fields
+            .nth(1)
+            .context("missing process group")?
+            .parse::<u32>()?;
+        if process_group == group && state != "Z" {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+pub(super) fn process_start_id(pid: u32) -> anyhow::Result<Option<String>> {
+    let stat = match fs::read(format!("/proc/{pid}/stat")) {
+        Ok(stat) => stat,
+        Err(error) if process_disappeared(&error) => return Ok(None),
+        Err(error) => return Err(error).context("reading process birth identity"),
+    };
+    let offset = stat
+        .windows(2)
+        .rposition(|pair| pair == b") ")
+        .context("invalid process stat")?;
+    let tail = std::str::from_utf8(&stat[offset + 2..])?;
+    let mut fields = tail.split_ascii_whitespace();
+    fields.next().context("missing process state")?;
+    let start = fields.nth(18).context("missing process birth identity")?;
+    Ok(Some(format!("proc:{start}")))
+}
+
+pub(super) struct ProcessHandle(std::os::fd::OwnedFd);
+pub(super) fn process_group_id(pid: u32) -> anyhow::Result<Option<u32>> {
+    let stat = match fs::read(format!("/proc/{pid}/stat")) {
+        Ok(stat) => stat,
+        Err(error) if process_disappeared(&error) => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let offset = stat
+        .windows(2)
+        .rposition(|pair| pair == b") ")
+        .context("invalid process stat")?;
+    let tail = std::str::from_utf8(&stat[offset + 2..])?;
+    Ok(Some(
+        tail.split_ascii_whitespace()
+            .nth(2)
+            .context("missing process group")?
+            .parse()?,
+    ))
+}
+impl ProcessHandle {
+    pub(super) fn capture(identity: &super::PrimeProcessIdentity) -> anyhow::Result<Option<Self>> {
+        Self::capture_identity(identity, false)
+    }
+
+    pub(super) fn capture_group(
+        identity: &super::PrimeProcessIdentity,
+    ) -> anyhow::Result<Option<Self>> {
+        Self::capture_identity(identity, true)
+    }
+
+    fn capture_identity(
+        identity: &super::PrimeProcessIdentity,
+        allow_exited: bool,
+    ) -> anyhow::Result<Option<Self>> {
+        use std::os::fd::FromRawFd as _;
+        let pid = i32::try_from(identity.pid)?;
+        anyhow::ensure!(pid > 0, "invalid owned process PID");
+        let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+        if raw < 0 {
+            let error = std::io::Error::last_os_error();
+            if process_disappeared(&error) {
+                return Ok(None);
+            }
+            return Err(error).context("opening owned process handle");
+        }
+        let handle = Self(unsafe { std::os::fd::OwnedFd::from_raw_fd(raw as i32) });
+        if process_start_id(identity.pid)?.as_deref() != Some(&identity.start_id)
+            || (!allow_exited && handle.exited()?)
+        {
+            return Ok(None);
+        }
+        Ok(Some(handle))
+    }
+    pub(super) fn group_executing(&self) -> anyhow::Result<Option<bool>> {
+        match self.send_group(0) {
+            Ok(()) => Ok(Some(true)),
+            Err(error) if error.raw_os_error() == Some(libc::ESRCH) => Ok(Some(false)),
+            Err(error) if error.raw_os_error() == Some(libc::EINVAL) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    pub(super) fn signal_group(&self, signal: i32) -> anyhow::Result<()> {
+        match self.send_group(signal) {
+            Ok(()) => Ok(()),
+            Err(error) if error.raw_os_error() == Some(libc::ESRCH) => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn send_group(&self, signal: i32) -> std::io::Result<()> {
+        use std::os::fd::AsRawFd as _;
+        // PIDFD_SIGNAL_PROCESS_GROUP binds the original group, including after leader reap.
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                self.0.as_raw_fd(),
+                signal,
+                std::ptr::null::<libc::siginfo_t>(),
+                4,
+            )
+        };
+        if result < 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+    pub(super) fn exited(&self) -> anyhow::Result<bool> {
+        use std::os::fd::AsRawFd as _;
+        let mut descriptor = libc::pollfd {
+            fd: self.0.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let result = unsafe { libc::poll(&mut descriptor, 1, 0) };
+        if result < 0 {
+            return Err(std::io::Error::last_os_error()).context("checking owned process exit");
+        }
+        Ok(result > 0)
+    }
+
+    pub(super) fn signal(&self, signal: i32) -> anyhow::Result<()> {
+        use std::os::fd::AsRawFd as _;
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                self.0.as_raw_fd(),
+                signal,
+                std::ptr::null::<libc::siginfo_t>(),
+                0,
+            )
+        };
+        if result < 0 {
+            let error = std::io::Error::last_os_error();
+            if !process_disappeared(&error) {
+                return Err(error).context("signalling owned process handle");
+            }
+        }
+        Ok(())
+    }
+}
+
+pub(super) fn runner_group_identities(
+    group: u32,
+) -> anyhow::Result<Vec<super::PrimeProcessIdentity>> {
+    use std::os::unix::fs::MetadataExt as _;
+    let mut result = Vec::new();
+    for entry in fs::read_dir("/proc")? {
+        let entry = entry?;
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+            continue;
+        };
+        let stat = match fs::read_to_string(entry.path().join("stat")) {
+            Ok(stat) => stat,
+            Err(error) if process_disappeared(&error) => continue,
+            Err(error) => {
+                let owner = entry.metadata().ok().map(|metadata| metadata.uid());
+                if foreign_process_permission_error(&error, owner, unsafe { libc::geteuid() }) {
+                    continue;
+                }
+                return Err(error).context("inspecting owned runner group");
+            }
+        };
+        let (_, tail) = stat.rsplit_once(") ").context("invalid process stat")?;
+        let mut fields = tail.split_ascii_whitespace();
+        let state = fields.next().context("missing process state")?;
+        let pgrp = fields
+            .nth(1)
+            .context("missing process group")?
+            .parse::<u32>()?;
+        if state != "Z" && pgrp == group {
+            let start = fields.nth(16).context("missing process birth identity")?;
+            result.push(super::PrimeProcessIdentity {
+                pid,
+                start_id: format!("proc:{start}"),
+            });
+        }
+    }
+    Ok(result)
+}
+
+pub(super) fn prime_processes(
+    marker: &str,
+    socket: &Path,
+    known: &[super::PrimeProcessIdentity],
+) -> anyhow::Result<Vec<super::PrimeProcessIdentity>> {
+    use std::io::Read as _;
+    let mut bytes = Vec::new();
+    let mut samples = Vec::new();
+    let socket = socket.as_os_str().as_encoded_bytes();
+    let read = |path: &Path, bytes: &mut Vec<u8>| -> std::io::Result<()> {
+        bytes.clear();
+        fs::File::open(path)?.read_to_end(bytes)?;
+        Ok(())
+    };
+    fs::metadata("/proc/self/stat").context("checking the Prime process census")?;
+    for entry in fs::read_dir("/proc")? {
+        let entry = entry?;
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+            continue;
+        };
+        if pid == std::process::id() {
+            continue;
+        }
+        let mut path = entry.path().join("stat");
+        if let Err(error) = read(&path, &mut bytes) {
+            if !process_disappeared(&error) && known.iter().any(|identity| identity.pid == pid) {
+                return Err(error).with_context(|| format!("inspecting owned Prime process {pid}"));
+            }
+            continue;
+        }
+        let offset = bytes
+            .windows(2)
+            .rposition(|pair| pair == b") ")
+            .context("invalid process stat")?;
+        let tail = std::str::from_utf8(&bytes[offset + 2..])?;
+        let mut fields = tail.split_ascii_whitespace();
+        let state = fields.next().context("missing process state")?;
+        let parent = fields.next().context("missing process parent")?.parse()?;
+        let start = fields.nth(17).context("missing process start identity")?;
+        if state == "Z" {
+            continue;
+        }
+        let identity = super::PrimeProcessIdentity {
+            pid,
+            start_id: format!("proc:{start}"),
+        };
+        path.set_file_name("environ");
+        let mut marked = read(&path, &mut bytes).is_ok()
+            && bytes
+                .split(|byte| *byte == 0)
+                .any(|entry| entry == marker.as_bytes());
+        if !marked {
+            path.set_file_name("cmdline");
+            marked = read(&path, &mut bytes).is_ok()
+                && bytes.split(|byte| *byte == 0).any(|entry| entry == socket);
+        }
+        samples.push(super::PrimeProcessSample {
+            identity,
+            parent,
+            marked,
+        });
+    }
+    for identity in known {
+        if !samples
+            .iter()
+            .any(|sample| sample.identity.pid == identity.pid)
+        {
+            let path = Path::new("/proc")
+                .join(identity.pid.to_string())
+                .join("stat");
+            match read(&path, &mut bytes) {
+                Ok(()) => anyhow::ensure!(
+                    bytes
+                        .windows(2)
+                        .rposition(|pair| pair == b") ")
+                        .is_some_and(|offset| bytes[offset + 2..].starts_with(b"Z ")),
+                    "owned Prime process {} omitted from census",
+                    identity.pid
+                ),
+                Err(error) if process_disappeared(&error) => {}
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("inspecting owned Prime process {}", identity.pid)
+                    })
+                }
+            }
+        }
+    }
+    super::select_stable_prime_processes(samples, known)
 }
 
 /// Sample system memory from `/proc` and `/sys`: a handful of small pseudo-file
@@ -355,6 +716,50 @@ fn find_process_in_group(pgrp: u32) -> Option<u32> {
     None
 }
 
+pub(super) fn foreground_arguments(shell_pid: u32) -> Vec<super::ProcessArguments> {
+    use std::io::Read;
+    let Some(foreground) = get_foreground_pid(shell_pid) else {
+        return Vec::new();
+    };
+    let group = unsafe { libc::getpgid(foreground as i32) };
+    if group < 0 {
+        return Vec::new();
+    }
+    collect_pid_tree(foreground)
+        .into_iter()
+        .filter_map(|pid| {
+            if unsafe { libc::getpgid(pid as i32) } != group {
+                return None;
+            }
+            let mut bytes = Vec::new();
+            fs::File::open(format!("/proc/{pid}/cmdline"))
+                .ok()?
+                .take(256 * 1024 + 1)
+                .read_to_end(&mut bytes)
+                .ok()?;
+            if bytes.len() > 256 * 1024 {
+                return None;
+            }
+            let argv: Vec<String> = bytes
+                .strip_suffix(&[0])
+                .unwrap_or(&bytes)
+                .split(|byte| *byte == 0)
+                .map(|word| std::str::from_utf8(word).map(str::to_owned))
+                .collect::<Result<_, _>>()
+                .ok()?;
+
+            let stdin = fs::read_link(format!("/proc/{pid}/fd/0")).ok();
+            let stdin_is_tty = stdin.map(|path| {
+                path.starts_with("/dev/pts")
+                    || path == std::path::Path::new("/dev/tty")
+                    || path == std::path::Path::new("/dev/console")
+                    || path.to_string_lossy().starts_with("/dev/tty")
+            });
+            Some(super::ProcessArguments { argv, stdin_is_tty })
+        })
+        .collect()
+}
+
 pub(super) fn parent_and_argv0(pid: u32) -> Option<(u32, String)> {
     let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     let ppid = u32::try_from(parse_stat_field(&stat, 3)?).ok()?;
@@ -448,6 +853,200 @@ mod tests {
     use super::*;
 
     #[test]
+    fn launch_executable_recovers_only_deleted_paths_with_a_live_replacement() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let directory = tempfile::tempdir().unwrap();
+        let installed = directory.path().join("aoe");
+        let deleted = directory.path().join("aoe (deleted)");
+        assert!(launch_executable(deleted.clone()).is_err());
+        fs::write(&installed, "#!/bin/sh\n").unwrap();
+        fs::set_permissions(&installed, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(launch_executable(deleted.clone()).unwrap(), installed);
+        fs::write(&deleted, "#!/bin/sh\n").unwrap();
+        assert_eq!(launch_executable(deleted.clone()).unwrap(), deleted);
+        fs::remove_file(&deleted).unwrap();
+        fs::set_permissions(&installed, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(launch_executable(deleted).is_err());
+    }
+
+    #[test]
+    fn reaped_prime_stat_is_absence_but_other_read_errors_are_not() {
+        use std::io::Read as _;
+        let mut child = Command::new("cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut stat = fs::File::open(format!("/proc/{}/stat", child.id())).unwrap();
+        drop(child.stdin.take());
+        child.wait().unwrap();
+        let error = stat.read_to_end(&mut Vec::new()).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::ESRCH));
+        assert!(process_disappeared(&error));
+        for (errno, gone) in [
+            (libc::ENOENT, true),
+            (libc::EACCES, false),
+            (libc::EIO, false),
+        ] {
+            assert_eq!(
+                process_disappeared(&std::io::Error::from_raw_os_error(errno)),
+                gone
+            );
+        }
+    }
+
+    #[test]
+    fn group_census_ignores_only_proven_foreign_permission_errors() {
+        for (errno, owner, expected) in [
+            (libc::EACCES, Some(1001), true),
+            (libc::EPERM, Some(1001), true),
+            (libc::EACCES, Some(1000), false),
+            (libc::EPERM, None, false),
+            (libc::EIO, Some(1001), false),
+        ] {
+            assert_eq!(
+                foreign_process_permission_error(
+                    &std::io::Error::from_raw_os_error(errno),
+                    owner,
+                    1000
+                ),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn prime_quiescence_never_declares_an_uninspectable_owned_process_absent() {
+        use std::io::{BufRead as _, Read as _, Write as _};
+        use std::os::unix::fs::PermissionsExt as _;
+        if std::env::var_os("AOE_PRIME_CENSUS_CHILD").is_some() {
+            assert_eq!(
+                unsafe { libc::prctl(libc::PR_SET_NAME, c"\xffowned".as_ptr(), 0, 0, 0) },
+                0
+            );
+            let signal = |message: &[u8]| {
+                let mut stdout = std::io::stdout().lock();
+                stdout.write_all(message).unwrap();
+                stdout.flush().unwrap();
+            };
+            signal(b"warm-ready\n");
+            std::io::stdin().read_exact(&mut [0]).unwrap();
+            assert_eq!(unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) }, 0);
+            signal(b"census-ready\n");
+            std::io::stdin().read_exact(&mut [0]).unwrap();
+            return;
+        }
+        struct OwnedChild(std::process::Child);
+        impl Drop for OwnedChild {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        struct OwnedRuntime(crate::process::prime::PrimeRuntime);
+        impl Drop for OwnedRuntime {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0.directory);
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(root.path());
+        let program = root.path().join("native-shutdown");
+        fs::write(&program, "#!/bin/sh\nprintf '%s' '{\"failed\":[]}'\n").unwrap();
+        fs::set_permissions(&program, fs::Permissions::from_mode(0o700)).unwrap();
+        let runtime = OwnedRuntime(
+            crate::process::prime::PrimeRuntime::new(program, root.path().join("agent"), None)
+                .unwrap(),
+        );
+        runtime.0.prepare().unwrap();
+        let cleanup = runtime.0.directory.join("cleanup");
+        let original = runtime.0.directory.join("cleanup.original");
+        fs::rename(&cleanup, &original).unwrap();
+        std::os::unix::fs::symlink(root.path(), &cleanup).unwrap();
+        assert!(runtime.0.cleanup().is_err());
+        assert!(runtime.0.directory.is_dir());
+        fs::remove_file(&cleanup).unwrap();
+        fs::rename(original, cleanup).unwrap();
+        let route = serde_json::to_string(&runtime.0).unwrap();
+        let proof_path = crate::process::worker_registry::workers_dir()
+            .unwrap()
+            .join(format!(
+                ".{}.prime-proof",
+                runtime.0.directory.file_name().unwrap().to_str().unwrap()
+            ));
+        let mut receipt: serde_json::Value =
+            serde_json::from_slice(&fs::read(&proof_path).unwrap()).unwrap();
+        receipt["settled"] = serde_json::json!(true);
+        fs::write(&proof_path, serde_json::to_vec(&receipt).unwrap()).unwrap();
+        let name = format!(
+            "{}::prime_quiescence_never_declares_an_uninspectable_owned_process_absent",
+            module_path!().split_once("::").unwrap().1
+        );
+        let mut child = OwnedChild(
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", &name, "--nocapture"])
+                .env("AOE_PRIME_CENSUS_CHILD", "1")
+                .env("TMPDIR", &runtime.0.directory)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+        let mut reader = std::io::BufReader::new(child.0.stdout.take().unwrap());
+        let mut ready = |expected: &str| {
+            let mut line = String::new();
+            loop {
+                assert!(
+                    reader.read_line(&mut line).unwrap() != 0,
+                    "owned probe exited before readiness"
+                );
+                if line.trim() == expected {
+                    break;
+                }
+                line.clear();
+            }
+        };
+        ready("warm-ready");
+        let stat = fs::read(format!("/proc/{}/stat", child.0.id())).unwrap();
+        let offset = stat.windows(2).rposition(|pair| pair == b") ").unwrap();
+        let start = std::str::from_utf8(&stat[offset + 2..])
+            .unwrap()
+            .split_ascii_whitespace()
+            .nth(19)
+            .unwrap();
+        let known = super::super::PrimeProcessIdentity {
+            pid: child.0.id(),
+            start_id: format!("proc:{start}"),
+        };
+        assert!(runtime.0.cleanup().is_err());
+        child.0.stdin.as_mut().unwrap().write_all(&[0]).unwrap();
+        ready("census-ready");
+        assert!(child.0.try_wait().unwrap().is_none());
+        let marker = format!("TMPDIR={}", runtime.0.directory.display());
+        let unbound = prime_processes(&marker, &runtime.0.socket(), &[]).unwrap();
+        assert!(
+            !unbound.iter().any(|identity| identity.pid == child.0.id()),
+            "UID alone assigned foreign ownership"
+        );
+        let owned =
+            prime_processes(&marker, &runtime.0.socket(), std::slice::from_ref(&known)).unwrap();
+        assert!(
+            owned.contains(&known),
+            "unreadable owned environment was treated as absence"
+        );
+        let fresh: crate::process::prime::PrimeRuntime = serde_json::from_str(&route).unwrap();
+        fresh.cleanup().unwrap();
+        assert!(
+            !child.0.wait().unwrap().success(),
+            "the attested process must actually exit, not merely disappear from the census"
+        );
+        let fresh: crate::process::prime::PrimeRuntime = serde_json::from_str(&route).unwrap();
+        fresh.cleanup().unwrap();
+        assert!(!runtime.0.directory.exists());
+    }
+
+    #[test]
     fn test_parse_stat_field() {
         // Example stat line (simplified)
         let stat = "1234 (bash) S 1233 1234 1234 34816 1234 4194304 1234 0 0 0";
@@ -491,5 +1090,601 @@ full avg10=0.10 avg60=0.20 avg300=0.30 total=42
         assert_eq!(parse_psi_some_avg10(""), None);
         // Only a `full` line, no `some` -> None.
         assert_eq!(parse_psi_some_avg10("full avg10=5.0 total=9"), None);
+    }
+}
+
+pub(super) fn effective_uid() -> u32 {
+    unsafe { libc::geteuid() }
+}
+pub(super) fn metadata_identity(metadata: &std::fs::Metadata) -> (u64, u64) {
+    use std::os::unix::fs::MetadataExt;
+    (metadata.dev(), metadata.ino())
+}
+
+pub(crate) mod runtime_io {
+    use std::ffi::{CStr, CString};
+    use std::fs::File;
+    use std::io::{self, Write};
+    use std::mem::MaybeUninit;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+    use std::path::{Path, PathBuf};
+
+    pub(crate) const REGULAR: u32 = libc::S_IFREG;
+    pub(crate) const DIRECTORY: u32 = libc::S_IFDIR;
+    pub(crate) const SOCKET: u32 = libc::S_IFSOCK;
+    pub(crate) const KIND_MASK: u32 = libc::S_IFMT;
+    pub(crate) const STICKY: u32 = libc::S_ISVTX;
+    pub(crate) enum DirectoryOpenFailure {
+        Symlink,
+        NotDirectory,
+        Permission,
+        Other,
+    }
+    pub(crate) fn directory_open_failure(error: &io::Error) -> DirectoryOpenFailure {
+        match error.raw_os_error() {
+            Some(libc::ELOOP) => DirectoryOpenFailure::Symlink,
+            Some(libc::ENOTDIR) => DirectoryOpenFailure::NotDirectory,
+            Some(libc::EACCES) | Some(libc::EPERM) => DirectoryOpenFailure::Permission,
+            _ => DirectoryOpenFailure::Other,
+        }
+    }
+    pub(crate) fn metadata_mode(metadata: &std::fs::Metadata) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode()
+    }
+    #[derive(Clone, Copy)]
+    pub(crate) struct Stat {
+        pub st_mode: u32,
+        pub st_uid: u32,
+        pub st_dev: u64,
+        pub st_ino: u64,
+        pub st_nlink: libc::nlink_t,
+    }
+    fn stat_value(stat: libc::stat) -> Stat {
+        Stat {
+            st_mode: stat.st_mode,
+            st_uid: stat.st_uid,
+            st_dev: stat.st_dev,
+            st_ino: stat.st_ino,
+            st_nlink: stat.st_nlink,
+        }
+    }
+    fn owned(fd: RawFd) -> io::Result<OwnedFd> {
+        if fd < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+        }
+    }
+    fn name(value: &str) -> io::Result<CString> {
+        CString::new(value).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))
+    }
+    #[derive(Clone, Copy)]
+    pub(crate) enum DirectoryAccess {
+        Search,
+        Read,
+    }
+
+    pub(crate) fn open_directory(path: &Path, access: DirectoryAccess) -> io::Result<OwnedFd> {
+        use nix::NixPath;
+        path.with_nix_path(|path| open_directory_at(libc::AT_FDCWD, path, access))?
+    }
+    pub(crate) fn open_directory_at(
+        dir: RawFd,
+        name: &CStr,
+        access: DirectoryAccess,
+    ) -> io::Result<OwnedFd> {
+        let flags = libc::O_DIRECTORY
+            | libc::O_CLOEXEC
+            | match access {
+                DirectoryAccess::Search => libc::O_PATH,
+                DirectoryAccess::Read => libc::O_RDONLY,
+            };
+        owned(unsafe { libc::openat(dir, name.as_ptr(), flags) })
+    }
+    pub(crate) fn open_readonly_at(dir: RawFd, name: &CStr) -> io::Result<File> {
+        owned(unsafe {
+            libc::openat(
+                dir,
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        })
+        .map(File::from)
+    }
+    pub(crate) fn open_lock_at(dir: RawFd, name: &CStr) -> io::Result<File> {
+        owned(unsafe {
+            libc::openat(
+                dir,
+                name.as_ptr(),
+                libc::O_RDWR | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0o600 as libc::c_uint,
+            )
+        })
+        .map(File::from)
+    }
+    pub(crate) fn stat_file(fd: RawFd) -> io::Result<Stat> {
+        let mut stat = MaybeUninit::<libc::stat>::uninit();
+        if unsafe { libc::fstat(fd, stat.as_mut_ptr()) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(stat_value(unsafe { stat.assume_init() }))
+    }
+    pub(crate) fn stat_entry(dir: RawFd, value: &str) -> io::Result<Stat> {
+        let value = name(value)?;
+        let mut stat = MaybeUninit::<libc::stat>::uninit();
+        if unsafe {
+            libc::fstatat(
+                dir,
+                value.as_ptr(),
+                stat.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(stat_value(unsafe { stat.assume_init() }))
+    }
+    pub(crate) fn set_file_mode(fd: RawFd, mode: u32) -> io::Result<()> {
+        if unsafe { libc::fchmod(fd, mode) } == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+    pub(crate) fn set_entry_mode(dir: RawFd, value: &str, mode: u32) -> io::Result<()> {
+        let value = name(value)?;
+        if unsafe { libc::fchmodat(dir, value.as_ptr(), mode, 0) } == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+    pub(crate) fn unlink_entry(dir: RawFd, value: &str) -> io::Result<()> {
+        let value = name(value)?;
+        if unsafe { libc::unlinkat(dir, value.as_ptr(), 0) } == 0 {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() == io::ErrorKind::NotFound {
+            Ok(())
+        } else {
+            Err(error)
+        }
+    }
+    pub(crate) fn sync_directory(dir: RawFd) {
+        let _ = unsafe { libc::fsync(dir) };
+    }
+    pub(crate) fn anchored_path(dir: RawFd, child: &str) -> io::Result<PathBuf> {
+        let base = PathBuf::from(format!("/proc/self/fd/{dir}"));
+        if !base.exists() {
+            return Err(io::Error::from(io::ErrorKind::NotFound));
+        }
+        Ok(base.join(child))
+    }
+    pub(crate) fn read_directory(dir: RawFd) -> io::Result<std::fs::ReadDir> {
+        std::fs::read_dir(anchored_path(dir, ".")?)
+    }
+    pub(crate) fn write_atomic(
+        dir: RawFd,
+        final_name: &str,
+        temporary: &str,
+        bytes: &[u8],
+    ) -> io::Result<()> {
+        let temporary_name = name(temporary)?;
+        let final_name = name(final_name)?;
+        let fd = unsafe {
+            libc::openat(
+                dir,
+                temporary_name.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0o600 as libc::c_uint,
+            )
+        };
+        let mut file = File::from(owned(fd)?);
+        let result = (|| {
+            set_file_mode(file.as_raw_fd(), 0o600)?;
+            file.write_all(bytes)?;
+            file.sync_all()?;
+            if unsafe { libc::renameat(dir, temporary_name.as_ptr(), dir, final_name.as_ptr()) }
+                != 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        })();
+        drop(file);
+        if result.is_err() {
+            let _ = unlink_entry(dir, temporary);
+        }
+        result
+    }
+    pub(crate) struct PeerCredentials {
+        pub uid: u32,
+        pub pid: u32,
+    }
+    pub(crate) fn peer_credentials(fd: RawFd) -> io::Result<PeerCredentials> {
+        let mut credentials = MaybeUninit::<libc::ucred>::uninit();
+        let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+        if unsafe {
+            libc::getsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_PEERCRED,
+                credentials.as_mut_ptr().cast(),
+                &mut length,
+            )
+        } != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        if length != std::mem::size_of::<libc::ucred>() as libc::socklen_t {
+            return Err(io::Error::from(io::ErrorKind::InvalidData));
+        }
+        let credentials = unsafe { credentials.assume_init() };
+        Ok(PeerCredentials {
+            uid: credentials.uid,
+            pid: credentials.pid as u32,
+        })
+    }
+    pub(crate) fn boot_id() -> Option<String> {
+        super::boot_id().filter(|value| valid_boot_id(value))
+    }
+    pub(crate) enum ProcessStart {
+        Ticks(String),
+        Absent,
+        Unprovable,
+    }
+    #[cfg(test)]
+    static PROC_READ_UNPROVABLE: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    #[cfg(test)]
+    pub(crate) fn fail_next_proc_read() {
+        PROC_READ_UNPROVABLE.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+    pub(crate) fn process_start_ticks(pid: u32) -> ProcessStart {
+        #[cfg(test)]
+        if PROC_READ_UNPROVABLE.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            return ProcessStart::Unprovable;
+        }
+        let stat = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Ok(value) => value,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return ProcessStart::Absent,
+            Err(_) => return ProcessStart::Unprovable,
+        };
+        let Some(close) = stat.rfind(')') else {
+            return ProcessStart::Unprovable;
+        };
+        let mut fields = stat[close + 1..].split_whitespace();
+        if matches!(fields.next(), Some("Z" | "X")) {
+            return ProcessStart::Absent;
+        }
+        match fields
+            .nth(18)
+            .filter(|value| !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()))
+        {
+            Some(ticks) => ProcessStart::Ticks(ticks.to_owned()),
+            None => ProcessStart::Unprovable,
+        }
+    }
+    pub(crate) fn process_start_identity(pid: u32) -> Option<String> {
+        let boot = boot_id()?;
+        let ProcessStart::Ticks(ticks) = process_start_ticks(pid) else {
+            return None;
+        };
+        Some(format!("linux:v1:{boot}:{ticks}"))
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum ProcessIdentityState {
+        Live,
+        Dead,
+        Unprovable,
+    }
+
+    fn valid_boot_id(value: &str) -> bool {
+        value.len() == 36
+            && value.bytes().enumerate().all(|(index, byte)| match index {
+                8 | 13 | 18 | 23 => byte == b'-',
+                _ => byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte),
+            })
+    }
+
+    fn parse_process_identity(value: &str) -> Option<(&str, &str)> {
+        let (boot, ticks) = value.strip_prefix("linux:v1:")?.split_once(':')?;
+        (valid_boot_id(boot)
+            && !ticks.is_empty()
+            && ticks.bytes().all(|byte| byte.is_ascii_digit()))
+        .then_some((boot, ticks))
+    }
+
+    pub(crate) fn valid_process_start_identity(value: &str) -> bool {
+        parse_process_identity(value).is_some()
+    }
+
+    pub(crate) fn process_identity_state(pid: u32, recorded: &str) -> ProcessIdentityState {
+        let Some((recorded_boot, recorded_ticks)) = parse_process_identity(recorded) else {
+            return ProcessIdentityState::Unprovable;
+        };
+        let Some(boot) = boot_id() else {
+            return ProcessIdentityState::Unprovable;
+        };
+        if boot != recorded_boot {
+            return ProcessIdentityState::Dead;
+        }
+        match process_start_ticks(pid) {
+            ProcessStart::Ticks(ticks) if ticks == recorded_ticks => ProcessIdentityState::Live,
+            ProcessStart::Ticks(_) | ProcessStart::Absent => ProcessIdentityState::Dead,
+            ProcessStart::Unprovable => ProcessIdentityState::Unprovable,
+        }
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    pub(crate) enum AclError {
+        NamedWrite,
+        Unverifiable,
+    }
+    pub(crate) const ACL_VERSION: u32 = 2;
+    pub(crate) const ACL_ENTRY_LEN: usize = 8;
+    pub(crate) const ACL_USER_OBJ: u8 = 0x01;
+    pub(crate) const ACL_USER: u8 = 0x02;
+    pub(crate) const ACL_GROUP_OBJ: u8 = 0x04;
+    pub(crate) const ACL_GROUP: u8 = 0x08;
+    pub(crate) const ACL_MASK: u8 = 0x10;
+    pub(crate) const ACL_OTHER: u8 = 0x20;
+    pub(crate) const ACL_WRITE: u8 = 0x02;
+    pub(crate) const ACL_PERMISSION_MASK: u8 = 0x07;
+    pub(crate) fn validate_posix_acl(fd: RawFd, access: DirectoryAccess) -> Result<(), AclError> {
+        let name = c"system.posix_acl_access";
+        // O_PATH needs a pathname operation, anchored to the retained descriptor.
+        let path =
+            matches!(access, DirectoryAccess::Search).then(|| format!("/proc/self/fd/{fd}\0"));
+        let read = |buffer: *mut libc::c_void, length: usize| unsafe {
+            match &path {
+                Some(path) => libc::getxattr(path.as_ptr().cast(), name.as_ptr(), buffer, length),
+                None => libc::fgetxattr(fd, name.as_ptr(), buffer, length),
+            }
+        };
+        let needed = read(std::ptr::null_mut(), 0);
+        if needed < 0 {
+            return match io::Error::last_os_error().raw_os_error() {
+                Some(libc::ENODATA | libc::ENOTSUP) => Ok(()),
+                _ => Err(AclError::Unverifiable),
+            };
+        }
+        let mut value = vec![0u8; needed as usize];
+        let actual = read(value.as_mut_ptr().cast(), value.len());
+        if actual < 0 {
+            return Err(AclError::Unverifiable);
+        }
+        value.truncate(actual as usize);
+        validate_acl_value(&value)
+    }
+    pub(crate) fn validate_acl_value(value: &[u8]) -> Result<(), AclError> {
+        let header = value.get(..4).ok_or(AclError::Unverifiable)?;
+        if u32::from_le_bytes(header.try_into().unwrap()) != ACL_VERSION {
+            return Err(AclError::Unverifiable);
+        }
+        let (entries, remainder) = value[4..].as_chunks::<ACL_ENTRY_LEN>();
+        if !remainder.is_empty() {
+            return Err(AclError::Unverifiable);
+        }
+        for entry in entries {
+            let tag = u16::from_le_bytes([entry[0], entry[1]]);
+            let permissions = u16::from_le_bytes([entry[2], entry[3]]);
+            let Ok(tag) = u8::try_from(tag) else {
+                return Err(AclError::Unverifiable);
+            };
+            if !matches!(
+                tag,
+                ACL_USER_OBJ | ACL_USER | ACL_GROUP_OBJ | ACL_GROUP | ACL_MASK | ACL_OTHER
+            ) || permissions & !u16::from(ACL_PERMISSION_MASK) != 0
+            {
+                return Err(AclError::Unverifiable);
+            }
+            if matches!(tag, ACL_USER | ACL_GROUP) && permissions & u16::from(ACL_WRITE) != 0 {
+                return Err(AclError::NamedWrite);
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_acl(dir: &Path, value: &[u8]) {
+        use std::os::unix::ffi::OsStrExt;
+
+        let path = CString::new(dir.as_os_str().as_bytes()).expect("path");
+        let name = c"system.posix_acl_access";
+        let result = unsafe {
+            libc::setxattr(
+                path.as_ptr(),
+                name.as_ptr(),
+                value.as_ptr().cast(),
+                value.len(),
+                0,
+            )
+        };
+        assert_eq!(
+            result,
+            0,
+            "set the access ACL: {}",
+            io::Error::last_os_error()
+        );
+    }
+
+    #[cfg(test)]
+    pub(crate) fn read_acl(dir: &Path) -> Vec<u8> {
+        let file = File::open(dir).expect("open the directory");
+        let name = c"system.posix_acl_access";
+        let needed =
+            unsafe { libc::fgetxattr(file.as_raw_fd(), name.as_ptr(), std::ptr::null_mut(), 0) };
+        assert!(needed > 0, "the directory must carry the access ACL");
+        let mut value = vec![0u8; needed as usize];
+        let read = unsafe {
+            libc::fgetxattr(
+                file.as_raw_fd(),
+                name.as_ptr(),
+                value.as_mut_ptr().cast(),
+                value.len(),
+            )
+        };
+        assert!(read > 0, "read the access ACL back");
+        value.truncate(read as usize);
+        value
+    }
+
+    #[cfg(test)]
+    pub(crate) struct Umask {
+        previous: libc::mode_t,
+        env_lock: Option<std::sync::MutexGuard<'static, ()>>,
+    }
+
+    #[cfg(test)]
+    impl Umask {
+        pub(crate) fn set(mask: libc::mode_t) -> Self {
+            let env_lock = crate::test_env_lock::acquire_env_lock(|| {
+                eprintln!(
+                    "waiting for the environment lock: another test holds a process-wide state"
+                )
+            });
+            Self {
+                previous: unsafe { libc::umask(mask) },
+                env_lock,
+            }
+        }
+    }
+
+    #[cfg(test)]
+    impl Drop for Umask {
+        fn drop(&mut self) {
+            unsafe { libc::umask(self.previous) };
+            crate::test_env_lock::release_env_lock(self.env_lock.is_some());
+        }
+    }
+}
+
+#[cfg(test)]
+mod runtime_identity_tests {
+    use super::runtime_io::*;
+
+    #[test]
+    #[serial_test::serial]
+    fn process_identities_distinguish_live_dead_and_unprovable() {
+        let pid = std::process::id();
+        let live = process_start_identity(pid).expect("current process identity");
+        assert!(valid_process_start_identity(&live));
+        assert_eq!(
+            process_identity_state(pid, &live),
+            ProcessIdentityState::Live
+        );
+
+        let (prefix, ticks) = live.rsplit_once(':').unwrap();
+        let other_ticks = if ticks == "0" { "1" } else { "0" };
+        assert_eq!(
+            process_identity_state(pid, &format!("{prefix}:{other_ticks}")),
+            ProcessIdentityState::Dead
+        );
+        let mut other_boot = boot_id().unwrap();
+        let first = if other_boot.starts_with('0') {
+            "1"
+        } else {
+            "0"
+        };
+        other_boot.replace_range(..1, first);
+        assert_eq!(
+            process_identity_state(pid, &format!("linux:v1:{other_boot}:1")),
+            ProcessIdentityState::Dead
+        );
+        for invalid in [
+            format!("darwin:v1:{other_boot}:1"),
+            format!("linux:v2:{other_boot}:1"),
+            format!("linux:v1:{other_boot}:123 "),
+            format!("linux:v1:{other_boot}:١"),
+            "linux:v1:AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE:1".into(),
+            String::new(),
+        ] {
+            assert_eq!(
+                process_identity_state(pid, &invalid),
+                ProcessIdentityState::Unprovable,
+                "{invalid:?}"
+            );
+        }
+        fail_next_proc_read();
+        assert_eq!(
+            process_identity_state(pid, &live),
+            ProcessIdentityState::Unprovable
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn stopped_publishers_remain_live_but_unreaped_zombies_are_dead() {
+        use std::process::{Child, Command, Stdio};
+        use std::time::{Duration, Instant};
+
+        struct Reap(Child);
+        impl Drop for Reap {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        fn observe_without_reaping(pid: u32, event: libc::c_int) {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+                // WNOWAIT establishes the transition without releasing the PID.
+                let result = unsafe {
+                    libc::waitid(
+                        libc::P_PID,
+                        pid,
+                        info.as_mut_ptr(),
+                        event | libc::WNOWAIT | libc::WNOHANG,
+                    )
+                };
+                if result == -1 {
+                    let error = std::io::Error::last_os_error();
+                    assert_eq!(error.raw_os_error(), Some(libc::EINTR), "{error}");
+                } else if unsafe { info.assume_init().si_pid() } == pid as libc::pid_t {
+                    return;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "process {pid} did not change state"
+                );
+                std::thread::yield_now();
+            }
+        }
+
+        let mut child = Reap(
+            Command::new("/bin/cat")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let pid = child.0.id();
+        let identity = process_start_identity(pid).unwrap();
+        assert_eq!(
+            process_identity_state(pid, &identity),
+            ProcessIdentityState::Live
+        );
+        assert_eq!(unsafe { libc::kill(pid as libc::pid_t, libc::SIGSTOP) }, 0);
+        observe_without_reaping(pid, libc::WSTOPPED);
+        assert_eq!(
+            process_identity_state(pid, &identity),
+            ProcessIdentityState::Live
+        );
+
+        drop(child.0.stdin.take());
+        assert_eq!(unsafe { libc::kill(pid as libc::pid_t, libc::SIGCONT) }, 0);
+        observe_without_reaping(pid, libc::WEXITED);
+        assert_eq!(
+            process_identity_state(pid, &identity),
+            ProcessIdentityState::Dead
+        );
+        child.0.wait().unwrap();
     }
 }

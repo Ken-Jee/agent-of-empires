@@ -151,6 +151,7 @@ pub(crate) async fn spawn_structured_session(
             progress,
         } = spec;
 
+
         let sandbox_image = sandbox_image.unwrap_or_else(|| {
             if config.sandbox.default_image.is_empty() {
                 "ubuntu:latest".to_string()
@@ -607,9 +608,7 @@ pub(crate) async fn spawn_structured_session(
         let post_hooks: anyhow::Result<()> = (|| {
             if instance.is_structured() {
                 let _ownership = instance.reacquire_launch_locks_after_hooks(store, generation, Ok(()))?;
-                acp_reservation = match runtime.block_on(worker_state.acp_supervisor.begin_resume(
-                    &instance.id, crate::acp::supervisor::ResumeKind::Spawn,
-                )) {
+                acp_reservation = match runtime.block_on(worker_state.acp_supervisor.begin_resume(&instance.id, crate::acp::supervisor::ResumeKind::Spawn, crate::process::worker_registry::ResumeAuthority::Explicit)) {
                     Ok(crate::acp::supervisor::ResumeReservationOutcome::Reserved(lease)) => Some(lease),
                     Err(crate::acp::supervisor::SupervisorError::CapacityFull { .. }) => None,
                     Ok(crate::acp::supervisor::ResumeReservationOutcome::AlreadyPresent) => {

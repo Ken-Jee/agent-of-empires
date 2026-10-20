@@ -36,3 +36,6 @@ const INDENTS: [&str; 10] = [
 pub(crate) fn get_indent(depth: usize) -> &'static str {
     INDENTS.get(depth).copied().unwrap_or(INDENTS[9])
 }
+
+/// Agent-view marker for a session whose paired terminal is running.
+pub(in crate::tui) const ICON_TERMINAL: &str = ">_";

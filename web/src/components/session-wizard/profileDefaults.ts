@@ -13,12 +13,12 @@ export type ProfileDefaults = Omit<Extract<Action, { type: "APPLY_PROFILE_DEFAUL
  * neither names a tool, since the reducer keeps the current tool for an empty one.
  */
 export function profileDefaults(settings: Settings, preferredTool: string, currentTool: string): ProfileDefaults {
-  const session = settings.session as Obj;
-  const sandbox = settings.sandbox as Obj;
-  const worktree = settings.worktree as Obj;
+  const session = settings.session;
+  const sandbox = settings.sandbox;
+  const worktree = settings.worktree;
   const tool = preferredTool || (session?.default_tool as string) || "";
   // `acp_defaults` lives in the [acp] section, not [session] (moved by v019).
-  const acp = ((settings.acp as Obj)?.acp_defaults as Obj)?.[tool || currentTool] as Obj;
+  const acp = (settings.acp?.acp_defaults as Obj)?.[tool || currentTool] as Obj;
   return {
     yoloMode: (session?.yolo_mode_default as boolean) ?? false,
     sandboxEnabled: (sandbox?.enabled_by_default as boolean) ?? false,
@@ -31,6 +31,6 @@ export function profileDefaults(settings: Settings, preferredTool: string, curre
     agentModel: typeof acp?.model === "string" ? acp.model : "",
     agentEffort: typeof acp?.effort === "string" ? acp.effort : "",
     // `auto` (or unset) keeps the dashboard's own default, the structured view.
-    useStructuredView: (settings.acp as Obj)?.default_new_session_view !== "terminal",
+    useStructuredView: settings.acp?.default_new_session_view !== "terminal",
   };
 }

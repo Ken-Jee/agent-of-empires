@@ -534,6 +534,14 @@ async fn delete_group_owned(
                 .filter(|row| belongs(&row.group_path, &body.group.path))
             {
                 row.group_path.clear();
+                if matches!(body.mode, DeleteGroupMode::MoveToParent) {
+                    row.group_path.push_str(
+                        body.group
+                            .path
+                            .rsplit_once('/')
+                            .map_or("", |(parent, _)| parent),
+                    );
+                }
                 detached.push(row.clone());
             }
             *groups = tree.get_all_groups();

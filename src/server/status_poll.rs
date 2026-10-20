@@ -5,9 +5,11 @@ use crate::session::Status;
 use std::sync::Arc;
 
 use super::idle_reap::reap_idle_sessions;
+#[cfg(test)]
+use super::reload::load_all_profiles;
 use super::reload::{
-    apply_tick_status_decisions, load_all_profiles, observed_transitions,
-    reload_state_instances_from_disk, seed_tick_tracking, PriorTickTracking,
+    apply_tick_status_decisions, observed_transitions, reload_state_instances_from_disk,
+    seed_tick_tracking, PriorTickTracking,
 };
 use super::session_identity::drain_session_id_updates_in_state;
 use super::sleep_inhibit::update_sleep_inhibit;
@@ -432,27 +434,28 @@ pub(super) async fn status_poll_loop(
             }
         }
         first = false;
-        // Fence every input, including the prior runtime observations.
         let namespace = state.profile_namespace.read().await;
         let reload_lane = state.reload_lane.lock().await;
         let snapshot_guard = state.session_service.disk_reload_guard().await;
         let read_epoch = state
             .mutation_epoch
             .load(std::sync::atomic::Ordering::SeqCst);
-        let prev: std::collections::HashMap<String, Status> = {
+        let (mut prev, prev_tracking, supplementary_prev) = {
             let instances = state.instances.read().await;
-            instances
+            let cache = state
+                .runtime_read_cache
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let prev: std::collections::HashMap<String, Status> = instances
                 .iter()
                 .map(|row| (row.id.clone(), row.status))
-                .collect()
-        };
-        // Carry detection confirmations and the Unknown escalation clock across disk loads.
-        let prev_tracking: std::collections::HashMap<String, PriorTickTracking> = {
-            let instances = state.instances.read().await;
-            instances
+                .collect();
+            let tracking: std::collections::HashMap<String, PriorTickTracking> = instances
                 .iter()
-                .map(|i| (i.id.clone(), PriorTickTracking::of(i)))
-                .collect()
+                .map(|row| (row.id.clone(), PriorTickTracking::of(row)))
+                .collect();
+            let supplementary = super::reload::supplementary_tick_tracking(&cache);
+            (prev, tracking, supplementary)
         };
 
         // Snapshot suppression BEFORE `batch_pane_metadata()` so a worker that unmarks
@@ -464,11 +467,10 @@ pub(super) async fn status_poll_loop(
         let file_watch_for_poll = state.file_watch.clone();
         let sandbox_health = health.borrow().clone();
         let updated = tokio::task::spawn_blocking(move || {
-            let loaded = load_all_profiles(&file_watch_for_poll);
+            let (mut loaded, metadata) =
+                super::reload::load_profiles_for_reload(&file_watch_for_poll);
             drop(snapshot_guard);
-            let loaded = loaded?;
-            let mut instances = loaded.instances;
-            seed_tick_tracking(&mut instances, prev_tracking);
+            seed_tick_tracking(&mut loaded.instances, &prev_tracking);
             crate::tmux::refresh_session_cache();
             let pane_metadata = crate::tmux::batch_pane_metadata();
             if let Err(error) = &pane_metadata {
@@ -479,47 +481,44 @@ pub(super) async fn status_poll_loop(
                 );
             }
             apply_tick_status_decisions(
-                &mut instances,
-                &prev,
+                &mut loaded.instances,
+                &mut prev,
+                &prev_tracking,
                 &suppressed_ids,
                 pane_metadata.as_ref().ok(),
                 &sandbox_health,
             );
-            let legacy_scope = super::pane::legacy_tool_scope_for_panes(
-                &instances,
-                &loaded.metadata.raw_tool_names,
+            if let Ok(metadata) = &metadata {
+                let legacy_scope = super::pane::legacy_tool_scope_for_panes(
+                    &loaded.instances,
+                    &metadata.raw_tool_names,
+                    pane_metadata.as_ref().ok(),
+                );
+                for row in &mut loaded.instances {
+                    let tools = metadata
+                        .auxiliary_tools
+                        .get(&row.source_profile)
+                        .map(Vec::as_slice)
+                        .unwrap_or_default();
+                    super::pane::sample_panes(
+                        row,
+                        tools,
+                        pane_metadata.as_ref().ok(),
+                        legacy_scope.as_ref(),
+                    );
+                }
+            }
+            super::reload::apply_supplementary_tick(
+                &mut loaded.cache,
+                &supplementary_prev,
                 pane_metadata.as_ref().ok(),
             );
-            for row in &mut instances {
-                let tools = loaded
-                    .metadata
-                    .auxiliary_tools
-                    .get(&row.source_profile)
-                    .map(Vec::as_slice)
-                    .unwrap_or_default();
-                super::pane::sample_panes(
-                    row,
-                    tools,
-                    pane_metadata.as_ref().ok(),
-                    legacy_scope.as_ref(),
-                );
-            }
-            Ok::<_, super::reload::ReloadFailure>((
-                instances,
-                loaded.metadata,
-                live_structured_worker_records(),
-                prev,
-            ))
+            (loaded, metadata, live_structured_worker_records(), prev)
         })
         .await;
 
         let updated = match updated {
-            Ok(Ok(updated)) => updated,
-            Ok(Err(error)) => {
-                tracing::warn!(target: "server.status", %error, "retaining last complete session state after reload failure");
-                state.mark_reload_failure(error.health).await;
-                continue;
-            }
+            Ok(updated) => updated,
             Err(error) => {
                 tracing::error!(target: "server.status", %error, "session reload task failed");
                 state
@@ -532,11 +531,12 @@ pub(super) async fn status_poll_loop(
             }
         };
         {
-            let (instances, metadata, live_worker_records, prev) = updated;
+            let (mut loaded, metadata, live_worker_records, prev) = updated;
+            let instances = &mut loaded.instances;
             let unread_enabled = crate::session::unread_enabled();
             let mut bundles: std::collections::HashMap<String, PassiveTransitionWrites> =
                 std::collections::HashMap::new();
-            for (idx, old) in observed_transitions(&instances, &prev) {
+            for (idx, old) in observed_transitions(instances, &prev) {
                 let inst = &instances[idx];
 
                 let decision = decide_passive_transition(inst, old, unread_enabled);
@@ -553,7 +553,7 @@ pub(super) async fn status_poll_loop(
             }
             let changes = reload_state_instances_from_disk(
                 &state,
-                instances,
+                loaded,
                 live_worker_records,
                 StatusSource::TmuxApplied,
                 read_epoch,

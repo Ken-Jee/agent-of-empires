@@ -114,8 +114,7 @@ struct ManagedCaptureLease(std::fs::File);
 
 impl Drop for ManagedCaptureLease {
     fn drop(&mut self) {
-        // Spelled through the trait: `File`'s inherent `unlock` is newer than
-        // this crate's MSRV.
+        // Through the trait, so the release matches the `fs2` lock.
         let _ = fs2::FileExt::unlock(&self.0);
     }
 }
@@ -665,9 +664,9 @@ impl Instance {
                 let Some(plan) = prime_plan else {
                     return Ok(PollerStart::NotApplicable);
                 };
-                let preferred_sidecar = self.prime_root_sidecar_poll_fn(plan.clone());
+                let root_publication = self.prime_root_poll_fn(plan.clone());
                 Box::new(prime_agent_poll_fn_sandboxed(
-                    preferred_sidecar,
+                    root_publication,
                     plan,
                     self.id.clone(),
                     capture_floor_ms,
@@ -930,7 +929,12 @@ impl Instance {
         &mut self,
         storage: &dyn crate::session::SessionStore,
     ) -> anyhow::Result<()> {
-        let flush = self.flush_published_conversation(storage);
+        let native_prime = self.prime_runtime().is_some();
+        let flush = if native_prime {
+            None
+        } else {
+            self.flush_published_conversation(storage)
+        };
         if !matches!(flush, Some(SidWrite::Failed)) {
             if let Ok(rows) = storage.load() {
                 if let Some(row) = rows.into_iter().find(|row| row.id == self.id) {
@@ -972,6 +976,17 @@ impl Instance {
             _ => Ok(()),
         };
         self.session_id_poller = None;
+        if native_prime
+            && result.is_ok()
+            && matches!(
+                self.flush_published_conversation(storage),
+                Some(SidWrite::Failed)
+            )
+        {
+            return Err(anyhow::anyhow!(
+                "could not persist final native Prime publication"
+            ));
+        }
         result
     }
 }
@@ -1365,8 +1380,12 @@ mod tests {
             crate::session::sync::drain_and_persist_session_ids(instances, &file_watch).touched()
         };
         let forkable = |row: &Instance| {
-            crate::session::fork::terminal_fork_seed(row.fork_parent_ref().unwrap(), "child".into())
-                .is_ok()
+            crate::session::fork::terminal_fork_seed(
+                row.fork_parent_ref().unwrap(),
+                "child".into(),
+                row.is_sandboxed(),
+            )
+            .is_ok()
         };
 
         assert!(

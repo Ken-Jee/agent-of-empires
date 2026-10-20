@@ -227,6 +227,22 @@ pub(crate) fn replace_file_no_follow(root: &Path, rel: &Path, content: &[u8]) ->
     )
 }
 
+/// Windows has no `O_NOFOLLOW` walk here; the sandbox this guards against is
+/// Linux and macOS only. Kept so the module compiles.
+#[cfg(not(unix))]
+pub(crate) fn replace_file_no_follow(root: &Path, rel: &Path, content: &[u8]) -> Result<()> {
+    let path = root.join(rel);
+    let dir = path
+        .parent()
+        .ok_or_else(|| anyhow!("replace_file_no_follow needs a path with a parent"))?;
+    fs::create_dir_all(dir)?;
+    let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
+    tmp.write_all(content)?;
+    tmp.as_file().sync_all()?;
+    tmp.persist(&path)?;
+    Ok(())
+}
+
 /// [`replace_file_no_follow`] with an explicit mode, for content that must not
 /// stay world readable.
 #[cfg(unix)]
@@ -394,14 +410,8 @@ pub(crate) fn read_file_no_follow(root: &Path, rel: &Path) -> Result<Option<Stri
     Ok(file.read_to_string(&mut content).ok().map(|_| content))
 }
 
-/// Serial for the per-attempt temp name in [`replace_file_no_follow`], so two
-/// writers in one process cannot pick the same one inside a clock tick.
-#[cfg(unix)]
-static NO_FOLLOW_TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// Windows keeps the check-then-open the unix arm closes; the sandbox this
-/// guards against is Linux and macOS only. Kept so the module compiles. `rel`
-/// is still validated, so the two arms agree on what a caller may ask for.
+/// Windows keeps the check-then-open the unix arm closes; the sandbox this guards against
+/// is Linux and macOS only.
 #[cfg(not(unix))]
 pub(crate) fn read_file_no_follow(root: &Path, rel: &Path) -> Result<Option<String>> {
     split_no_follow_rel(rel, "read_file_no_follow")?;
@@ -412,21 +422,10 @@ pub(crate) fn read_file_no_follow(root: &Path, rel: &Path) -> Result<Option<Stri
         .flatten())
 }
 
-/// Windows has no `O_NOFOLLOW` walk here; the sandbox this guards against is
-/// Linux and macOS only. Kept so the module compiles.
-#[cfg(not(unix))]
-pub(crate) fn replace_file_no_follow(root: &Path, rel: &Path, content: &[u8]) -> Result<()> {
-    let path = root.join(rel);
-    let dir = path
-        .parent()
-        .ok_or_else(|| anyhow!("replace_file_no_follow needs a path with a parent"))?;
-    fs::create_dir_all(dir)?;
-    let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
-    tmp.write_all(content)?;
-    tmp.as_file().sync_all()?;
-    tmp.persist(&path)?;
-    Ok(())
-}
+/// Serial for the per-attempt temp name in [`replace_file_no_follow`], so two
+/// writers in one process cannot pick the same one inside a clock tick.
+#[cfg(unix)]
+static NO_FOLLOW_TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Resolve `path` through a symlink chain to the underlying target file. Used
 /// for user-facing config files where users symlink to a dotfiles repo:
@@ -474,7 +473,7 @@ pub(crate) fn resolve_symlink_chain(path: &Path) -> Result<PathBuf> {
 pub(crate) fn locked_update<T, R, E>(
     path: &Path,
     parse: impl FnOnce(&str) -> Result<T>,
-    serialize: impl FnOnce(&T) -> Result<String>,
+    serialize: impl Fn(&T) -> Result<String>,
     mutate: impl FnOnce(&mut T) -> std::result::Result<R, E>,
 ) -> Result<std::result::Result<R, E>>
 where
@@ -502,7 +501,10 @@ where
 
     let result = mutate(&mut value);
     if result.is_ok() {
-        atomic_write(path, serialize(&value)?.as_bytes())?;
+        let content = serialize(&value)?;
+        atomic_write(path, content.as_bytes())?;
+        // Best-effort here, unlike atomic_write's "every fallible mutation before the
+        // rename" contract.
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -510,6 +512,36 @@ where
         }
     }
     Ok(result)
+}
+
+/// Missing or blank registries are empty; unreadable and nonregular paths are errors.
+fn read_nonempty(path: &Path) -> Result<Option<String>> {
+    open_regular_registry(path)?
+        .map(read_registry_file)
+        .transpose()
+        .map(Option::flatten)
+}
+
+fn open_regular_registry(path: &Path) -> Result<Option<fs::File>> {
+    let file = match crate::process::open_read_nonblocking(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+        Ok(file) => file,
+    };
+    if !file.metadata()?.is_file() {
+        anyhow::bail!("{} is not a regular file", path.display());
+    }
+    Ok(Some(file))
+}
+
+fn read_registry_file(mut file: fs::File) -> Result<Option<String>> {
+    use std::io::Read;
+    let mut content = String::new();
+    file.read_to_string(&mut content)?;
+    if content.trim().is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(content))
 }
 
 /// A resolved data file protected by its sidecar flock.
@@ -547,7 +579,7 @@ impl LockedDataFile {
     pub(crate) fn update<T, R, E>(
         &self,
         parse: impl FnOnce(&str) -> Result<T>,
-        serialize: impl FnOnce(&T) -> Result<String>,
+        serialize: impl Fn(&T) -> Result<String>,
         mutate: impl FnOnce(&mut T) -> std::result::Result<R, E>,
     ) -> Result<std::result::Result<(R, T), E>>
     where
@@ -557,9 +589,13 @@ impl LockedDataFile {
             Some(content) if !content.trim().is_empty() => parse(&content)?,
             _ => T::default(),
         };
+        let before = serialize(&value)?;
         let result = mutate(&mut value);
         if result.is_ok() {
-            self.target.replace(serialize(&value)?.as_bytes())?;
+            let content = serialize(&value)?;
+            if content != before {
+                self.target.replace(content.as_bytes())?;
+            }
         }
         Ok(result.map(|result| (result, value)))
     }
@@ -1566,6 +1602,7 @@ fn apply_group_move(
 #[derive(Clone, Copy)]
 enum ReadPolicy<'a> {
     Recover,
+    ReadOnly,
     Complete(&'a ProfileFiles),
 }
 
@@ -1620,12 +1657,37 @@ impl Storage {
         )
     }
 
+    /// Read a catalog-admitted component without interpreting it as a profile selector.
+    pub(crate) fn open_inventory_reference(
+        profile: &str,
+        file_watch: Arc<FileWatchService>,
+    ) -> Result<Self> {
+        let mut components = Path::new(profile).components();
+        anyhow::ensure!(
+            matches!(
+                components.next(),
+                Some(std::path::Component::Normal(component))
+                    if component == std::ffi::OsStr::new(profile)
+            ) && components.next().is_none(),
+            "Invalid admitted profile component"
+        );
+        Self::open_resolved_profile(profile.to_owned(), file_watch, ProfileRootPolicy::Reference)
+    }
+
     fn open_bound(
         profile: &str,
         file_watch: Arc<FileWatchService>,
         policy: ProfileRootPolicy,
     ) -> Result<Self> {
         let profile_name = resolve_existing_profile(profile)?;
+        Self::open_resolved_profile(profile_name, file_watch, policy)
+    }
+
+    fn open_resolved_profile(
+        profile_name: String,
+        file_watch: Arc<FileWatchService>,
+        policy: ProfileRootPolicy,
+    ) -> Result<Self> {
         let profile_dir = get_profile_dir_path(&profile_name)?;
         let sessions_path = profile_dir.join("sessions.json");
         let save_lock = save_lock_for(&profile_name);
@@ -1684,13 +1746,9 @@ impl Storage {
         .is_none()
     }
 
-    /// Arm the injected `sessions.json` write failure until the returned guard
-    /// drops. Preferred over the raw setter because the flag is process-wide:
-    /// a test that panics (or simply returns early) while it is armed would
-    /// otherwise leave every later test failing with
-    /// "injected sessions write failure".
+    /// Inject `sessions.json` write failures until the guard drops; the flag is process-wide.
     #[cfg(test)]
-    pub(crate) fn fail_writes_for_test(&mut self) -> crate::session::storage::WriteFailureGuard {
+    pub(crate) fn fail_writes_for_test(&self) -> crate::session::storage::WriteFailureGuard {
         FAIL_WRITES_FOR_TEST.store(true, Ordering::SeqCst);
         crate::session::storage::WriteFailureGuard
     }
@@ -1783,9 +1841,24 @@ impl Storage {
         self.load_instances(ReadPolicy::Recover)
     }
 
+    /// Read valid session rows without quarantine, repair, or writes.
+    pub(crate) fn load_instances_readonly(&self) -> Result<Vec<Instance>> {
+        self.load_instances(ReadPolicy::ReadOnly)
+    }
+
+    /// Read group metadata without reading sessions or writing quarantine files.
+    pub fn load_groups_readonly(&self) -> Result<Vec<Group>> {
+        self.load_rows(
+            &self.sessions_path.with_file_name("groups.json"),
+            ReadPolicy::ReadOnly,
+            "group",
+            self.files.as_deref().map(|files| &files.groups),
+        )
+    }
+
     fn profile_files<'a>(&'a self, policy: ReadPolicy<'a>) -> Option<&'a ProfileFiles> {
         match policy {
-            ReadPolicy::Recover => self.files.as_deref(),
+            ReadPolicy::Recover | ReadPolicy::ReadOnly => self.files.as_deref(),
             ReadPolicy::Complete(files) => Some(files),
         }
     }
@@ -1816,11 +1889,7 @@ impl Storage {
     ) -> Result<Vec<T>> {
         let content = match source {
             Some(source) => source.read()?,
-            None => match fs::read_to_string(path) {
-                Ok(content) => Some(content),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-                Err(error) => return Err(error.into()),
-            },
+            None => read_nonempty(path)?,
         };
         let Some(content) = content else {
             return Ok(Vec::new());
@@ -1843,7 +1912,7 @@ impl Storage {
                 }
             }
         }
-        if !corrupt.is_empty() {
+        if !corrupt.is_empty() && matches!(policy, ReadPolicy::Recover) {
             let quarantine = path.with_file_name(format!("{kind}s.corrupt.jsonl"));
             Self::write_corrupt_rows_quarantine(
                 &quarantine,
@@ -1926,6 +1995,17 @@ impl Storage {
             .as_deref()
             .context("profile store is not bound")?
             .verify_current(&self.sessions_path)
+    }
+
+    #[allow(clippy::unnecessary_cast)]
+    pub(crate) fn bound_profile_identity(&self) -> Result<(u64, u64)> {
+        let (device, inode) = self
+            .files
+            .as_deref()
+            .context("profile store is not bound")?
+            .directory
+            .identity()?;
+        Ok((device as u64, inode as u64))
     }
 
     pub(crate) fn read_sandbox_checkpoint(
@@ -3712,6 +3792,34 @@ mod tests {
     use serial_test::serial;
     use tempfile::tempdir;
 
+    #[test]
+    fn registry_read_keeps_validated_file_after_path_replacement() {
+        let root = tempdir().unwrap();
+        for name in ["sessions.json", "groups.json"] {
+            let path = root.path().join(name);
+            fs::write(&path, "original registry").unwrap();
+            let file = open_regular_registry(&path).unwrap().unwrap();
+            let replacement = path.with_extension("replacement");
+            fs::write(&replacement, "replacement registry").unwrap();
+            fs::rename(replacement, &path).unwrap();
+            assert_eq!(
+                read_registry_file(file).unwrap().as_deref(),
+                Some("original registry")
+            );
+            assert_eq!(fs::read_to_string(&path).unwrap(), "replacement registry");
+            fs::remove_file(&path).unwrap();
+            assert!(read_nonempty(&path).unwrap().is_none());
+            fs::write(
+                &path, " 
+	",
+            )
+            .unwrap();
+            assert!(read_nonempty(&path).unwrap().is_none());
+            fs::remove_file(&path).unwrap();
+            fs::create_dir(&path).unwrap();
+            assert!(read_nonempty(&path).is_err());
+        }
+    }
     fn setup_test_home(temp: &std::path::Path) -> AppDirGuard {
         isolate_app_dir_at(temp)
     }

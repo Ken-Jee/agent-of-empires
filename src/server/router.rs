@@ -8,7 +8,7 @@ use super::access::{access_policy, cityhall_gate, security_headers};
 #[cfg(feature = "web")]
 use super::assets::{serve_asset, serve_index, serve_public_file};
 use super::state::AppState;
-use crate::server::{acp_ws, api, auth, live_ws, login, push};
+use crate::server::{acp_ws, api, auth, live_ws, login, push, runtime_ws};
 
 pub(super) fn build_router(state: Arc<AppState>) -> Router {
     use axum::routing::{delete, get, patch, post, put};
@@ -51,7 +51,14 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
         // Atomic multi-session workspace delete.
         .route("/api/workspaces", delete(api::delete_workspace))
         // Unified MCP management surface (#1996)
-        .route("/api/mcp/servers", get(api::get_mcp_servers))
+        .route(
+            "/api/mcp/servers",
+            get(api::get_mcp_servers).post(api::create_mcp_server),
+        )
+        .route(
+            "/api/mcp/servers/{name}",
+            put(api::edit_mcp_server).delete(api::delete_mcp_server),
+        )
         .route(
             "/api/mcp/servers/{name}/resolve",
             post(api::resolve_mcp_conflict),
@@ -88,6 +95,8 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
         )
         .route("/api/sessions/{id}/file", get(api::session_file))
         .route("/api/sessions/{id}/file/raw", get(api::session_file_raw))
+        // Read-only runtime read: one Hello, one Snapshot, one clean close.
+        .route("/api/runtime/read/ws", get(runtime_ws::runtime_ws))
         .route(
             "/api/sessions/{id}/artifacts/{*path}",
             get(api::serve_session_artifact),
@@ -215,6 +224,14 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
         // Plugin management.
         .route("/api/plugins", get(api::list_plugins))
         .route("/api/plugins/{id}/icon", get(api::serve_plugin_icon))
+        .route(
+            "/api/plugins/{id}/pages/{page_id}",
+            get(api::serve_plugin_page),
+        )
+        .route(
+            "/api/plugins/{id}/pages/{page_id}/ticket",
+            post(api::mint_plugin_page_ticket),
+        )
         .route("/api/plugins/commands", get(api::plugin_commands))
         .route(
             "/api/plugins/commands/{fqid}/invoke",
@@ -230,6 +247,7 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
             post(api::restart_plugin_worker),
         )
         .route("/api/plugins/{id}/action", post(api::invoke_plugin_action))
+        .route("/api/plugins/{id}/sessions", get(api::plugin_sessions))
         .route(
             "/api/plugins/{id}/settings/options/resolve",
             post(api::resolve_options),

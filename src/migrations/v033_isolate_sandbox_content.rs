@@ -943,19 +943,15 @@ fn retain_legacy_original_with(
 fn read_registries(app: &Path) -> Result<Vec<(PathBuf, Value)>> {
     let mut registries = Vec::new();
     for path in layout::registry_paths(app)? {
-        match serde_json::from_slice(&fs::read(&path)?) {
-            Ok(value) => registries.push((path, value)),
-            // A registry AoE cannot parse is a pre-existing anomaly it cannot
-            // reason about; skipping it with a warning keeps one corrupt file
-            // from bricking every launch and migration, matching the reuse path
-            // that already tolerates a failed reload.
-            Err(error) => tracing::warn!(
-                target: "session.store",
-                registry = %path.display(),
-                error = %error,
-                "skipping unparseable session registry",
-            ),
-        }
+        let value = (|| -> Result<Value> { layout::decode_session_inventory(&fs::read(&path)?) })()
+            .map_err(|source| {
+                let profile = layout::profile_for_registry(app, &path);
+                layout::SandboxCheckpointFailure {
+                    profile: (!profile.is_empty()).then_some(profile),
+                    source,
+                }
+            })?;
+        registries.push((path, value));
     }
     Ok(registries)
 }
@@ -2319,8 +2315,24 @@ fn reconcile_in(
     reap: &dyn Fn(&str) -> Result<bool>,
     exposure: &ExposureProbe<'_>,
 ) -> Result<()> {
+    let registries = match read_registries(app) {
+        Ok(registries) => registries,
+        Err(error) => {
+            if let Some(profile) = (!move_stores && only.is_none())
+                .then_some(&error)
+                .and_then(layout::initial_profile_inventory_failure)
+            {
+                tracing::warn!(target: "session.store", profile, %error, "Sandbox content isolation remains pending");
+                progress::notice(format!(
+                    "sandbox content isolation remains pending: profile {profile:?} has invalid session inventory; repair it and retry"
+                ));
+                return Ok(());
+            }
+            return Err(error);
+        }
+    };
     let mut targets = BTreeMap::new();
-    for (path, registry) in read_registries(app)? {
+    for (path, registry) in registries {
         for row in registry
             .as_array()
             .context("session registry must be an array")?
@@ -3486,6 +3498,94 @@ mod tests {
         let registry = app.join("sessions.json");
         fs::write(&registry, serde_json::to_vec(&rows).unwrap()).unwrap();
         (app, registry, instance, roots)
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn incomplete_inventory_never_retires_or_certifies_native_content() {
+        for operation in ["notify", "bulk", "scoped", "recovery", "fresh"] {
+            let temporary = tempfile::tempdir().unwrap();
+            let _environment = crate::session::test_support::isolate_app_dir_at(temporary.path());
+            let home = dirs::home_dir().unwrap();
+            let (app, registry, instance, roots) = stopped_original_beside(temporary.path(), &[]);
+            let original = fs::read(&registry).unwrap();
+            let damaged = app.join("profiles/damaged/sessions.json");
+            fs::create_dir_all(damaged.parent().unwrap()).unwrap();
+            fs::write(&damaged, b"{").unwrap();
+            let targets = migration_targets(&app, &roots).unwrap();
+            let exposure = |_: &str| Ok(Vec::new());
+            assert!(recovery_exposure(&app, &targets, &exposure).is_err());
+            let fresh_id = "4444444444444444";
+            let config = crate::session::Config::default();
+            let fresh_roots = container_config::sandbox_content_roots(
+                "codex",
+                None,
+                &config.session,
+                &home,
+                fresh_id,
+            )
+            .unwrap();
+            let result = match operation {
+                "notify" | "bulk" | "scoped" => reconcile_in(
+                    &app,
+                    &home,
+                    (operation == "scoped").then_some(instance.id.as_str()),
+                    operation == "bulk",
+                    &|_| panic!("the initial incomplete inventory must stop before liveness"),
+                    &|_| panic!("the initial incomplete inventory must stop before reaping"),
+                    &exposure,
+                ),
+                "recovery" => migrate_target(
+                    &app,
+                    &home,
+                    (&registry, &instance.id, "codex"),
+                    &|_| Ok(false),
+                    &|_| Ok(true),
+                    &exposure,
+                )
+                .map(drop),
+                "fresh" => ensure_fresh_content_with(
+                    &app,
+                    &home,
+                    (fresh_id, "codex"),
+                    &fresh_roots,
+                    &config,
+                    temporary.path(),
+                    &exposure,
+                )
+                .map(drop),
+                _ => unreachable!(),
+            };
+            if operation == "notify" {
+                result.unwrap();
+            } else {
+                let error = result.unwrap_err();
+                assert_eq!(
+                    layout::initial_profile_inventory_failure(&error),
+                    Some("damaged"),
+                    "{operation}: {error:#}"
+                );
+            }
+            assert_eq!(fs::read(&registry).unwrap(), original, "{operation}");
+            assert_eq!(fs::read(&damaged).unwrap(), b"{", "{operation}");
+            assert_eq!(
+                fs::read(roots[0].path.join("sessions/original.jsonl")).unwrap(),
+                b"PRIVATE_ORIGINAL_CONTEXT",
+                "{operation}",
+            );
+            assert!(
+                !app.join(RECEIPTS).exists(),
+                "{operation}: no receipt or certificate may be written"
+            );
+            assert!(
+                targets.iter().all(|path| !path.exists()),
+                "{operation}: no recovery publication"
+            );
+            assert!(
+                !fresh_roots[0].path.exists(),
+                "{operation}: no fresh content may be certified"
+            );
+        }
     }
 
     /// #4239: a live sandbox whose hook directory was removed from the host

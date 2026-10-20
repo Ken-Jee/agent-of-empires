@@ -76,7 +76,7 @@ pub(crate) async fn connect_with_headers(
     let token = endpoint.bearer_token();
     let base = super::native_url(&endpoint.base_url)?;
     if token.is_some() && base.scheme() == "http" && !super::is_loopback_url(&base) {
-        return Err(DaemonClientError::InsecureBearerTransport.into());
+        return Err(DaemonClientError::InsecureCredentialTransport.into());
     }
     let mut url = base.clone();
     url.set_scheme(if base.scheme() == "https" {

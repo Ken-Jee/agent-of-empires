@@ -63,8 +63,6 @@ function loadLastUsedTool(): string {
   return stored && ACP_CAPABLE_TOOLS.has(stored) ? stored : "claude";
 }
 
-type Obj = Record<string, unknown> | undefined;
-
 export interface WizardPrefill {
   path?: string;
   tool?: string;
@@ -188,6 +186,7 @@ export function SessionWizard({
     groups: [],
     profiles: [],
     dockerAvailable: false,
+    dockerChecked: false,
   });
 
   // No project yet is the TUI's focused Path field: open straight on the picker.
@@ -223,9 +222,7 @@ export function SessionWizard({
     mcpSummaries: string[];
   } | null>(null);
   const [defaultsProfile, setDefaultsProfile] = useState<string | null>(null);
-  const [dockerReady, setDockerReady] = useState(false);
-  const defaultsReady =
-    dockerReady && defaultsProfile !== null && defaultsProfile === (state.data.profile || servedProfile);
+  const defaultsReady = defaultsProfile !== null && defaultsProfile === (state.data.profile || servedProfile);
   const defaultsGeneration = useRef(0);
   const selectedProfile = useRef<string | null>(null);
   const resetImplicitDefaults = useRef(false);
@@ -266,9 +263,7 @@ export function SessionWizard({
     const switches = profileSwitchRef;
     fetchAgents().then((a) => dispatch({ type: "SET_AGENTS", agents: a }));
     fetchGroups().then((g) => dispatch({ type: "SET_GROUPS", groups: g }));
-    void fetchDockerStatus()
-      .then((d) => dispatch({ type: "SET_DOCKER", available: d.available }))
-      .finally(() => setDockerReady(true));
+    fetchDockerStatus().then((d) => dispatch({ type: "SET_DOCKER", available: d.available }));
     fetchProfiles()
       .then((profiles) => dispatch({ type: "SET_PROFILES", profiles }))
       .catch(() => {});
@@ -314,8 +309,8 @@ export function SessionWizard({
       .then(([settings]) => {
         if (generation !== generations.current || !settings) return;
         setCommandMaps(commandMapsFromSettings(settings));
-        const image = ((settings.sandbox as Obj)?.default_image as string) || "";
-        if (image) dispatch({ type: "SET_FIELD", field: "sandboxImage", value: image });
+        const image = settings.sandbox?.default_image;
+        if (typeof image === "string" && image) dispatch({ type: "SET_FIELD", field: "sandboxImage", value: image });
         const defaults = profileDefaults(settings, prefill?.tool ?? "", dataRef.current.tool);
         dispatch({
           type: "APPLY_PROFILE_DEFAULTS",
@@ -325,7 +320,6 @@ export function SessionWizard({
             ? defaults.sandboxEnabled
             : (prefill?.sandboxEnabled ?? defaults.sandboxEnabled),
           skipIfDirty: !resetDefaults,
-          resetStructuredViewDirty: resetDefaults,
         });
         resetImplicitDefaults.current = false;
       })
@@ -391,6 +385,8 @@ export function SessionWizard({
     }
     setPanel(null);
     const editsAtSelection = { ...directEdits.current };
+    dispatch({ type: "RESET_STRUCTURED_VIEW_DIRTY" });
+    // Launch waits for this switch, and a response for a superseded profile is dropped.
     const switchId = ++profileSwitchRef.current;
     const isCurrent = () => profileSwitchRef.current === switchId;
     const effectiveProfile = profileName || servedProfile;
@@ -434,7 +430,6 @@ export function SessionWizard({
       if (settings) {
         handleApplyProfileDefaults({
           ...profileDefaults(settings, "", latest.tool),
-          resetStructuredViewDirty: true,
           commandMaps: commandMapsFromSettings(settings),
         });
         // The confirmation resets earlier edits, not choices made while this read was pending.
@@ -934,7 +929,9 @@ export function SessionWizard({
               }
               onSubmit={handleSubmit}
               nameOnly={nameOnly}
-              defaultsReady={defaultsReady && !profileSwitching && !projectUnresolved}
+              defaultsReady={
+                defaultsReady && !profileSwitching && !projectUnresolved && !(d.sandboxEnabled && !state.dockerChecked)
+              }
               onBackground={creating && onCreatedInBackground ? handleBackground : undefined}
             />
           </div>

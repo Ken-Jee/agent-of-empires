@@ -18,6 +18,8 @@ If startup or connection fails, the TUI shows the diagnostic and masks daemon-ow
 | `Enter` | Attach to a session |
 | `d` | Delete a session |
 | `t` | Toggle Agent / Terminal view |
+| `T` | Attach to the session's paired terminal |
+| `\|` | Split the preview: agent above its paired terminal |
 | `D` | Open the [diff view](guides/diff-view.md) |
 | `/` | Search sessions |
 | `?` | Full keymap |

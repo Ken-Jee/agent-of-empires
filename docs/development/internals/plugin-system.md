@@ -27,15 +27,15 @@ Every worker needs `runtime.worker`; other capabilities gate host RPCs and are c
 
 ## Contributions
 
-Static manifest contributions are collected from active plugins: settings join the single settings schema and keep plugin ownership, themes resolve within the plugin directory, commands and keybindings are namespaced with core names taking precedence, status definitions provide host-rendered labels, and the `pane`, `home-pane`, and `composer-action` slots render typed worker state.
+Static manifest contributions are collected from active plugins: settings join the single settings schema and keep plugin ownership, themes resolve within the plugin directory, commands and keybindings are namespaced with core names taking precedence, status definitions provide host-rendered labels, the `pane`, `home-pane`, and `composer-action` slots render typed worker state, and a `page` slot serves its declared HTML entry.
 
-No plugin code runs in a frontend. Workers publish typed state, the host stores the latest generation, and the web or daemon-connected TUI renders it; generation ids stop a stopped worker's late cleanup from deleting a newer worker's state. Pane actions return to the worker as JSON-RPC notifications.
+Host-rendered slots run no plugin code in a frontend: workers publish typed state, the host stores the latest generation, and the web or daemon-connected TUI renders it; generation ids stop a stopped worker's late cleanup from deleting a newer worker's state. Pane actions return to the worker as JSON-RPC notifications. A `page` is the exception: its own HTML and inline script run in a sandboxed frame with an opaque origin, never on the dashboard origin.
 
 ## Worker host
 
 The worker host exists only in `aoe serve`, where session storage and the event store are available. For each active plugin with a runtime it resolves the entrypoint, launches one child process, and speaks newline-delimited JSON-RPC 2.0 over stdio. Command runtimes resolve plugin-relative executables inside the install tree, bare interpreter names may resolve on `PATH`, and release-binary runtimes use the platform asset the installer placed; build steps follow the same policy.
 
-Workers are tied to the daemon lifetime, with no reattach socket or durable runner record. Supervision reaps the whole process group, limits concurrency, and stops retrying after three crashes in 60 seconds; disabling and re-enabling a plugin clears its crash tombstone. Worker stderr goes under `<app_dir>/plugin-workers/`. `PluginHost::reconcile` is the idempotent lifecycle entrypoint used at daemon startup and after enable or disable, and local CLI and TUI toggles route through a running daemon when possible so workers change immediately.
+Workers are tied to the daemon lifetime, with no reattach socket or durable runner record. Supervision reaps the whole process group, limits concurrency, and stops retrying after three crashes in 60 seconds; disabling and re-enabling a plugin clears its crash tombstone. Worker stderr goes to per-plugin files under `<app_dir>/plugin-workers/`, pruned in `src/plugin/worker_logs.rs`; see [Worker logs](../../plugins.md#worker-logs). `PluginHost::reconcile` is the idempotent lifecycle entrypoint used at daemon startup and after enable or disable, and local CLI and TUI toggles route through a running daemon when possible so workers change immediately.
 
 ## Host APIs and events
 

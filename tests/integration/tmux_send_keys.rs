@@ -27,36 +27,37 @@ impl Drop for KillSession<'_> {
 #[test]
 #[serial]
 fn send_keys_keeps_a_trailing_semicolon() {
+    let mut _env = agent_of_empires::server::test_support::RuntimeEnvGuard::read_lock();
     if Command::new("tmux").arg("-V").output().is_err() {
         eprintln!("skipping: tmux not on PATH");
         return;
     }
+    let home = tempfile::tempdir().expect("owned home");
+    _env.bind(home.path());
     let socket = tmux_socket();
     let name = format!("{}send_keys_semicolon", tmux::SESSION_PREFIX);
     let _cleanup = KillSession {
         socket: &socket,
         name: &name,
     };
-    // `cat -v` echoes each submitted line back, so the pane shows what arrived.
-    let status = Command::new("tmux")
-        .arg("-S")
-        .arg(&socket)
-        .args(["new-session", "-d", "-s", &name, "cat -v"])
-        .status()
-        .expect("tmux new-session");
-    assert!(status.success(), "tmux new-session failed");
-    tmux::refresh_session_cache();
+    let session = Session::from_name(&name);
+    session
+        .create(
+            home.path().to_str().expect("temporary HOME is UTF-8"),
+            Some("cat -v"),
+            "main",
+        )
+        .expect("create managed cat session");
+    let target = format!("{name}:^.0");
 
-    Session::from_name(&name)
-        .send_keys("ls;")
-        .expect("send_keys");
+    session.send_keys("ls;").expect("send_keys");
 
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         let out = Command::new("tmux")
             .arg("-S")
             .arg(&socket)
-            .args(["capture-pane", "-p", "-t", &name])
+            .args(["capture-pane", "-p", "-t", &target])
             .output()
             .expect("tmux capture-pane");
         let pane = String::from_utf8_lossy(&out.stdout);

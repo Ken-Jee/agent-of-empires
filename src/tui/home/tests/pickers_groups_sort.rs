@@ -22,6 +22,14 @@ pub(super) async fn settle_namespace(
     action: impl FnOnce(&mut HomeView) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
     use crate::daemon::{MutationReceipt, NamespaceMutation, NamespaceOutcome};
+    fn group_snapshot(view: &HomeView) -> serde_json::Value {
+        let groups: std::collections::BTreeMap<_, _> = view
+            .group_trees
+            .iter()
+            .map(|(profile, tree)| (profile, tree.get_all_groups()))
+            .collect();
+        serde_json::to_value(groups).unwrap()
+    }
     fn wire(request: &NamespaceMutation) -> (&'static str, &'static str, serde_json::Value) {
         match request {
             NamespaceMutation::CollapseGroup(body) => (
@@ -42,7 +50,7 @@ pub(super) async fn settle_namespace(
         }
     }
     let before_rows = serde_json::to_value(view.cloned_instances()).unwrap();
-    let before_groups = serde_json::to_value(view.all_groups()).unwrap();
+    let before_groups = group_snapshot(view);
     let mut respond = view.session_feed.namespace_driver_for_test();
     action(view)?;
     let boundary_destination = match &view.pending_namespace_intent {
@@ -56,10 +64,7 @@ pub(super) async fn settle_namespace(
         serde_json::to_value(view.cloned_instances()).unwrap(),
         before_rows
     );
-    assert_eq!(
-        serde_json::to_value(view.all_groups()).unwrap(),
-        before_groups
-    );
+    assert_eq!(group_snapshot(view), before_groups);
     let (method, path, body) = wire(&expected);
     let (status, headers, value) = request_with_headers(state, method, path, body.clone()).await;
     if !status.is_success() {
@@ -94,10 +99,7 @@ pub(super) async fn settle_namespace(
         serde_json::to_value(view.cloned_instances()).unwrap(),
         before_rows
     );
-    assert_eq!(
-        serde_json::to_value(view.all_groups()).unwrap(),
-        before_groups
-    );
+    assert_eq!(group_snapshot(view), before_groups);
     apply_published(view, state).await;
     // AtEdge is a completed sibling reorder; Home may now submit a canonical
     // cross-group continuation. Keep its original driver alive through that command.
@@ -270,6 +272,19 @@ pub(super) async fn settle_delete_group(
     state: &std::sync::Arc<crate::server::AppState>,
     view: &mut HomeView,
 ) -> anyhow::Result<()> {
+    settle_delete_group_with_options(
+        state,
+        view,
+        &crate::tui::dialogs::GroupDeleteOptions::default(),
+    )
+    .await
+}
+
+async fn settle_delete_group_with_options(
+    state: &std::sync::Arc<crate::server::AppState>,
+    view: &mut HomeView,
+    options: &crate::tui::dialogs::GroupDeleteOptions,
+) -> anyhow::Result<()> {
     let path = view.selected_group.clone().expect("selected group");
     let profile = view
         .profile_for_cursor(view.cursor)
@@ -281,13 +296,20 @@ pub(super) async fn settle_delete_group(
     let expected = crate::daemon::NamespaceMutation::DeleteGroup(crate::daemon::DeleteGroupBody {
         group: crate::daemon::GroupLocation { profile, path },
         mode: if has_members {
-            crate::daemon::DeleteGroupMode::KeepSessions
+            if options.action == crate::tui::dialogs::GroupDeleteAction::MoveToParent {
+                crate::daemon::DeleteGroupMode::MoveToParent
+            } else {
+                crate::daemon::DeleteGroupMode::KeepSessions
+            }
         } else {
             crate::daemon::DeleteGroupMode::EmptyOnly
         },
         cleanup: Default::default(),
     });
-    settle_namespace(state, view, expected, HomeView::delete_selected_group).await
+    settle_namespace(state, view, expected, |view| {
+        view.delete_selected_group(options)
+    })
+    .await
 }
 
 pub(super) async fn settle_rename_group(
@@ -776,6 +798,75 @@ fn test_group_has_managed_worktrees_and_containers() {
 
 #[tokio::test]
 #[serial]
+async fn moving_a_group_to_its_parent_uses_native_authority_and_preserves_other_profiles() {
+    let mut env = create_test_env_with_group_sessions();
+    let other = Storage::new_unwatched("other").unwrap();
+    let mut other_row = Instance::new("other member", "/tmp/other-group");
+    other_row.source_profile = "other".into();
+    other_row.group_path = "work/projects".into();
+    other
+        .update(|rows, groups| {
+            rows.push(other_row.clone());
+            *groups = GroupTree::new_with_groups(rows, groups).get_all_groups();
+            Ok(())
+        })
+        .unwrap();
+    let other_before = payload_bytes("other");
+    let profiles = crate::session::list_profiles().unwrap();
+    let state = native_state(&profiles.iter().map(String::as_str).collect::<Vec<_>>()).await;
+    apply_published(&mut env.view, &state).await;
+    let moved: Vec<_> = env
+        .view
+        .instances()
+        .filter(|row| {
+            row.source_profile == "test"
+                && (row.group_path == "work/projects"
+                    || row.group_path.starts_with("work/projects/"))
+        })
+        .map(|row| row.id.clone())
+        .collect();
+    assert!(!moved.is_empty());
+    env.view.cursor = env.view.flat_items.iter().position(|item| matches!(item, Item::Group { profile, path, .. } if profile.as_deref().is_none_or(|profile| profile == "test") && path == "work/projects")).expect("nested group");
+    env.view.update_selected();
+    let options = crate::tui::dialogs::GroupDeleteOptions {
+        action: crate::tui::dialogs::GroupDeleteAction::MoveToParent,
+        ..Default::default()
+    };
+    settle_delete_group_with_options(&state, &mut env.view, &options)
+        .await
+        .unwrap();
+    let (persisted, groups) = Storage::open_unwatched("test")
+        .unwrap()
+        .load_with_groups()
+        .unwrap();
+    for id in moved {
+        assert_eq!(
+            persisted
+                .iter()
+                .find(|row| row.id == id)
+                .unwrap()
+                .group_path,
+            "work"
+        );
+        assert_eq!(
+            env.view
+                .instances()
+                .find(|row| row.id == id)
+                .unwrap()
+                .group_path,
+            "work"
+        );
+    }
+    assert!(!groups
+        .iter()
+        .any(|group| group.path == "work/projects" || group.path.starts_with("work/projects/")));
+    assert!(groups.iter().any(|group| group.path == "work"));
+    assert_eq!(payload_bytes("other"), other_before);
+    assert_eq!(other.load().unwrap()[0].group_path, "work/projects");
+}
+
+#[tokio::test]
+#[serial]
 async fn test_delete_selected_group_updates_groups_field() {
     let mut env = create_test_env_with_group_sessions();
     let profiles = crate::session::list_profiles().unwrap();
@@ -813,19 +904,14 @@ async fn test_delete_selected_group_updates_groups_field() {
         .group_exists("work"));
 
     // Verify self.groups is updated (this is the bug fix)
-    let all_groups = env.view.all_groups();
-    let group_paths: Vec<_> = all_groups.iter().map(|g| g.path.as_str()).collect();
+    let all_groups = env.view.all_group_paths();
+    let group_paths: Vec<_> = all_groups.iter().map(String::as_str).collect();
     assert!(!group_paths.contains(&"work"));
     assert!(!group_paths.contains(&"work/projects"));
 
     // A reload from storage agrees with the in-memory tree.
     env.view.reload().unwrap();
-    let reloaded_groups: Vec<_> = env
-        .view
-        .all_groups()
-        .iter()
-        .map(|g| g.path.clone())
-        .collect();
+    let reloaded_groups = env.view.all_group_paths();
     let tree_groups: Vec<_> = env
         .view
         .group_trees
@@ -836,6 +922,117 @@ async fn test_delete_selected_group_updates_groups_field() {
         .map(|g| g.path.clone())
         .collect();
     assert_eq!(reloaded_groups, tree_groups);
+}
+
+#[tokio::test]
+#[serial]
+async fn deleting_subgroups_moves_members_to_the_selected_destination() {
+    for (group_path, choose_default, target) in [
+        ("work/projects", false, "work"),
+        ("work/projects/topic", false, "work/projects"),
+        ("work/projects", true, ""),
+    ] {
+        let (_temp, _guard) = test_home();
+        let parent = group_path.rsplit_once('/').unwrap().0;
+        let nested_path = format!("{group_path}/nested");
+        let near_prefix = format!("{group_path}-other");
+        let mut archived = instance_in("archived", "/tmp/archived", &nested_path);
+        archived.archive();
+        let mut trashed = instance_in("trashed", "/tmp/trashed", group_path);
+        trashed.trash();
+        let instances = [
+            instance_in("direct", "/tmp/direct", group_path),
+            instance_in("nested", "/tmp/nested", &nested_path),
+            archived,
+            trashed,
+            instance_in("near-prefix", "/tmp/near-prefix", &near_prefix),
+            instance_in("parent", "/tmp/parent", parent),
+        ];
+        seed_profile("alpha", &instances);
+        seed_profile(
+            "beta",
+            &[instance_in("other-profile", "/tmp/other", group_path)],
+        );
+        let other_before = payload_bytes("beta");
+        let state = native_state(&["alpha", "beta"]).await;
+        let mut view = test_view(None);
+        refresh_native_fixture(&state, &mut view).await;
+        view.group_by = crate::session::config::GroupByMode::Manual;
+        view.flat_items = view.build_flat_items();
+        view.cursor = view
+            .flat_items
+            .iter()
+            .position(|item| {
+                matches!(item, Item::Group { path, profile, .. }
+                if path == group_path && profile.as_deref() == Some("alpha"))
+            })
+            .expect("subgroup in alpha");
+        view.update_selected();
+        view.open_delete_for_selected();
+        assert!(view.group_delete_options_dialog.is_some());
+        if choose_default {
+            view.handle_key(key(KeyCode::Tab), None);
+            view.handle_key(key(KeyCode::Char(' ')), None);
+        }
+        let expected =
+            crate::daemon::NamespaceMutation::DeleteGroup(crate::daemon::DeleteGroupBody {
+                group: crate::daemon::GroupLocation {
+                    profile: "alpha".into(),
+                    path: group_path.into(),
+                },
+                mode: if choose_default {
+                    crate::daemon::DeleteGroupMode::KeepSessions
+                } else {
+                    crate::daemon::DeleteGroupMode::MoveToParent
+                },
+                cleanup: Default::default(),
+            });
+        settle_namespace(&state, &mut view, expected, |view| {
+            view.handle_key(key(KeyCode::Enter), None);
+            assert!(view.group_delete_options_dialog.is_none());
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        let (persisted, groups) = Storage::open_unwatched("alpha")
+            .unwrap()
+            .load_with_groups()
+            .unwrap();
+        assert_eq!(persisted.len(), instances.len());
+        for original in &instances {
+            let moved = original.group_path == group_path || original.group_path == nested_path;
+            let expected = if moved { target } else { &original.group_path };
+            let stored = persisted.iter().find(|i| i.id == original.id).unwrap();
+            assert_eq!(
+                stored.group_path, expected,
+                "{}: {group_path}",
+                stored.title
+            );
+            assert_eq!(stored.archived_at, original.archived_at);
+            assert_eq!(stored.trashed_at, original.trashed_at);
+            assert_eq!(
+                view.get_instance(&original.id).unwrap().group_path,
+                expected
+            );
+        }
+        assert!(groups.iter().any(|g| g.path == parent));
+        assert!(groups.iter().any(|g| g.path == near_prefix));
+        assert!(!groups
+            .iter()
+            .any(|g| g.path == group_path || g.path == nested_path));
+        let tree = view.group_trees.get("alpha").unwrap();
+        assert!(!tree.group_exists(group_path));
+        assert!(!tree.group_exists(&nested_path));
+
+        let (other_instances, other_groups) = Storage::open_unwatched("beta")
+            .unwrap()
+            .load_with_groups()
+            .unwrap();
+        assert_eq!(other_instances[0].group_path, group_path);
+        assert!(other_groups.iter().any(|g| g.path == group_path));
+        assert_eq!(payload_bytes("beta"), other_before);
+    }
 }
 
 /// A group archive is admitted as one selection; only daemon receipts may
@@ -1051,7 +1248,7 @@ async fn test_delete_group_with_sessions_updates_groups_field() {
     assert_eq!(view.selected_group_profile.as_deref(), Some("test"));
 
     let options = GroupDeleteOptions {
-        delete_sessions: true,
+        action: crate::tui::dialogs::GroupDeleteAction::DeleteSessions,
         delete_worktrees: false,
         delete_branches: false,
         delete_containers: false,
@@ -3734,5 +3931,72 @@ async fn test_a_hidden_destination_falls_back_to_the_header_in_its_own_profile()
         view.selected_group_profile.as_deref(),
         Some("beta"),
         "the header the selection lands on is in the moving row's own profile"
+    );
+}
+
+#[test]
+#[serial]
+fn same_named_groups_across_profiles_are_tagged_and_listed_once() {
+    use crate::session::{GroupTree, Item};
+
+    let temp = TempDir::new().unwrap();
+    let _guard = setup_test_home(&temp);
+
+    for (profile, groups) in [("alpha", &["work", "solo"][..]), ("beta", &["work"][..])] {
+        let insts: Vec<Instance> = groups
+            .iter()
+            .map(|g| {
+                let mut i = Instance::new(&format!("{profile}-{g}"), "/tmp/x");
+                i.group_path = g.to_string();
+                i
+            })
+            .collect();
+        let tree = GroupTree::new_with_groups(&insts, &[]);
+        Storage::new_unwatched(profile)
+            .unwrap()
+            .update(|i, g| {
+                *i = insts.clone();
+                *g = tree.get_all_groups();
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    let tools = AvailableTools::with_tools(&["claude"]);
+    let mut view =
+        HomeView::new_for_test(None, tools, crate::file_watch::FileWatchService::noop()).unwrap();
+    view.group_by = crate::session::config::GroupByMode::Manual;
+    view.flat_items = view.build_flat_items();
+
+    assert_eq!(view.all_group_paths(), vec!["solo", "work"]);
+
+    view.open_new_session_dialog();
+    let dialog = view.new_dialog.as_mut().expect("new session dialog");
+    dialog.focus_group();
+    dialog.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
+    assert_eq!(dialog.group_picker_items(), vec!["solo", "work"]);
+    view.new_dialog = None;
+
+    let theme = crate::tui::styles::Theme::default();
+    let labels: Vec<String> = view
+        .flat_items
+        .iter()
+        .filter(|item| matches!(item, Item::Group { .. }))
+        .map(|item| {
+            view.render_item_line(item, false, false, &theme, 200, false)
+                .spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<String>()
+        })
+        .collect();
+    let tagged = |tag: &str| labels.iter().filter(|l| l.contains(tag)).count();
+    assert_eq!(tagged("[alpha] work (1)"), 1, "{labels:?}");
+    assert_eq!(tagged("[beta] work (1)"), 1, "{labels:?}");
+    assert!(
+        labels
+            .iter()
+            .any(|l| l.contains("solo (1)") && !l.contains('[')),
+        "{labels:?}"
     );
 }

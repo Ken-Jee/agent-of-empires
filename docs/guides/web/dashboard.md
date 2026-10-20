@@ -34,6 +34,8 @@ The palette (top-bar button or keyboard shortcut) is a fuzzy launcher for global
 
 When an embedded agent or paired terminal, or the structured-session composer, has keyboard focus, press `Ctrl+Q` to return focus to the active session in the sidebar. Then press `a` to move to the next session needing attention; `a` works when a terminal or text field is not focused.
 
+With a session row focused, use **↑** and **↓** to move through visible rows without opening one; press **Enter** to open the focused row.
+
 Individual settings appear under `Settings`: a writable toggle flips inline with a toast, while read-only servers and settings needing elevation open the settings view instead. The Settings header has its own search box (the TUI settings screen uses `/`) that filters across every tab.
 
 ## First-run onboarding
@@ -54,7 +56,7 @@ A sort picker next to the filter button offers three modes:
 
 - **Manual** (default): keeps your drag-ordered list, drag enabled.
 - **Recent activity**: orders by the most recent of `last_accessed_at`, `idle_entered_at`, and `created_at` across each workspace's sessions, descending.
-- **Attention**: floats sessions needing a human to the top, mirroring the TUI's Attention sort. Ranks by status (Waiting, Error, Idle, Unknown, Running, Stopped, transient states last); sessions flagged urgent via the `attention-urgent` hook rise above non-urgent rows in their tier, favorited rows come first within a status rank, ties break by most-recent activity.
+- **Attention**: floats sessions needing a human to the top, mirroring the TUI's Attention sort. Ranks by status (Waiting, Error, Idle, Unknown, Running, Stopped, transient states last); session and plugin attention requests rise within their tier, favorited rows come first within a status rank, and ties break by most-recent activity.
 
 Drag-to-reorder is disabled in the computed modes. The picker's state is per-browser (localStorage), not synced and not tied to your profile. The Multi-repo and Scratch groups default to the bottom; in manual mode you can drag them anywhere, in computed modes they stay at the bottom.
 
@@ -74,7 +76,7 @@ The choice is per-browser (localStorage). Collapse state is tracked separately p
 
 The right-click (long-press on touch) context menu on any session row exposes three triage primitives:
 
-- **Pin**: floats the workspace to the top in every sort mode. Pin is web-only and distinct from the favorite mark. On the web, favorite stays a within-tier Attention signal; in the TUI it pins to the top of its sibling scope in every sort order while `session.favorites_first` is on (the default). Renders as a pushpin glyph.
+- **Pin**: floats the workspace to the top in every sort mode. Pin is web-only and distinct from the favorite mark. Favorites keep their `✦` marker in both normal and compact sidebars. On the web, favorite stays a within-tier Attention signal; in the TUI it pins to the top of its sibling scope in every sort order while `session.favorites_first` is on (the default).
 - **Archive**: tears down every tmux session the workspace owns (agent, web terminal, container terminal, and tool sub-sessions; pass `kill_pane: false` in the API body, or `--no-kill` on the CLI, to skip the tmux teardown) and shuts down the structured-view worker for ACP sessions, then sinks the row into the collapsible "Snoozed & archived" footer. Daemon restarts skip archived sessions. An archived session never starts or resumes, whether from a message, **Start**, attaching, or a daemon restart; unarchive it first. See #1868.
 - **Snooze**: sinks the row for a chosen duration (presets: 1h, 2h, 3h, 4h, 5h, 6h, 1d, 1w). Wakes when the timer expires; sending a message wakes it early.
 

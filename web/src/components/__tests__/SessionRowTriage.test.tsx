@@ -46,14 +46,16 @@ describe("SessionRow chips", () => {
     },
   );
 
-  it("marks a favorite with the theme-colored star, and nothing otherwise", () => {
-    renderRow(ws({ favorited: true }));
-    const star = label("Favorited")!;
-    expect(star.textContent).toBe("✦");
-    expect(star.className).toContain("text-favorite");
-    cleanup();
-    renderRow(ws({ favorited: false }));
-    expect(label("Favorited")).toBeNull();
+  it("keeps favorite identity distinct from pin in normal and compact rows", () => {
+    for (const compact of [false, true]) {
+      const { rerenderRow } = renderRow(ws({ favorited: true, pinned_at: null }), { compact });
+      expect(label("Favorited")?.textContent).toBe("✦");
+      expect(label("Pinned")).toBeNull();
+      rerenderRow(ws({ favorited: false, pinned_at: null }));
+      expect(label("Favorited")).toBeNull();
+      expect(label("Pinned")).toBeNull();
+      cleanup();
+    }
   });
 
   it("shows the snooze remaining time and the payload rate-limit park", () => {
@@ -362,5 +364,24 @@ describe("SessionRow color label (#2383)", () => {
     for (const key of ["red", "amber", "green", "clear"]) {
       expect(testId(`sidebar-context-menu-color-${key}`)).toBeNull();
     }
+  });
+});
+describe("SessionRow keyboard navigation", () => {
+  it("prevents page scrolling at the last visible row", () => {
+    const { container } = renderRow(ws());
+    const sidebar = document.createElement("nav");
+    sidebar.setAttribute("role", "navigation");
+    sidebar.setAttribute("aria-label", "Sessions sidebar");
+    container.parentElement!.insertBefore(sidebar, container);
+    sidebar.appendChild(container);
+
+    const row = screen.getByTestId("sidebar-session-row");
+    vi.spyOn(row, "getClientRects").mockReturnValue([{} as DOMRect] as unknown as DOMRectList);
+    row.focus();
+    const event = new KeyboardEvent("keydown", { key: "ArrowDown", bubbles: true, cancelable: true });
+    row.dispatchEvent(event);
+
+    expect(event.defaultPrevented).toBe(true);
+    expect(document.activeElement).toBe(row);
   });
 });

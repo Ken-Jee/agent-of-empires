@@ -41,7 +41,7 @@ pub(super) fn take_injected_fresh_handshake_failure() -> bool {
             .unwrap_or(0);
         AtomicI64::new(n)
     });
-    // `try_update` needs Rust 1.99; this keeps the 1.85 MSRV and the Nix toolchain building.
+    // `try_update` needs Rust 1.99, newer than the MSRV and the Nix toolchain.
     #[allow(deprecated)]
     let claimed = remaining.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
         (n > 0).then_some(n - 1)
@@ -55,7 +55,7 @@ pub(super) fn take_injected_fresh_handshake_failure() -> bool {
 /// `systemd-run` injects. Stdio and `pre_exec` are not carried over: set them
 /// on the result. A program containing `=` stays unscoped, since `env` would
 /// read it as an assignment.
-pub(super) fn wrap_in_scope(
+pub(crate) fn wrap_in_scope(
     cmd: tokio::process::Command,
     prefix: &crate::process::systemd::ScopePrefix,
 ) -> tokio::process::Command {
@@ -316,6 +316,64 @@ pub(super) async fn spawn_runner_detached(
         // fixed container mount in build_sandbox_docker_argv (#2587).
         cmd.env(crate::session::artifacts::ARTIFACT_DIR_ENV, dir);
     }
+    if !config.uses_native_prime() {
+        if let Some(lease) = &config.launch_lease {
+            lease.record_prime(crate::acp::runner_lifecycle::PrimeOwnership::NotPrime);
+        }
+    }
+    if config.uses_native_prime() {
+        let mut snapshot = std::process::Command::new(&spawn_command);
+        snapshot.envs(
+            cmd.as_std()
+                .get_envs()
+                .filter_map(|(key, value)| value.map(|value| (key, value))),
+        );
+        let runtime = super::spawn::prime_runtime_for_spawn(
+            config,
+            &spawn_command,
+            &snapshot,
+            &host_environment,
+            sandbox_argv.as_ref(),
+        )?
+        .ok_or_else(|| AcpError::Spawn("Prime runtime missing".into()))?;
+        if let Some(lease) = &config.launch_lease {
+            lease.record_prime(crate::acp::runner_lifecycle::PrimeOwnership::Owned {
+                runtime: Box::new(runtime.clone()),
+            });
+        }
+        let encoded =
+            serde_json::to_string(&runtime).map_err(|e| AcpError::Spawn(e.to_string()))?;
+        let original: Vec<_> = cmd
+            .as_std()
+            .get_args()
+            .map(std::ffi::OsStr::to_owned)
+            .collect();
+        let separator = original
+            .iter()
+            .position(|arg| arg == "--")
+            .ok_or_else(|| AcpError::Spawn("runner argument separator missing".into()))?;
+
+        let mut owned = tokio::process::Command::new(&current_exe);
+        owned
+            .args(&original[..separator])
+            .arg("--prime-runtime")
+            .arg(&encoded)
+            .arg("--")
+            .arg(&current_exe)
+            .arg("__prime-agent")
+            .arg("--runtime")
+            .arg(&encoded)
+            .arg("--")
+            .args(&original[separator + 1..])
+            .arg("--daemon-socket")
+            .arg(runtime.socket());
+        owned.env_clear().envs(
+            cmd.as_std()
+                .get_envs()
+                .filter_map(|(key, value)| value.map(|value| (key, value))),
+        );
+        cmd = owned;
+    }
     if !extra_path_dirs.is_empty() {
         // Prepend the resolved bin dirs so the adapter and its
         // `#!/usr/bin/env node` shim resolve against the same install.
@@ -389,7 +447,14 @@ pub(super) async fn spawn_runner_detached(
             .id()
             .ok_or_else(|| AcpError::Spawn("runner exited before it could be identified".into()))?;
         if let Some(lease) = &lease {
-            lease.record_runner(crate::acp::runner_lifecycle::RunnerIdentity { pid, generation });
+            lease.record_runner(crate::acp::runner_lifecycle::RunnerIdentity {
+                pid,
+                generation,
+                birth_fingerprint: crate::process::process_birth_identity(pid)
+                    .ok()
+                    .flatten()
+                    .map(|identity| identity.fingerprint()),
+            });
         }
         // The producer owns reaping even if the blocking-result waiter is dropped.
         tokio::spawn(async move {

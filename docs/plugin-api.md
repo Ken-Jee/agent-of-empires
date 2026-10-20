@@ -8,7 +8,7 @@ A manifest carries two independent version axes.
 
 | Key | Meaning |
 |---|---|
-| `api_version` | The manifest *schema* version. The current schema is `15`. The host rejects a manifest whose `api_version` is newer than it supports. |
+| `api_version` | The manifest *schema* version. The current schema is `18`. The host rejects a manifest whose `api_version` is newer than it supports. |
 | `aoe_version` | A semver requirement on the *host app* version, e.g. `">=1.11.0, <2.0.0"`. The host refuses to install, and skips loading, a plugin whose requirement excludes the running version. Optional; requires `api_version >= 4`. |
 
 Each key below notes the `api_version` it needs. Target the newest schema your plugin uses, and set `aoe_version` to the host range you have tested.
@@ -30,7 +30,7 @@ capabilities = ["runtime.worker"]
 | `id` | string | yes | Plugin id (see [Plugin id](#plugin-id)). Namespaces config, events, and action names. |
 | `name` | string | yes | Human-readable display name. |
 | `version` | string | yes | Semantic version of the plugin. |
-| `api_version` | integer | yes | Manifest schema version, `1` to `15`. |
+| `api_version` | integer | yes | Manifest schema version, `1` to `18`. |
 | `description` | string | no | Shown in plugin listings. Defaults to empty. |
 | `aoe_version` | string | no | Host-app semver requirement. Requires `api_version >= 4`. |
 | `capabilities` | array of string | no | Runtime grants the worker needs (see [Capabilities](#capabilities)). Static contributions need none. |
@@ -49,7 +49,7 @@ Capabilities gate runtime resource access. They are prompted once at install and
 |---|---|
 | `runtime.worker` | Running any plugin code at all (host RPCs the worker initiates). Any worker needs this. |
 | `session.read` | Reading sessions of the host's profile: the attached session, `sessions.list`, and the `session.status.changed` notifications (`api_version >= 14`). |
-| `session.write` | Mutating the attached session. |
+| `session.write` | Mutating any session of the profile: `session.meta.set`/`cas`, and archive/trash from a plugin page. |
 | `config.read` | Reading host or other-plugin configuration (not the plugin's own settings). |
 | `config.write` | Writing host or other-plugin configuration. |
 | `process.spawn` | Spawning processes beyond the plugin's own worker. |
@@ -147,6 +147,7 @@ max = 86400
 | `fields` | array | no | Item fields of an `object_list` (`api_version >= 9`). |
 | `item_id_key` | string | no | Item field holding each `object_list` row's stable id; defaults to `_id` (host-generated) (`api_version >= 9`). |
 | `min_items` / `max_items` | integer | no | Inclusive item-count bounds for an `object_list` (`api_version >= 9`). |
+| `per_project` | bool | no | Also settable per registered project, falling back to the global value. Defaults to `false` (`api_version >= 18`). See [Per-project settings](#per-project-settings). |
 
 Setting types:
 
@@ -201,6 +202,20 @@ required = true
 
 An item field takes the same keys as a top-level setting (`key`, `label`, `description`, `type`, `options`, `min`, `max`, `default`, `multiline`, `option_source`, `depends_on`) plus `required`. It may be a `dynamic_multi_select` (`api_version >= 11`), whose stored value is an array of the chosen option values, or a `string_list` (`api_version >= 14`), whose stored value is an array of freeform user-typed strings.
 
+### Per-project settings
+
+A top-level setting with `per_project = true` (`api_version >= 18`) can also be set for a registered project. The value is stored in that project's registry entry (`projects.json`), validated like a global write, and edited in the web project form. A profile-scoped registry entry shadows a global one for the same path.
+
+A worker reads the resolved value with `config.get`, passing the project's repository path:
+
+```json
+{ "key": "depth", "project_path": "/home/me/work/repo" }
+```
+
+The result is `{ "value", "scope", "revision" }`. `scope` is `"project"` when the project sets the key, else `"global"` when the global value is set, else `"default"` for the manifest `default`; `value` and `scope` are `null` when none applies. Without `project_path`, or for a path that is not a registered project, the project step is skipped. A key that is not `per_project` only ever returns its stored global value, with no `default` fallback and `project_path` ignored.
+
+Writing a per-project value sends `plugin.settings.changed` with the usual `{ revision, changed_keys }` plus the registry's `project_path`. Re-read those keys with `config.get` and that `project_path`.
+
 ## Session listing
 
 `sessions.list` (capability `session.read`) returns `{ "sessions": [...] }`. The optional `exclude` param is an array of `archived`, `snoozed` and `trashed`; with none, every stored session is returned. A trashed session stays present with `trashed: true`; a permanently purged session is absent.
@@ -210,10 +225,11 @@ An item field takes the same keys as a top-level setting (`key`, `label`, `descr
 | `id`, `title`, `tool`, `status` | string | Identity and current status. |
 | `project_path` | string | The session's own working directory; for a worktree session this is the worktree, not the main repo. |
 | `archived`, `snoozed`, `trashed` | bool | Lifecycle flags. |
+| `unread` | bool | The session carries the unread marker; always `false` while `session.unread_indicator` is off. |
 | `workspace_repos` | array | One `{ source_path, branch }` per repo checkout of a multi-repo workspace; empty otherwise. |
 | `worktree` | object | `{ branch, main_repo_path, managed_by_aoe }`; present only for worktree sessions. |
 
-`trashed`, `workspace_repos` and `worktree` were added after the first release; they are additive RPC fields and do not change the manifest `api_version`. Treat a missing key as absent on an older host.
+`trashed`, `unread`, `workspace_repos` and `worktree` were added after the first release; they are additive RPC fields and do not change the manifest `api_version`. Treat a missing key as absent on an older host.
 
 ## Session-driving RPCs
 
@@ -293,7 +309,7 @@ Quotas per plugin: 64 keys, 256-byte keys, 64 KiB values. `cas` (compare-and-swa
 
 ## UI slots
 
-Declares the host-rendered slots the worker pushes state into via the `ui.state.set` host RPC.
+Declares the host-rendered slots the worker pushes state into via the `ui.state.set` host RPC, and the plugin's pages.
 
 ```toml
 [[ui]]
@@ -305,10 +321,14 @@ id = "my_pane"
 |---|---|---|---|
 | `slot` | string | yes | One of the slot names below. Unknown slots are rejected. |
 | `id` | string | no | Addressing id for `(slot, id)` state pushes. Required to be non-empty when a command `action` targets it. |
+| `title` | string | page only | Page name shown in the dashboard. Required on a `page`. |
+| `icon` | string | no | Page only. A [lucide](https://lucide.dev/icons/) kebab-case icon name. |
+| `entry` | string | page only | Plugin-relative path to the page's `.html` file. Required on a `page`. See [Pages](#pages). |
 
 | Slot | Scope | Renders |
 |---|---|---|
 | `status-bar` | global | A segment in the dashboard status bar. |
+| `header-start` | global | A chip beside the logo in the dashboard top bar, hidden below the `md` breakpoint and with the wordmark on the compact sidebar rail (requires `api_version >= 17`). |
 | `card` | global | A card on the dashboard overview. |
 | `sort-key` | global | A named sort option over a `row-column` value. |
 | `filter-facet` | global | A named filter over a `row-column` value. |
@@ -318,11 +338,92 @@ id = "my_pane"
 | `pane` | per-session | A dockable tool-window pane (requires `api_version >= 3`). See [Pane payload](#pane-payload). |
 | `home-pane` | global | A host-wide docked pane on the dashboard overview and the structured-view pane overlay, carrying the same block vocabulary as `pane` but session-less (requires `api_version >= 13`). Several plugins' home panes stack in snapshot order. |
 | `composer-action` | per-session | A button beside the ACP composer controls (requires `api_version >= 8`). |
+| `page` | global | A full dashboard view rendered from a plugin HTML file (requires `api_version >= 16`). Optional pushed state is opaque to the host. See [Pages](#pages). |
 | `notification` | n/a | A transient notification pushed via `ui.notify`; gated by the `notifications` capability, not a slot declaration. |
+
+### Pages
+
+```toml
+[[ui]]
+slot = "page"
+id = "board"
+title = "Board"
+icon = "kanban"
+entry = "dist/board.html"
+```
+
+A page `id` uses only letters, digits, `-` and `_`, and is unique among the plugin's pages. `entry` follows the [screenshot path rules](#screenshots) with an `.html` extension and must resolve inside the plugin directory. A plugin may declare several pages.
+
+The entry must be one self-contained file: inline every script and style, and embed images as `data:` or `blob:` URLs. The host serves only that file, at `GET /api/plugins/{id}/pages/{page_id}` for an active plugin, uncached. Its policy sandboxes the document (`sandbox allow-scripts allow-downloads`), so it gets an opaque origin even when the URL is opened directly, runs the inline script and style and `data:`/`blob:` images, and blocks every other resource load, connection and form submission. As a second layer, the URL refuses any query string and any request whose `Sec-Fetch-Dest` is present and not `iframe`, and only the dashboard may frame it. Browsers send `Sec-Fetch-Dest` only over HTTPS or to localhost, so a dashboard reached over plain HTTP by LAN IP relies on the sandbox alone.
+
+The dashboard opens a page at `/plugins/{id}/{page_id}`, from its button beside the TopBar search or the command palette, in an iframe with `sandbox="allow-scripts allow-downloads"` and nothing else. The page cannot read dashboard storage or cookies, call the API, submit forms, open windows or navigate the dashboard; its only data path is the bridge. It can save a file by clicking an `<a download>` on a `blob:` URL. `allow-downloads` does not require a user gesture, so a page can also start a download from script; the browser's own download protections apply and vary by browser, and Safari can block a download started after an `await`. Start downloads from a click handler. A manifest with `api_version >= 18` can rely on downloads being allowed. A page that reloads itself more than 60 seconds after opening loses its authentication when device binding is on; reopen it from the dashboard instead.
+
+A worker may push state for a page with `ui.state.set` (`slot = "page"`, `id` = the page id, no `session_id`). The payload is any JSON object up to 64 KiB, stored unvalidated; `ui.state.remove` clears it. It appears in `GET /api/plugins/ui-state` as a global entry, `{ "plugin_id", "slot": "page", "id", "payload" }`, which the page reads through `plugins.uiState`.
+
+#### Page bridge
+
+The page opens the bridge by posting `ready` to `parent` with target origin `"*"`, since its origin is opaque, transferring one end of a `MessageChannel` and passing `params: { "nonce" }` set to its URL fragment without the `#`. The dashboard frames each opening with a fresh nonce there, so a document the page navigates to cannot open the bridge in its place. Every later request, reply and push travels over that channel, so nothing reaches a document that replaces the page. The dashboard accepts one `ready` per frame and ignores any other message on the window. Every message carries `aoeBridge: 1`, the bridge version.
+
+A request is `{ "aoeBridge": 1, "id", "method", "params"? }`, where `id` is a number or a string of at most 128 characters and `params` an object. The reply echoes the `id` with either `result` or `error: { "code", "message" }`. The dashboard drops, without replying, any message that is not an object, has another version, or has a malformed `id`, `method` or `params`.
+
+| Method | Params | Requires | Result |
+|---|---|---|---|
+| `ready` | `{ "nonce" }` | none | `null`, then the `context` and `theme` pushes |
+| `sessions.list` | none | `session.read` | The sessions, in the rows a worker's [`sessions.list`](#session-listing) returns |
+| `plugins.uiState` | none | `session.read` | The `GET /api/plugins/ui-state` body, including other plugins' entries |
+| `action` | `{ "method", "params"?, "sessionId"? }` | not read-only or CityHall | `{ "baselineRevision" }`; the call goes to this plugin's own worker, as a [pane action](#pane-actions) does |
+| `openSession` | `{ "id" }` | none | `null`; the dashboard navigates to the session, or shows it below the page, with its side panels, when the user turned on split view |
+| `session.archive` | `{ "id" }` | `session.read` and `session.write`, not read-only or CityHall | `null`; archives the session and stops its pane |
+| `session.trash` | `{ "id" }` | `session.read` and `session.write`, not read-only or CityHall | `null`; moves the session to the trash and stops its pane |
+| `session.contextMenu` | `{ "id", "x", "y", "items"? }` | `session.read` | The picked item's `id`, or `null`. Opens the sidebar's session menu at frame coordinates `x`, `y`, clamped to the frame; every action in it is the user's own and follows the dashboard's modes, and it ignores clicks for 300 ms after opening so a page cannot time one onto an item. `items`, at most 20 `{ "id", "label" }`, are appended to the menu under the page's title. Resolves when the menu closes |
+
+Error codes: `unknown_method`, `invalid_params` (also an `id` that `sessions.list` does not return), `capability_denied` (the plugin does not declare the required capability), `read_only`, `cityhall_mode`, and `failed` (the dashboard's request failed). An `action` result only acknowledges delivery; its effect arrives in `plugins.uiState` once the worker updates its state.
+
+The dashboard pushes `{ "aoeBridge": 1, "event", "data" }` messages, with no `id`:
+
+- `context`, once after `ready`: `{ "readOnly", "cityhall", "pluginId", "pageId", "bridgeVersion" }`.
+- `theme`, after `ready` and on every theme change: `{ "appearance": "dark" | "light", "cssVars": { "--name": "value" } }`, the dashboard's resolved CSS variables.
+- `selection`, after `ready` and whenever it changes: `{ "sessionId" }`, the session split view shows below the page, or `null`.
+
+When the frame loads a second document, because the page reloaded or navigated itself, the dashboard removes the frame and offers to reopen it. A minimal client:
+
+```ts
+let next = 0;
+const pending = new Map<number, (reply: { result?: unknown; error?: { code: string; message: string } }) => void>();
+const handlers: Record<string, (data: any) => void> = {};
+const { port1, port2 } = new MessageChannel();
+
+port1.onmessage = ({ data: m }) => {
+  if (m.event) return handlers[m.event]?.(m.data);
+  pending.get(m.id)?.(m);
+  pending.delete(m.id);
+};
+
+function request<T>(msg: object, send: (msg: object) => void): Promise<T> {
+  const id = ++next;
+  const reply = new Promise<T>((resolve, reject) =>
+    pending.set(id, (m) => (m.error ? reject(m.error) : resolve(m.result as T))),
+  );
+  send({ aoeBridge: 1, id, ...msg });
+  return reply;
+}
+
+const call = <T>(method: string, params?: object) => request<T>({ method, params }, (m) => port1.postMessage(m));
+
+handlers.theme = ({ cssVars }) => {
+  for (const [k, v] of Object.entries(cssVars)) document.documentElement.style.setProperty(k, String(v));
+};
+handlers.context = (ctx) => console.log("bridge context", ctx);
+request({ method: "ready", params: { nonce: location.hash.slice(1) } }, (m) => parent.postMessage(m, "*", [port2]))
+  .then(() => call<{ id: string }[]>("sessions.list"))
+  .then((sessions) => console.log(sessions));
+```
 
 ### Badge payload
 
-`status-bar`, `row-badge` and `detail-badge` take either one badge, `{ text?, icon?, tone?, href?, tooltip? }` (`status-bar` and `detail-badge` require `text` or `items`), or an `items` list of such badges that replaces the top-level fields. `items: []` clears the badge.
+`status-bar`, `header-start`, `row-badge` and `detail-badge` take either one badge, `{ text?, icon?, tone?, href?, tooltip? }` (`status-bar`, `header-start` and `detail-badge` require `text` or `items`), or an `items` list of such badges that replaces the top-level fields. `items: []` clears the badge.
+
+`status-bar`, `header-start` and `detail-badge` also take an integer `order`, default 0, lowest first; ties keep plugin id then entry id order. In the terminal UI they render as text and tone in the status line, `header-start` first; icons, tooltips and links are web only.
 
 Give items a shared `group` to collapse them into one chip that shows one item at a time. Clicking or tapping it advances to the next item and wraps around, for example a usage badge cycling `5h`, `7d` and `opus` values:
 
@@ -543,3 +644,7 @@ bin = "my-plugin-worker"
 |---|---|---|---|
 | `asset` | string | yes | Asset-name template; `${os}`, `${arch}`, `${target}` are substituted before matching the release. |
 | `bin` | string | no | Executable path inside the extracted archive. Omit to run the downloaded asset directly (a raw, non-archive binary). |
+
+### Worker logs
+
+The worker's stdout carries JSON-RPC only; write diagnostics to stderr. The host captures stderr in `<app_dir>/plugin-workers/<plugin-id>_<worker-uuid>.log`, one file per start, and `aoe plugin logs <id>` prints the newest path. Only the five newest logs per plugin are kept. See [Worker logs](plugins.md#worker-logs).

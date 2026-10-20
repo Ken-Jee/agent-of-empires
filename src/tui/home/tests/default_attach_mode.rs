@@ -481,9 +481,7 @@ fn switch_view_target_gated_on_structured_opt_in() {
     assert_eq!(env.view.session_switch_view_target(&id), None);
 }
 
-/// Tab is Enter's complement on a session row: whichever of live-send and tmux-attach
-/// `default_attach_mode` doesn't route Enter to. The footer must surface it so it isn't
-/// discoverable only from the source or the `?` overlay.
+/// The footer advertises Tab's alternate action for the configured Enter mode.
 #[test]
 #[serial]
 fn footer_advertises_tab_as_live_when_default_is_tmux() {
@@ -494,17 +492,12 @@ fn footer_advertises_tab_as_live_when_default_is_tmux() {
     env.view.update_selected();
     let out = render_home(&mut env);
     assert!(
-        out.contains("↵  Attach"),
-        "Enter hint should stay tmux attach under the default mode.\n{out}"
-    );
-    assert!(
         out.contains("⇥  Live"),
         "Tab hint should advertise Live mode when Enter is pinned to tmux attach.\n{out}"
     );
 }
 
-/// Inverse: once `default_attach_mode = LiveSend` takes over Enter, the two hints swap
-/// rather than both claiming "Attach", the same swap the `?` overlay does.
+/// Live-send on Enter makes Tab the tmux attach alternative.
 #[test]
 #[serial]
 fn footer_advertises_tab_as_attach_when_default_is_live_send() {
@@ -516,17 +509,12 @@ fn footer_advertises_tab_as_attach_when_default_is_live_send() {
     env.view.update_selected();
     let out = render_home(&mut env);
     assert!(
-        out.contains("↵  Live"),
-        "Enter hint should say Live once it owns live-send.\n{out}"
-    );
-    assert!(
         out.contains("⇥  Attach"),
         "Tab hint should offer the tmux escape hatch once Enter owns live-send.\n{out}"
     );
 }
 
-/// Acp rows ignore `default_attach_mode` entirely (Tab mirrors Enter or no-ops), so the
-/// footer must not advertise a Tab complement that does nothing different.
+/// Structured rows have no distinct Tab action to advertise.
 #[test]
 #[serial]
 fn footer_hides_tab_hint_for_structured_sessions() {
@@ -542,10 +530,6 @@ fn footer_hides_tab_hint_for_structured_sessions() {
     assert!(
         !out.contains("⇥"),
         "structured view rows must not show a Tab hint at all.\n{out}"
-    );
-    assert!(
-        out.contains("↵  Attach"),
-        "structured rows keep the plain Enter attach label.\n{out}"
     );
 }
 

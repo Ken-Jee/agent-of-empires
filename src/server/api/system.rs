@@ -442,46 +442,43 @@ fn apply_profile_patch(
     name: &str,
     patch: &serde_json::Value,
 ) -> anyhow::Result<crate::session::ProfileConfig> {
-    // `get_profile_dir` creates a directory that is missing, so loading with a
-    // default would let a save to an unknown name mint a hollow profile: no
-    // storage transition, no disk watch, and it shows up in the picker. Saving
-    // to a profile that does not exist is a caller error, not a creation.
+    // A settings save cannot create a profile.
     crate::session::require_known_profile(name)?;
-    let config = crate::session::load_profile_config(name).unwrap_or_default();
-    let mut current = serde_json::to_value(&config)?;
-    if let Some(update_obj) = patch.as_object() {
-        for (key, value) in update_obj {
-            match value {
-                serde_json::Value::Object(fields) => {
-                    for (field, fval) in fields {
-                        if fval.is_null() {
-                            clear_path(&mut current, key, field);
-                        } else if let Some(root) = current.as_object_mut() {
-                            let section = root
-                                .entry(key.clone())
-                                .or_insert_with(|| serde_json::json!({}));
-                            if let Some(sec) = section.as_object_mut() {
-                                sec.insert(field.clone(), fval.clone());
+    crate::session::update_profile_config(name, |config| {
+        let mut current = serde_json::to_value(&*config)?;
+        if let Some(update_obj) = patch.as_object() {
+            for (key, value) in update_obj {
+                match value {
+                    serde_json::Value::Object(fields) => {
+                        for (field, fval) in fields {
+                            if fval.is_null() {
+                                clear_path(&mut current, key, field);
+                            } else if let Some(root) = current.as_object_mut() {
+                                let section = root
+                                    .entry(key.clone())
+                                    .or_insert_with(|| serde_json::json!({}));
+                                if let Some(sec) = section.as_object_mut() {
+                                    sec.insert(field.clone(), fval.clone());
+                                }
                             }
                         }
                     }
-                }
-                serde_json::Value::Null => {
-                    if let Some(root) = current.as_object_mut() {
-                        root.remove(key);
+                    serde_json::Value::Null => {
+                        if let Some(root) = current.as_object_mut() {
+                            root.remove(key);
+                        }
                     }
-                }
-                other => {
-                    if let Some(root) = current.as_object_mut() {
-                        root.insert(key.clone(), other.clone());
+                    other => {
+                        if let Some(root) = current.as_object_mut() {
+                            root.insert(key.clone(), other.clone());
+                        }
                     }
                 }
             }
         }
-    }
-    let config: crate::session::ProfileConfig = serde_json::from_value(current)?;
-    crate::session::save_profile_config(name, &config)?;
-    Ok(config)
+        *config = serde_json::from_value(current)?;
+        Ok(config.clone())
+    })
 }
 
 /// Persist a settings patch, routing each leaf to the layer `GET /api/settings`
@@ -489,6 +486,7 @@ fn apply_profile_patch(
 pub async fn update_settings(
     State(state): State<Arc<AppState>>,
     axum::extract::Query(query): axum::extract::Query<SettingsQuery>,
+    headers: HeaderMap,
     session: Option<Extension<AuthenticatedSession>>,
     loopback: Option<Extension<LocalAuthorization>>,
     body: Result<Json<serde_json::Value>, axum::extract::rejection::JsonRejection>,
@@ -533,6 +531,7 @@ pub async fn update_settings(
         profile_patch,
         session,
         loopback,
+        WriteStamp::from_headers(&headers),
     )
     .await
 }
@@ -546,6 +545,7 @@ async fn save_settings_patch(
     mut profile_patch: serde_json::Value,
     session: Option<Extension<AuthenticatedSession>>,
     loopback: Option<Extension<LocalAuthorization>>,
+    stamp: Option<WriteStamp>,
 ) -> axum::response::Response {
     // Machine-wide leaves set what every profile inherits, so they are the
     // privileged half of this surface. The route-level gate cannot see which
@@ -576,13 +576,27 @@ async fn save_settings_patch(
         }
     }
 
+    let mut applied = write_gate().await;
+    let stale = drop_stale_leaves(&applied, stamp.as_ref(), "", &mut machine)
+        | drop_stale_leaves(
+            &applied,
+            stamp.as_ref(),
+            profile.as_deref().unwrap_or(""),
+            &mut profile_patch,
+        );
+    if stale && is_empty_patch(&machine) && is_empty_patch(&profile_patch) {
+        return stale_write_response();
+    }
+    let write_profile = profile.is_some() && !is_empty_patch(&profile_patch);
     // The profile override is written first: a machine-wide failure then leaves
     // the narrower half in place, which is what the partial-save message says.
     if let Some(name) = profile.clone().filter(|_| write_profile) {
         let patch = profile_patch.clone();
         let label = name.clone();
         match tokio::task::spawn_blocking(move || apply_profile_patch(&name, &patch)).await {
-            Ok(Ok(_)) => {}
+            Ok(Ok(_)) => {
+                record_applied(&mut applied, stamp.as_ref(), &label, &profile_patch);
+            }
             Ok(Err(e)) => {
                 tracing::warn!(target: "http.api.system", "Profile settings update failed: {e}");
                 return bad_request(format!(
@@ -618,8 +632,8 @@ async fn save_settings_patch(
                     .collect()
             })
             .unwrap_or_default();
-        rewrite_plugin_sections(&mut machine);
-        let written = machine.clone();
+        let mut written = machine.clone();
+        rewrite_plugin_sections(&mut written);
         match tokio::task::spawn_blocking(move || apply_machine_patch(&written)).await {
             Ok(Ok((config, logging_changed))) => {
                 // No-op and restart-only edits preserve temporary runtime filters.
@@ -636,10 +650,11 @@ async fn save_settings_patch(
                 // after the durable write. Best-effort; config.get is the fallback.
                 if !plugin_changes.is_empty() {
                     if let Some(host) = &state.plugin_host {
-                        host.emit_settings_changed(&plugin_changes).await;
+                        host.emit_settings_changed(&plugin_changes, None).await;
                     }
                 }
                 machine_config = Some(config);
+                record_applied(&mut applied, stamp.as_ref(), "", &machine);
             }
             Ok(Err(e)) => {
                 tracing::warn!(target: "http.api.system", "Settings update failed: {e}");
@@ -660,6 +675,7 @@ async fn save_settings_patch(
             }
         }
     }
+    drop(applied);
 
     // Answer with the same layer the caller addressed, so a save and the read
     // that follows it never disagree.
@@ -697,6 +713,118 @@ async fn save_settings_patch(
             )
         }
     }
+}
+
+/// Header a client stamps on each settings PATCH: `<tab id>.<sequence>`, increasing per tab.
+const WRITE_STAMP_HEADER: &str = "x-aoe-write-stamp";
+
+/// Past this many tracked leaves the table is reset rather than grown without bound.
+const MAX_TRACKED_WRITES: usize = 4096;
+
+struct WriteStamp {
+    tab: String,
+    seq: u64,
+}
+
+impl WriteStamp {
+    fn from_headers(headers: &HeaderMap) -> Option<Self> {
+        let (tab, seq) = headers
+            .get(WRITE_STAMP_HEADER)?
+            .to_str()
+            .ok()?
+            .rsplit_once('.')?;
+        Some(Self {
+            tab: tab.to_string(),
+            seq: seq.parse().ok()?,
+        })
+    }
+
+    fn key(&self, scope: &str, section: &str, field: &str) -> String {
+        format!("{}|{scope}|{section}.{field}", self.tab)
+    }
+}
+
+/// Latest stamped write applied per tab and leaf, behind the lock that also serialises the
+/// writes themselves. A PATCH whose connection dropped can still commit late; dropping it
+/// when a newer write of the same leaf already landed keeps the client's latest edit.
+async fn write_gate() -> tokio::sync::MutexGuard<'static, HashMap<String, u64>> {
+    static GATE: tokio::sync::OnceCell<tokio::sync::Mutex<HashMap<String, u64>>> =
+        tokio::sync::OnceCell::const_new();
+    GATE.get_or_init(|| async { tokio::sync::Mutex::new(HashMap::new()) })
+        .await
+        .lock()
+        .await
+}
+
+fn patch_leaves(patch: &serde_json::Value) -> Vec<(String, String)> {
+    let Some(sections) = patch.as_object() else {
+        return Vec::new();
+    };
+    sections
+        .iter()
+        .flat_map(|(section, value)| match value.as_object() {
+            Some(fields) => fields
+                .keys()
+                .map(|field| (section.clone(), field.clone()))
+                .collect(),
+            None => vec![(section.clone(), String::new())],
+        })
+        .collect()
+}
+
+/// Remove leaves an equal or newer stamped write already applied; true if any were removed.
+fn drop_stale_leaves(
+    applied: &HashMap<String, u64>,
+    stamp: Option<&WriteStamp>,
+    scope: &str,
+    patch: &mut serde_json::Value,
+) -> bool {
+    let Some(stamp) = stamp else {
+        return false;
+    };
+    let mut dropped = false;
+    for (section, field) in patch_leaves(patch) {
+        if applied
+            .get(&stamp.key(scope, &section, &field))
+            .is_some_and(|&seen| seen >= stamp.seq)
+        {
+            dropped = true;
+            if field.is_empty() {
+                patch.as_object_mut().map(|m| m.remove(&section));
+            } else if let Some(fields) = patch.get_mut(&section).and_then(|v| v.as_object_mut()) {
+                fields.remove(&field);
+                if fields.is_empty() {
+                    patch.as_object_mut().map(|m| m.remove(&section));
+                }
+            }
+        }
+    }
+    dropped
+}
+
+fn record_applied(
+    applied: &mut HashMap<String, u64>,
+    stamp: Option<&WriteStamp>,
+    scope: &str,
+    patch: &serde_json::Value,
+) {
+    let Some(stamp) = stamp else {
+        return;
+    };
+    if applied.len() > MAX_TRACKED_WRITES {
+        applied.clear();
+    }
+    for (section, field) in patch_leaves(patch) {
+        applied.insert(stamp.key(scope, &section, &field), stamp.seq);
+    }
+}
+
+fn stale_write_response() -> axum::response::Response {
+    api_error(
+        StatusCode::CONFLICT,
+        "stale_write",
+        "A newer save of these settings was already applied",
+    )
 }
 
 fn internal_error() -> axum::response::Response {
@@ -1766,12 +1894,13 @@ pub struct ServerAbout {
     /// active profile. Context-window percentage at which the reminder
     /// appears.
     pub acp_compaction_reminder_percent: u8,
-    /// `"debug"` when built with `debug_assertions`, `"release"`
-    /// otherwise. The web UI renders a "DEV" badge in the topbar
-    /// when this is `"debug"` so users can tell concurrently-running
-    /// debug (port 8081) and release (port 8080) instances apart at
-    /// a glance, including PWA installs where the port disappears
-    /// from the window chrome. See #1055.
+    /// Resolved `acp.notice_display`: how the structured view shows agent notices.
+    pub acp_notice_display: crate::session::config::NoticeDisplay,
+    /// Resolved `acp.notice_timeout_secs`, used when `acp_notice_display` is `timeout`.
+    pub acp_notice_timeout_secs: u32,
+    /// `"debug"` when built with `debug_assertions`, else `"release"`. The web
+    /// UI renders a DEV badge from it so concurrent debug (8081) and release
+    /// (8080) instances are distinguishable, PWA installs included.
     pub build_flavor: &'static str,
     /// Content-hashed entry bundle name (`index-<hash>.js`) of the
     /// embedded dashboard build. The client compares this against its
@@ -1799,6 +1928,8 @@ pub async fn get_about(State(state): State<Arc<AppState>>) -> Json<ServerAbout> 
     let acp_replay_events = acp_cfg.replay_events;
     let acp_compaction_reminder = acp_cfg.compaction_reminder;
     let acp_compaction_reminder_percent = acp_cfg.compaction_reminder_percent;
+    let acp_notice_display = acp_cfg.notice_display;
+    let acp_notice_timeout_secs = acp_cfg.notice_timeout_secs;
     let snapshot = state
         .sleep_inhibit_snapshot
         .load(std::sync::atomic::Ordering::Relaxed);
@@ -1821,6 +1952,8 @@ pub async fn get_about(State(state): State<Arc<AppState>>) -> Json<ServerAbout> 
         acp_replay_events,
         acp_compaction_reminder,
         acp_compaction_reminder_percent,
+        acp_notice_display,
+        acp_notice_timeout_secs,
         build_flavor: if cfg!(debug_assertions) {
             "debug"
         } else {
@@ -2251,6 +2384,7 @@ fn first_non_cityhall_profile_leaf(patch: &serde_json::Value) -> Option<String> 
 pub async fn update_profile_settings(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(name): axum::extract::Path<String>,
+    headers: HeaderMap,
     session: Option<axum::Extension<AuthenticatedSession>>,
     loopback: Option<axum::Extension<LocalAuthorization>>,
     body: Result<Json<serde_json::Value>, axum::extract::rejection::JsonRejection>,
@@ -2291,8 +2425,18 @@ pub async fn update_profile_settings(
     // Validate scope before stripping, including global-only local fields.
     strip_local_only(&mut body);
 
+    let stamp = WriteStamp::from_headers(&headers);
+    let mut applied = write_gate().await;
+    if drop_stale_leaves(&applied, stamp.as_ref(), &name, &mut body) && is_empty_patch(&body) {
+        return stale_write_response();
+    }
+    let scope = name.clone();
     let written = body.clone();
     let result = tokio::task::spawn_blocking(move || apply_profile_patch(&name, &written)).await;
+    if matches!(&result, Ok(Ok(_))) {
+        record_applied(&mut applied, stamp.as_ref(), &scope, &body);
+    }
+    drop(applied);
 
     match result {
         Ok(Ok(config)) => match serde_json::to_value(&config) {
@@ -2858,6 +3002,7 @@ mod tests {
                         profile: None,
                         layer: None,
                     }),
+                    HeaderMap::new(),
                     None,
                     Some(axum::Extension(LocalAuthorization::UnixOwner(0))),
                     Ok(Json(body)),
@@ -2923,5 +3068,62 @@ mod tests {
         // empty rather than just "not /etc/passwd".
         let body = to_bytes(resp.into_body(), 1024).await.unwrap();
         assert!(body.is_empty(), "unexpected body bytes: {body:?}");
+    }
+    /// A PATCH whose connection dropped can commit after the client's newer edit of the
+    /// same leaf; the stamp makes the server drop it instead of restoring the old value.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn settings_save_drops_a_late_older_write_of_the_same_leaf() {
+        use serde_json::json;
+        let home = tempfile::TempDir::new().unwrap();
+        let _home = crate::session::test_support::isolate_home(home.path());
+        let state = crate::server::test_support::build_test_app_state(Vec::new());
+        let save = |tab_seq: &'static str, slice: &'static str| {
+            let state = state.clone();
+            async move {
+                let mut headers = HeaderMap::new();
+                headers.insert(WRITE_STAMP_HEADER, tab_seq.parse().unwrap());
+                update_settings(
+                    State(state),
+                    axum::extract::Query(SettingsQuery {
+                        profile: None,
+                        layer: Some("machine".into()),
+                    }),
+                    headers,
+                    None,
+                    Some(axum::Extension(LocalAuthorization::TcpLoopback)),
+                    Ok(Json(json!({"systemd": {"slice": slice}}))),
+                )
+                .await
+                .into_response()
+                .status()
+            }
+        };
+
+        assert_eq!(save("tab1.2", "newer.slice").await, StatusCode::OK);
+        assert_eq!(save("tab1.1", "older.slice").await, StatusCode::CONFLICT);
+        assert_eq!(
+            crate::session::Config::load().unwrap().systemd.slice,
+            "newer.slice"
+        );
+        // Another tab has its own sequence, and an unstamped write is never dropped.
+        assert_eq!(save("tab2.1", "other-tab.slice").await, StatusCode::OK);
+        assert_eq!(
+            update_settings(
+                State(state.clone()),
+                axum::extract::Query(SettingsQuery {
+                    profile: None,
+                    layer: Some("machine".into()),
+                }),
+                HeaderMap::new(),
+                None,
+                Some(axum::Extension(LocalAuthorization::TcpLoopback)),
+                Ok(Json(json!({"systemd": {"slice": "unstamped.slice"}}))),
+            )
+            .await
+            .into_response()
+            .status(),
+            StatusCode::OK
+        );
     }
 }

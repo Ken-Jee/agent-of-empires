@@ -56,8 +56,8 @@ mod tests {
             match existing_journal {
                 Some(existing) => assert_eq!(journal, existing),
                 None => {
-                    let parsed: serde_json::Value = serde_json::from_slice(&journal)?;
-                    assert_eq!(parsed, serde_json::json!({"version":2,"owners":[]}));
+                    let storage = crate::session::Storage::open_unwatched("default")?;
+                    assert!(crate::session::purge_owners::protection(&storage, None)?.is_empty());
                 }
             }
             let state_bytes = std::fs::read(app.join("state.toml"))?;

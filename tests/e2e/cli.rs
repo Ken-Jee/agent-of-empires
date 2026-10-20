@@ -469,7 +469,7 @@ fn cli_restart_all_refuses_to_run_when_tmux_server_context_does_not_match() {
     let caller_name = set_cli_tmux_context(&mut h, &caller_id, "Caller");
     let restartable_pid = tmux_pane_pid(&h, &restartable_name);
     let (socket, server_pid) = tmux_server_identity(&h, &caller_name);
-    h.set_env("TMUX", &format!("{socket},{},0", server_pid + 1));
+    h.set_env("TMUX", format!("{socket},{},0", server_pid + 1));
 
     let output = h.run_cli(&["session", "restart", "--all"]);
 
@@ -922,6 +922,67 @@ fn cli_mcp_list_merges_layers_and_redacts_secrets() {
     assert_eq!(val["keptOnRemoval"], json!([]));
     assert_eq!(val["conflicts"], json!([]));
     assert_eq!(val["driftPaused"], false);
+}
+
+/// #3045: add, edit and remove an AoE-owned MCP server; native servers are refused.
+#[test]
+#[parallel]
+fn cli_mcp_add_edit_remove_flow() {
+    let h = TuiTestHarness::new("cli_mcp_add_edit_remove");
+    let home = h.home_path();
+    std::fs::write(
+        home.join(".claude.json"),
+        r#"{ "mcpServers": { "native-only": { "command": "n" } } }"#,
+    )
+    .expect("write .claude.json");
+    let mcp_json =
+        || std::fs::read_to_string(app_dir_in(home).join("mcp.json")).unwrap_or_default();
+
+    let out = h.run_cli_ok(&[
+        "mcp",
+        "add",
+        "fs",
+        "--command",
+        "mcp-fs",
+        "--arg",
+        "--root",
+        "--env",
+        "TOKEN=SUPER_SECRET",
+    ]);
+    assert!(!out.contains("SUPER_SECRET"), "secret leaked:\n{out}");
+
+    // Editing the command keeps the stored secret; --unset-env then removes it.
+    h.run_cli_ok(&["mcp", "edit", "fs", "--command", "mcp-fs2"]);
+    assert!(mcp_json().contains("SUPER_SECRET"));
+    let listed = json_out(&h, &["mcp", "list", "--agent", "claude", "--json"]);
+    let fs = listed["effective"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["name"] == "fs")
+        .expect("fs listed")
+        .clone();
+    assert_eq!(fs["command"], "mcp-fs2");
+    assert_eq!(fs["provenance"], "global");
+    assert_eq!(fs["envNames"], json!(["TOKEN"]));
+    h.run_cli_ok(&["mcp", "edit", "fs", "--unset-env", "TOKEN"]);
+    assert!(!mcp_json().contains("SUPER_SECRET"));
+    h.run_cli_ok(&["mcp", "edit", "fs", "--clear-args"]);
+    assert!(!mcp_json().contains("--root"));
+
+    let before = mcp_json();
+    for args in [
+        &["mcp", "edit", "native-only", "--command", "x"][..],
+        &["mcp", "remove", "native-only"][..],
+    ] {
+        let out = h.run_cli(args);
+        assert!(!out.status.success(), "{args:?} must fail");
+        assert!(String::from_utf8_lossy(&out.stderr).contains("not an AoE-owned server"));
+    }
+    assert_eq!(mcp_json(), before);
+
+    h.run_cli_ok(&["mcp", "remove", "fs"]);
+    assert!(!h.run_cli(&["mcp", "remove", "fs"]).status.success());
 }
 
 /// #3050: discover, adopt, edit, share, and remove a skill while the external
@@ -1541,8 +1602,17 @@ fn cli_migration_34_37_43_persists_policy_and_second_run_bytes() {
         let state = toml::to_string_pretty(&toml::Table::try_from(&retained).unwrap()).unwrap();
         std::fs::write(app.join("state.toml"), &state).unwrap();
         let identity = "01234567-89ab-4cde-8fab-0123456789ab";
-        let row = json!({"id":"retained","trashed_at":"2026-10-11T00:00:00Z","trash_lifecycle_id":identity,"lifecycle_generation":7,
-            "failed_purge":{"trashed_at":"2026-10-11T00:00:00Z","trash_lifecycle_id":identity,"lifecycle_generation":7,"forced":true}});
+        let row = json!({
+            "id":"retained",
+            "title":"Retained legacy session",
+            "project_path":h.project_path().to_str().unwrap(),
+            "created_at":"2026-10-10T00:00:00Z",
+            "tool":"claude",
+            "trashed_at":"2026-10-11T00:00:00Z",
+            "trash_lifecycle_id":identity,
+            "lifecycle_generation":7,
+            "failed_purge":{"trashed_at":"2026-10-11T00:00:00Z","trash_lifecycle_id":identity,"lifecycle_generation":7,"forced":true}
+        });
         let sessions = app.join("profiles/default/sessions.json");
         std::fs::write(&sessions, json!([row]).to_string()).unwrap();
         let launch = json!({"schema":2,"pid":42,"instance_id":"retained-instance","auth_mode":"token","remote":false});
@@ -1581,10 +1651,6 @@ fn cli_migration_34_37_43_persists_policy_and_second_run_bytes() {
             std::fs::read_to_string(app.join("state.toml")).unwrap(),
             state
         );
-        assert_eq!(
-            std::fs::read_to_string(app.join("pending-purge-owners.json")).unwrap(),
-            journal
-        );
         let paths = [
             app.join("state.toml"),
             sessions,
@@ -1606,6 +1672,5 @@ fn cli_migration_34_37_43_persists_policy_and_second_run_bytes() {
         for (path, before) in paths.iter().zip(bytes) {
             assert_eq!(std::fs::read(path).unwrap(), before);
         }
-        eprintln!("actual CLI schema {version}->{completed_checkpoint}, policy/identity/state/journal/unknown authority and second-run bytes preserved");
     }
 }

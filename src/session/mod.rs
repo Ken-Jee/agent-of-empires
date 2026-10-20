@@ -150,11 +150,30 @@ pub fn set_favorites_first(on: bool) {
 }
 
 pub(crate) use anchored_fs::ResolvedDataFile;
+/// Process-wide cache of `session.preview_link_prefixes`, read where OSC 8
+/// targets are extracted, off the TUI thread.
+static PREVIEW_LINK_PREFIXES: std::sync::RwLock<Vec<String>> = std::sync::RwLock::new(Vec::new());
+
+/// Whether a pane link to `url` is worth keeping under the cached prefixes.
+pub fn preview_link_openable(url: &str) -> bool {
+    let prefixes = PREVIEW_LINK_PREFIXES
+        .read()
+        .unwrap_or_else(|e| e.into_inner());
+    crate::util::is_openable_link(url, &prefixes)
+}
+
+/// Update the cached preview link prefixes from resolved config.
+pub fn set_preview_link_prefixes(prefixes: &[String]) {
+    *PREVIEW_LINK_PREFIXES
+        .write()
+        .unwrap_or_else(|e| e.into_inner()) = prefixes.to_vec();
+}
 pub use config::profile_config::{
     load_profile_config, merge_configs, resolve_config, resolve_config_or_warn,
-    save_profile_config, validate_capability_format, validate_check_interval, validate_env_format,
-    validate_memory_limit, validate_network_format, validate_port_mapping_format,
-    validate_security_opt_format, validate_systemd_slice, validate_volume_format, ProfileConfig,
+    save_profile_config, update_profile_config, validate_capability_format,
+    validate_check_interval, validate_env_format, validate_memory_limit, validate_network_format,
+    validate_port_mapping_format, validate_security_opt_format, validate_systemd_slice,
+    validate_volume_format, ProfileConfig,
 };
 pub use config::repo_config::{
     check_repo_trust, execute_hooks, execute_hooks_in_container, load_repo_config,
@@ -291,7 +310,7 @@ pub fn app_dir_exists() -> bool {
     get_app_dir_path().map(|p| p.exists()).unwrap_or(false)
 }
 
-fn get_app_dir_path() -> Result<PathBuf> {
+pub(crate) fn get_app_dir_path() -> Result<PathBuf> {
     #[cfg(target_os = "linux")]
     let dir = xdg_config_base()?.join(APP_DIR_NAME_XDG);
 
@@ -419,23 +438,9 @@ pub fn get_profile_dir(profile: &str) -> Result<PathBuf> {
     Ok(dir)
 }
 
-/// Resolve the on-disk profile directory path WITHOUT creating it.
-///
-/// Use this for read-only operations (loading config, looking up paths)
-/// where the directory-creation side effect of [`get_profile_dir`] would
-/// pollute `profiles/` with empty stub directories. Notably, GET
-/// `/api/settings?profile=<name>` for an unknown profile used to create
-/// that profile's directory as a side effect of the read, which then
-/// made the unknown profile appear in subsequent GET /api/profiles
-/// responses. Routing those reads through this helper keeps the lookup
-/// pure.
-///
-/// Empty `profile` resolves through [`config::resolve_default_profile`]
-/// just like [`get_profile_dir`] does, including its bootstrap side
-/// effect on a genuine first run; callers that want to avoid that should
-/// pass an explicit non-empty name.
+/// Explicit names resolve without creation; an empty name retains default-profile bootstrap.
 pub fn get_profile_dir_path(profile: &str) -> Result<PathBuf> {
-    let base = get_app_dir()?;
+    let base = get_app_dir_path()?;
     let resolved;
     let profile_name = if profile.is_empty() {
         resolved = config::resolve_default_profile();
@@ -485,18 +490,15 @@ pub fn list_profiles() -> Result<Vec<String>> {
     list_profile_names_in(&profiles_dir)
 }
 
-/// Picker order: alphabetical, with a profile named `default` last.
-///
-/// Presentation only. [`list_profiles`] stays plainly sorted because
-/// [`config::resolve_default_profile`] takes its first entry when
-/// `config.default_profile` is unset.
+/// Picker order keeps a profile named `default` last; resolution remains alphabetical.
+pub fn profile_display_order(left: &str, right: &str) -> std::cmp::Ordering {
+    (left == "default")
+        .cmp(&(right == "default"))
+        .then_with(|| left.cmp(right))
+}
+
 pub fn sort_profiles_for_display<T: AsRef<str>>(profiles: &mut [T]) {
-    profiles.sort_by(|a, b| {
-        let (a, b) = (a.as_ref(), b.as_ref());
-        (a == "default")
-            .cmp(&(b == "default"))
-            .then_with(|| a.cmp(b))
-    });
+    profiles.sort_by(|left, right| profile_display_order(left.as_ref(), right.as_ref()));
 }
 
 /// [`list_profiles`] in picker order, for surfaces a human chooses from.
@@ -666,33 +668,53 @@ pub(crate) fn validate_instance_id(id: &str) -> Result<()> {
     Ok(())
 }
 
-/// Validate that `name` is a safe, single-component profile name.
-///
-/// Defense in depth: `get_profile_dir` and `delete_profile` ultimately
-/// `join` `name` onto `<app_dir>/profiles/`, so a name like `..`, `/etc`,
-/// or `a/b` would resolve outside the profiles directory. We require
-/// exactly one path component, and that component must be `Normal`. Also
-/// rejects empty strings and the reserved `all` (which the TUI uses as a
-/// sentinel for "all-profiles" mode in profile pickers).
-fn validate_profile_name(name: &str) -> Result<()> {
+#[derive(Clone, Copy)]
+enum ProfileNameError {
+    Empty,
+    Reserved,
+    Separators,
+    Component,
+}
+
+fn profile_name_error(name: &str) -> Option<ProfileNameError> {
     if name.is_empty() {
-        anyhow::bail!("Profile name cannot be empty");
+        return Some(ProfileNameError::Empty);
     }
     if name.eq_ignore_ascii_case("all") {
-        anyhow::bail!("Profile name 'all' is reserved");
+        return Some(ProfileNameError::Reserved);
     }
-    // Unix Path treats `\` as a regular byte, so backslashes pass the components check below.
     if name.contains('\\') {
-        anyhow::bail!("Profile name cannot contain path separators");
+        return Some(ProfileNameError::Separators);
     }
     let mut components = Path::new(name).components();
     let first = components.next();
     if components.next().is_some() {
-        anyhow::bail!("Profile name cannot contain path separators");
+        return Some(ProfileNameError::Separators);
     }
     match first {
-        Some(std::path::Component::Normal(c)) if c == std::ffi::OsStr::new(name) => Ok(()),
-        _ => anyhow::bail!(
+        Some(std::path::Component::Normal(component))
+            if component == std::ffi::OsStr::new(name) =>
+        {
+            None
+        }
+        _ => Some(ProfileNameError::Component),
+    }
+}
+
+pub(crate) fn valid_profile_name(name: &str) -> bool {
+    profile_name_error(name).is_none()
+}
+
+/// Validate the local single-component selection grammar.
+pub(crate) fn validate_profile_name(name: &str) -> Result<()> {
+    match profile_name_error(name) {
+        None => Ok(()),
+        Some(ProfileNameError::Empty) => anyhow::bail!("Profile name cannot be empty"),
+        Some(ProfileNameError::Reserved) => anyhow::bail!("Profile name 'all' is reserved"),
+        Some(ProfileNameError::Separators) => {
+            anyhow::bail!("Profile name cannot contain path separators")
+        }
+        Some(ProfileNameError::Component) => anyhow::bail!(
             "Profile name '{}' is not a valid single-component name",
             name
         ),

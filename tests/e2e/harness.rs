@@ -157,21 +157,24 @@ macro_rules! require_node {
 }
 pub(crate) use require_node;
 
-// ---------------------------------------------------------------------------
-// Daemon port helpers (shared by serve.rs and structured view e2e)
-// ---------------------------------------------------------------------------
+/// The fake OpenCode store server is a small Python program, so the tests that
+/// need one skip where Python is absent rather than failing.
+pub fn python_available() -> bool {
+    which::which("python3").is_ok()
+}
 
-/// Bind a TCP listener to an ephemeral port, drop it, and return the port.
-///
-/// There is an unavoidable TOCTOU window between dropping the listener and the
-/// daemon binding. The OS will not hand the same port to two *live* listeners,
-/// but this drops its listener immediately, so two calls close together could
-/// otherwise return the same number. That was harmless when every test in this
-/// binary was `#[serial]`; now that most are `#[parallel]`, two concurrent tests
-/// racing for one port would produce a confusing "address already in use" in
-/// whichever daemon lost. Remembering what we have already issued closes the
-/// in-process half of the race; the ephemeral bind still covers ports taken by
-/// unrelated processes.
+macro_rules! require_python3 {
+    () => {
+        if !$crate::harness::python_available() {
+            eprintln!("Skipping test: python3 not available");
+            return;
+        }
+    };
+}
+pub(crate) use require_python3;
+
+/// Ephemeral port not yet issued to another test in this process. The
+/// bind-then-drop TOCTOU window remains for unrelated processes.
 pub fn pick_free_port() -> u16 {
     use std::collections::HashSet;
     use std::sync::{Mutex, OnceLock};
@@ -368,12 +371,8 @@ pub struct TuiTestHarness {
     render_log_offset: std::cell::Cell<u64>,
     recording: bool,
     cast_path: Option<PathBuf>,
-    /// Extra env vars exported on every spawned process (tmux session +
-    /// `run_cli` subprocesses). Used by structured view tests to thread
-    /// FAKE_ACP_* and the runner-socket timeout into the daemon (and
-    /// thus the daemon-spawned worker, which inherits this env).
-    extra_env: Vec<(String, String)>,
-    /// Explicit removals override inherited and configured values.
+    /// Exported on every spawned process (tmux session and `run_cli`).
+    extra_env: Vec<(std::ffi::OsString, std::ffi::OsString)>,
     extra_env_remove: Vec<String>,
     /// Prepended to PATH ahead of the `claude` stub.
     extra_path_dirs: Vec<PathBuf>,
@@ -488,14 +487,14 @@ last_seen_version = "{}"
             cast_path: None,
             // aoe addresses tmux via `-S <socket>`, so pin it to the harness socket.
             extra_env: vec![
-                ("AOE_TMUX_SOCKET".to_string(), tmux_socket_env),
+                ("AOE_TMUX_SOCKET".into(), tmux_socket_env.into()),
                 (
-                    "XDG_RUNTIME_DIR".to_string(),
-                    config_dir.join("runtime").display().to_string(),
+                    "XDG_RUNTIME_DIR".into(),
+                    config_dir.join("runtime").into_os_string(),
                 ),
                 (
-                    "DBUS_SESSION_BUS_ADDRESS".to_string(),
-                    "unix:path=/dev/null".to_string(),
+                    "DBUS_SESSION_BUS_ADDRESS".into(),
+                    "unix:path=/dev/null".into(),
                 ),
             ],
             extra_env_remove: Vec::new(),
@@ -524,19 +523,30 @@ last_seen_version = "{}"
     /// Tear the TUI's own tmux session down so a test can `spawn_tui` again and assert on
     /// what a fresh start reads from disk.
     pub fn kill_tui(&mut self) {
+        // Killing the last session makes tmux exit asynchronously, and a
+        // `new-session` that connects to the exiting server fails.
+        self.tmux_ok(&["set-option", "-s", "exit-empty", "off"], "keep server");
         let name = self.session_name.clone();
         self.tmux_kill_session(&name);
         self.spawned = false;
     }
 
     /// Export an extra env var on every spawned process (tmux + `run_cli`).
-    pub fn set_env(&mut self, key: &str, value: &str) {
-        self.extra_env_remove.retain(|removed| removed != key);
-        self.extra_env.push((key.to_string(), value.to_string()));
+    pub fn set_env(
+        &mut self,
+        key: impl AsRef<std::ffi::OsStr>,
+        value: impl AsRef<std::ffi::OsStr>,
+    ) {
+        let key = key.as_ref();
+        self.extra_env_remove
+            .retain(|removed| std::ffi::OsStr::new(removed) != key);
+        self.extra_env
+            .push((key.to_owned(), value.as_ref().to_owned()));
     }
 
     pub fn remove_env(&mut self, key: &str) {
-        self.extra_env.retain(|(existing, _)| existing != key);
+        self.extra_env
+            .retain(|(existing, _)| existing.as_os_str() != std::ffi::OsStr::new(key));
         if !self.extra_env_remove.iter().any(|removed| removed == key) {
             self.extra_env_remove.push(key.to_string());
         }
@@ -626,9 +636,7 @@ last_seen_version = "{}"
             }
         }
         self.extra_path_dirs.push(bin);
-        // Belt-and-suspenders: the shim bakes these in, but keep them on
-        // the daemon env too for any path that bypasses the shim.
-        self.set_env("FAKE_ACP_DEBUG_LOG", &debug_log.display().to_string());
+        self.set_env("FAKE_ACP_DEBUG_LOG", debug_log.as_os_str());
         self.set_env("AOE_ACP_RUNNER_SOCKET_TIMEOUT_MS", "60000");
     }
 
@@ -859,7 +867,7 @@ last_seen_version = "{}"
             .env("PATH", self.env_path())
             .env("TERM", "xterm-256color")
             .env_remove("NO_COLOR")
-            .envs(self.extra_env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+            .envs(self.extra_env.iter().map(|(key, value)| (key, value)))
             .output()
             .expect("failed to run tmux new-session");
 
@@ -918,7 +926,7 @@ last_seen_version = "{}"
             .env("PATH", self.env_path())
             .env("TERM", "xterm-256color")
             .env_remove("NO_COLOR")
-            .envs(self.extra_env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+            .envs(self.extra_env.iter().map(|(key, value)| (key, value)))
             .output()
             .expect("failed to run tmux new-session");
 
@@ -1312,7 +1320,7 @@ last_seen_version = "{}"
             .env("PATH", self.env_path())
             .env_remove("AGENT_OF_EMPIRES_DEBUG")
             .env_remove("AOE_LOG_LEVEL")
-            .envs(self.extra_env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+            .envs(self.extra_env.iter().map(|(key, value)| (key, value)));
         for key in &self.extra_env_remove {
             command.env_remove(key);
         }

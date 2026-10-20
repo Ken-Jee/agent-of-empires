@@ -26,6 +26,7 @@ export function useSessions() {
   const [workspaceOrdering, setWorkspaceOrdering] = useState<string[]>([]);
   const [error, setError] = useState(false);
   const [loaded, setLoaded] = useState(false);
+
   const lastLocalOrderingAtRef = useRef<number>(0);
   // GET admission is global; only installed rows attest individual mutation receipts.
   const floorGet = useRef<RuntimeCursor | null>(null);
@@ -67,6 +68,7 @@ export function useSessions() {
     }
   }, []);
 
+  // Published after the commit so no row sees the new ordinal beside the previous snapshot.
   useEffect(() => {
     let cancelled = false;
     let generation = 0;

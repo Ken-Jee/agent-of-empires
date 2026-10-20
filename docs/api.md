@@ -181,6 +181,42 @@ session when login is enabled. They are unavailable in CityHall mode. Adoption
 rejects symlinks, special files, packages over 64 MiB, individual files over
 32 MiB, more than 1,024 files, and directory nesting deeper than 16 levels.
 
+## Runtime CLI reads
+
+Read-only CLI commands use `/api/runtime/read/ws` when `--daemon-url` or `AOE_DAEMON_URL` selects an HTTP endpoint. `/api/runtime/ws` is reserved for the TUI stream and does not serve this one-shot protocol.
+
+An explicit endpoint requires a served answer and never falls back. Environment discovery falls back to local storage, with a notice on stderr, if its configuration is unusable or no TCP peer is reached within one second. Authentication, upgrade and protocol failures after reaching a peer never fall back. Each served exchange has a 15-second deadline.
+
+After upgrading the CLI, a `protocol_mismatch` means the target daemon uses a different protocol version. On that daemon's host, run `aoe serve --restart` for a detached daemon; otherwise restart the foreground daemon or its service through the service manager. Update that host's installation if needed. A missing runtime-read route can also indicate an older daemon, but first check the selected URL and proxy routing.
+
+Without an HTTP endpoint, Linux reads use a verified, same-user local daemon socket when published; otherwise they use local storage. Invalid or unverifiable publication artifacts refuse fallback. Other platforms use local storage.
+
+The route follows the daemon's authentication mode. CLI clients use `AOE_DAEMON_TOKEN` or `AOE_DAEMON_PASSPHRASE`; passphrase login shares the ACP client's device-bound session cache. Environment URLs discard query parameters, including query tokens. Explicit endpoints reject queries. HTTP on a non-loopback host is accepted only without credentials; remote authentication requires HTTPS. Localhost connections bypass proxies and pin both loopback address families.
+
+Loopback HTTP does not verify the listener's OS user. If another local user binds the selected port, that process can receive the CLI's bearer token or passphrase. Use it only with trusted local users and port ownership; unset the HTTP endpoint to use verified same-user UDS discovery on Linux.
+
+Runtime snapshots include stored launch commands on both transports to preserve CLI output. Commands may contain inline secrets; treat clients allowed to read snapshots as trusted, and do not expose `--auth none` to untrusted peers. Human output from served reads strips C0/C1 control characters from daemon-provided fields; JSON retains the original values.
+
+Wire protocol **version 4** sends a `Hello` followed by a `Snapshot`. Profiles carry `name`, `listed` and `aliases`; aliases select the same physical store while preserving the requested spelling. Alias-only external stores are available through scoped reads but excluded from ordinary profile inventories and all-profile lists.
+
+Snapshots may include `systemd_scope_namespace`, the daemon's application-directory namespace for systemd scopes. Eligible local CLI JSON output uses this value for cgroup hints; remote peers and snapshots without the optional value omit the hint. Clients never derive it from their own home directory or the protocol's build namespace. This metadata provides consistency, not authentication or authority to retire resources.
+
+Runtime-read session identity and parent relationships are scoped to a profile. The same session ID may appear in different profiles without invalidating the snapshot. Stored absolute project paths retain their spelling, including legacy `.` / `..` components and repeated separators; reads do not normalize them or resolve them on the client.
+
+Profile stores and alias targets must remain responsive. A stalled filesystem operation can indefinitely block daemon status refresh and persisted session mutations waiting on the reload gate. A stalled snapshot worker holds `runtime.flight` and an admission permit; queued workers can exhaust read admission. Client exchange deadlines do not cancel these filesystem operations. Isolation of hung alias targets is tracked in [#4702](https://github.com/agent-of-empires/agent-of-empires/issues/4702).
+
+Scoped session reads refuse whole-profile registry decode failures, such as malformed JSON or a non-array container, rather than returning an empty success. The legacy read-only projection skips individually undecodable rows without rewriting the registry; a registry containing only a row missing its `id` can therefore produce `[]` with exit status 0 for a JSON session list. Successfully decoded rows that violate the runtime-read wire contract degrade that profile's session data.
+
+All-profile listing preserves healthy profiles' rows and warns on stderr for each unavailable profile. Human output exits successfully; JSON remains valid but exits nonzero when the listing is incomplete. Invalid stored groups degrade only that profile's group enumeration; invalid global projects degrade only global metadata. These components remain independent.
+
+The CLI projection is not native mutation authority. Complete canonical profile loading can still degrade native health and refuse native mutations with HTTP 503 while healthy CLI reads continue. Snapshot sampling never rewrites the stores.
+
+Newly listed profile stores are read on a cache miss without replacing existing live session rows. A newly listed store reusing a cached profile name or alias is not admitted as a cache miss; the daemon must accept a reload first. This includes deleting and recreating a profile with the same name, preventing retained live rows from being mixed with replacement-store data.
+
+Wire members declared nullable must still be present. CLI JSON is a separate contract; for example, `session show --json` omits an unknown `agent_session_id`. A `systemd_unit` glob in local list JSON describes an expected scope name, not proof that the unit exists; remote snapshots omit it.
+
+Background daemon maintenance can recover missing native session IDs from validated publications after the agent pane exits. Read requests do not perform these writes.
+
 ## GET /api/sessions
 
 List sessions. Returns every session by default, including trashed and
@@ -392,6 +428,8 @@ embedding a bearer token in the query string.
 
 **Example**
 
+When `profile` is omitted, creation uses the server's selected profile or the configured default. An explicitly empty `profile` is rejected.
+
 ```json
 {
   "path": "/path/to/repo",
@@ -436,9 +474,7 @@ its burst-detection window expires before Enter arrives).
 { "message": "review the diff and pick the smallest fix" }
 ```
 
-`message` is sent literally. Newlines inside the string are sent as
-shift-Enter (line break in the agent's input box) and a final Enter
-submits the whole message.
+Before delivery, the HTTP endpoint removes bracketed-paste delimiters and remaining ESC bytes, then removes only trailing CR/LF characters. Internal line breaks, spaces, and tabs remain. The terminal transport adapts pasted LF to CR and adds a final Enter. An empty or whitespace-only result is rejected.
 
 **Responses**
 

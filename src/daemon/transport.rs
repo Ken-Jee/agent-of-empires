@@ -112,10 +112,22 @@ pub(crate) async fn execute(
     unix_path: Option<&Path>,
     request: reqwest::Request,
 ) -> Result<reqwest::Response, DaemonClientError> {
+    execute_with_peer(http, unix_path, request, None).await
+}
+
+pub(super) async fn execute_with_peer(
+    http: &reqwest::Client,
+    unix_path: Option<&Path>,
+    request: reqwest::Request,
+    expected_peer: Option<u32>,
+) -> Result<reqwest::Response, DaemonClientError> {
     use futures_util::StreamExt;
     let deadline =
         tokio::time::Instant::now() + request.timeout().copied().unwrap_or(super::DEFAULT_TIMEOUT);
     let Some(path) = unix_path else {
+        if expected_peer.is_some() {
+            return Err(DaemonClientError::PeerIdentity);
+        }
         let mut response = tokio::time::timeout_at(deadline, http.execute(request))
             .await
             .map_err(|_| DaemonClientError::Timeout)?
@@ -127,6 +139,24 @@ pub(crate) async fn execute(
     };
     tokio::time::timeout_at(deadline, async {
         let stream = connect_unix(path).await?;
+        if let Some(expected) = expected_peer {
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            let actual = stream
+                .peer_cred()
+                .ok()
+                .and_then(|credentials| credentials.pid())
+                .and_then(|pid| u32::try_from(pid).ok());
+            #[cfg(target_os = "macos")]
+            let actual =
+                nix::sys::socket::getsockopt(&stream, nix::sys::socket::sockopt::LocalPeerPid)
+                    .ok()
+                    .and_then(|pid| u32::try_from(pid).ok());
+            #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
+            let actual = None;
+            if actual != Some(expected) {
+                return Err(DaemonClientError::PeerIdentity);
+            }
+        }
         let (mut sender, connection) =
             hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(stream))
                 .await

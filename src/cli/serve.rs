@@ -426,17 +426,92 @@ pub fn pid_file_path() -> Result<PathBuf> {
     Ok(dir.join("serve.pid"))
 }
 
-/// Persisted launch state for a running `aoe serve --daemon`. Written
-/// only by `start_daemon`, so its presence is the signal that the daemon
-/// is self-managed (started by `aoe serve --daemon`) rather than run in
-/// the foreground or under a service supervisor; that is what lets
-/// `aoe update` decide whether it may restart the daemon. `aoe serve
-/// --restart` and the post-update restart replay it. It is removed on
-/// stop, on the daemon's own graceful exit, and in `daemon_pid`'s
-/// stale-PID sweep, so nothing relies on a stale copy. The passphrase is
-/// never stored here; it is recalled from `serve.passphrase` /
-/// `AOE_SERVE_PASSPHRASE` at restart time.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+/// Held by a foreground `aoe serve` for its lifetime and by `aoe migrate` for its run,
+/// so the two never overlap. The OS drops it with the process.
+#[derive(Debug)]
+pub struct ServeLock {
+    _file: std::fs::File,
+}
+
+pub fn try_lock_serve() -> Result<Option<ServeLock>> {
+    try_lock_serve_at(&crate::session::get_app_dir()?.join("serve.lock"))
+}
+
+pub struct ServeStartup {
+    lock: ServeLock,
+    transaction: crate::daemon::lifecycle::Transaction,
+}
+
+impl ServeStartup {
+    pub fn run_migrations(
+        &self,
+        reporter: Option<crate::migrations::progress::Reporter>,
+    ) -> Result<()> {
+        crate::migrations::run_migrations_under_transaction(reporter, false, &self.transaction)
+    }
+}
+
+/// Establish lifecycle authority and serve/migrate exclusion before migrations.
+pub async fn lock_for_startup(profile: &str, args: &mut ServeArgs) -> Result<Option<ServeStartup>> {
+    if args.stop || args.status || args.restart || args.rollback {
+        return Ok(None);
+    }
+    let transaction = if args.daemon_child {
+        crate::daemon::lifecycle::Transaction::receive()?
+    } else {
+        crate::daemon::lifecycle::Transaction::acquire().await?
+    };
+    if !args.core_only && args.passphrase.is_none() {
+        args.passphrase = std::env::var("AOE_SERVE_PASSPHRASE").ok();
+    }
+    args.cityhall = args.cityhall || std::env::var_os("AOE_CITYHALL_MODE").is_some();
+    match daemon_status() {
+        DaemonStatus::Verified(pid) if pid != std::process::id() => {
+            let launch = managed_launch(pid)?;
+            if !launch.core_only || args.core_only || args.daemon_child {
+                return Err(daemon_running_error(pid));
+            }
+            validate_launch_args(profile, args).await?;
+            let passphrase = recall_serve_passphrase(&launch)?;
+            retain_rollback_launch(&transaction, &launch, passphrase.as_deref())?;
+            stop_daemon_locked(&transaction).await?;
+        }
+        DaemonStatus::Unverified => {
+            bail!("Cannot verify the existing daemon; refusing replacement")
+        }
+        _ => {}
+    }
+    let lock = try_lock_serve()?.context(
+        "another aoe serve or `aoe migrate` is starting or running; retry once it finishes",
+    )?;
+    Ok(Some(ServeStartup { lock, transaction }))
+}
+
+fn daemon_running_error(pid: u32) -> anyhow::Error {
+    anyhow::anyhow!(
+        "aoe serve daemon already running (PID {pid}).\n\n  \
+         Status:  aoe serve --status\n  \
+         Open UI: aoe url\n  \
+         Stop:    aoe serve --stop"
+    )
+}
+
+fn try_lock_serve_at(path: &std::path::Path) -> Result<Option<ServeLock>> {
+    use fs2::FileExt as _;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)?;
+    match file.try_lock_exclusive() {
+        Ok(()) => Ok(Some(ServeLock { _file: file })),
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ServeLaunch {
     pub schema: u32,
     pub pid: u32,
@@ -929,21 +1004,45 @@ const SERVE_STATE_FILES: [&str; 4] = [
     "serve.launch",
 ];
 
-async fn clear_serve_state() {
-    if let Ok(dir) = crate::session::get_app_dir() {
-        for name in SERVE_STATE_FILES {
-            let _ = tokio::fs::remove_file(dir.join(name)).await;
-        }
-    }
+/// Separate from the lifetime lock a running server holds, which this state is
+/// published and cleared under. Publishers hold it from before spawning until the pid
+/// and launch files are written; cleanup holds it across its ownership check and deletion.
+fn lock_serve_state() -> Result<std::fs::File> {
+    use fs2::FileExt as _;
+    let path = crate::session::get_app_dir()?.join("serve.state.lock");
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .with_context(|| format!("opening {}", path.display()))?;
+    file.lock_exclusive()
+        .with_context(|| format!("locking {}", path.display()))?;
+    Ok(file)
 }
 
-fn remove_stale_serve_state(pid_path: &std::path::Path) {
-    let _ = std::fs::remove_file(pid_path);
-    if let Ok(dir) = crate::session::get_app_dir() {
-        for name in SERVE_STATE_FILES {
-            let _ = std::fs::remove_file(dir.join(name));
-        }
+/// Deletes the serve state only while `serve.pid` still names `expected_pid`.
+/// Returns whether it did.
+fn clear_serve_state(expected_pid: i32) -> bool {
+    let (Ok(_lock), Ok(pid_path), Ok(dir)) = (
+        lock_serve_state(),
+        pid_file_path(),
+        crate::session::get_app_dir(),
+    ) else {
+        return false;
+    };
+    let recorded = std::fs::read_to_string(&pid_path)
+        .ok()
+        .and_then(|raw| parse_positive_pid(&raw));
+    if recorded != Some(expected_pid) {
+        return false;
     }
+    let _ = std::fs::remove_file(&pid_path);
+    for name in SERVE_STATE_FILES {
+        let _ = std::fs::remove_file(dir.join(name));
+    }
+    true
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -954,6 +1053,21 @@ pub(crate) enum DaemonStatus {
 }
 
 pub(crate) fn daemon_status() -> DaemonStatus {
+    daemon_status_with(
+        |pid| {
+            classify_daemon_probe(nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(pid),
+                None,
+            ))
+        },
+        inspect_daemon_process,
+    )
+}
+
+fn daemon_status_with(
+    probe: impl FnOnce(i32) -> DaemonProbeDisposition,
+    inspect: impl FnOnce(i32) -> DaemonProcessIdentity,
+) -> DaemonStatus {
     let Ok(path) = pid_file_path() else {
         return DaemonStatus::Unverified;
     };
@@ -966,29 +1080,18 @@ pub(crate) fn daemon_status() -> DaemonStatus {
         return DaemonStatus::Unverified;
     };
 
-    let probe = nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None);
-    match classify_daemon_probe(probe) {
-        DaemonProbeDisposition::VerifyIdentity => match inspect_daemon_process(pid) {
+    match probe(pid) {
+        DaemonProbeDisposition::VerifyIdentity => match inspect(pid) {
             DaemonProcessIdentity::Verified => DaemonStatus::Verified(pid as u32),
-            DaemonProcessIdentity::Foreign => {
-                remove_stale_serve_state(&path);
-                DaemonStatus::Absent
-            }
+            DaemonProcessIdentity::Foreign => DaemonStatus::Absent,
             DaemonProcessIdentity::Indeterminate => DaemonStatus::Unverified,
         },
-        DaemonProbeDisposition::Stale => {
-            remove_stale_serve_state(&path);
-            DaemonStatus::Absent
-        }
-        // EPERM proves the process may still exist, while other errors are
-        // likewise insufficient evidence of staleness. Preserve lifecycle
-        // state, but do not return an unverified PID to control callers.
+        DaemonProbeDisposition::Stale => DaemonStatus::Absent,
         DaemonProbeDisposition::Indeterminate => DaemonStatus::Unverified,
     }
 }
 
-/// Returns the PID only when the process can be verified as `aoe serve`.
-/// The TUI uses this to detect and display a running local daemon.
+/// Verifying the daemon's identity spawns `ps`, so keep calls off the render path.
 pub fn daemon_pid() -> Option<u32> {
     match daemon_status() {
         DaemonStatus::Verified(pid) => Some(pid),
@@ -1037,7 +1140,7 @@ async fn validate_launch_args(profile: &str, args: &ServeArgs) -> Result<AuthMod
 }
 
 #[tracing::instrument(target = "cli.serve", skip_all, fields(profile = %profile))]
-pub async fn run(profile: &str, mut args: ServeArgs) -> Result<()> {
+pub async fn run(profile: &str, mut args: ServeArgs, startup: Option<ServeStartup>) -> Result<()> {
     if args.stop {
         return stop_daemon().await;
     }
@@ -1053,32 +1156,19 @@ pub async fn run(profile: &str, mut args: ServeArgs) -> Result<()> {
     if args.rollback {
         return rollback_daemon().await;
     }
-    let transaction = if args.daemon_child {
-        crate::daemon::lifecycle::Transaction::receive()?
-    } else {
-        crate::daemon::lifecycle::Transaction::acquire().await?
+    let startup = match startup {
+        Some(startup) => startup,
+        None => lock_for_startup(profile, &mut args)
+            .await?
+            .context("serve startup guard missing")?,
     };
-
-    if !args.core_only && args.passphrase.is_none() {
-        args.passphrase = std::env::var("AOE_SERVE_PASSPHRASE").ok();
-    }
-    args.cityhall = args.cityhall || std::env::var_os("AOE_CITYHALL_MODE").is_some();
+    let ServeStartup {
+        lock: serve_lock,
+        transaction,
+    } = startup;
 
     let auth_mode = validate_launch_args(profile, &args).await?;
     let is_localhost = host_is_localhost(&args.host);
-    let predecessor = match daemon_status() {
-        DaemonStatus::Verified(pid) if pid != std::process::id() => {
-            let launch = managed_launch(pid)?;
-            if !launch.core_only || args.core_only || args.daemon_child {
-                bail!("aoe serve daemon already running (PID {pid}); use --restart or --stop");
-            }
-            Some(launch)
-        }
-        DaemonStatus::Unverified => {
-            bail!("Cannot verify the existing daemon; refusing replacement")
-        }
-        _ => None,
-    };
 
     if args.behind_proxy && args.remote {
         let msg = "--behind-proxy is ignored when --remote is set; \
@@ -1149,15 +1239,11 @@ pub async fn run(profile: &str, mut args: ServeArgs) -> Result<()> {
         }
     }
 
-    if let Some(launch) = predecessor {
-        let passphrase = recall_serve_passphrase(&launch)?;
-        retain_rollback_launch(&transaction, &launch, passphrase.as_deref())?;
-        stop_daemon_locked(&transaction).await?;
-    }
-
     if args.daemon {
+        drop(serve_lock);
         return start_daemon(profile, &args, &transaction, true).await;
     }
+    let _serve_lock = serve_lock;
 
     let _lifetime = transaction.lifetime()?;
     apply_cityhall_bundle().await?;
@@ -1174,7 +1260,8 @@ pub async fn run(profile: &str, mut args: ServeArgs) -> Result<()> {
 
     // Write PID file for non-daemon mode too (so --stop works either way)
     if let Ok(path) = pid_file_path() {
-        let _ = tokio::fs::write(&path, std::process::id().to_string()).await;
+        let _lock = lock_serve_state()?;
+        let _ = std::fs::write(&path, std::process::id().to_string());
         tracing::debug!(target: "serve.lifecycle", path = %path.display(), pid = std::process::id(), "wrote pid file");
     }
 
@@ -1201,20 +1288,7 @@ pub async fn run(profile: &str, mut args: ServeArgs) -> Result<()> {
     )
     .await;
 
-    // Clean up PID and URL files on exit, but only if the PID file
-    // still belongs to this process. A newer daemon spawn may have
-    // overwritten it; removing their file would orphan them.
-    if let Ok(path) = pid_file_path() {
-        let is_ours = tokio::fs::read_to_string(&path)
-            .await
-            .ok()
-            .and_then(|s| s.trim().parse::<u32>().ok())
-            .is_some_and(|pid| pid == std::process::id());
-        if is_ours {
-            let _ = tokio::fs::remove_file(&path).await;
-            clear_serve_state().await;
-        }
-    }
+    clear_serve_state(std::process::id() as i32);
 
     result
 }
@@ -1377,6 +1451,10 @@ async fn start_daemon(
         .then(crate::session::config::resolve_default_profile);
     let profile = resolved_profile.as_deref().unwrap_or(profile);
 
+    let _state_lock = lock_serve_state()?;
+    if let Some(existing) = daemon_pid() {
+        bail!("aoe serve daemon already running (PID {existing}); not starting another");
+    }
     let exe = std::env::current_exe()?;
     let instance_id = uuid::Uuid::new_v4().to_string();
     let mut cmd = Command::new(exe);
@@ -1479,6 +1557,16 @@ async fn start_daemon(
 
     let mut child = cmd.spawn()?;
     let pid = child.id();
+    let birth = match crate::process::process_birth_identity(pid)
+        .and_then(|birth| birth.context("Spawned daemon has no provable kernel birth"))
+    {
+        Ok(birth) => birth,
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        }
+    };
 
     tracing::info!(
         target: "serve.daemon",
@@ -1520,21 +1608,49 @@ async fn start_daemon(
         let _ = child.wait();
         return Err(error);
     }
+    drop(_state_lock);
     let endpoint = crate::acp::client::DaemonEndpoint::local_unix(
         crate::daemon::transport::local_socket_path()?,
     );
     let client = endpoint.daemon_client()?;
-    let ready = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+    let ready = tokio::time::timeout_at(deadline, async {
+        #[cfg(target_os = "linux")]
+        let mut require_local_read = None;
         loop {
             if let Some(status) = child.try_wait()? {
                 anyhow::bail!("Daemon exited before readiness: {status}");
             }
-            if client
-                .local_runtime_ready(Some(profile))
-                .await
-                .unwrap_or(false)
+            if client.local_daemon_ready(pid).await.unwrap_or(false)
                 && daemon_pid() == Some(pid)
+                && launch
+                    .instance_id
+                    .as_deref()
+                    .is_some_and(|instance| live_daemon_instance_matches(pid, instance))
+                && crate::process::process_birth_identity(pid)
+                    .is_ok_and(|current| current.as_ref() == Some(&birth))
             {
+                #[cfg(target_os = "linux")]
+                {
+                    use crate::cli::runtime_read::uds::{self, TrustedPathError};
+                    let required = *require_local_read.get_or_insert_with(|| {
+                        !args.cityhall
+                            && match uds::existing_app_namespace() {
+                                Ok(_) | Err(TrustedPathError::Missing) => true,
+                                Err(TrustedPathError::Invalid | TrustedPathError::Refused(_)) => {
+                                    false
+                                }
+                            }
+                    });
+                    if required
+                        && !uds::connect(deadline)
+                            .await
+                            .is_ok_and(|connection| connection.owned_by(pid))
+                    {
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        continue;
+                    }
+                }
                 return Ok::<(), anyhow::Error>(());
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -1583,6 +1699,14 @@ pub async fn restart_daemon() -> Result<()> {
     complete_rollback_after(start_daemon(&launch.profile, &args, &transaction, true).await)
 }
 
+fn report_stale_cleanup(pid: i32) {
+    if clear_serve_state(pid) {
+        println!("Daemon was not running (stale PID file cleaned up)");
+    } else {
+        println!("Daemon was not running; serve state changed meanwhile and was preserved");
+    }
+}
+
 #[tracing::instrument(target = "serve.shutdown", skip_all)]
 pub(crate) async fn stop_daemon() -> Result<()> {
     let transaction = crate::daemon::lifecycle::Transaction::acquire().await?;
@@ -1605,6 +1729,17 @@ async fn stop_daemon_locked(transaction: &crate::daemon::lifecycle::Transaction)
         .ok_or_else(|| anyhow::anyhow!("Invalid PID in {}: {}", path.display(), pid_str.trim()))?;
     tracing::info!(target: "serve.shutdown", pid, "sending SIGTERM to daemon");
 
+    if matches!(
+        classify_daemon_probe(nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(pid),
+            None
+        )),
+        DaemonProbeDisposition::Stale
+    ) {
+        report_stale_cleanup(pid);
+        return Ok(());
+    }
+
     match inspect_daemon_process(pid) {
         DaemonProcessIdentity::Verified => {
             if serve_launch_contradicts(pid as u32) {
@@ -1616,10 +1751,11 @@ async fn stop_daemon_locked(transaction: &crate::daemon::lifecycle::Transaction)
             }
         }
         DaemonProcessIdentity::Foreign => {
-            remove_stale_serve_state(&path);
+            if clear_serve_state(pid) {
+                bail!("PID {pid} belongs to a different process (stale PID file). Cleaned up.");
+            }
             bail!(
-                "PID {} belongs to a different process (stale PID file). Cleaned up.",
-                pid
+                "PID {pid} belongs to a different process; serve state changed meanwhile and was preserved."
             );
         }
         DaemonProcessIdentity::Indeterminate => {
@@ -1670,17 +1806,11 @@ async fn stop_daemon_locked(transaction: &crate::daemon::lifecycle::Transaction)
                     _ => {}
                 }
             }
-            // The daemon's own cleanup may have already removed some
-            // of these; that's fine.
-            let _ = tokio::fs::remove_file(&path).await;
-            clear_serve_state().await;
+            clear_serve_state(pid);
             println!("Stopped aoe serve daemon (PID {})", pid);
         }
         Err(nix::errno::Errno::ESRCH) => {
-            // Process doesn't exist; clean up stale PID file
-            tokio::fs::remove_file(&path).await?;
-            clear_serve_state().await;
-            println!("Daemon was not running (stale PID file cleaned up)");
+            report_stale_cleanup(pid);
         }
         Err(e) => bail!("Failed to stop daemon (PID {}): {}", pid, e),
     }
@@ -1841,6 +1971,40 @@ mod tests {
         for (command, expected) in cases {
             assert_eq!(command_is_aoe_serve(command), *expected, "{command:?}");
         }
+    }
+
+    #[tokio::test]
+    async fn only_a_server_start_takes_the_startup_lock() {
+        use crate::cli::{Cli, Commands};
+        use clap::Parser;
+        for flag in ["--stop", "--status", "--restart"] {
+            let Some(Commands::Serve(mut args)) =
+                Cli::try_parse_from(["aoe", "serve", flag]).unwrap().command
+            else {
+                panic!("expected serve");
+            };
+            assert!(
+                lock_for_startup("default", &mut args)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "{flag}"
+            );
+        }
+    }
+
+    #[test]
+    fn serve_and_migrate_exclude_each_other_in_both_orders() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("serve.lock");
+        let daemon = try_lock_serve_at(&path).unwrap().expect("first holder");
+        assert!(try_lock_serve_at(&path).unwrap().is_none());
+        drop(daemon);
+        let migrate = try_lock_serve_at(&path)
+            .unwrap()
+            .expect("free after release");
+        assert!(try_lock_serve_at(&path).unwrap().is_none());
+        drop(migrate);
     }
 
     #[test]
@@ -2343,6 +2507,144 @@ mod tests {
 
     /// Parses real argv and dispatches like `main`, pinning which `serve`
     /// shapes consume `--profile` (#148).
+    mod serve_state_cleanup {
+        use super::super::*;
+        use serial_test::serial;
+
+        fn publish(dir: &std::path::Path, pid: u32) {
+            std::fs::write(dir.join("serve.pid"), pid.to_string()).unwrap();
+            for name in SERVE_STATE_FILES {
+                std::fs::write(dir.join(name), format!("{name} of {pid}")).unwrap();
+            }
+        }
+
+        fn assert_published(dir: &std::path::Path, pid: u32) {
+            assert_eq!(
+                std::fs::read_to_string(dir.join("serve.pid")).unwrap(),
+                pid.to_string()
+            );
+            for name in SERVE_STATE_FILES {
+                assert_eq!(
+                    std::fs::read_to_string(dir.join(name)).unwrap(),
+                    format!("{name} of {pid}")
+                );
+            }
+        }
+
+        #[test]
+        #[serial]
+        fn status_probe_leaves_the_published_state_alone() {
+            let _guard = crate::session::test_support::isolate_app_dir();
+            let dir = crate::session::get_app_dir().unwrap();
+
+            let mut exited = std::process::Command::new("true").spawn().unwrap();
+            exited.wait().unwrap();
+            let mut foreign = std::process::Command::new("sleep")
+                .arg("60")
+                .spawn()
+                .unwrap();
+
+            for (name, pid) in [("exited", exited.id()), ("foreign", foreign.id())] {
+                publish(&dir, pid);
+                assert_eq!(daemon_status(), DaemonStatus::Absent, "{name}");
+                assert_published(&dir, pid);
+            }
+
+            let _ = foreign.kill();
+            let _ = foreign.wait();
+        }
+
+        #[test]
+        #[serial]
+        fn replacement_survives_a_probe_held_across_its_publication() {
+            let _guard = crate::session::test_support::isolate_app_dir();
+            let dir = crate::session::get_app_dir().unwrap();
+
+            for (name, disposition) in [
+                ("foreign", DaemonProbeDisposition::VerifyIdentity),
+                ("exited", DaemonProbeDisposition::Stale),
+            ] {
+                publish(&dir, 4242);
+                let (observed_tx, observed_rx) = std::sync::mpsc::channel();
+                let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+
+                let status = std::thread::scope(|scope| {
+                    let old_probe = scope.spawn(move || {
+                        daemon_status_with(
+                            |_| {
+                                observed_tx.send(()).unwrap();
+                                release_rx.recv().unwrap();
+                                disposition
+                            },
+                            |_| DaemonProcessIdentity::Foreign,
+                        )
+                    });
+                    observed_rx.recv().unwrap();
+                    {
+                        let _lock = lock_serve_state().unwrap();
+                        publish(&dir, 4343);
+                    }
+                    release_tx.send(()).unwrap();
+                    old_probe.join().unwrap()
+                });
+
+                assert_eq!(status, DaemonStatus::Absent, "{name}");
+                assert!(!clear_serve_state(4242), "{name}: stale cleaner must skip");
+                assert_published(&dir, 4343);
+                assert_eq!(
+                    read_serve_urls().first().map(|u| u.url.as_str()),
+                    Some("serve.url of 4343"),
+                    "{name}: discovery"
+                );
+            }
+        }
+
+        #[test]
+        #[serial]
+        fn state_publication_and_cleanup_run_under_the_server_lifetime_lock() {
+            let _guard = crate::session::test_support::isolate_app_dir();
+            let dir = crate::session::get_app_dir().unwrap();
+            let lifetime = try_lock_serve().unwrap().expect("lifetime lock is free");
+
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                {
+                    let _lock = lock_serve_state().unwrap();
+                    publish(&dir, 4242);
+                }
+                let cleared = clear_serve_state(4242);
+                done_tx.send(cleared).unwrap();
+            });
+            let cleared = done_rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .expect("state lock must not wait on the lifetime lock");
+            assert!(cleared);
+            worker.join().unwrap();
+            drop(lifetime);
+        }
+
+        #[test]
+        #[serial]
+        fn cleanup_deletes_only_the_state_it_inspected() {
+            let _guard = crate::session::test_support::isolate_app_dir();
+            let dir = crate::session::get_app_dir().unwrap();
+
+            publish(&dir, 4242);
+            assert!(!clear_serve_state(4243));
+            assert_published(&dir, 4242);
+
+            assert!(clear_serve_state(4242));
+            for name in [
+                "serve.pid",
+                "serve.url",
+                "serve.mode",
+                "serve.passphrase",
+                "serve.launch",
+            ] {
+                assert!(!dir.join(name).exists(), "{name} should be removed");
+            }
+        }
+    }
     mod profile_guard {
         use super::super::run;
         use crate::cli::{Cli, Commands};
@@ -2373,9 +2675,7 @@ mod tests {
             let (_guard, profiles) = armed_profiles_dir();
             for verb in ["--stop", "--status", "--restart"] {
                 let (profile, args) = dispatch_argv(&["aoe", "serve", verb, "-p", "ghost-profile"]);
-                // No daemon runs here; the report must be about the daemon,
-                // never the profile.
-                if let Err(e) = run(&profile, args).await {
+                if let Err(e) = run(&profile, args, None).await {
                     let msg = e.to_string();
                     assert!(
                         !msg.contains("does not exist") && !msg.contains("aoe profile create"),
@@ -2397,7 +2697,7 @@ mod tests {
             // guard, so no port is ever bound.
             let (profile, args) =
                 dispatch_argv(&["aoe", "serve", "--behind-proxy", "-p", "ghost-profile"]);
-            let msg = run(&profile, args)
+            let msg = run(&profile, args, None)
                 .await
                 .expect_err("unknown profile must refuse a fresh start")
                 .to_string();
@@ -2418,7 +2718,7 @@ mod tests {
         async fn fresh_start_lets_a_known_profile_through_to_argument_validation() {
             let (_guard, _profiles) = armed_profiles_dir();
             let (profile, args) = dispatch_argv(&["aoe", "serve", "--behind-proxy", "-p", "real"]);
-            let msg = run(&profile, args)
+            let msg = run(&profile, args, None)
                 .await
                 .expect_err("--behind-proxy without --allowed-host is refused")
                 .to_string();

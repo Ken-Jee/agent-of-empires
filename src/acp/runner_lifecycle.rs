@@ -1,24 +1,104 @@
 //! Per-session ownership of a structured-view runner.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
-/// Exact identity of a runner process: its pid plus the generation stamped
-/// into its registry record at spawn. Generation 0 (older records) matches on pid alone.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Registry generation and kernel birth identity of one runner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct RunnerIdentity {
     pub pid: u32,
     pub generation: u64,
+    pub birth_fingerprint: Option<crate::process::ProcessBirthFingerprint>,
 }
 
 impl RunnerIdentity {
-    /// Whether a registry record still describes this runner.
+    pub fn unattested(pid: u32, generation: u64) -> Self {
+        Self {
+            pid,
+            generation,
+            birth_fingerprint: None,
+        }
+    }
+
+    pub fn from_record(record: &crate::process::worker_registry::WorkerRecord) -> Self {
+        Self {
+            pid: record.pid,
+            generation: record.generation,
+            birth_fingerprint: record
+                .runner_identity
+                .as_ref()
+                .map(|identity| identity.fingerprint()),
+        }
+    }
+
+    pub fn owns_record(&self, record: &crate::process::worker_registry::WorkerRecord) -> bool {
+        self.pid == record.pid
+            && self.generation == record.generation
+            && self.birth_fingerprint
+                == record
+                    .runner_identity
+                    .as_ref()
+                    .map(|identity| identity.fingerprint())
+    }
+    pub fn disowns_record(&self, record: &crate::process::worker_registry::WorkerRecord) -> bool {
+        !self.matches_record(record.pid, record.generation)
+            || self
+                .birth_fingerprint
+                .zip(
+                    record
+                        .runner_identity
+                        .as_ref()
+                        .map(|identity| identity.fingerprint()),
+                )
+                .is_some_and(|(expected, current)| expected != current)
+    }
+
+    /// Legacy zero generations do not establish destructive authority.
     pub fn matches_record(&self, pid: u32, generation: u64) -> bool {
         self.pid == pid
             && (self.generation == 0 || generation == 0 || self.generation == generation)
+    }
+}
+
+/// Frozen authority for native processes outside the runner's process group.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub(crate) enum PrimeOwnership {
+    #[default]
+    Unresolved,
+    NotPrime,
+    Owned {
+        runtime: Box<crate::process::prime::PrimeRuntime>,
+    },
+}
+
+impl PrimeOwnership {
+    pub(crate) fn from_record(record: &crate::process::worker_registry::WorkerRecord) -> Self {
+        match &record.prime_runtime {
+            Some(runtime) => Self::Owned {
+                runtime: Box::new(runtime.clone()),
+            },
+            None if record.agent_key != "prime-agent" => Self::NotPrime,
+            None => Self::Unresolved,
+        }
+    }
+
+    pub(crate) fn ensure_stopped(&self) -> anyhow::Result<()> {
+        match self {
+            Self::NotPrime => Ok(()),
+            Self::Owned { runtime } => runtime.verify_stopped(),
+            Self::Unresolved => anyhow::bail!("Native runner ownership is unresolved"),
+        }
+    }
+
+    pub(crate) fn retire(&self) -> anyhow::Result<()> {
+        match self {
+            Self::NotPrime => Ok(()),
+            Self::Owned { runtime } => runtime.cleanup(),
+            Self::Unresolved => anyhow::bail!("Native runner ownership is unresolved"),
+        }
     }
 }
 
@@ -37,13 +117,28 @@ pub struct Lease {
     construction: Arc<Construction>,
 }
 
-#[derive(Default)]
 struct Construction {
+    id: uuid::Uuid,
     cancellation: CancellationToken,
-    runner_pid: AtomicU32,
-    runner_generation: AtomicU64,
+    runner: Mutex<Option<RunnerIdentity>>,
     scopes: Mutex<Vec<crate::process::worker_registry::ScopeOwnership>>,
     admission: Mutex<Option<crate::acp::supervisor::LaunchAdmission>>,
+    prime: Mutex<PrimeOwnership>,
+    cancelled_before_birth: std::sync::atomic::AtomicBool,
+}
+
+impl Default for Construction {
+    fn default() -> Self {
+        Self {
+            id: uuid::Uuid::new_v4(),
+            cancellation: CancellationToken::new(),
+            runner: Mutex::default(),
+            scopes: Mutex::default(),
+            admission: Mutex::default(),
+            prime: Mutex::default(),
+            cancelled_before_birth: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
 }
 
 impl std::fmt::Debug for Construction {
@@ -54,7 +149,9 @@ impl std::fmt::Debug for Construction {
 
 impl PartialEq for Lease {
     fn eq(&self, other: &Self) -> bool {
-        self.session_id == other.session_id && self.epoch == other.epoch
+        self.session_id == other.session_id
+            && self.epoch == other.epoch
+            && self.producer_id() == other.producer_id()
     }
 }
 
@@ -66,6 +163,10 @@ impl Lease {
 
     pub fn epoch(&self) -> u64 {
         self.epoch
+    }
+
+    pub(crate) fn producer_id(&self) -> uuid::Uuid {
+        self.construction.id
     }
 
     pub(crate) fn cancellation(&self) -> &CancellationToken {
@@ -118,21 +219,79 @@ impl Lease {
 
     /// The producer records the exact detached child before its first post-spawn await.
     pub(crate) fn record_runner(&self, identity: RunnerIdentity) {
-        self.construction
-            .runner_generation
-            .store(identity.generation, Ordering::Relaxed);
-        self.construction
-            .runner_pid
-            .store(identity.pid, Ordering::Release);
+        *self
+            .construction
+            .runner
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(identity);
     }
 
     pub(crate) fn spawned_runner(&self) -> Option<RunnerIdentity> {
         let _birth = self.lock_birth();
-        let pid = self.construction.runner_pid.load(Ordering::Acquire);
-        (pid != 0).then_some(RunnerIdentity {
-            pid,
-            generation: self.construction.runner_generation.load(Ordering::Relaxed),
-        })
+        *self
+            .construction
+            .runner
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+    }
+
+    pub(crate) fn record_prime(&self, ownership: PrimeOwnership) {
+        let mut prime = self
+            .construction
+            .prime
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if !self.was_cancelled_before_birth() {
+            *prime = ownership;
+        }
+    }
+
+    pub(crate) fn prime(&self) -> PrimeOwnership {
+        self.construction
+            .prime
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    }
+
+    pub(crate) fn constructed_ownership(&self) -> (Option<RunnerIdentity>, PrimeOwnership) {
+        let _birth = self.lock_birth();
+        let identity = *self
+            .construction
+            .runner
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        (identity, self.prime())
+    }
+
+    fn cancel_before_birth(&self) -> bool {
+        self.cancellation().cancel();
+        let _birth = self.lock_birth();
+        if self
+            .construction
+            .runner
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .is_some()
+        {
+            return false;
+        }
+        let mut prime = self
+            .construction
+            .prime
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        *prime = PrimeOwnership::NotPrime;
+        self.construction
+            .cancelled_before_birth
+            .store(true, std::sync::atomic::Ordering::Release);
+        true
+    }
+
+    pub(crate) fn was_cancelled_before_birth(&self) -> bool {
+        self.construction
+            .cancelled_before_birth
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 }
 
@@ -168,6 +327,7 @@ enum Phase {
         identity: Option<RunnerIdentity>,
         attempts: u32,
     },
+    RetirementComplete,
 }
 
 #[derive(Debug)]
@@ -175,6 +335,7 @@ struct Entry {
     epoch: u64,
     phase: Phase,
     delete_adapter_state: bool,
+    journal_ack_required: bool,
     construction: Arc<Construction>,
     /// An explicit stop, or a failed first launch, owes a scope sweep before
     /// the settle. Kept through retries, so a reclaimed teardown sweeps too.
@@ -217,9 +378,10 @@ pub enum StopDecision {
 
 /// Runtime process-group signalling and exit proof.
 pub trait ProcessControl: Send + Sync + 'static {
-    fn is_alive(&self, pid: u32) -> bool;
-    fn terminate_group(&self, pid: u32);
-    fn kill_group(&self, pid: u32);
+    fn is_alive(&self, identity: RunnerIdentity) -> bool;
+    fn terminate_group(&self, identity: RunnerIdentity);
+    fn kill_group(&self, identity: RunnerIdentity);
+    fn forget(&self, identity: RunnerIdentity);
     /// Retire only captured scopes and prove them empty; failure retains the lease.
     fn release_scope(
         &self,
@@ -233,19 +395,56 @@ pub trait ProcessControl: Send + Sync + 'static {
     ) -> bool;
 }
 
-pub struct SystemProcessControl;
+#[derive(Default)]
+pub struct SystemProcessControl {
+    guards: std::sync::Mutex<HashMap<RunnerIdentity, crate::process::RunnerProcessGuard>>,
+}
+
+impl SystemProcessControl {
+    fn with_guard<T>(
+        &self,
+        identity: RunnerIdentity,
+        action: impl FnOnce(&crate::process::RunnerProcessGuard) -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
+        let mut guards = self
+            .guards
+            .lock()
+            .map_err(|_| anyhow::anyhow!("runner guard lock poisoned"))?;
+        if let std::collections::hash_map::Entry::Vacant(entry) = guards.entry(identity) {
+            entry.insert(crate::process::RunnerProcessGuard::capture(
+                identity.pid,
+                identity.birth_fingerprint,
+            )?);
+        }
+        action(&guards[&identity])
+    }
+}
 
 impl ProcessControl for SystemProcessControl {
-    fn is_alive(&self, pid: u32) -> bool {
-        crate::process::worker::is_process_group_alive(pid)
+    fn is_alive(&self, identity: RunnerIdentity) -> bool {
+        if identity.pid == 0 {
+            return false;
+        }
+        self.with_guard(identity, |guard| guard.executing())
+            .unwrap_or(true)
     }
 
-    fn terminate_group(&self, pid: u32) {
-        crate::process::worker::terminate_process_group(pid);
+    fn terminate_group(&self, identity: RunnerIdentity) {
+        if let Err(error) = self.with_guard(identity, |guard| guard.signal(libc::SIGTERM)) {
+            tracing::warn!(pid = identity.pid, %error, "runner termination unproven");
+        }
     }
 
-    fn kill_group(&self, pid: u32) {
-        crate::process::worker::kill_process_group(pid);
+    fn kill_group(&self, identity: RunnerIdentity) {
+        if let Err(error) = self.with_guard(identity, |guard| guard.signal(libc::SIGKILL)) {
+            tracing::warn!(pid = identity.pid, %error, "runner termination unproven");
+        }
+    }
+
+    fn forget(&self, identity: RunnerIdentity) {
+        if let Ok(mut guards) = self.guards.lock() {
+            guards.remove(&identity);
+        }
     }
 
     fn release_scope(
@@ -334,9 +533,9 @@ impl LifecycleTable {
             .map(|entry| self.lease(session_id, entry.epoch))
     }
     fn current(&mut self, lease: &Lease) -> Option<&mut Entry> {
-        self.entries
-            .get_mut(&lease.session_id)
-            .filter(|e| e.epoch == lease.epoch)
+        self.entries.get_mut(&lease.session_id).filter(|entry| {
+            entry.epoch == lease.epoch && Arc::ptr_eq(&entry.construction, &lease.construction)
+        })
     }
 
     /// Record a generation observed on disk so marker authority tracks
@@ -370,9 +569,9 @@ impl LifecycleTable {
     pub fn admit(&mut self, session_id: &str, kind: ResumeKind) -> Result<Lease, AdmitError> {
         match self.entries.get(session_id).map(|e| &e.phase) {
             None => {}
-            Some(Phase::Stopping { .. } | Phase::TeardownRetry { .. }) => {
-                return Err(AdmitError::TeardownPending)
-            }
+            Some(
+                Phase::Stopping { .. } | Phase::TeardownRetry { .. } | Phase::RetirementComplete,
+            ) => return Err(AdmitError::TeardownPending),
             Some(_) => return Err(AdmitError::AlreadyPresent),
         }
         if let Some(reason) = self.stale_cancels.remove(session_id) {
@@ -385,6 +584,7 @@ impl LifecycleTable {
                 epoch,
                 phase: Phase::Starting { kind, cancel: None },
                 delete_adapter_state: false,
+                journal_ack_required: false,
                 construction: Arc::new(Construction::default()),
                 sweep_owed: false,
             },
@@ -430,6 +630,20 @@ impl LifecycleTable {
             Phase::Starting { cancel, .. } | Phase::Respawning { cancel } => cancel.clone(),
             _ => return false,
         };
+        if matches!(
+            entry.phase,
+            Phase::Starting {
+                kind: ResumeKind::Spawn,
+                ..
+            }
+        ) && !lease.cancel_before_birth()
+        {
+            return false;
+        }
+        if entry.journal_ack_required && lease.was_cancelled_before_birth() {
+            entry.phase = Phase::RetirementComplete;
+            return true;
+        }
         self.entries.remove(&lease.session_id);
         if let Some(reason) = cancel {
             self.stale_cancels.insert(lease.session_id.clone(), reason);
@@ -480,11 +694,56 @@ impl LifecycleTable {
                     identity,
                 }
             }
+            Phase::RetirementComplete => StopDecision::NotOwned,
             Phase::Stopping { .. } | Phase::TeardownRetry { .. } => {
                 entry.sweep_owed = true;
                 StopDecision::AlreadyStopping
             }
         }
+    }
+
+    pub(crate) fn require_retirement_ack(&mut self, lease: &Lease) -> bool {
+        if let Some(entry) = self.entries.get_mut(lease.session_id()) {
+            if entry.epoch != lease.epoch()
+                || !Arc::ptr_eq(&entry.construction, &lease.construction)
+            {
+                return false;
+            }
+            entry.journal_ack_required = true;
+            return true;
+        }
+        if lease.was_cancelled_before_birth() {
+            let (identity, prime) = lease.constructed_ownership();
+            if identity.is_some() || prime != PrimeOwnership::NotPrime {
+                return false;
+            }
+            self.entries.insert(
+                lease.session_id().into(),
+                Entry {
+                    epoch: lease.epoch(),
+                    phase: Phase::RetirementComplete,
+                    delete_adapter_state: true,
+                    journal_ack_required: true,
+                    construction: Arc::clone(&lease.construction),
+                    sweep_owed: false,
+                },
+            );
+        }
+        true
+    }
+
+    /// The caller has durably acknowledged this exact completed construction.
+    pub(crate) fn acknowledge_retirement(&mut self, lease: &Lease) -> bool {
+        match self.entries.get(lease.session_id()) {
+            None => return true,
+            Some(entry)
+                if entry.epoch == lease.epoch()
+                    && Arc::ptr_eq(&entry.construction, &lease.construction)
+                    && matches!(entry.phase, Phase::RetirementComplete) => {}
+            Some(_) => return false,
+        }
+        self.entries.remove(lease.session_id());
+        true
     }
 
     /// Take ownership of a disk-only runner so its teardown is tracked.
@@ -498,6 +757,7 @@ impl LifecycleTable {
             Entry {
                 epoch,
                 delete_adapter_state: false,
+                journal_ack_required: false,
                 construction: Arc::new(Construction::default()),
                 phase: Phase::Stopping {
                     attempts: 0,
@@ -519,7 +779,11 @@ impl LifecycleTable {
         };
         match settlement {
             Settlement::Proven => {
-                self.entries.remove(&lease.session_id);
+                if entry.journal_ack_required {
+                    entry.phase = Phase::RetirementComplete;
+                } else {
+                    self.entries.remove(&lease.session_id);
+                }
             }
             Settlement::Unproven(identity) => {
                 entry.phase = Phase::TeardownRetry {
@@ -559,6 +823,7 @@ impl LifecycleTable {
         };
         let admission = lease.admission();
         let scopes = lease.scopes();
+        let prime = lease.prime();
         let epoch = self.mint(&session_id, true);
         let entry = self
             .entries
@@ -566,6 +831,7 @@ impl LifecycleTable {
             .expect("entry checked above");
         entry.epoch = epoch;
         entry.phase = Phase::Respawning { cancel: None };
+        entry.journal_ack_required = false;
         entry.construction = Arc::new(Construction::default());
         *entry
             .construction
@@ -577,6 +843,11 @@ impl LifecycleTable {
             .scopes
             .lock()
             .unwrap_or_else(|error| error.into_inner()) = scopes;
+        *entry
+            .construction
+            .prime
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = prime;
         Ok((self.lease(&session_id, epoch), identity))
     }
 
@@ -611,7 +882,7 @@ impl LifecycleTable {
     /// The stop reason recorded against an in-flight resume or respawn.
     pub fn cancel_requested(&self, lease: &Lease) -> Option<String> {
         let entry = self.entries.get(&lease.session_id)?;
-        if entry.epoch != lease.epoch {
+        if entry.epoch != lease.epoch || !Arc::ptr_eq(&entry.construction, &lease.construction) {
             return None;
         }
         match &entry.phase {
@@ -622,9 +893,11 @@ impl LifecycleTable {
 
     /// Permanent retirement applies only to the matching runner lease.
     pub fn delete_adapter_state_requested(&self, lease: &Lease) -> bool {
-        self.entries
-            .get(&lease.session_id)
-            .is_some_and(|entry| entry.epoch == lease.epoch && entry.delete_adapter_state)
+        self.entries.get(&lease.session_id).is_some_and(|entry| {
+            entry.epoch == lease.epoch
+                && Arc::ptr_eq(&entry.construction, &lease.construction)
+                && entry.delete_adapter_state
+        })
     }
 
     /// Claim a parked teardown for another attempt, or one still marked
@@ -691,7 +964,7 @@ impl LifecycleTable {
 
     pub fn phase(&self, session_id: &str) -> WorkerPhase {
         match self.entries.get(session_id).map(|e| &e.phase) {
-            None => WorkerPhase::Absent,
+            None | Some(Phase::RetirementComplete) => WorkerPhase::Absent,
             Some(Phase::Starting { .. } | Phase::Respawning { .. }) => WorkerPhase::Resuming,
             Some(Phase::Running { .. }) => WorkerPhase::Running,
             Some(Phase::Stopping { .. } | Phase::TeardownRetry { .. }) => WorkerPhase::Stopping,
@@ -714,12 +987,15 @@ impl LifecycleTable {
     }
 
     pub fn is_owned(&self, session_id: &str) -> bool {
-        self.entries.contains_key(session_id)
+        self.entries
+            .get(session_id)
+            .is_some_and(|entry| !matches!(entry.phase, Phase::RetirementComplete))
     }
 
     pub(crate) fn construction_is_pending(&self, lease: &Lease) -> bool {
         self.entries.get(lease.session_id()).is_some_and(|entry| {
             entry.epoch == lease.epoch()
+                && Arc::ptr_eq(&entry.construction, &lease.construction)
                 && matches!(
                     entry.phase,
                     Phase::Starting { .. } | Phase::Respawning { .. }
@@ -738,7 +1014,7 @@ impl LifecycleTable {
                     Phase::Starting {
                         kind: ResumeKind::Attach,
                         ..
-                    }
+                    } | Phase::RetirementComplete
                 )
             })
             .count()
@@ -748,7 +1024,7 @@ impl LifecycleTable {
     /// capacity on top of `occupied_slots`.
     pub fn counts_registry_record(&self, session_id: &str) -> bool {
         match self.entries.get(session_id).map(|e| &e.phase) {
-            None => true,
+            None | Some(Phase::RetirementComplete) => true,
             Some(Phase::Starting {
                 kind: ResumeKind::Attach,
                 ..
@@ -765,7 +1041,7 @@ impl LifecycleTable {
 /// Scripted process control for lifecycle tests.
 #[cfg(test)]
 pub(crate) mod test_support {
-    use super::{ProcessControl, WorkerPhase};
+    use super::{ProcessControl, RunnerIdentity, WorkerPhase};
     use std::collections::HashSet;
     use std::sync::Mutex;
 
@@ -835,11 +1111,12 @@ pub(crate) mod test_support {
     }
 
     impl ProcessControl for FakeProcessControl {
-        fn is_alive(&self, pid: u32) -> bool {
-            self.alive.lock().unwrap().contains(&pid)
+        fn is_alive(&self, identity: RunnerIdentity) -> bool {
+            self.alive.lock().unwrap().contains(&identity.pid)
         }
 
-        fn terminate_group(&self, pid: u32) {
+        fn terminate_group(&self, identity: RunnerIdentity) {
+            let pid = identity.pid;
             self.signals.lock().unwrap().push((pid, "TERM"));
             if !self.immortal.lock().unwrap().contains(&pid) {
                 self.alive.lock().unwrap().remove(&pid);
@@ -847,12 +1124,15 @@ pub(crate) mod test_support {
             self.terminated.notify_one();
         }
 
-        fn kill_group(&self, pid: u32) {
+        fn kill_group(&self, identity: RunnerIdentity) {
+            let pid = identity.pid;
             self.signals.lock().unwrap().push((pid, "KILL"));
             if !self.immortal.lock().unwrap().contains(&pid) {
                 self.alive.lock().unwrap().remove(&pid);
             }
         }
+
+        fn forget(&self, _identity: RunnerIdentity) {}
 
         fn release_scope(
             &self,
@@ -902,7 +1182,7 @@ mod tests {
     const ID: &str = "s-1";
 
     fn identity(pid: u32, generation: u64) -> RunnerIdentity {
-        RunnerIdentity { pid, generation }
+        RunnerIdentity::unattested(pid, generation)
     }
 
     #[cfg(unix)]
@@ -919,8 +1199,9 @@ mod tests {
             .spawn()
             .unwrap();
         let pid = leader.id();
+        let control = SystemProcessControl::default();
         let mut member = None;
-        let observed = (|| -> std::io::Result<bool> {
+        let observed = (|| -> anyhow::Result<(RunnerIdentity, bool)> {
             member = Some(
                 Command::new("sleep")
                     .arg("120")
@@ -930,9 +1211,17 @@ mod tests {
                     .process_group(pid as i32)
                     .spawn()?,
             );
+            let birth = crate::process::process_birth_identity(pid)?
+                .ok_or_else(|| anyhow::anyhow!("group leader has no birth identity"))?;
+            let identity = RunnerIdentity {
+                pid,
+                generation: 1,
+                birth_fingerprint: Some(birth.fingerprint()),
+            };
+            control.with_guard(identity, |_| Ok(()))?;
             leader.kill()?;
             leader.wait()?;
-            Ok(SystemProcessControl.is_alive(pid))
+            Ok((identity, control.is_alive(identity)))
         })();
         if let Some(mut member) = member {
             let _ = member.kill();
@@ -940,12 +1229,13 @@ mod tests {
         }
         let _ = leader.kill();
         leader.wait().unwrap();
+        let (identity, observed) = observed.unwrap();
         assert!(
-            observed.unwrap(),
+            observed,
             "a surviving group member must prevent teardown settlement"
         );
         assert!(
-            !SystemProcessControl.is_alive(pid),
+            !control.is_alive(identity),
             "a reaped group must permit settlement"
         );
     }

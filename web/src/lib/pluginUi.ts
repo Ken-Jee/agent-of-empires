@@ -56,6 +56,16 @@ export function globalEntries(entries: PluginUiEntry[], slot: PluginUiSlot): Plu
   return entries.filter((e) => e.slot === slot && e.session_id == null);
 }
 
+/** By payload `order` (default 0, lowest first); the sort is stable, so ties keep snapshot order. Sorts in place. */
+export function byOrder(entries: PluginUiEntry[]): PluginUiEntry[] {
+  const order = (e: PluginUiEntry) => (typeof e.payload.order === "number" ? e.payload.order : 0);
+  return entries.sort((a, b) => order(a) - order(b));
+}
+
+export function chipEntries(entries: PluginUiEntry[], slot: PluginUiSlot): PluginUiEntry[] {
+  return byOrder(globalEntries(entries, slot));
+}
+
 /** Also the tearing guard: entries for vanished sessions never match. */
 export function sessionEntries(
   entries: PluginUiEntry[],
@@ -109,6 +119,17 @@ export function toneTextClass(tone: PluginUiTone | undefined): string {
       .split(" ")
       .find((c) => c.startsWith("text-")) ?? "text-text-dim"
   );
+}
+
+/** Sessions with any plugin `row-column` entry toned `danger` or `warn`, for the sidebar attention sort and badges. */
+export function pluginAttentionSessionIds(entries: PluginUiEntry[]): Set<string> {
+  const ids = new Set<string>();
+  for (const e of entries) {
+    if (e.slot !== "row-column" || e.session_id == null) continue;
+    const tone = entryTone(e);
+    if (tone === "danger" || tone === "warn") ids.add(e.session_id);
+  }
+  return ids;
 }
 
 // `sort-key` and `filter-facet` are global entries referencing a per-session `row-column` by id; sorting and filtering run client-side.

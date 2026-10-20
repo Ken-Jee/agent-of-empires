@@ -17,12 +17,13 @@ pub use runtime_connection::{RuntimeConnection, RuntimeConnectionError, RuntimeE
 pub(crate) mod transport;
 pub(crate) mod websocket;
 pub use websocket::WsError;
+pub mod live;
 mod wire;
 
 use std::fmt;
 use std::time::Duration;
 
-use reqwest::header::{HeaderValue, AUTHORIZATION};
+use reqwest::header::{HeaderName, HeaderValue, AUTHORIZATION, COOKIE};
 use reqwest::{StatusCode, Url};
 use thiserror::Error;
 
@@ -55,13 +56,13 @@ const MAX_SUCCESS_BODY_BYTES: usize = 16 * 1024 * 1024;
 pub struct DaemonClient {
     http: reqwest::Client,
     sessions_url: Url,
-    authorization: Option<HeaderValue>,
+    credentials: Vec<(HeaderName, HeaderValue)>,
     unix_path: Option<std::path::PathBuf>,
 }
 
 impl fmt::Debug for DaemonClient {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let authenticated = self.authorization.is_some();
+        let authenticated = self.authenticated();
         let mut debug = f.debug_struct("DaemonClient");
         if authenticated {
             debug.field("sessions_url", &"<redacted>");
@@ -83,21 +84,21 @@ pub enum DaemonClientError {
     /// The bearer token cannot be represented as an HTTP authorization header.
     #[error("invalid daemon bearer token")]
     InvalidBearerToken,
-    #[error("daemon bearer token requires HTTPS or a loopback HTTP URL")]
-    InsecureBearerTransport,
+    #[error("invalid daemon session credential")]
+    InvalidSessionCredential,
+    #[error("daemon credentials require HTTPS or a loopback HTTP URL")]
+    InsecureCredentialTransport,
     #[error("daemon Unix transport failed")]
     UnixTransport,
     #[error("daemon peer is not owned by the current user")]
     PeerIdentity,
     #[error("daemon request timed out; mutation outcome may be unknown")]
     Timeout,
-    /// The default reqwest client could not be built.
     #[error("failed to build daemon HTTP client")]
     ClientBuild,
     #[error("daemon transport error")]
     Transport,
-    /// The daemon returned a non-successful HTTP status. Authenticated
-    /// responses omit the body so transformed credentials cannot be reflected.
+    /// Authenticated responses never reflect credential-bearing bodies.
     #[error("{}", daemon_status_message(*status, *code, body))]
     Status {
         status: StatusCode,
@@ -160,15 +161,47 @@ impl DaemonClient {
     ///
     /// Bearer authentication requires HTTPS except for loopback HTTP endpoints.
     pub fn new(base_url: &str, bearer_token: Option<&str>) -> Result<Self, DaemonClientError> {
+        let credentials = authorization_header(bearer_token)?
+            .map(|value| vec![(AUTHORIZATION, value)])
+            .unwrap_or_default();
+        Self::with_credentials(base_url, credentials)
+    }
+
+    /// Passphrase-login session: the `aoe_session` cookie pair plus the
+    /// device-binding secret. Same transport rules as a bearer token.
+    pub fn with_session(
+        base_url: &str,
+        cookie: &str,
+        binding_secret: &str,
+    ) -> Result<Self, DaemonClientError> {
+        Self::with_credentials(
+            base_url,
+            vec![
+                (COOKIE, sensitive_header(cookie)?),
+                (
+                    HeaderName::from_static("x-aoe-device-binding"),
+                    sensitive_header(binding_secret)?,
+                ),
+            ],
+        )
+    }
+
+    fn with_credentials(
+        base_url: &str,
+        credentials: Vec<(HeaderName, HeaderValue)>,
+    ) -> Result<Self, DaemonClientError> {
         let sessions_url = sessions_url(base_url)?;
-        let authorization = authorization_header(bearer_token)?;
-        let http = native_http_client(&sessions_url, authorization.is_some())?;
+        let http = native_http_client(&sessions_url, !credentials.is_empty())?;
         Ok(Self {
             http,
             sessions_url,
-            authorization,
+            credentials,
             unix_path: None,
         })
+    }
+
+    fn authenticated(&self) -> bool {
+        !self.credentials.is_empty()
     }
 
     pub fn new_unix(path: impl Into<std::path::PathBuf>) -> Result<Self, DaemonClientError> {
@@ -200,19 +233,34 @@ impl DaemonClient {
         profile: Option<&str>,
     ) -> Result<bool, DaemonClientError> {
         let info = self.runtime_info().await?;
+        Ok(self.matches_local_runtime(&info)
+            && info.health == RuntimeHealth::Healthy
+            && !info.profiles.is_empty()
+            && profile.is_none_or(|profile| info.profiles.iter().any(|name| name == profile)))
+    }
+
+    pub(crate) async fn local_daemon_ready(&self, pid: u32) -> Result<bool, DaemonClientError> {
+        let url = self
+            .sessions_url
+            .join("runtime")
+            .map_err(|_| DaemonClientError::Transport)?;
+        let info: RuntimeInfo = self
+            .request_json_with_peer(self.http.get(url), Some(pid))
+            .await?;
+        Ok(self.matches_local_runtime(&info))
+    }
+
+    fn matches_local_runtime(&self, info: &RuntimeInfo) -> bool {
         let namespace = self
             .unix_path
             .as_deref()
             .and_then(std::path::Path::parent)
             .and_then(std::path::Path::parent)
             .and_then(std::path::Path::to_str);
-        Ok(info.protocol_version == RUNTIME_PROTOCOL_VERSION
+        info.protocol_version == RUNTIME_PROTOCOL_VERSION
             && !info.epoch.is_empty()
             && info.local_owner
             && namespace.is_some_and(|expected| expected == info.namespace)
-            && info.health == RuntimeHealth::Healthy
-            && !info.profiles.is_empty()
-            && profile.is_none_or(|profile| info.profiles.iter().any(|name| name == profile)))
     }
 
     /// Review executable repository configuration without provisioning or granting trust.
@@ -708,16 +756,24 @@ impl DaemonClient {
     }
 
     fn should_read_error_body(&self, code: Option<ApiErrorCode>) -> bool {
-        self.authorization.is_none()
+        !self.authenticated()
             && (self.unix_path.is_none() || code == Some(ApiErrorCode::CreateHookFailed))
     }
 
     async fn request_response(
         &self,
-        mut request: reqwest::RequestBuilder,
+        request: reqwest::RequestBuilder,
     ) -> Result<reqwest::Response, DaemonClientError> {
-        if let Some(authorization) = &self.authorization {
-            request = request.header(AUTHORIZATION, authorization.clone());
+        self.request_response_with_peer(request, None).await
+    }
+
+    async fn request_response_with_peer(
+        &self,
+        mut request: reqwest::RequestBuilder,
+        expected_peer: Option<u32>,
+    ) -> Result<reqwest::Response, DaemonClientError> {
+        for (name, value) in &self.credentials {
+            request = request.header(name.clone(), value.clone());
         }
         let mut request = request.build().map_err(|_| DaemonClientError::Transport)?;
         if request.timeout().is_none() {
@@ -732,8 +788,13 @@ impl DaemonClient {
                 None
             }
         };
-        let mut response =
-            transport::execute(&self.http, self.unix_path.as_deref(), request).await?;
+        let mut response = transport::execute_with_peer(
+            &self.http,
+            self.unix_path.as_deref(),
+            request,
+            expected_peer,
+        )
+        .await?;
         let status = response.status();
         if !status.is_success() {
             let code = ApiErrorCode::from_headers(status, response.headers(), false);
@@ -797,10 +858,20 @@ impl DaemonClient {
         &self,
         request: reqwest::RequestBuilder,
     ) -> Result<T, DaemonClientError> {
-        let mut response = self.request_response(request).await?;
+        self.request_json_with_peer(request, None).await
+    }
+
+    async fn request_json_with_peer<T: serde::de::DeserializeOwned>(
+        &self,
+        request: reqwest::RequestBuilder,
+        expected_peer: Option<u32>,
+    ) -> Result<T, DaemonClientError> {
+        let mut response = self
+            .request_response_with_peer(request, expected_peer)
+            .await?;
         let body = read_bounded_body(&mut response, MAX_SUCCESS_BODY_BYTES).await?;
         serde_json::from_slice(&body).map_err(|error| {
-            if self.authorization.is_some() || self.unix_path.is_some() {
+            if self.authenticated() || self.unix_path.is_some() {
                 DaemonClientError::AuthenticatedDecode
             } else {
                 DaemonClientError::Decode(error)
@@ -936,8 +1007,17 @@ pub(crate) fn native_http_client(
     url: &Url,
     authenticated: bool,
 ) -> Result<reqwest::Client, DaemonClientError> {
+    native_http_client_builder(url, authenticated)?
+        .build()
+        .map_err(|_| DaemonClientError::ClientBuild)
+}
+
+pub(crate) fn native_http_client_builder(
+    url: &Url,
+    authenticated: bool,
+) -> Result<reqwest::ClientBuilder, DaemonClientError> {
     if authenticated && url.scheme() == "http" && !is_loopback_url(url) {
-        return Err(DaemonClientError::InsecureBearerTransport);
+        return Err(DaemonClientError::InsecureCredentialTransport);
     }
     let mut builder = reqwest::Client::builder()
         .timeout(DEFAULT_TIMEOUT)
@@ -958,21 +1038,33 @@ pub(crate) fn native_http_client(
             );
         }
     }
-    builder.build().map_err(|_| DaemonClientError::ClientBuild)
+    Ok(builder)
 }
 
 pub(crate) fn is_loopback_url(url: &Url) -> bool {
-    let Some(host) = url.host_str() else {
-        return false;
-    };
-    let ip_host = host
-        .strip_prefix('[')
+    url.host_str().is_some_and(is_loopback_host)
+}
+
+/// The host half of [`is_loopback_url`], for the callers that have read a host
+/// rather than a URL. A name equal to `localhost` whatever its case, or a
+/// loopback address.
+pub(crate) fn is_loopback_host(host: &str) -> bool {
+    host.eq_ignore_ascii_case("localhost") || is_loopback_address(host)
+}
+
+/// The address half, for the callers that need to know whether the peer is the
+/// machine they are on rather than whether it is named something friendly. A
+/// name is not an answer here, because nothing in this predicate resolves one,
+/// so a name the caller cannot check is not a loopback peer: only an address
+/// that parses as a loopback `IpAddr`, so the whole of `127.0.0.0/8` and `::1`
+/// and nothing else. A bracketed IPv6 authority keeps its brackets in a URL, so
+/// they come off before the address is read.
+pub(crate) fn is_loopback_address(host: &str) -> bool {
+    host.strip_prefix('[')
         .and_then(|host| host.strip_suffix(']'))
-        .unwrap_or(host);
-    host.eq_ignore_ascii_case("localhost")
-        || ip_host
-            .parse::<std::net::IpAddr>()
-            .is_ok_and(|ip| ip.is_loopback())
+        .unwrap_or(host)
+        .parse::<std::net::IpAddr>()
+        .is_ok_and(|ip| ip.is_loopback())
 }
 
 pub(crate) fn native_url(base_url: &str) -> Result<Url, DaemonClientError> {
@@ -1032,6 +1124,13 @@ pub(crate) fn authorization_header(
     Ok(Some(value))
 }
 
+fn sensitive_header(value: &str) -> Result<HeaderValue, DaemonClientError> {
+    let mut value =
+        HeaderValue::from_str(value).map_err(|_| DaemonClientError::InvalidSessionCredential)?;
+    value.set_sensitive(true);
+    Ok(value)
+}
+
 fn truncate_utf8(value: &mut String, max_bytes: usize) {
     let mut boundary = max_bytes.min(value.len());
     while !value.is_char_boundary(boundary) {
@@ -1043,6 +1142,50 @@ fn truncate_utf8(value: &mut String, max_bytes: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn daemon_start_accepts_degraded_native_health_but_pins_peer_and_preserves_tui_refusal() {
+        let root = tempfile::tempdir().unwrap();
+        let daemon = root.path().join("daemon");
+        std::fs::create_dir(&daemon).unwrap();
+        let path = daemon.join("api.sock");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let info = RuntimeInfo {
+            protocol_version: RUNTIME_PROTOCOL_VERSION,
+            epoch: "native-epoch".into(),
+            namespace: root.path().to_str().unwrap().into(),
+            tmux_socket: None,
+            local_owner: true,
+            profiles: vec!["healthy".into()],
+            read_only: false,
+            cityhall_mode: false,
+            health: RuntimeHealth::Degraded {
+                code: ReloadFailureCode::ProfileData,
+                profiles: vec!["damaged".into()],
+            },
+            interaction_capabilities: RuntimeCapabilities {
+                mutations: false,
+                native_interaction: false,
+            },
+        };
+        let router = axum::Router::new().route(
+            "/api/runtime",
+            axum::routing::get(move || {
+                let info = info.clone();
+                async move { axum::Json(info) }
+            }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = DaemonClient::new_unix(path).unwrap();
+        assert!(client.local_daemon_ready(std::process::id()).await.unwrap());
+        assert!(!client.local_runtime_ready(Some("healthy")).await.unwrap());
+        assert!(matches!(
+            client.local_daemon_ready(std::process::id() + 1).await,
+            Err(DaemonClientError::PeerIdentity)
+        ));
+        server.abort();
+        let _ = server.await;
+    }
 
     #[test]
     fn error_body_policy_exposes_hook_failures_only_to_local_owner() {

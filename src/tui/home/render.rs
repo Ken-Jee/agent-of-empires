@@ -11,7 +11,7 @@ use rattles::presets::prelude as spinners;
 use super::{
     get_indent, live_send, HomeView, TerminalMode, ViewMode, ICON_ARCHIVED_SECTION, ICON_COLLAPSED,
     ICON_DELETING, ICON_DORMANT, ICON_ERROR, ICON_EXPANDED, ICON_FAVORITE, ICON_IDLE, ICON_PINNED,
-    ICON_STOPPED, ICON_TRASH_SECTION, ICON_UNKNOWN, ICON_UNREAD,
+    ICON_STOPPED, ICON_TERMINAL, ICON_TRASH_SECTION, ICON_UNKNOWN, ICON_UNREAD,
 };
 use crate::containers::image_update::ImageUpdate;
 use crate::session::config::{GroupByMode, RowTagMode, SidebarPosition, SortOrder};
@@ -170,6 +170,72 @@ pub(super) fn map_live_preview_cursor(
         return None;
     }
     Some(Position::new(col as u16, row as u16))
+}
+
+/// Follow a trusted captured cursor when a shared pane is taller than its passive view.
+fn passive_capture_scroll_offset(
+    line_count: usize,
+    visible_rows: usize,
+    cursor: Option<crate::tmux::PaneCursor>,
+) -> u16 {
+    let Some(cursor) = cursor else {
+        return 0;
+    };
+    if !cursor.visible
+        || !cursor.position_reliable
+        || visible_rows == 0
+        || usize::from(cursor.pane_height) <= visible_rows
+    {
+        return 0;
+    }
+    let origin = cursor.composite_pane0.map_or(0, |rect| rect.top as i64);
+    let row = line_count as i64 - i64::from(cursor.pane_height) + origin + i64::from(cursor.y);
+    if row < 0 || row >= line_count as i64 {
+        return 0;
+    }
+    let (tail_top, _) = preview::visible_line_range(line_count, visible_rows, 0);
+    let screen_top = line_count.saturating_sub(usize::from(cursor.pane_height));
+    let top = (row as usize + 1)
+        .saturating_sub(visible_rows)
+        .max(screen_top)
+        .min(tail_top);
+    tail_top.saturating_sub(top).min(u16::MAX as usize) as u16
+}
+
+/// Rows each split half needs; a shorter preview stays single.
+const SPLIT_MIN_HALF_ROWS: u16 = 6;
+
+/// The split preview's rects: agent on top, a one-row divider, terminal below.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct SplitRects {
+    pub(super) agent: Rect,
+    pub(super) divider: Rect,
+    pub(super) terminal: Rect,
+}
+
+/// Equal halves, so a pane sized for either half fits the other and focus swaps never
+/// resize the fleet. An odd leftover row stays blank at the bottom.
+pub(super) fn split_preview_rects(inner: Rect) -> Option<SplitRects> {
+    let half = inner.height.saturating_sub(1) / 2;
+    if half < SPLIT_MIN_HALF_ROWS {
+        return None;
+    }
+    Some(SplitRects {
+        agent: Rect {
+            height: half,
+            ..inner
+        },
+        divider: Rect {
+            y: inner.y + half,
+            height: 1,
+            ..inner
+        },
+        terminal: Rect {
+            y: inner.y + half + 1,
+            height: half,
+            ..inner
+        },
+    })
 }
 
 /// Number of pane lines to capture for the preview, accounting for the user's
@@ -1750,12 +1816,22 @@ impl HomeView {
                     Some(total) if total > session_count => format!("{session_count}/{total}"),
                     _ => session_count.to_string(),
                 };
+                // Same path in several profiles: lead with the profile so truncation never hides it.
+                let profile_tag = profile
+                    .as_ref()
+                    .filter(|p| {
+                        self.group_trees
+                            .iter()
+                            .any(|(other, t)| other != *p && t.group_exists(path))
+                    })
+                    .map(|p| format!("[{p}] "))
+                    .unwrap_or_default();
                 let text = if let Some(glyph) = section_glyph {
                     Cow::Owned(format!("{} {} ({})", glyph, name, session_count))
                 } else if pinned {
                     Cow::Owned(format!("{} ({}) {}", name, session_count, ICON_PINNED))
                 } else {
-                    Cow::Owned(format!("{} ({})", name, session_count))
+                    Cow::Owned(format!("{}{} ({})", profile_tag, name, session_count))
                 };
                 let mut style = Style::default().fg(theme.group).bold();
                 // Shelf headers and their nested project sub-folders sit below the sort
@@ -1771,29 +1847,21 @@ impl HomeView {
             }
             Item::Session { id, .. } => {
                 if let Some(inst) = self.get_instance(id) {
-                    // Each view mode contributes only the live-state glyph
-                    // and color for its own backing pane; every overlay on top
-                    // of that (archive/trash, snooze, urgent, favorite) is
-                    // mode-independent and belongs to `decorate_row`.
+                    // Each view mode contributes only the live-state glyph and color for
+                    // its own pane; the overlays on top belong to `decorate_row`.
                     let (seed, sunk) = match self.view_mode {
                         ViewMode::Structured => {
-                            // For Idle sessions, decay color from `fresh_idle`
-                            // toward `idle` over `idle_decay_window`. A slow
-                            // `breathe` rattle replaces the static braille
-                            // glyph while we're inside the window, matching
-                            // the animated visual language of the other
-                            // attention-worthy states (Running, Waiting,
-                            // Starting). Also serves as a redundant cue for
-                            // colorblind users / monochrome terminals.
+                            // Idle sessions decay from `fresh_idle` toward `idle`
+                            // over `idle_decay_window`, with a slow `breathe` rattle
+                            // inside the window to match the other attention-worthy
+                            // states and cue colorblind or monochrome terminals.
                             let idle_age = inst.idle_age();
                             let is_fresh_idle =
                                 matches!(idle_age, Some(age) if age < self.idle_decay_window);
-                            // Dormant (idle-reaped, resumable) structured
-                            // workers get their own glyph + dim amber, taking
-                            // precedence over the raw status. Unread still
-                            // wins over dormancy below (an unseen finished turn
-                            // is the more actionable signal, matching the web
-                            // sidebar's unread-dot precedence). See #2250.
+                            // Dormant (idle-reaped, resumable) structured workers get
+                            // their own glyph and dim amber, ahead of the raw status.
+                            // Unread still wins below: an unseen finished turn is the
+                            // more actionable signal, as in the web sidebar. See #2250.
                             let is_shown_dormant = inst.is_shown_dormant();
                             let mut icon = if is_shown_dormant {
                                 ICON_DORMANT
@@ -1813,20 +1881,13 @@ impl HomeView {
                                     Status::Creating => spinner_starting(&inst.created_at),
                                 }
                             };
-                            // Unread paints only on resting rows
-                            // (Idle/Unknown): a live status (Running/Waiting/
-                            // Starting/...) supersedes it and keeps its own
-                            // color AND spinner. Auto-unread only ever lands
-                            // on Idle; a manual flag on a live row defers to
-                            // the live state. Sunk rows (archived/snoozed)
-                            // never paint unread: the user dismissed the row,
-                            // so surfacing it as unread contradicts that. The
-                            // flag stays on disk, so unarchiving/unsnoozing
-                            // restores it. Snooze is checked in every sort
-                            // mode here (unlike the Attention-only snooze
-                            // decoration in `decorate_row`), so a snoozed
-                            // unread row outside Attention sort still drops
-                            // the dot (#2571).
+                            // Unread paints only on resting rows (Idle/Unknown); a
+                            // live status keeps its own color and spinner. Sunk rows
+                            // (archived/snoozed) never paint it, since the user
+                            // dismissed them; the flag stays on disk and comes back on
+                            // restore. Snooze is checked in every sort mode here, not
+                            // just Attention, so a snoozed unread row still drops the
+                            // dot (#2571).
                             let unread_resting = crate::session::unread_enabled()
                                 && inst.is_unread()
                                 && !inst.is_archived()
@@ -1853,9 +1914,8 @@ impl HomeView {
                             };
                             let mut modifier = ratatui::style::Modifier::empty();
                             if unread_resting {
-                                // Make unread unmistakable: a solid dot glyph
-                                // plus bold, on top of the `theme.unread`
-                                // color set above. A plain color swap read as
+                                // Make unread unmistakable: solid dot plus bold on
+                                // top of `theme.unread`; a color swap alone read as
                                 // too subtle (#2088 review).
                                 icon = ICON_UNREAD;
                                 modifier = ratatui::style::Modifier::BOLD;
@@ -1977,7 +2037,12 @@ impl HomeView {
             } else {
                 None
             };
-        let badge_width = badge_text.map_or(0, |s| s.len());
+        // Agent view only: Terminal view already shows the terminal's state in the icon.
+        let terminal_badge = (self.view_mode == ViewMode::Structured
+            && self.paired_terminal_running_for_display(inst))
+        .then(|| format!(" {ICON_TERMINAL}"));
+        let badge_width =
+            badge_text.map_or(0, |s| s.len()) + terminal_badge.as_ref().map_or(0, |s| s.len());
         let age = if self.show_activity_age {
             row_age(inst, in_attention)
         } else {
@@ -2020,6 +2085,17 @@ impl HomeView {
             ));
         }
 
+        if let Some(badge) = terminal_badge {
+            let badge_style = Style::default().fg(theme.terminal_active);
+            line_spans.push(Span::styled(
+                badge,
+                if is_selected {
+                    selected_row_style(badge_style, theme)
+                } else {
+                    badge_style
+                },
+            ));
+        }
         if let Some(badge) = badge_text {
             let badge_style = Style::default().fg(theme.sandbox);
             line_spans.push(Span::styled(
@@ -2128,6 +2204,230 @@ impl HomeView {
             }
         };
         Some(name)
+    }
+
+    /// Whether the preview splits into agent and paired terminal: only for a live
+    /// tmux-backed agent in Agent or Terminal view, where `view_mode` names the focused
+    /// half. A gone agent pane falls back to the single preview and its placeholder.
+    pub(super) fn split_terminal_applies(&self) -> bool {
+        if !self.split_terminal || matches!(self.view_mode, ViewMode::Tool(_)) {
+            return false;
+        }
+        self.selected_session
+            .as_ref()
+            .and_then(|id| self.get_instance(id))
+            .is_some_and(|inst| {
+                !inst.is_structured()
+                    && !inst.is_archived()
+                    && !inst.is_trashed()
+                    && !matches!(inst.status, Status::Creating | Status::Deleting)
+                    && crate::tmux::session_exists_for_display(
+                        &crate::tmux::Session::resolve_name_for_display(&inst.id, &inst.title),
+                    )
+            })
+    }
+
+    /// The pane behind the split half that is not focused. `None` for a terminal that is
+    /// not running, so no worker polls a missing session.
+    fn split_passive_tmux_name(&self) -> Option<String> {
+        let id = self.selected_session.as_ref()?;
+        let inst = self.get_instance(id)?;
+        if matches!(self.view_mode, ViewMode::Terminal) {
+            return Some(crate::tmux::Session::resolve_name_for_display(
+                &inst.id,
+                &inst.title,
+            ));
+        }
+        if !self.paired_terminal_running_for_display(inst) {
+            return None;
+        }
+        Some(match self.effective_terminal_mode(id) {
+            TerminalMode::Host => {
+                crate::tmux::TerminalSession::resolve_name_for_display(&inst.id, &inst.title)
+            }
+            TerminalMode::Container => {
+                crate::tmux::ContainerTerminalSession::resolve_name_for_display(
+                    &inst.id,
+                    &inst.title,
+                )
+            }
+        })
+    }
+
+    /// Point the split worker at the passive half's pane, or drop it when there is none.
+    /// Passive capture is observer-only: idle cadence, plain `capture-pane`, never a
+    /// resize, since the terminal is shared with the web dashboard.
+    fn sync_split_capture_worker(&mut self, desired: Option<String>) {
+        let Some(target) = desired else {
+            self.split_capture_worker = None;
+            self.split_capture_target = None;
+            return;
+        };
+        let forward_empty = !matches!(self.view_mode, ViewMode::Terminal);
+        let worker = self.split_capture_worker.get_or_insert_with(|| {
+            let worker = live_send::LiveCaptureWorker::spawn(self.preview_wake.clone());
+            worker.set_vt_enabled(false);
+            worker
+        });
+        if self.split_capture_target.as_deref() != Some(target.as_str()) {
+            worker.set_target(target.clone());
+            self.split_capture_target = Some(target);
+        }
+        worker.set_forward_empty(forward_empty);
+    }
+
+    /// Paint the unfocused split half and its divider. Touches no preview geometry, so
+    /// mouse, scroll and selection keep describing the focused half.
+    fn render_split_passive_half(
+        &mut self,
+        frame: &mut Frame,
+        split: &SplitRects,
+        compact: bool,
+        theme: &Theme,
+    ) {
+        let Some(id) = self.selected_session.clone() else {
+            return;
+        };
+        frame.render_widget(
+            Block::default()
+                .borders(Borders::TOP)
+                .border_style(Style::default().fg(theme.terminal_border))
+                .title(" Terminal ")
+                .title_style(Style::default().fg(theme.terminal_border)),
+            split.divider,
+        );
+        let terminal_focused = matches!(self.view_mode, ViewMode::Terminal);
+        let rect = if terminal_focused {
+            split.agent
+        } else {
+            split.terminal
+        };
+        if !terminal_focused
+            && !self
+                .get_instance(&id)
+                .is_some_and(|inst| self.paired_terminal_running_for_display(inst))
+        {
+            let key = if self.strict_hotkeys { "Ctrl+T" } else { "T" };
+            // Live mode forwards `T` to the agent; only the leader reaches the swap.
+            let how = match self.live_send.as_ref().map(|state| state.leader) {
+                Some(Some(leader)) => {
+                    format!("Press {} then t", live_send::display_chord(leader))
+                }
+                Some(None) => format!("Exit live mode, then press {key}"),
+                None => format!("Press {key}"),
+            };
+            frame.render_widget(
+                Paragraph::new(format!("No terminal running. {how} to start one."))
+                    .style(Style::default().fg(theme.dimmed))
+                    .alignment(Alignment::Center),
+                rect,
+            );
+            return;
+        }
+        let container = self.effective_terminal_mode(&id) == TerminalMode::Container;
+        let select: fn(&mut Self) -> &mut super::PreviewCache = match (terminal_focused, container)
+        {
+            (true, _) => |s| &mut s.preview_cache,
+            (false, true) => |s| &mut s.container_terminal_preview_cache,
+            (false, false) => |s| &mut s.terminal_preview_cache,
+        };
+        let Some(info_height) = self.get_instance(&id).map(|inst| {
+            if terminal_focused {
+                preview::agent_info_height(inst)
+            } else {
+                preview::terminal_info_height(inst)
+            }
+        }) else {
+            return;
+        };
+        let output = preview::PreviewLayout::compute(rect, compact, false, info_height).output;
+        self.apply_split_capture(output.width, output.height, select);
+        select(self).ensure_parsed();
+        let cache = match (terminal_focused, container) {
+            (true, _) => &self.preview_cache,
+            (false, true) => &self.container_terminal_preview_cache,
+            (false, false) => &self.terminal_preview_cache,
+        };
+        let Some(inst) = self.get_instance(&id) else {
+            return;
+        };
+        let parsed_lines = cache
+            .parsed_text
+            .as_ref()
+            .map_or(0, |text| text.lines.len());
+        let scroll_offset =
+            passive_capture_scroll_offset(parsed_lines, output.height as usize, cache.cursor);
+        let cached = CachedPreview::new(cache.parsed_text.as_ref(), cache.is_pending_for(&id));
+        if terminal_focused {
+            Preview::render_with_cache(
+                frame,
+                rect,
+                inst,
+                cached,
+                scroll_offset,
+                theme,
+                self.idle_decay_window,
+                compact,
+                false,
+            );
+        } else {
+            Preview::render_terminal_preview(
+                frame,
+                rect,
+                inst,
+                self.auxiliary_presence_for_view(inst),
+                cached,
+                scroll_offset,
+                theme,
+                compact,
+                false,
+            );
+        }
+        frame.buffer_mut().set_style(
+            rect,
+            Style::default().add_modifier(ratatui::style::Modifier::DIM),
+        );
+    }
+
+    /// Apply the split worker's newest frame to the passive half's cache. No scroll or
+    /// freeze handling: the passive half always shows the live edge.
+    fn apply_split_capture(
+        &mut self,
+        width: u16,
+        height: u16,
+        select: fn(&mut Self) -> &mut super::PreviewCache,
+    ) {
+        let Some(id) = self.selected_session.clone() else {
+            return;
+        };
+        {
+            let cache = select(self);
+            if cache.session_id.as_deref() != Some(id.as_str()) && !cache.content.is_empty() {
+                *cache = super::PreviewCache::default();
+            }
+        }
+        let Some(worker) = self.split_capture_worker.as_ref() else {
+            return;
+        };
+        worker.set_capture_lines(capture_lines_for(height, 0));
+        let Some(frame) = worker.take_latest() else {
+            return;
+        };
+        if !worker.frame_is_current(&frame) {
+            return;
+        }
+        if frame.content.is_empty() && !worker.should_forward_empty() {
+            worker.restore_latest(frame);
+            return;
+        }
+        select(self).store_capture(
+            frame.content,
+            id,
+            frame.target,
+            frame.generation,
+            (width, height),
+            frame.cursor,
+        );
     }
 
     /// Observe worker progress without relying on changed-frame publication.
@@ -2440,6 +2740,7 @@ impl HomeView {
         &mut self,
         inner: Rect,
         compact: bool,
+        show_info: bool,
         exclude: Option<&str>,
     ) {
         self.adopt_passive_resize_completions();
@@ -2467,7 +2768,7 @@ impl HomeView {
             let output = preview::PreviewLayout::compute(
                 inner,
                 compact,
-                self.show_preview_info,
+                show_info,
                 preview::agent_info_height(inst),
             )
             .output;
@@ -2776,6 +3077,21 @@ impl HomeView {
             .border_style(Style::default().fg(border_color))
             .padding(Padding::horizontal(1));
 
+        let split = self
+            .split_terminal_applies()
+            .then(|| split_preview_rects(block.inner(area)))
+            .flatten();
+        // Split mode hands the whole single-preview path the focused half, so geometry,
+        // scroll, selection and mouse hits all describe it; the other half is paint-only.
+        let inner = match (&split, &self.view_mode) {
+            (Some(s), ViewMode::Terminal) => s.terminal,
+            (Some(s), _) => s.agent,
+            (None, _) => block.inner(area),
+        };
+        // Info headers are off while split: two headers would leave a worktree agent a
+        // couple of output rows, and the passive fleet would size every pane to match.
+        let show_info = self.show_preview_info && split.is_none();
+
         // In compact mode, hoist session name + status icon into the
         // outer title so the (now omitted) info header isn't missed.
         let compact_title: Option<Line> = if compact {
@@ -2846,7 +3162,9 @@ impl HomeView {
             // (Agent's worktree-flavored one, Terminal/Tool's minimal one), so the hint
             // applies everywhere except the compact branch, whose title is taken.
             let key = if self.strict_hotkeys { "I" } else { "i" };
-            let hint_text = if self.show_preview_info {
+            let hint_text = if split.is_some() {
+                String::new()
+            } else if show_info {
                 format!(" hide info with {key} ")
             } else {
                 format!(" show info with {key} ")
@@ -2860,9 +3178,8 @@ impl HomeView {
             // mounted structured preview owns its own scroll state, and the generic
             // indicator reads the tmux cache, which is stale or empty for it.
             let structured_mounted = self.structured_preview.is_some();
-            let scroll_indicator = if !self.show_preview_info && !structured_mounted {
-                let inner_height = area.height.saturating_sub(2);
-                let visible_height = inner_height as usize;
+            let scroll_indicator = if !show_info && !structured_mounted {
+                let visible_height = inner.height as usize;
                 let captured_lines = self.active_captured_lines();
                 format_scroll_indicator(captured_lines, visible_height, self.preview_scroll_offset)
             } else {
@@ -2876,7 +3193,6 @@ impl HomeView {
             block = block.title_top(Line::from(hint_spans).right_aligned());
         }
 
-        let inner = block.inner(area);
         self.preview_area = inner;
         // Keep the outer rect for partial redraws; using `inner` would nest the block.
 
@@ -2959,6 +3275,12 @@ impl HomeView {
                 self.displayed_pane_tmux_name()
             };
         self.sync_preview_capture_worker(desired);
+        let passive = if selected_archived || selected_trashed || selected_stopped {
+            None
+        } else {
+            split.as_ref().and_then(|_| self.split_passive_tmux_name())
+        };
+        self.sync_split_capture_worker(passive);
 
         // Pre-size every other open session's detached pane to the rect it would be shown
         // at (and adopt worker completions), in every view mode. The selected session is
@@ -2973,7 +3295,7 @@ impl HomeView {
         } else {
             None
         };
-        self.reconcile_passive_fleet(inner, compact, fleet_exclude.as_deref());
+        self.reconcile_passive_fleet(inner, compact, show_info, fleet_exclude.as_deref());
 
         if selected_archived {
             self.render_archived_preview(frame, inner, theme);
@@ -3011,7 +3333,7 @@ impl HomeView {
                 let layout = preview::PreviewLayout::compute(
                     inner,
                     compact,
-                    self.show_preview_info,
+                    show_info,
                     inst.map(preview::agent_info_height).unwrap_or(0),
                 );
                 if let (Some(info_area), Some(inst)) = (layout.info, inst) {
@@ -3061,6 +3383,10 @@ impl HomeView {
             return;
         }
 
+        if let Some(split) = &split {
+            self.render_split_passive_half(frame, split, compact, theme);
+        }
+
         match self.view_mode {
             ViewMode::Structured => {
                 // Check if selected session is being created (show hook progress)
@@ -3087,7 +3413,7 @@ impl HomeView {
                             preview::PreviewLayout::compute(
                                 inner,
                                 compact,
-                                self.show_preview_info,
+                                show_info,
                                 preview::agent_info_height(inst),
                             )
                             .output
@@ -3125,7 +3451,7 @@ impl HomeView {
                                 theme,
                                 self.idle_decay_window,
                                 compact,
-                                self.show_preview_info,
+                                show_info,
                             );
                         }
                     } else {
@@ -3154,7 +3480,7 @@ impl HomeView {
                             preview::PreviewLayout::compute(
                                 inner,
                                 compact,
-                                self.show_preview_info,
+                                show_info,
                                 preview::terminal_info_height(inst),
                             )
                             .output
@@ -3209,7 +3535,7 @@ impl HomeView {
                             self.preview_scroll_offset,
                             theme,
                             compact,
-                            self.show_preview_info,
+                            show_info,
                         );
                     }
                 } else {
@@ -3232,7 +3558,7 @@ impl HomeView {
                             preview::PreviewLayout::compute(
                                 inner,
                                 compact,
-                                self.show_preview_info,
+                                show_info,
                                 preview::terminal_info_height(inst),
                             )
                             .output
@@ -3267,7 +3593,7 @@ impl HomeView {
                             self.preview_scroll_offset,
                             theme,
                             compact,
-                            self.show_preview_info,
+                            show_info,
                         );
                     }
                 } else {
@@ -3332,7 +3658,12 @@ impl HomeView {
             let Some(line) = text.lines.get(view.first_line + row_offset as usize) else {
                 break;
             };
-            for span in crate::tui::links::link_spans_for_line(line, pane.width, &cache.links) {
+            for span in crate::tui::links::link_spans_for_line(
+                line,
+                pane.width,
+                &cache.links,
+                &self.preview_link_prefixes,
+            ) {
                 for col in span.start..span.end {
                     let pos = (pane.x + col, pane.y + row_offset);
                     if !buf_area.contains(Position::from(pos)) {
@@ -3821,8 +4152,14 @@ impl HomeView {
                     } else {
                         "b hide sidebar"
                     };
-                    let menu =
-                        format!("  {lead}:  k palette \u{00b7} {sidebar_cmd} \u{00b7} q exit ");
+                    let swap_cmd = match state.target {
+                        live_send::LiveSendTarget::Terminal
+                        | live_send::LiveSendTarget::ContainerTerminal => "t agent",
+                        _ => "t terminal",
+                    };
+                    let menu = format!(
+                        "  {lead}:  k palette \u{00b7} {sidebar_cmd} \u{00b7} {swap_cmd} \u{00b7} | split \u{00b7} q exit "
+                    );
                     let menu_budget = (area.width as usize)
                         .saturating_sub(unicode_width::UnicodeWidthStr::width(chip));
                     let menu = truncate_to_width(&menu, menu_budget);
@@ -3934,8 +4271,8 @@ impl HomeView {
         let committed_search = !self.search_active && !self.search_matches.is_empty();
 
         // Priority-tagged shortcut groups: lower priority survives longer when the footer
-        // can't fit everything (iPhone Mosh landscape is ~80 cols). Essentials (Nav /
-        // Enter / Help / Quit / Serve) survive first; Diff / Search / Mode / Group drop
+        // can't fit everything (iPhone Mosh landscape is ~80 cols). Essentials (Enter / Help
+        // / the running web dashboard) survive first; Diff / Search / Mode / Group drop
         // first. Groups render in declaration order, joined with · at render time.
         let mk = |key: &str, desc: &str| -> Vec<Span<'static>> {
             vec![
@@ -3956,8 +4293,7 @@ impl HomeView {
         let kenter = Some(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         let ktab = Some(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
 
-        // (priority, click-key, spans); `click-key` is `None` for the non-actionable
-        // status indicators, which render but aren't clickable.
+        // Shortcut groups carry a priority, optional key action, and display spans.
         let mut groups: Vec<(u8, Option<KeyEvent>, Vec<Span<'static>>)> = Vec::new();
 
         use crate::tui::session_feed::SidebarSource;
@@ -3991,14 +4327,17 @@ impl HomeView {
             }
             SidebarSource::Daemon => ("Runtime read-only", theme.dimmed),
         };
-        groups.push((
-            0,
-            None,
-            vec![Span::styled(
-                format!(" \u{25CF} {runtime_label} "),
-                Style::default().fg(runtime_color).bold(),
-            )],
-        ));
+        let runtime_status = Span::styled(
+            format!(" \u{25CF}{runtime_label}"),
+            Style::default().fg(runtime_color).bold(),
+        );
+        let runtime_width = runtime_status.width();
+        let runtime_rect = Rect {
+            x: area.x + area.width.saturating_sub(runtime_width as u16),
+            y: area.y,
+            width: area.width.min(runtime_width as u16),
+            height: 1,
+        };
 
         // Other-TUI indicator, shown when more than one `aoe` TUI is alive: two TUIs
         // watching the same sessions clash over pane sizes (tmux reflows to the smallest
@@ -4056,13 +4395,11 @@ impl HomeView {
             None => (None, None),
         };
         if let Some(enter_action_text) = enter_action_text {
-            // U+21B5 renders Enter in one cell across most fonts, saving 4 cols over the
-            // word and matching k9s/lazygit/fzf. The trailing space adds a second visual
-            // gap, since the glyph fills its cell tightly.
-            groups.push((0, kenter, mk("↵ ", enter_action_text)));
+            // U+21B5 keeps Enter to one display cell without shortening its action label.
+            groups.push((0, kenter, mk("↵", enter_action_text)));
         }
         if let Some(tab_action_text) = tab_action_text {
-            groups.push((1, ktab, mk("⇥ ", tab_action_text)));
+            groups.push((2, ktab, mk("⇥ ", tab_action_text)));
         }
 
         groups.push((
@@ -4101,13 +4438,13 @@ impl HomeView {
         // already uses `N`.
         let new_uses_shift = committed_search && !strict;
         groups.push((
-            2,
+            1,
             kc(if strict || new_uses_shift { 'N' } else { 'n' }),
             mk(if strict || new_uses_shift { "N" } else { "n" }, "New"),
         ));
 
-        // Priority 1 is the core daily workflow (message), which survives the greedy pack
-        // at ~80 cols; del stays at p3 and can drop first.
+        // Priority 1 is the core daily workflow (new, message, the web dashboard), which
+        // survives the greedy pack at ~80 cols; del stays at p3 and can drop first.
         if self.selected_session.is_some() {
             groups.push((
                 1,
@@ -4145,7 +4482,7 @@ impl HomeView {
         // advertises it wherever `f` actually does something.
         if self.selected_session.is_some() && (in_attention || crate::session::favorites_first()) {
             groups.push((
-                1,
+                2,
                 kc(if strict { 'F' } else { 'f' }),
                 mk(if strict { "F" } else { "f" }, "Fav"),
             ));
@@ -4170,47 +4507,65 @@ impl HomeView {
             if strict { kctrl('d') } else { kc('D') },
             mk(if strict { "^D" } else { "D" }, "Diff"),
         ));
+        let mut serving_status = None;
+        if !super::input::web_plugin_disabled() {
+            let (priority, spans) = web_footer_entry(self.serve_running, strict, theme);
+            serving_status = self.serve_running.then_some(groups.len());
+            groups.push((priority, if strict { kctrl('r') } else { kc('R') }, spans));
+        }
         groups.push((1, kctrl('k'), mk("^K", "Cmds")));
         groups.push((0, kc('?'), mk_key("?")));
 
-        // Greedy pack by priority: a group's width is its span widths, each kept
-        // separator adds 3 cols, and 1 col is reserved for the leading margin. Measured in
-        // display cells so the pack and the click rects line up with painted cells.
-        let widths: Vec<usize> = groups
-            .iter()
-            .map(|(_, _, g)| g.iter().map(|s| s.width()).sum::<usize>())
-            .collect();
-
-        // Tips badge: pinned bottom-right and clickable, its width reserved before the
-        // greedy pack so thin terminals drop hints rather than collide with it. Hidden
-        // when nothing is unseen or it cannot fit. The footer's own bg is
-        // `theme.selection`, so hover uses the brighter `session_selection`.
         let badge_bg = if self.tips_badge_hovered {
             theme.session_selection
         } else {
             theme.selection
         };
-        let badge_line = (self.tips_unseen > 0).then(|| {
-            Line::from(Span::styled(
-                format!(" \u{1f4a1} {} tips ", self.tips_unseen),
-                Style::default().fg(theme.accent).bold().bg(badge_bg),
-            ))
+        let tips_index = (self.tips_unseen > 0).then(|| {
+            let index = groups.len();
+            groups.push((
+                2,
+                None,
+                vec![Span::styled(
+                    format!(" \u{1f4a1} {} tips ", self.tips_unseen),
+                    Style::default().fg(theme.accent).bold().bg(badge_bg),
+                )],
+            ));
+            index
         });
-        let badge_width = badge_line.as_ref().map(|l| l.width()).unwrap_or(0);
-        let badge_fits = badge_width > 0 && badge_width <= area.width as usize;
-        let badge_reserve = if badge_fits { badge_width + 1 } else { 0 };
 
+        // Pack shortcuts and optional Tips by priority within the runtime status boundary.
+        // Widths and separators use display cells, matching the painted click rectangles.
+        let mut widths: Vec<usize> = groups
+            .iter()
+            .map(|(_, _, g)| g.iter().map(|s| s.width()).sum::<usize>())
+            .collect();
+        let compact_badge_width = unicode_width::UnicodeWidthStr::width("\u{1f4a1}");
         let avail = (area.width as usize)
             .saturating_sub(1)
-            .saturating_sub(badge_reserve);
+            .saturating_sub(runtime_width);
 
         let mut order: Vec<usize> = (0..groups.len()).collect();
-        order.sort_by_key(|&i| groups[i].0);
+        // The running server status packs before other priority-0 groups, so it is the last to drop.
+        order.sort_by_key(|&i| (groups[i].0, Some(i) != serving_status));
 
         let mut keep = vec![false; groups.len()];
         let mut used = 0usize;
         let mut count = 0usize;
+        let mut compact_tips = false;
         for i in order {
+            if Some(i) == tips_index {
+                if used + widths[i] <= avail {
+                    keep[i] = true;
+                    used += widths[i];
+                } else if used + compact_badge_width <= avail {
+                    keep[i] = true;
+                    compact_tips = true;
+                    widths[i] = compact_badge_width;
+                    used += compact_badge_width;
+                }
+                continue;
+            }
             let sep = if count == 0 { 0 } else { 3 };
             if used + widths[i] + sep <= avail {
                 keep[i] = true;
@@ -4218,6 +4573,7 @@ impl HomeView {
                 count += 1;
             }
         }
+        let badge_width = tips_index.map(|i| widths[i] as u16).unwrap_or(0);
 
         // Inverted-chip highlight for the button under the pointer, matching
         // the LIVE chip's fg/bg swap so hover reads as "this is clickable".
@@ -4231,8 +4587,16 @@ impl HomeView {
         // Column of the next span; starts past the leading space margin. Used
         // to record each clickable button's hit rect as it's laid out.
         let mut col = area.x.saturating_add(1);
-        for (i, (_, key, group)) in groups.into_iter().enumerate() {
+        let mut badge_line = None;
+        for (i, (_, key, mut group)) in groups.into_iter().enumerate() {
             if !keep[i] {
+                continue;
+            }
+            if Some(i) == tips_index {
+                if compact_tips {
+                    group[0].content = "\u{1f4a1}".into();
+                }
+                badge_line = Some(Line::from(group));
                 continue;
             }
             if !first {
@@ -4268,23 +4632,22 @@ impl HomeView {
         let status = Paragraph::new(Line::from(spans)).style(Style::default().bg(theme.selection));
         frame.render_widget(status, area);
 
-        // Draw the badge over the reserved right edge and remember its rect so
-        // a click there opens the tips overlay.
-        if badge_fits {
-            if let Some(line) = badge_line {
-                let bw = badge_width as u16;
-                let rect = Rect {
-                    x: area.x + area.width.saturating_sub(bw),
-                    y: area.y,
-                    width: bw,
-                    height: 1,
-                };
-                frame.render_widget(
-                    Paragraph::new(line).style(Style::default().bg(badge_bg)),
-                    rect,
-                );
-                self.tips_badge_rect = Some(rect);
-            }
+        frame.render_widget(
+            Paragraph::new(Line::from(runtime_status)).style(Style::default().bg(theme.selection)),
+            runtime_rect,
+        );
+        if let Some(line) = badge_line {
+            let rect = Rect {
+                x: runtime_rect.x.saturating_sub(badge_width),
+                y: area.y,
+                width: badge_width,
+                height: 1,
+            };
+            frame.render_widget(
+                Paragraph::new(line).style(Style::default().bg(badge_bg)),
+                rect,
+            );
+            self.tips_badge_rect = Some(rect);
         }
     }
 
@@ -4339,9 +4702,49 @@ pub(super) fn live_pane_origin(
     )
 }
 
+/// The dashboard entry is a hint until serving, then outranks the other shortcuts.
+/// A build without the dashboard bundle serves the API only, so it never says "Web".
+fn web_footer_entry(running: bool, strict: bool, theme: &Theme) -> (u8, Vec<Span<'static>>) {
+    let what = if cfg!(feature = "web") { "Web" } else { "API" };
+    let key = Span::styled(
+        if strict { "^R " } else { "R " },
+        Style::default().fg(theme.accent).bold(),
+    );
+    if running {
+        let status = Span::styled(
+            format!("\u{25CF} {what}"),
+            Style::default().fg(theme.running).bold(),
+        );
+        (0, vec![key, status])
+    } else {
+        (
+            1,
+            vec![key, Span::styled(what, Style::default().fg(theme.dimmed))],
+        )
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn web_footer_entry_hints_until_served_then_shows_a_status_that_outranks_hints() {
+        let theme = crate::tui::styles::load_theme("empire");
+        let what = if cfg!(feature = "web") { "Web" } else { "API" };
+        for (running, strict, priority, text) in [
+            (false, false, 1, format!("R {what}")),
+            (false, true, 1, format!("^R {what}")),
+            (true, false, 0, format!("R \u{25CF} {what}")),
+            (true, true, 0, format!("^R \u{25CF} {what}")),
+        ] {
+            let (p, spans) = web_footer_entry(running, strict, &theme);
+            let rendered: String = spans.iter().map(|s| s.content.as_ref()).collect();
+            assert_eq!((p, rendered.as_str()), (priority, text.as_str()));
+            let label_fg = spans.last().and_then(|s| s.style.fg);
+            let expected = if running { theme.running } else { theme.dimmed };
+            assert_eq!(label_fg, Some(expected), "running={running}");
+        }
+    }
 
     #[test]
     fn live_resize_failure_retries_only_after_backoff() {
@@ -4859,6 +5262,23 @@ mod tests {
     // The column lives at `list_width - badge_width - SLOT - MARGIN`; `pad_len` goes
     // between the row prefix and the column, and None hides the column so the title is
     // not clipped.
+
+    #[test]
+    fn split_preview_rects_cases() {
+        let at = |height| Rect::new(0, 3, 50, height);
+        assert_eq!(split_preview_rects(at(12)), None, "two halves need 13 rows");
+        let split = split_preview_rects(at(13)).expect("13 rows split");
+        assert_eq!(
+            (split.agent, split.divider, split.terminal),
+            (
+                Rect::new(0, 3, 50, 6),
+                Rect::new(0, 9, 50, 1),
+                Rect::new(0, 10, 50, 6)
+            )
+        );
+        let even = split_preview_rects(at(14)).expect("14 rows split");
+        assert_eq!(even.agent.height, even.terminal.height, "halves stay equal");
+    }
 
     #[test]
     fn activity_column_padding_cases() {

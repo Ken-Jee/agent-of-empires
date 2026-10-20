@@ -255,6 +255,73 @@ fn test_empty_age_slot_does_not_truncate_active_title() {
     }
 }
 
+/// Agent view marks a row whose paired terminal survives detach; Terminal view does not,
+/// since its icon already carries that state.
+#[test]
+#[serial]
+fn test_agent_row_marks_running_paired_terminal() {
+    let (_temp, _guard) = test_home();
+    let inst = Instance::new("shell-owner", "/tmp/a");
+    let term = crate::tmux::TerminalSession::generate_name(&inst.id, &inst.title);
+    seed_profile("alpha", &[inst]);
+    let mut view = test_view(Some("alpha"));
+    view.group_by = crate::session::config::GroupByMode::Manual;
+    view.flat_items = view.build_flat_items();
+    let row = view
+        .flat_items
+        .iter()
+        .find(|item| matches!(item, Item::Session { .. }))
+        .cloned()
+        .expect("session row");
+    let Item::Session { id, .. } = &row else {
+        unreachable!("session row");
+    };
+    let line = |view: &HomeView| {
+        view.render_item_line(
+            &row,
+            false,
+            false,
+            &crate::tui::styles::Theme::default(),
+            40,
+            false,
+        )
+        .spans
+        .iter()
+        .map(|s| s.content.to_string())
+        .collect::<String>()
+    };
+
+    let cases = [
+        ("terminal running", true, ViewMode::Structured, true),
+        ("no terminal", false, ViewMode::Structured, false),
+        ("terminal view", true, ViewMode::Terminal, false),
+    ];
+    for (name, running, mode, expect_badge) in cases {
+        view.mutate_instance(id, |instance| {
+            instance.auxiliary = vec![crate::session::AuxiliaryObservation {
+                target: crate::session::AuxiliaryTarget::Host { index: 0 },
+                pane: crate::session::PaneObservation {
+                    state: if running {
+                        crate::session::PanePresence::Alive
+                    } else {
+                        crate::session::PanePresence::Absent
+                    },
+                    tmux_session: running.then(|| term.clone()),
+                    legacy_tool: None,
+                },
+            }];
+        });
+        view.view_mode = mode;
+        let text = line(&view);
+        assert_eq!(
+            text.trim_end()
+                .ends_with(crate::tui::home::icons::ICON_TERMINAL),
+            expect_badge,
+            "{name}: {text:?}"
+        );
+    }
+}
+
 /// On a row too narrow for title and branch tag, the tag gives way and the title stays.
 #[test]
 #[serial]

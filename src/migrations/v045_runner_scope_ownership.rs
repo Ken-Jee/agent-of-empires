@@ -3,6 +3,7 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
+use serde::Deserialize;
 use serde_json::{json, Value};
 
 pub fn run() -> Result<()> {
@@ -22,16 +23,34 @@ pub fn run() -> Result<()> {
         let Some(raw) = file.read()? else {
             continue;
         };
-        let mut rows: Value = serde_json::from_str(&raw)?;
-        let rows = rows.as_array_mut().context("invalid sessions document")?;
-        let mut changed = false;
-        for row in rows.iter_mut() {
-            let row = row.as_object_mut().context("invalid session row")?;
+        let mut document: Value = match serde_json::from_str(&raw) {
+            Ok(document) => document,
+            Err(error) => {
+                tracing::warn!(path = %path.display(), %error, "Quarantined unreadable session component; repair it and run aoe migrate");
+                continue;
+            }
+        };
+        let Some(rows) = document.as_array_mut() else {
+            tracing::warn!(path = %path.display(), "Quarantined invalid session component; repair it and run aoe migrate");
+            continue;
+        };
+        for row in rows.iter().filter_map(Value::as_object) {
             if let Some(scopes) = row.get("terminal_scopes") {
-                serde_json::from_value::<
-                    Option<Vec<crate::process::worker_registry::ScopeOwnership>>,
-                >(scopes.clone())?;
-            } else {
+                Option::<Vec<crate::process::worker_registry::ScopeOwnership>>::deserialize(
+                    scopes,
+                )?;
+            }
+        }
+        if rows
+            .iter()
+            .any(|row| crate::session::Instance::deserialize(row).is_err())
+        {
+            tracing::warn!(path = %path.display(), "Quarantined invalid session rows; repair them and run aoe migrate");
+            continue;
+        }
+        let mut changed = false;
+        for row in rows.iter_mut().filter_map(Value::as_object_mut) {
+            if !row.contains_key("terminal_scopes") {
                 row.insert("terminal_scopes".into(), Value::Null);
                 changed = true;
             }
@@ -60,21 +79,50 @@ pub fn run() -> Result<()> {
                 let Some(raw) = file.read()? else {
                     return Ok(());
                 };
-                let mut record: Value = serde_json::from_str(&raw)?;
-                let object = record.as_object_mut().context("invalid worker record")?;
+                let mut record: Value = match serde_json::from_str(&raw) {
+                    Ok(record) => record,
+                    Err(error) => {
+                        tracing::warn!(session = id, %error, "Quarantined unreadable worker component; repair it and run aoe migrate");
+                        return Ok(());
+                    }
+                };
+                let Some(object) = record.as_object_mut() else {
+                    tracing::warn!(
+                        session = id,
+                        "Quarantined invalid worker component; repair it and run aoe migrate"
+                    );
+                    return Ok(());
+                };
+                if let Some(identity) = object.get("runner_identity") {
+                    Option::<crate::process::ProcessBirthIdentity>::deserialize(identity)?;
+                }
+                if let Some(runtime) = object.get("prime_runtime") {
+                    Option::<crate::process::prime::PrimeRuntime>::deserialize(runtime)?;
+                }
+                if let Some(pid) = object.get("pid") {
+                    u32::deserialize(pid)?;
+                }
+                if let Some(generation) = object.get("generation") {
+                    u64::deserialize(generation)?;
+                }
                 if let Some(scope) = object.get("scope") {
                     serde_json::from_value::<crate::process::worker_registry::ScopeOwnership>(
                         scope.clone(),
                     )?;
-                    serde_json::from_value::<crate::process::worker_registry::WorkerRecord>(
-                        record.clone(),
-                    )?;
+                    if crate::process::worker_registry::WorkerRecord::deserialize(&record).is_err()
+                    {
+                        tracing::warn!(
+                            session = id,
+                            "Quarantined invalid worker fields; repair them and run aoe migrate"
+                        );
+                    }
                     return Ok(());
                 }
                 object.insert("scope".into(), json!({"state": "unresolved"}));
-                serde_json::from_value::<crate::process::worker_registry::WorkerRecord>(
-                    record.clone(),
-                )?;
+                if crate::process::worker_registry::WorkerRecord::deserialize(&record).is_err() {
+                    tracing::warn!(session = id, "Deferred unresolved worker scope; repair the component and run aoe migrate");
+                    return Ok(());
+                }
                 crate::session::backup_before_migration(&app.join("acp-workers").join(&name))?;
                 file.replace(&serde_json::to_vec(&record)?)?;
                 file.sync_parent()?;
@@ -86,6 +134,10 @@ pub fn run() -> Result<()> {
             })?;
         }
     }
+    migrate_journal(&root, &app)
+}
+
+pub(super) fn migrate_journal(root: &crate::session::AnchoredDir, app: &Path) -> Result<()> {
     let file = root.bind_file(crate::session::purge_owners::FILE_NAME.as_ref())?;
     let (lock, path) = file.open_sidecar()?;
     let _lock = crate::session::acquire_open_storage_flock(lock, &path)?;
@@ -94,32 +146,59 @@ pub fn run() -> Result<()> {
     };
     let mut journal: Value = serde_json::from_str(&raw)?;
     anyhow::ensure!(
-        journal["version"] == 2,
+        journal["version"] == 2 || journal["version"] == 3,
         "Unsupported pending purge ownership version"
     );
+    let legacy = journal["version"] == 2;
     let owners = journal["owners"]
         .as_array_mut()
         .context("invalid pending purge ownership")?;
-    let mut changed = false;
+    let mut changed = legacy;
     for owner in owners {
         let runner = owner["runner"]
             .as_object_mut()
             .context("invalid captured runner")?;
         match runner.get("state").and_then(Value::as_str) {
             Some("captured" | "uncaptured") => {
+                if runner.get("state").and_then(Value::as_str) == Some("uncaptured")
+                    && !runner.contains_key("producer_id")
+                {
+                    runner.insert("producer_id".into(), Value::Null);
+                    changed = true;
+                }
+                if legacy {
+                    if !runner.contains_key("prime") {
+                        runner.insert("prime".into(), json!({"state": "unresolved"}));
+                        changed = true;
+                    }
+                    if runner.get("state").and_then(Value::as_str) == Some("captured")
+                        && !runner.contains_key("birth_fingerprint")
+                    {
+                        runner.insert("birth_fingerprint".into(), Value::Null);
+                        changed = true;
+                    }
+                }
                 if let Some(scopes) = runner.get("scopes") {
                     serde_json::from_value::<Vec<crate::process::worker_registry::ScopeOwnership>>(
                         scopes.clone(),
                     )?;
                 } else {
+                    anyhow::ensure!(legacy, "Current purge capture is missing scope ownership");
                     runner.insert("scopes".into(), json!([{"state": "unresolved"}]));
                     changed = true;
                 }
+            }
+            Some("cancelled_before_birth") => {
+                anyhow::ensure!(
+                    !legacy,
+                    "Legacy purge capture cannot attest completed construction"
+                );
             }
             Some("unresolved") => {}
             _ => anyhow::bail!("invalid captured runner state"),
         }
     }
+    journal["version"] = json!(3);
     let encoded = serde_json::to_vec(&journal)?;
     crate::session::purge_owners::validate_journal_for_migration(std::str::from_utf8(&encoded)?)?;
     if changed {
@@ -181,6 +260,15 @@ mod tests {
         let journal_path = app.join(crate::session::purge_owners::FILE_NAME);
         let mut journal: Value = serde_json::from_slice(&std::fs::read(&journal_path)?)?;
         let token = journal["owners"][0]["token"].clone();
+        journal["version"] = json!(2);
+        journal["owners"][0]["runner"]
+            .as_object_mut()
+            .unwrap()
+            .remove("prime");
+        journal["owners"][0]["runner"]
+            .as_object_mut()
+            .unwrap()
+            .remove("birth_fingerprint");
         journal["owners"][0]["runner"]
             .as_object_mut()
             .unwrap()
@@ -200,6 +288,12 @@ mod tests {
             journal["owners"][0]["runner"]["scopes"],
             json!([{"state":"unresolved"}])
         );
+        assert_eq!(journal["version"], 3);
+        assert_eq!(
+            journal["owners"][0]["runner"]["prime"],
+            json!({"state":"unresolved"})
+        );
+        assert!(journal["owners"][0]["runner"]["birth_fingerprint"].is_null());
         let record_bytes = std::fs::read(&record_path)?;
         let journal_bytes = std::fs::read(&journal_path)?;
         let sessions_bytes = std::fs::read(&sessions_path)?;
@@ -249,12 +343,20 @@ mod tests {
         let repaired = br#"{"version":2,"owners":[]}"#;
         std::fs::write(&journal_path, repaired)?;
         crate::migrations::run_migrations()?;
-        assert_eq!(std::fs::read(app.join(".schema_version"))?, b"45");
+        assert_eq!(
+            std::fs::read_to_string(app.join(".schema_version"))?,
+            crate::migrations::current_schema_version().to_string()
+        );
         assert_eq!(std::fs::read(&record_path)?, record_bytes);
-        assert_eq!(std::fs::read(&journal_path)?, repaired);
+        let migrated = std::fs::read(&journal_path)?;
+        let value: Value = serde_json::from_slice(&migrated)?;
+        assert_eq!(value, json!({"version":3,"owners":[]}));
+        assert!(crate::session::migration_backups(&journal_path)?
+            .iter()
+            .any(|(_, path)| std::fs::read(path).is_ok_and(|bytes| bytes == repaired)));
         crate::migrations::run_migrations()?;
         assert_eq!(std::fs::read(&record_path)?, record_bytes);
-        assert_eq!(std::fs::read(journal_path)?, repaired);
+        assert_eq!(std::fs::read(journal_path)?, migrated);
         Ok(())
     }
 }

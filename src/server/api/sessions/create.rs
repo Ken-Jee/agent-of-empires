@@ -105,6 +105,7 @@ pub(super) fn resolve_create_fork_seed(
     crate::session::fork::terminal_fork_seed(
         Some(parent),
         crate::session::capture::generate_session_uuid(),
+        parents[index].is_sandboxed(),
     )
     .map_err(|denied| (denied, Some(index)))
 }

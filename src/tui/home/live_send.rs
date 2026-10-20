@@ -337,6 +337,17 @@ pub(in crate::tui) enum LiveSendTarget {
     Tool(String),
 }
 
+impl LiveSendTarget {
+    /// The home view that previews this target's pane.
+    pub(in crate::tui) fn view_mode(&self) -> super::ViewMode {
+        match self {
+            Self::Agent => super::ViewMode::Structured,
+            Self::Terminal | Self::ContainerTerminal => super::ViewMode::Terminal,
+            Self::Tool(name) => super::ViewMode::Tool(name.clone()),
+        }
+    }
+}
+
 /// Format a display label for a `(title, target)` pair so the compose
 /// dialog header and the live-mode status banner stay in lockstep.
 /// Agent keeps the bare title (historical look); terminal variants
@@ -3797,12 +3808,50 @@ mod tests {
             .unwrap_or(0)
     }
 
-    /// The worker never steals the size-owner lock back after entry: an
-    /// external steal (a web "take over") flips its sticky `lock_lost`
-    /// flag, the thief keeps the lock, and a queued resize is dropped
-    /// instead of stomping the new owner's grid. This is the fix for the
-    /// silent tug-of-war where a background TUI's next keystroke or
-    /// preview-rect jitter reverted a phone takeover.
+    fn create_live_send_fixture(name: &str) -> crate::tmux::Session {
+        let mut args: Vec<String> = [
+            "new-session",
+            "-d",
+            "-s",
+            name,
+            "-x",
+            "80",
+            "-y",
+            "24",
+            r#"/bin/sh -c 'stty -echo; printf "INPUT-READY\n"; IFS= read -r line; printf "INPUT-ACK:%s\n" "$line"; exec sleep 30'"#,
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        crate::tmux::utils::append_pane_base_index_args(&mut args, name);
+        let output = crate::tmux::tmux_command()
+            .args(&args)
+            .output()
+            .expect("tmux new-session");
+        assert!(
+            output.status.success(),
+            "create live-send fixture: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let target = format!("{name}:^.0");
+        wait_until(
+            "input consumer ready",
+            std::time::Duration::from_secs(5),
+            || {
+                let output = crate::tmux::tmux_command()
+                    .args(["capture-pane", "-p", "-t", &target])
+                    .output()
+                    .expect("capture consumer readiness");
+                output.status.success()
+                    && String::from_utf8_lossy(&output.stdout).contains("INPUT-READY")
+            },
+        );
+        crate::tmux::refresh_session_cache();
+        crate::tmux::Session::from_name(name)
+    }
+
+    // Losing size ownership drops queued resizes, not keys.
+
     #[test]
     #[serial_test::serial]
     fn worker_flags_lock_loss_and_drops_resize_after_external_steal() {
@@ -3811,23 +3860,7 @@ mod tests {
             return;
         }
         let guard = crate::tmux::test_helpers::TmuxTestSession::new("aoe_test_livelock_steal");
-        let out = crate::tmux::tmux_command()
-            .args([
-                "new-session",
-                "-d",
-                "-s",
-                guard.name(),
-                "-x",
-                "80",
-                "-y",
-                "24",
-                "sleep 30",
-            ])
-            .output()
-            .expect("tmux new-session");
-        assert!(out.status.success());
-        crate::tmux::refresh_session_cache();
-        let session = crate::tmux::Session::from_name(guard.name());
+        let session = create_live_send_fixture(guard.name());
 
         let worker = LiveSendWorker::spawn(
             guard.name().to_string(),
@@ -3855,19 +3888,20 @@ mod tests {
             Some("live-test-thief".to_string()),
             "worker must not steal the lock back"
         );
-        // Keys queued after the resize are dispatched after its batch, even
-        // when ownership filtering removes the resize itself.
+        let target = format!("{}:^.0", guard.name());
         worker.send(TmuxKey::Literal("RESIZE-BATCH-COMPLETE".into()));
+        worker.send(TmuxKey::Named("Enter".into()));
         wait_until(
             "post-resize input reached the pane",
             std::time::Duration::from_secs(5),
             || {
                 let output = crate::tmux::tmux_command()
-                    .args(["capture-pane", "-p", "-t", guard.name()])
+                    .args(["capture-pane", "-p", "-t", &target])
                     .output()
                     .expect("capture ordered input");
                 output.status.success()
-                    && String::from_utf8_lossy(&output.stdout).contains("RESIZE-BATCH-COMPLETE")
+                    && String::from_utf8_lossy(&output.stdout)
+                        .contains("INPUT-ACK:RESIZE-BATCH-COMPLETE")
             },
         );
         assert_eq!(
@@ -3877,8 +3911,6 @@ mod tests {
         );
     }
 
-    /// Control case: while the worker still owns the lock, resizes verify
-    /// successfully and dispatch as before.
     #[test]
     #[serial_test::serial]
     fn worker_resizes_while_it_owns_the_lock() {
@@ -3887,23 +3919,7 @@ mod tests {
             return;
         }
         let guard = crate::tmux::test_helpers::TmuxTestSession::new("aoe_test_livelock_own");
-        let out = crate::tmux::tmux_command()
-            .args([
-                "new-session",
-                "-d",
-                "-s",
-                guard.name(),
-                "-x",
-                "80",
-                "-y",
-                "24",
-                "sleep 30",
-            ])
-            .output()
-            .expect("tmux new-session");
-        assert!(out.status.success());
-        crate::tmux::refresh_session_cache();
-        let session = crate::tmux::Session::from_name(guard.name());
+        let session = create_live_send_fixture(guard.name());
 
         let worker = LiveSendWorker::spawn(
             guard.name().to_string(),
@@ -3924,11 +3940,8 @@ mod tests {
         assert!(!worker.lock_lost());
     }
 
-    /// The entry steal can come up empty two ways: the pane has not appeared
-    /// yet, or another surface won the confirm-read race. The retry path used
-    /// to force-steal for both, which silently stomped a live owner and never
-    /// flagged the loss. Spawning before the session exists reproduces the
-    /// `owned == false` entry deterministically, without racing tmux forks.
+    // Start before session creation to exercise the failed entry-steal retry.
+
     #[test]
     #[serial_test::serial]
     fn worker_defers_to_live_owner_when_entry_steal_found_no_session() {
@@ -3950,23 +3963,7 @@ mod tests {
             || worker.take_resize_failed(),
         );
 
-        let out = crate::tmux::tmux_command()
-            .args([
-                "new-session",
-                "-d",
-                "-s",
-                guard.name(),
-                "-x",
-                "80",
-                "-y",
-                "24",
-                "sleep 30",
-            ])
-            .output()
-            .expect("tmux new-session");
-        assert!(out.status.success());
-        crate::tmux::refresh_session_cache();
-        let session = crate::tmux::Session::from_name(guard.name());
+        let session = create_live_send_fixture(guard.name());
 
         // The new session has a live owner before the next resize.
         assert!(session.steal_size_owner("live-test-thief"));
@@ -3983,19 +3980,20 @@ mod tests {
             Some("live-test-thief".to_string()),
             "unowned retry must not steal from a live owner"
         );
-        // Keys queued after the resize are dispatched after its batch, even
-        // when ownership filtering removes the resize itself.
+        let target = format!("{}:^.0", guard.name());
         worker.send(TmuxKey::Literal("RESIZE-BATCH-COMPLETE".into()));
+        worker.send(TmuxKey::Named("Enter".into()));
         wait_until(
             "post-resize input reached the pane",
             std::time::Duration::from_secs(5),
             || {
                 let output = crate::tmux::tmux_command()
-                    .args(["capture-pane", "-p", "-t", guard.name()])
+                    .args(["capture-pane", "-p", "-t", &target])
                     .output()
                     .expect("capture ordered input");
                 output.status.success()
-                    && String::from_utf8_lossy(&output.stdout).contains("RESIZE-BATCH-COMPLETE")
+                    && String::from_utf8_lossy(&output.stdout)
+                        .contains("INPUT-ACK:RESIZE-BATCH-COMPLETE")
             },
         );
         assert_eq!(
@@ -4005,8 +4003,6 @@ mod tests {
         );
     }
 
-    /// The same retry path must still take a vacant lock, so a genuinely
-    /// slow-to-appear pane gets owned instead of being abandoned.
     #[test]
     #[serial_test::serial]
     fn worker_claims_vacant_lock_when_session_appears_late() {
@@ -4027,23 +4023,7 @@ mod tests {
             || worker.take_resize_failed(),
         );
 
-        let out = crate::tmux::tmux_command()
-            .args([
-                "new-session",
-                "-d",
-                "-s",
-                guard.name(),
-                "-x",
-                "80",
-                "-y",
-                "24",
-                "sleep 30",
-            ])
-            .output()
-            .expect("tmux new-session");
-        assert!(out.status.success());
-        crate::tmux::refresh_session_cache();
-        let session = crate::tmux::Session::from_name(guard.name());
+        let session = create_live_send_fixture(guard.name());
 
         worker.resize(60, 20);
         wait_until(

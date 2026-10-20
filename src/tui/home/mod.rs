@@ -65,8 +65,8 @@ use super::settings::SettingsView;
 
 use self::icons::{
     ICON_ARCHIVED_SECTION, ICON_COLLAPSED, ICON_DELETING, ICON_DORMANT, ICON_ERROR, ICON_EXPANDED,
-    ICON_FAVORITE, ICON_IDLE, ICON_PINNED, ICON_STOPPED, ICON_TRASH_SECTION, ICON_UNKNOWN,
-    ICON_UNREAD, UNREAD_DWELL,
+    ICON_FAVORITE, ICON_IDLE, ICON_PINNED, ICON_STOPPED, ICON_TERMINAL, ICON_TRASH_SECTION,
+    ICON_UNKNOWN, ICON_UNREAD, UNREAD_DWELL,
 };
 use self::preview::{PreviewCache, PreviewSelection, PreviewTextView, PreviewTimings};
 use self::rows::project_group_key;
@@ -574,6 +574,7 @@ pub struct HomeView {
     // `metrics` holds the latest sample for the strip and detail view.
     pub(super) show_diagnostics: bool,
     pub(super) show_shortcut_bar: bool,
+    pub(super) preview_link_prefixes: Vec<String>,
     pub(super) metrics_poller: super::metrics_poller::MetricsPoller,
     pub(super) pending_metrics_refresh: bool,
     pub(super) metrics: crate::process::metrics::MetricsSnapshot,
@@ -774,6 +775,9 @@ pub struct HomeView {
     // knows another instance is attached (the two clash over agent pane sizes
     // since tmux reflows to the smallest attached client).
     pub(super) active_tui_count: usize,
+    pub(super) serve_running: bool,
+    pub(super) serve_probe: crate::tui::worker::Worker<(), bool>,
+    pub(super) serve_probe_in_flight: bool,
 
     // Settings view
     pub(super) settings_view: Option<SettingsView>,
@@ -856,10 +860,12 @@ pub struct HomeView {
     /// `app_state.show_preview_info`.
     pub(super) show_preview_info: bool,
 
-    /// Collapsed state of the synthetic "Archived" sidebar section.
-    /// Defaults to `true` (collapsed) so archived rows stay tucked at the
-    /// bottom until the user opts to see them. Persisted to
-    /// `app_state.archived_section_collapsed`.
+    /// Preview the agent above its paired terminal; `view_mode` picks the focused half.
+    pub(super) split_terminal: bool,
+    /// Captures whichever split half is not focused; the focused half uses
+    /// `preview_capture_worker` like a single preview.
+    pub(super) split_capture_worker: Option<live_send::LiveCaptureWorker>,
+    pub(super) split_capture_target: Option<String>,
     pub(super) archived_section_collapsed: bool,
 
     /// Stopped sessions inside groups are left out of the sidebar, for this run only.
@@ -876,11 +882,8 @@ pub struct HomeView {
     // ponytail: in-memory only; persist to app_state if users ask for it.
     pub(super) trashed_section_collapsed: bool,
 
-    /// Spam-debounce for the `e` / `E` / `F5` restart keybind: maps
-    /// session id to the wall-clock instant of the last restart attempt.
-    /// Presses arriving within 1.5s of the prior entry are dropped so
-    /// rapid key-repeat doesn't race overlapping `restart_with_size`
-    /// calls and tear down the still-booting tmux pane.
+    /// Non-web links handed to the system opener until their exit status arrives.
+    pub(super) opener_exits: Vec<(String, std::sync::mpsc::Receiver<std::process::ExitStatus>)>,
     pub(super) restart_cooldown_at: std::collections::HashMap<String, std::time::Instant>,
 
     // Tool sessions config (lazygit, yazi, etc.)

@@ -1,5 +1,6 @@
 //! Canonical project reads and explicitly scoped registry commits.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use axum::{
@@ -10,10 +11,12 @@ use axum::{
 };
 use serde::Deserialize;
 
-use super::AppState;
+use super::{api_error, AppState};
 use crate::daemon::{
     CreateProjectBody, ProfileSnapshot, ProjectResponse, ReloadFailureCode, RuntimeHealth,
 };
+use crate::server::auth::{handler_elevated, AuthenticatedSession, LocalAuthorization};
+use crate::session::config::settings_schema::validate_project_plugin_setting;
 use crate::session::projects::{self, ProjectPatch, RegistryError};
 use crate::session::{Project, ProjectScope};
 
@@ -188,6 +191,7 @@ async fn commit_project(
             }
             Ok((
                 commit.result,
+                commit.effect,
                 commit
                     .projects
                     .into_iter()
@@ -204,7 +208,7 @@ async fn commit_project(
         Ok(result) => result,
         Err(error) => (None, Err(RegistryError::Other(error.into()))),
     };
-    let (change, mut committed, shared_global, shared_profiles) = match result {
+    let (change, effect, mut committed, shared_global, shared_profiles) = match result {
         Ok(committed) => committed,
         Err(RegistryError::Conflict(message)) => {
             return project_error(StatusCode::CONFLICT, "conflict", &message)
@@ -212,6 +216,7 @@ async fn commit_project(
         Err(RegistryError::NotFound(message)) => {
             return project_error(StatusCode::NOT_FOUND, "not_found", &message)
         }
+        Err(RegistryError::Forbidden(_)) => return elevation_required(),
         Err(RegistryError::Other(error)) => {
             tracing::error!(target: "http.api.projects", %error, "project registry commit failed");
             *state.canonical_health.write().await = RuntimeHealth::Degraded {
@@ -266,6 +271,9 @@ async fn commit_project(
     state.runtime.request_publish();
     drop(publication);
     drop(namespace);
+    if let Some(effect) = &effect {
+        emit_effective_changes(&state, effect).await;
+    }
     let snapshot = match state.runtime.publish(&state).await {
         Ok(snapshot) => snapshot,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
@@ -301,6 +309,8 @@ async fn commit_project(
 #[tracing::instrument(target = "http.api.projects", skip_all)]
 pub async fn create_project(
     State(state): State<Arc<AppState>>,
+    session: Option<axum::Extension<AuthenticatedSession>>,
+    loopback: Option<axum::Extension<LocalAuthorization>>,
     body: Result<Json<CreateProjectBody>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
     if let Some(response) = super::cityhall_block(&state) {
@@ -309,10 +319,14 @@ pub async fn create_project(
     if state.read_only {
         return super::read_only_response();
     }
-    let Json(body) = match body {
-        Ok(body) => body,
-        Err(rejection) => return rejection.into_response(),
+    let Json(mut body) = match body {
+        Ok(b) => b,
+        Err(rej) => return rej.into_response(),
     };
+    body.overrides.plugin_settings.retain(|_, settings| {
+        settings.retain(|_, value| !value.is_null());
+        !settings.is_empty()
+    });
     if *state.canonical_health.read().await != RuntimeHealth::Healthy {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
@@ -358,14 +372,41 @@ pub async fn create_project(
             );
         }
     };
+    let plugin_settings: PluginSettingsPatch = project
+        .overrides
+        .plugin_settings
+        .iter()
+        .map(|(plugin, settings)| {
+            (
+                plugin.clone(),
+                settings
+                    .iter()
+                    .map(|(key, value)| (key.clone(), Some(value.clone())))
+                    .collect(),
+            )
+        })
+        .collect();
+    let elevated = handler_elevated(&state, session.as_deref(), loopback.is_some()).await;
+    if !elevated && !plugin_settings.values().all(BTreeMap::is_empty) {
+        return elevation_required();
+    }
+    if let Err(message) = validate_plugin_settings(&plugin_settings) {
+        return project_error(StatusCode::BAD_REQUEST, "bad_plugin_setting", &message);
+    }
     commit_project(
         state,
         scope,
         Some(profile),
         StatusCode::CREATED,
         move |profile, scope| {
-            projects::add(profile, scope, project, allow_override)
-                .map(|commit| commit.map_result(ProjectChange::Current))
+            projects::add_guarded(profile, scope, project, allow_override, |effect| {
+                if elevated || effect.is_noop() {
+                    Ok(())
+                } else {
+                    Err(RegistryError::Forbidden(PLUGIN_SETTINGS_ELEVATION.into()))
+                }
+            })
+            .map(|commit| commit.map_result(ProjectChange::Current))
         },
     )
     .await
@@ -376,6 +417,8 @@ pub async fn delete_project(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
     Query(query): Query<ProjectQuery>,
+    session: Option<axum::Extension<AuthenticatedSession>>,
+    loopback: Option<axum::Extension<LocalAuthorization>>,
 ) -> Response {
     if let Some(response) = super::cityhall_block(&state) {
         return response;
@@ -387,14 +430,21 @@ pub async fn delete_project(
         Ok(scope) => scope,
         Err(response) => return response,
     };
+    let elevated = handler_elevated(&state, session.as_deref(), loopback.is_some()).await;
     commit_project(
         state,
         scope,
         query.profile,
         StatusCode::OK,
         move |profile, scope| {
-            projects::remove(profile, scope, &name)
-                .map(|commit| commit.map_result(|removed| ProjectChange::Removed(removed.into())))
+            projects::remove_guarded(profile, scope, &name, |entry, effect| {
+                if elevated || (entry.overrides.plugin_settings.is_empty() && effect.is_noop()) {
+                    Ok(())
+                } else {
+                    Err(RegistryError::Forbidden(PLUGIN_SETTINGS_ELEVATION.into()))
+                }
+            })
+            .map(|commit| commit.map_result(|removed| ProjectChange::Removed(removed.into())))
         },
     )
     .await
@@ -404,6 +454,81 @@ struct OverridesPatch {
     worktree_enabled: Option<Option<bool>>,
     smart_rename: Option<Option<bool>>,
     sandbox_enabled: Option<Option<bool>>,
+    /// Per plugin id, per setting key: `Some(value)` sets, `None` (JSON `null`) clears.
+    plugin_settings: PluginSettingsPatch,
+}
+
+type PluginSettingsPatch = BTreeMap<String, BTreeMap<String, Option<serde_json::Value>>>;
+
+impl OverridesPatch {
+    fn is_empty(&self) -> bool {
+        self.worktree_enabled.is_none()
+            && self.smart_rename.is_none()
+            && self.sandbox_enabled.is_none()
+            && self.plugin_settings.is_empty()
+    }
+}
+
+fn parse_plugin_settings_patch(
+    body: &serde_json::Value,
+) -> Result<PluginSettingsPatch, (&'static str, &'static str)> {
+    const BAD: (&str, &str) = (
+        "bad_field",
+        "overrides.plugin_settings must map plugin ids to objects of setting values",
+    );
+    let Some(plugins) = body.get("plugin_settings") else {
+        return Ok(PluginSettingsPatch::new());
+    };
+    let plugins = plugins.as_object().ok_or(BAD)?;
+    plugins
+        .iter()
+        .map(|(plugin_id, settings)| {
+            let settings = settings.as_object().ok_or(BAD)?;
+            let settings = settings
+                .iter()
+                .map(|(key, value)| (key.clone(), (!value.is_null()).then(|| value.clone())))
+                .collect();
+            Ok((plugin_id.clone(), settings))
+        })
+        .collect()
+}
+
+const PLUGIN_SETTINGS_ELEVATION: &str = "per-project plugin settings need a recent passphrase";
+
+/// Per-project plugin values steer plugin behaviour like the machine-wide ones, so any set or
+/// clear needs the same elevation (`PATCH /api/settings` gates those). So does anything that would
+/// drop, reveal or shadow stored values: removing an entry, or one overriding another at its path.
+fn elevation_required() -> axum::response::Response {
+    tracing::warn!(target: "http.api.projects", reason = "elevation_required", "rejected plugin settings write");
+    api_error(
+        StatusCode::FORBIDDEN,
+        "elevation_required",
+        PLUGIN_SETTINGS_ELEVATION,
+    )
+}
+
+/// Reject any value for a setting its plugin does not declare `per_project`, or that
+/// fails the same validation a global write gets. Clears (`None`) are always allowed.
+fn validate_plugin_settings(patch: &PluginSettingsPatch) -> Result<(), String> {
+    let registry = crate::plugin::registry();
+    for (plugin_id, settings) in patch {
+        let plugin = registry.get(plugin_id).filter(|p| p.active());
+        for (key, value) in settings {
+            let Some(value) = value else { continue };
+            let decl = plugin.and_then(|p| p.manifest.settings.iter().find(|s| &s.key == key));
+            validate_project_plugin_setting(plugin_id, key, decl, value)?;
+        }
+    }
+    Ok(())
+}
+
+/// Tell each plugin's worker which per-project keys changed in effect at the path.
+async fn emit_effective_changes(state: &AppState, change: &projects::EffectiveChange) {
+    let Some(host) = &state.plugin_host else {
+        return;
+    };
+    host.emit_settings_changed(&change.changed_keys(), Some(&change.path))
+        .await;
 }
 
 fn parse_overrides_patch(
@@ -446,6 +571,7 @@ fn parse_overrides_patch(
         worktree_enabled,
         smart_rename,
         sandbox_enabled,
+        plugin_settings: parse_plugin_settings_patch(body)?,
     })
 }
 
@@ -471,12 +597,7 @@ fn parse_project_patch(
         Some(value @ serde_json::Value::Object(_)) => parse_overrides_patch(value)?,
         Some(_) => return Err(("bad_field", "overrides must be an object")),
     };
-    if base_branch.is_none()
-        && pinned.is_none()
-        && overrides.worktree_enabled.is_none()
-        && overrides.smart_rename.is_none()
-        && overrides.sandbox_enabled.is_none()
-    {
+    if base_branch.is_none() && pinned.is_none() && overrides.is_empty() {
         return Err((
             "no_fields",
             "provide at least one of: default_base_branch, pinned, overrides",
@@ -488,6 +609,7 @@ fn parse_project_patch(
         worktree_enabled: overrides.worktree_enabled,
         smart_rename: overrides.smart_rename,
         sandbox_enabled: overrides.sandbox_enabled,
+        plugin_settings: overrides.plugin_settings,
     })
 }
 
@@ -496,6 +618,8 @@ pub async fn update_project(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
     Query(query): Query<ProjectQuery>,
+    session: Option<axum::Extension<AuthenticatedSession>>,
+    loopback: Option<axum::Extension<LocalAuthorization>>,
     body: Result<Json<serde_json::Value>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
     if let Some(response) = super::cityhall_block(&state) {
@@ -516,6 +640,14 @@ pub async fn update_project(
         Ok(patch) => patch,
         Err((code, message)) => return project_error(StatusCode::BAD_REQUEST, code, message),
     };
+    if !patch.plugin_settings.values().all(BTreeMap::is_empty)
+        && !handler_elevated(&state, session.as_deref(), loopback.is_some()).await
+    {
+        return elevation_required();
+    }
+    if let Err(message) = validate_plugin_settings(&patch.plugin_settings) {
+        return project_error(StatusCode::BAD_REQUEST, "bad_plugin_setting", &message);
+    }
     commit_project(
         state,
         scope,
@@ -531,6 +663,387 @@ pub async fn update_project(
 
 #[cfg(test)]
 mod tests {
+    use super::parse_project_patch;
+    use crate::session::ProjectOverrides;
+    use serde_json::json;
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn plugin_setting_writes_need_elevation_but_other_overrides_do_not() {
+        use super::*;
+        let home = tempfile::TempDir::new().unwrap();
+        let _home = crate::session::test_support::isolate_home(home.path());
+        crate::server::test_support::seed_instances_on_disk_for_test("test", Vec::new());
+        let repo = home.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        projects::add(
+            "test",
+            ProjectScope::Global,
+            Project::new("demo", repo.to_string_lossy(), ProjectScope::Global),
+            false,
+        )
+        .unwrap();
+        let state =
+            crate::server::test_support::build_test_app_state_configured(Vec::new(), |state| {
+                state.login_manager = Arc::new(crate::server::login::LoginManager::new(Some("pw")));
+            });
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+        let session = state
+            .login_manager
+            .create_session(b"bind", "127.0.0.1", "t")
+            .await;
+        let patch = |body: serde_json::Value| {
+            let state = state.clone();
+            let session = session.clone();
+            async move {
+                let resp = update_project(
+                    State(state),
+                    Path("demo".to_string()),
+                    Query(ProjectQuery {
+                        scope: Some("global".into()),
+                        profile: Some("test".into()),
+                    }),
+                    Some(axum::Extension(AuthenticatedSession(session))),
+                    None,
+                    Ok(Json(body)),
+                )
+                .await
+                .into_response();
+                let status = resp.status();
+                let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                let error = serde_json::from_slice::<serde_json::Value>(&bytes)
+                    .ok()
+                    .and_then(|v| v["error"].as_str().map(str::to_owned));
+                (status, error)
+            }
+        };
+        let plugin = json!({"overrides": {"plugin_settings": {"acme.kit": {"depth": 1}}}});
+        let clear = json!({"overrides": {"plugin_settings": {"acme.kit": {"depth": null}}}});
+
+        for body in [plugin.clone(), clear] {
+            let (status, error) = patch(body).await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+            assert_eq!(error.as_deref(), Some("elevation_required"));
+        }
+        let (status, _) = patch(json!({"overrides": {"smart_rename": true}})).await;
+        assert_eq!(status, StatusCode::OK, "other overrides stay non-elevated");
+
+        state.login_manager.elevate_session(&session).await;
+        let (status, error) = patch(plugin).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "past the gate, the unknown plugin fails validation"
+        );
+        assert_eq!(error.as_deref(), Some("bad_plugin_setting"));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn dropping_or_shadowing_stored_plugin_settings_needs_elevation() {
+        use super::*;
+        let home = tempfile::TempDir::new().unwrap();
+        let _home = crate::session::test_support::isolate_home(home.path());
+        crate::server::test_support::seed_instances_on_disk_for_test("test", Vec::new());
+        let repo = home.path().join("repo");
+        let plain = home.path().join("plain");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(&plain).unwrap();
+        for (name, path) in [("demo", &repo), ("plain", &plain)] {
+            projects::add(
+                "test",
+                ProjectScope::Global,
+                Project::new(name, path.to_string_lossy(), ProjectScope::Global),
+                false,
+            )
+            .unwrap();
+        }
+        projects::update_overrides("test", ProjectScope::Global, "demo", |ov| {
+            ov.set_plugin_setting("acme.kit", "depth", Some(json!(1)))
+        })
+        .unwrap();
+        let state =
+            crate::server::test_support::build_test_app_state_configured(Vec::new(), |state| {
+                state.login_manager = Arc::new(crate::server::login::LoginManager::new(Some("pw")));
+            });
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+        let session = state
+            .login_manager
+            .create_session(b"bind", "127.0.0.1", "t")
+            .await;
+        let ext = || Some(axum::Extension(AuthenticatedSession(session.clone())));
+        let delete = |name: &str| {
+            delete_project(
+                State(state.clone()),
+                Path(name.to_string()),
+                Query(ProjectQuery {
+                    scope: Some("global".into()),
+                    profile: Some("test".into()),
+                }),
+                ext(),
+                None,
+            )
+        };
+        let shadow = |path: &std::path::Path| {
+            create_project(
+                State(state.clone()),
+                ext(),
+                None,
+                Ok(Json(CreateProjectBody {
+                    path: path.to_string_lossy().to_string(),
+                    name: Some("shadow".into()),
+                    profile: "test".into(),
+                    scope: ProjectScope::Profile,
+                    allow_override: true,
+                    default_base_branch: None,
+                    pinned: false,
+                    overrides: ProjectOverrides::default(),
+                })),
+            )
+        };
+
+        let status = |resp: axum::response::Response| resp.status();
+        assert_eq!(
+            status(delete("demo").await.into_response()),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            status(shadow(&repo).await.into_response()),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            status(delete("plain").await.into_response()),
+            StatusCode::OK,
+            "an entry without plugin settings stays non-elevated"
+        );
+        assert_eq!(
+            status(shadow(&plain).await.into_response()),
+            StatusCode::CREATED
+        );
+
+        state.login_manager.elevate_session(&session).await;
+        assert_eq!(status(delete("demo").await.into_response()), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn removing_an_empty_shadow_needs_elevation_when_it_reveals_values() {
+        use super::*;
+        let home = tempfile::TempDir::new().unwrap();
+        let _home = crate::session::test_support::isolate_home(home.path());
+        crate::server::test_support::seed_instances_on_disk_for_test("test", Vec::new());
+        let repo = home.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        projects::add(
+            "test",
+            ProjectScope::Global,
+            Project::new("base", repo.to_string_lossy(), ProjectScope::Global),
+            false,
+        )
+        .unwrap();
+        projects::update_overrides("test", ProjectScope::Global, "base", |ov| {
+            ov.set_plugin_setting("acme.kit", "depth", Some(json!(7)))
+        })
+        .unwrap();
+        projects::add(
+            "test",
+            ProjectScope::Profile,
+            Project::new("shadow", repo.to_string_lossy(), ProjectScope::Profile),
+            true,
+        )
+        .unwrap();
+        let state =
+            crate::server::test_support::build_test_app_state_configured(Vec::new(), |state| {
+                state.login_manager = Arc::new(crate::server::login::LoginManager::new(Some("pw")));
+            });
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+        let session = state
+            .login_manager
+            .create_session(b"bind", "127.0.0.1", "t")
+            .await;
+        let delete_shadow = || {
+            delete_project(
+                State(state.clone()),
+                Path("shadow".to_string()),
+                Query(ProjectQuery {
+                    scope: Some("profile".into()),
+                    profile: Some("test".into()),
+                }),
+                Some(axum::Extension(AuthenticatedSession(session.clone()))),
+                None,
+            )
+        };
+
+        assert_eq!(
+            delete_shadow().await.into_response().status(),
+            StatusCode::FORBIDDEN,
+            "the global entry's values would become effective again"
+        );
+        state.login_manager.elevate_session(&session).await;
+        assert_eq!(
+            delete_shadow().await.into_response().status(),
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn create_drops_null_plugin_values_so_the_project_inherits() {
+        use super::*;
+        use crate::session::config::settings_schema::resolve_plugin_setting;
+        let home = tempfile::TempDir::new().unwrap();
+        let _home = crate::session::test_support::isolate_home(home.path());
+        crate::server::test_support::seed_instances_on_disk_for_test("test", Vec::new());
+        let repo = home.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let state =
+            crate::server::test_support::build_test_app_state_configured(Vec::new(), |state| {
+                state.login_manager = Arc::new(crate::server::login::LoginManager::new(Some("pw")));
+            });
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+        let session = state
+            .login_manager
+            .create_session(b"bind", "127.0.0.1", "t")
+            .await;
+        let body: CreateProjectBody = serde_json::from_value(json!({
+            "path": repo.to_string_lossy(),
+            "profile": "test",
+            "scope": "profile",
+            "overrides": { "plugin_settings": { "acme.kit": { "verbose": null } } },
+        }))
+        .unwrap();
+
+        let resp = create_project(
+            State(state),
+            Some(axum::Extension(AuthenticatedSession(session))),
+            None,
+            Ok(Json(body)),
+        )
+        .await
+        .into_response();
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "a null is no write, so no elevation"
+        );
+
+        let stored = projects::find_by_canonical_path("test", &repo).expect("registered");
+        assert!(stored.overrides.plugin_settings.is_empty());
+        let decl = aoe_plugin_api::SettingContribution {
+            per_project: true,
+            ..serde_json::from_value(json!({"key": "verbose", "type": "bool"})).unwrap()
+        };
+        let resolved = resolve_plugin_setting(
+            "acme.kit",
+            "verbose",
+            Some(&decl),
+            Some(&stored),
+            Some(json!(true)),
+        );
+        assert_eq!(
+            resolved.map(|(value, source)| (value, source.as_str())),
+            Some((json!(true), "global"))
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn create_and_delete_refuse_to_guess_when_a_registry_is_unreadable() {
+        use super::*;
+        let home = tempfile::TempDir::new().unwrap();
+        let _home = crate::session::test_support::isolate_home(home.path());
+        crate::server::test_support::seed_instances_on_disk_for_test("test", Vec::new());
+        let repo = home.path().join("repo");
+        let other = home.path().join("other");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        projects::add(
+            "test",
+            ProjectScope::Profile,
+            Project::new("p", repo.to_string_lossy(), ProjectScope::Profile),
+            false,
+        )
+        .unwrap();
+        let state = crate::server::test_support::build_test_app_state(Vec::new());
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+        // The global registry is the unreadable one; the writes below only touch the profile one.
+        std::fs::write(
+            crate::session::get_app_dir().unwrap().join("projects.json"),
+            "{ not json",
+        )
+        .unwrap();
+
+        let resp = delete_project(
+            State(state.clone()),
+            Path("p".to_string()),
+            Query(ProjectQuery {
+                scope: Some("profile".into()),
+                profile: Some("test".into()),
+            }),
+            None,
+            None,
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(matches!(
+            *state.canonical_health.read().await,
+            RuntimeHealth::Degraded { .. }
+        ));
+        let resp = create_project(
+            State(state.clone()),
+            None,
+            None,
+            Ok(Json(CreateProjectBody {
+                path: other.to_string_lossy().to_string(),
+                name: None,
+                profile: "test".into(),
+                scope: ProjectScope::Profile,
+                allow_override: false,
+                default_base_branch: None,
+                pinned: false,
+                overrides: ProjectOverrides::default(),
+            })),
+        )
+        .await
+        .into_response();
+        assert_eq!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "native mutations stay closed after the registry failure"
+        );
+
+        let names: Vec<String> = projects::load_profile("test")
+            .unwrap()
+            .into_iter()
+            .map(|p| p.name)
+            .collect();
+        assert_eq!(names, ["p"], "neither write went through");
+    }
+
+    #[test]
+    fn project_patch_parses_plugin_settings() {
+        let parsed = parse_project_patch(json!({
+            "overrides": { "plugin_settings": { "acme.kit": { "depth": 3, "gone": null } } }
+        }))
+        .unwrap();
+        let settings = &parsed.plugin_settings["acme.kit"];
+        assert_eq!(settings["depth"], Some(json!(3)));
+        assert_eq!(settings["gone"], None);
+
+        for bad in [
+            json!({"overrides": {"plugin_settings": []}}),
+            json!({"overrides": {"plugin_settings": {"acme.kit": 1}}}),
+        ] {
+            assert_eq!(
+                parse_project_patch(bad.clone()).unwrap_err().0,
+                "bad_field",
+                "{bad}"
+            );
+        }
+    }
 
     #[tokio::test]
     #[serial_test::serial]
@@ -675,6 +1188,7 @@ mod tests {
                         worktree_enabled: Some(Some(true)),
                         smart_rename: Some(Some(false)),
                         sandbox_enabled: Some(Some(true)),
+                        plugin_settings: std::collections::BTreeMap::new(),
                     })?))?,
             )
             .await?;

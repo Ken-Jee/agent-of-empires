@@ -4,8 +4,9 @@ use std::io::{IsTerminal, Write};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 
+use crate::cli::serve::{daemon_status, try_lock_serve, DaemonStatus};
 use crate::migrations::progress::{fit_width, ConsoleProgress, Event, Reporter};
 
 const QUIET_FOR: Duration = Duration::from_millis(1500);
@@ -98,11 +99,31 @@ pub fn stderr_reporter() -> Reporter {
     })
 }
 
-pub fn run() -> Result<()> {
+fn refuse_while_daemon_runs(status: DaemonStatus) -> Result<()> {
+    if let DaemonStatus::Verified(pid) = status {
+        bail!(
+            "aoe serve daemon is running (PID {pid}); migrations must not run alongside it.\n\n  \
+             Stop it with `aoe serve --stop`, then run `aoe migrate` again."
+        );
+    }
+    Ok(())
+}
+
+pub async fn run() -> Result<()> {
+    refuse_while_daemon_runs(daemon_status())?;
+    let transaction = crate::daemon::lifecycle::Transaction::acquire().await?;
+    // The status check can go stale; the lock keeps a daemon from starting mid-migration.
+    let Some(_serve_lock) = try_lock_serve()? else {
+        bail!("an aoe serve daemon is starting; retry `aoe migrate` once it is up and stopped");
+    };
     if !crate::migrations::has_pending_migrations() {
         eprintln!("{PREFIX}data schema is current; retrying any deferred migration work");
     }
-    crate::migrations::run_migrations_announced(Some(stderr_reporter()))?;
+    crate::migrations::run_migrations_under_transaction(
+        Some(stderr_reporter()),
+        true,
+        &transaction,
+    )?;
     if std::io::stderr().is_terminal() {
         eprint!("\r\x1b[2K");
     }
@@ -126,6 +147,15 @@ mod tests {
             position: 1,
             total: 1,
         }
+    }
+
+    #[test]
+    fn only_a_verified_daemon_blocks_migrate() {
+        assert!(refuse_while_daemon_runs(DaemonStatus::Absent).is_ok());
+        assert!(refuse_while_daemon_runs(DaemonStatus::Unverified).is_ok());
+        let err = refuse_while_daemon_runs(DaemonStatus::Verified(4242)).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("PID 4242") && msg.contains("aoe serve --stop"));
     }
 
     #[test]

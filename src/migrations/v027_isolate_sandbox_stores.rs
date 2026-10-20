@@ -52,7 +52,7 @@ impl CopyState {
     fn copied_file(&mut self, bytes: u64) {
         self.files += 1;
         self.bytes += bytes;
-        if self.files % 100 == 0 {
+        if self.files.is_multiple_of(100) {
             progress::progress(format!(
                 "{} files, {}",
                 self.files,
@@ -332,6 +332,38 @@ pub(crate) struct SandboxCheckpointFailure {
     pub source: anyhow::Error,
 }
 
+#[derive(Debug, thiserror::Error)]
+enum SessionInventoryInputError {
+    #[error(transparent)]
+    Json(#[from] serde_json::Error),
+    #[error("session registry row {index} must be an object with a nonempty string id")]
+    RowIdentity { index: usize },
+}
+
+pub(super) fn decode_session_inventory(bytes: &[u8]) -> Result<Value> {
+    let rows: Vec<Value> =
+        serde_json::from_slice(bytes).map_err(SessionInventoryInputError::from)?;
+    for (index, row) in rows.iter().enumerate() {
+        if row
+            .get("id")
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
+        {
+            return Err(SessionInventoryInputError::RowIdentity { index }.into());
+        }
+    }
+    Ok(Value::Array(rows))
+}
+
+// Only the initial, nonmoving inventory probe may defer this failure.
+pub(super) fn initial_profile_inventory_failure(error: &anyhow::Error) -> Option<&str> {
+    let failure = error.downcast_ref::<SandboxCheckpointFailure>()?;
+    failure
+        .source
+        .downcast_ref::<SessionInventoryInputError>()?;
+    failure.profile.as_deref()
+}
+
 pub(crate) struct SandboxProfileCommit {
     pub storage: crate::session::Storage,
     pub rows: Vec<crate::session::Instance>,
@@ -600,7 +632,23 @@ fn reconcile_scoped(
     scope.check_available()?;
     let app_dir = crate::session::get_app_dir()?;
     let bare_start = !explicit_migrate && scope.only.is_none();
-    if !transition_may_be_pending(&app_dir, bare_start)? {
+    let pending = match transition_may_be_pending(&app_dir, bare_start) {
+        Ok(pending) => pending,
+        Err(error) => {
+            if let Some(profile) = bare_start
+                .then_some(&error)
+                .and_then(initial_profile_inventory_failure)
+            {
+                tracing::warn!(target: "session.store", profile, %error, "Sandbox store isolation remains pending");
+                progress::notice(format!(
+                    "sandbox store isolation remains pending: profile {profile:?} has invalid session inventory; repair it and retry"
+                ));
+                return Ok(());
+            }
+            return Err(error);
+        }
+    };
+    if !pending {
         return Ok(());
     }
     let home = dirs::home_dir().context("home directory unavailable for sandbox migration")?;
@@ -1916,7 +1964,8 @@ pub(super) fn registry_paths(app_dir: &Path) -> Result<Vec<PathBuf>> {
 
 fn registry_file_exists(path: &Path) -> Result<bool> {
     match fs::metadata(path) {
-        Ok(metadata) => Ok(metadata.is_file()),
+        Ok(metadata) if metadata.is_file() => Ok(true),
+        Ok(_) => anyhow::bail!("session registry is not a regular file: {}", path.display()),
         Err(error)
             if matches!(
                 error.kind(),
@@ -1933,7 +1982,7 @@ fn load_registry_paths(app_dir: &Path, paths: Vec<PathBuf>) -> Result<Vec<Regist
     paths
         .into_iter()
         .map(|path| {
-            let value = (|| -> Result<Value> { Ok(serde_json::from_slice(&fs::read(&path)?)?) })()
+            let value = (|| -> Result<Value> { decode_session_inventory(&fs::read(&path)?) })()
                 .map_err(|source| {
                     let profile = profile_for_registry(app_dir, &path);
                     SandboxCheckpointFailure {
@@ -2694,6 +2743,127 @@ mod tests {
         let app = crate::session::get_app_dir().unwrap();
         let home = dirs::home_dir().unwrap();
         (temp, guard, app, home)
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn bare_start_defers_profile_parse_errors_without_changing_ownership() {
+        let (_temp, _guard, app, home) = isolated();
+        let healthy = crate::session::Storage::new_unwatched("healthy").unwrap();
+        let mut row = crate::session::Instance::new("healthy", "/tmp/healthy");
+        row.source_profile = "healthy".into();
+        healthy
+            .update(|rows, _| {
+                rows.push(row.clone());
+                Ok(())
+            })
+            .unwrap();
+        let healthy_bytes = fs::read(healthy.sessions_path()).unwrap();
+        let damaged = crate::session::Storage::new_unwatched("damaged").unwrap();
+        let mut legacy = crate::session::Instance::new("shared gemini", "/tmp/shared");
+        legacy.id = "aaaaaaaaaaaaaaaa".into();
+        legacy.tool = "gemini".into();
+        legacy.sandbox_store_generation = 0;
+        legacy.sandbox_info = Some(crate::session::SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "fixture".into(),
+            container_name: "aoe-sandbox-fixture".into(),
+            extra_env: None,
+            custom_instruction: None,
+            container_workdir: None,
+            before_start_env: Vec::new(),
+            provider: None,
+        });
+        let legacy_bytes = serde_json::to_vec(&vec![legacy]).unwrap();
+        fs::write(app.join("sessions.json"), &legacy_bytes).unwrap();
+        let source = home.join(".gemini/sandbox/history/original.json");
+        fs::create_dir_all(source.parent().unwrap()).unwrap();
+        fs::write(&source, b"SHARED_CONTEXT").unwrap();
+        let journal = serde_json::to_vec(&vec![home.join(".gemini/sandbox")]).unwrap();
+        fs::write(app.join(JOURNAL), &journal).unwrap();
+        fs::write(
+            app.join(".schema_version"),
+            crate::migrations::current_schema_version().to_string(),
+        )
+        .unwrap();
+        let damaged_inputs: [&[u8]; 3] =
+            [b"{", b"{}\n", b"[{\"sandbox_info\":{\"enabled\":true}}]\n"];
+        for damaged_bytes in damaged_inputs {
+            fs::write(damaged.sessions_path(), damaged_bytes).unwrap();
+            let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            for _ in 0..2 {
+                let sink = events.clone();
+                crate::migrations::run_migrations_with(Some(std::sync::Arc::new(move |event| {
+                    sink.lock().unwrap().push(event);
+                })))
+                .unwrap();
+                assert_eq!(fs::read(healthy.sessions_path()).unwrap(), healthy_bytes);
+                assert_eq!(fs::read(damaged.sessions_path()).unwrap(), damaged_bytes);
+                assert_eq!(fs::read(app.join("sessions.json")).unwrap(), legacy_bytes);
+                assert_eq!(fs::read(app.join(JOURNAL)).unwrap(), journal);
+                assert_eq!(fs::read(&source).unwrap(), b"SHARED_CONTEXT");
+                assert!(!home.join(".gemini/sandbox-v2").exists());
+            }
+            assert!(events.lock().unwrap().iter().any(|event| {
+            matches!(event, progress::Event::Notice(line) if line.contains("damaged") && line.contains("pending"))
+        }));
+
+            use axum::response::IntoResponse;
+            let state = crate::server::test_support::build_test_app_state(Vec::new());
+            crate::server::test_support::accept_runtime_read_cache_for_test(&state).await;
+            assert_eq!(fs::read(damaged.sessions_path()).unwrap(), damaged_bytes);
+            let published = state.runtime.publish(&state).await.unwrap();
+            assert!(matches!(
+                published.value.contents.health,
+                crate::daemon::RuntimeHealth::Degraded { .. }
+            ));
+            assert!(!published.value.contents.capabilities.mutations);
+            let native = crate::server::api::stop_session(
+                axum::extract::State(state.clone()),
+                axum::extract::Path(row.id.clone()),
+            )
+            .await
+            .into_response();
+            assert_eq!(native.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
+            drop(state);
+
+            for (explicit_migrate, only) in [(true, None), (false, Some("aaaaaaaaaaaaaaaa"))] {
+                let error = reconcile_scoped(
+                    explicit_migrate,
+                    MigrationScope { only, store: None },
+                    &|_| panic!("incomplete inventory must not probe containers"),
+                    &|_| panic!("incomplete inventory must not reap containers"),
+                )
+                .unwrap_err();
+                assert_eq!(initial_profile_inventory_failure(&error), Some("damaged"));
+            }
+            assert!(transition_in_flight(&app).is_err());
+        }
+
+        fs::remove_file(damaged.sessions_path()).unwrap();
+        fs::create_dir(damaged.sessions_path()).unwrap();
+        assert!(
+            crate::migrations::run_migrations().is_err(),
+            "directory I/O is not a parse deferral"
+        );
+        fs::remove_dir(damaged.sessions_path()).unwrap();
+        fs::write(damaged.sessions_path(), b"[]").unwrap();
+        fs::write(app.join("sessions.json"), b"{").unwrap();
+        assert!(
+            crate::migrations::run_migrations().is_err(),
+            "legacy global corruption is not a profile deferral"
+        );
+        fs::write(app.join("sessions.json"), &legacy_bytes).unwrap();
+        fs::write(app.join(JOURNAL), b"{").unwrap();
+        assert!(
+            crate::migrations::run_migrations().is_err(),
+            "journal errors must remain fatal"
+        );
+        assert_eq!(fs::read(app.join(JOURNAL)).unwrap(), b"{");
+        assert_eq!(fs::read(healthy.sessions_path()).unwrap(), healthy_bytes);
+        assert_eq!(fs::read(&source).unwrap(), b"SHARED_CONTEXT");
+        assert!(!home.join(".gemini/sandbox-v2").exists());
     }
 
     /// The persisted session rows.
@@ -4101,26 +4271,35 @@ gemini = "{}"
 
     #[test]
     #[serial_test::serial]
-    fn unresolved_rows_do_not_block_ready_rows_or_retire_the_shared_source() {
+    fn unidentified_rows_block_inventory_while_known_unresolved_rows_stay_pending() {
         let (_temp, _app_guard, app, home) = isolated();
         let legacy = home.join(".gemini/sandbox");
         fs::create_dir_all(&legacy).unwrap();
         fs::write(legacy.join("data"), b"data").unwrap();
-        let rows = serde_json::json!([
+        let mut rows = serde_json::json!([
             {"id":"1111111111111111","tool":"missing-agent","sandbox_info":{"enabled":true}},
             {"tool":"missing-agent","sandbox_info":{"enabled":true}},
             {"id":"2222222222222222","tool":"gemini","sandbox_info":{"enabled":true}}
         ]);
+        let original = serde_json::to_vec(&rows).unwrap();
+        fs::write(app.join("sessions.json"), &original).unwrap();
+
+        assert!(run_in(&app, &home, &|_| Ok(false)).is_err());
+        assert_eq!(fs::read(app.join("sessions.json")).unwrap(), original);
+        assert_eq!(fs::read(legacy.join("data")).unwrap(), b"data");
+        assert!(!home.join(".gemini/sandbox-v2").exists());
+
+        rows[1]["id"] = "3333333333333333".into();
         fs::write(
             app.join("sessions.json"),
             serde_json::to_vec(&rows).unwrap(),
         )
         .unwrap();
-
         run_in(&app, &home, &|_| Ok(false)).unwrap();
 
         let rows: Value = read_rows(&app);
         assert!(rows[0].get("sandbox_store_generation").is_none());
+        assert!(rows[1].get("sandbox_store_generation").is_none());
         assert_eq!(rows[2]["sandbox_store_generation"], 2);
         assert_eq!(
             fs::read(home.join(".gemini/sandbox-v2/2222222222222222/data")).unwrap(),

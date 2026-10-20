@@ -1,6 +1,7 @@
 import type { AgentLifecycleInfo } from "./agentProfiles";
 import { notifySettingsChanged } from "./settingsEvents";
 import { clientFormFactor } from "./formFactor";
+import type { SchemaSettings } from "./generated/settingsKeys";
 import type {
   SessionResponse,
   RichDiffFilesResponse,
@@ -8,6 +9,7 @@ import type {
   AgentInfo,
   ProfileInfo,
   ProfileSettingsResponse,
+  HooksOverride,
   BrowseResponse,
   GroupInfo,
   ProjectInfo,
@@ -133,7 +135,7 @@ const queuePath = (sessionId: string, promptId?: string) =>
   `/api/sessions/${encodeURIComponent(sessionId)}/queue${promptId === undefined ? "" : `/${encodeURIComponent(promptId)}`}`;
 
 const sessionUpdate = (id: string, action: string, init: RequestInit) =>
-  fetchJson<SessionResponse>(`/api/sessions/${id}/${action}`, init);
+  fetchJson<SessionResponse>(`/api/sessions/${encodeURIComponent(id)}/${action}`, init);
 
 const mcpPath = (name: string, action: string) => `/api/mcp/servers/${encodeURIComponent(name)}/${action}`;
 
@@ -393,15 +395,14 @@ export function sessionRawFileUrl(id: string, filePath: string): string {
 
 // --- Settings ---
 
-export interface SettingsResponse {
-  theme?: {
-    idle_decay_minutes?: number;
-  };
+/** Sections and fields come from the server schema (`SchemaSettings`, generated), so a name the
+ *  server lacks fails to compile. `app_state`, `hooks` and plugin sections are outside the schema. */
+export type SettingsResponse = SchemaSettings & {
   app_state?: {
     has_seen_web_tour?: boolean;
   };
-  [key: string]: unknown;
-}
+  hooks?: HooksOverride;
+} & { [K in `plugin:${string}`]?: Record<string, unknown> };
 
 export interface SystemHealthAgent {
   id: string;
@@ -446,6 +447,33 @@ async function announceSave(save: Promise<boolean>): Promise<boolean> {
   const ok = await save;
   if (ok) notifySettingsChanged();
   return ok;
+}
+
+/** `uncertain`: the write may have landed (network error, 5xx, or a failure after the server persisted). */
+export type SaveOutcome = "committed" | "rejected" | "uncertain";
+
+const POST_PERSIST_ERRORS = new Set(["partially_saved", "load_failed"]);
+
+// Stamps each settings PATCH so the server can drop one that commits after a newer edit of the same field.
+const writeTab = globalThis.crypto?.randomUUID?.() ?? Math.random().toString(36).slice(2);
+let writeSeq = 0;
+
+async function sendSave(url: string, init: RequestInit): Promise<SaveOutcome> {
+  const headers = { ...(init.headers as Record<string, string>), "X-Aoe-Write-Stamp": `${writeTab}.${++writeSeq}` };
+  try {
+    const { ok, status, payload } = await send(url, { ...init, headers });
+    if (ok) return "committed";
+    if (status >= 500 || POST_PERSIST_ERRORS.has(stringField(payload, "error") ?? "")) return "uncertain";
+    return "rejected";
+  } catch {
+    return "uncertain";
+  }
+}
+
+async function announceOutcome(save: Promise<SaveOutcome>): Promise<SaveOutcome> {
+  const outcome = await save;
+  if (outcome !== "rejected") notifySettingsChanged();
+  return outcome;
 }
 
 /** Fetch this install's CityHall config bundle as TOML text (settings +
@@ -895,6 +923,7 @@ export type PluginUiTone = "neutral" | "info" | "success" | "warn" | "danger";
 /** The host-rendered slots, kebab-case as the host serializes them. */
 export type PluginUiSlot =
   | "status-bar"
+  | "header-start"
   | "row-badge"
   | "row-column"
   | "sort-key"
@@ -904,6 +933,7 @@ export type PluginUiSlot =
   | "composer-action"
   | "detail-badge"
   | "home-pane"
+  | "page"
   | "notification";
 
 /** One piece of UI state a worker pushed. `payload` shape is determined by
@@ -931,20 +961,41 @@ export interface PluginUiNotification {
   href?: string;
 }
 
+/** A page an active plugin declares; `url` serves its HTML to a sandboxed frame. */
+export interface PluginPage {
+  plugin_id: string;
+  id: string;
+  title: string;
+  icon: string | null;
+  url: string;
+  /** The plugin's granted capabilities; the page bridge gates on them. */
+  capabilities: string[];
+}
+
 export interface PluginUiState {
   entries: PluginUiEntry[];
   notifications: PluginUiNotification[];
-  /** Mutation counter per plugin, then per scope (a session id, or `""` for a
-   *  global slot). A manual pane action records the baseline the action POST
-   *  returns and holds its spinner until its own scope's counter moves off it,
-   *  so another session's push never clears it. Absent on an older daemon. */
+  /** Absent on older daemons. */
+  pages?: PluginPage[];
+  /** Mutation counter per plugin, then per scope (session id, or `""` for global). Absent on older daemons. */
   revisions?: Record<string, Record<string, number>>;
+}
+
+/** A plugin's sessions in its worker's `sessions.list` row shape; null unless it declares `session.read`. */
+export function fetchPluginSessions(pluginId: string): Promise<{ sessions: Record<string, unknown>[] } | null> {
+  return fetchJson(`/api/plugins/${encodeURIComponent(pluginId)}/sessions`);
 }
 
 /** The host's aggregated UI-state snapshot. Returns an empty state (not null)
  *  shape on the server when no plugin host is running. */
 export function fetchPluginUiState(): Promise<PluginUiState | null> {
   return fetchJson<PluginUiState>("/api/plugins/ui-state");
+}
+
+/** Lets the next frame load of a page's `url` authenticate when device binding is on; the ticket rides an HttpOnly cookie. */
+export async function mintPluginPageTicket(url: string): Promise<boolean> {
+  const reply = await send(`${url}/ticket`, { method: "POST" }).catch(() => null);
+  return reply?.ok ?? false;
 }
 
 export async function setPluginEnabled(id: string, enabled: boolean): Promise<PluginToggleResult> {
@@ -1023,15 +1074,15 @@ export async function invokePluginCommand(fqid: string, sessionId: string): Prom
 /** Save settings; the server puts each field in the layer `fetchSettings`
  *  reads it from: `profile` (default: the served one) where it may override,
  *  machine-wide otherwise. */
-export function updateSettings(updates: Record<string, unknown>, profile?: string): Promise<boolean> {
+export function updateSettings(updates: Record<string, unknown>, profile?: string): Promise<SaveOutcome> {
   const params = profile ? `?profile=${encodeURIComponent(profile)}` : "";
-  return announceSave(fetchOk(`/api/settings${params}`, jsonInit("PATCH", updates)));
+  return announceOutcome(sendSave(`/api/settings${params}`, jsonInit("PATCH", updates)));
 }
 
 /** Set the machine-wide value of every field in `updates`, for editors that
  *  set the value a profile inherits. */
-export function updateMachineSettings(updates: Record<string, unknown>): Promise<boolean> {
-  return announceSave(fetchOk("/api/settings?layer=machine", jsonInit("PATCH", updates)));
+export function updateMachineSettings(updates: Record<string, unknown>): Promise<SaveOutcome> {
+  return announceOutcome(sendSave("/api/settings?layer=machine", jsonInit("PATCH", updates)));
 }
 
 /**
@@ -1223,28 +1274,21 @@ export function profileWritableSections(schema: SettingsFieldDescriptor[]): Set<
   return sections;
 }
 
-/** PATCH a profile's settings, refusing any section the schema does not list as
- *  writable (see {@link profileWritableSections}) before sending. Returns
- *  whether the server accepted the write. */
-export async function updateProfileSettings(name: string, updates: Record<string, unknown>): Promise<boolean> {
+/** PATCH profile settings, refusing blocked sections. Without a schema, defers to the server's guard. */
+export async function updateProfileSettings(name: string, updates: Record<string, unknown>): Promise<SaveOutcome> {
   const schema = await getSettingsSchema();
   // With the schema in hand, refuse a blocked section before sending. If the
   // schema fetch failed, defer to the server's authoritative guard rather than
   // blocking a legitimate save on a transient network error.
   if (schema) {
     const writable = profileWritableSections(schema);
-    for (const key of Object.keys(updates)) {
-      if (!writable.has(key)) {
-        // Refuse loudly rather than silently dropping the key. A blocked
-        // section in a profile PATCH (e.g. `hooks`) is a caller bug; the
-        // server would 400 it anyway. Failing here keeps a buggy caller
-        // from reporting a partial save as success.
-        console.error(`updateProfileSettings: refusing to send blocked profile section "${key}"`);
-        return false;
-      }
+    const blocked = Object.keys(updates).find((key) => !writable.has(key));
+    if (blocked !== undefined) {
+      console.error(`updateProfileSettings: refusing to send blocked profile section "${blocked}"`);
+      return "rejected";
     }
   }
-  return announceSave(fetchOk(`/api/profiles/${encodeURIComponent(name)}/settings`, jsonInit("PATCH", updates)));
+  return announceOutcome(sendSave(`/api/profiles/${encodeURIComponent(name)}/settings`, jsonInit("PATCH", updates)));
 }
 
 // --- Themes & Sounds ---
@@ -1321,12 +1365,10 @@ export interface ServerAbout {
   /** Resolved `acp.compaction_reminder_percent` from the active
    *  profile's config. */
   acp_compaction_reminder_percent: number;
-  build_flavor: "debug" | "release"; // `"debug"` => debug_assertions; drives topbar DEV badge. See #1055.
-  /** Content-hashed entry bundle name (`index-<hash>.js`) of the
-   *  embedded dashboard build. Compared against this page's own entry
-   *  script by DashboardUpdateBanner to detect a stale client (an
-   *  installed PWA has no refresh affordance, so it keeps running old
-   *  code after the binary updates until prompted to reload). */
+  acp_notice_display: "persistent" | "timeout" | "hidden";
+  acp_notice_timeout_secs: number;
+  build_flavor: "debug" | "release";
+  /** Entry bundle name, compared against this page's own to detect a stale client. */
   web_build_id?: string | null;
   /** Read-only runtime state of the daemon's sleep-inhibit reconciler.
    *  Always present: `get_about` emits it unconditionally
@@ -2438,11 +2480,12 @@ export async function attachSessionProject(
  *  passing a path that does not exist yet, or clear the group with an
  *  empty string (the ungroup sentinel, matching session creation and the
  *  TUI). Hits the dedicated `PATCH /api/sessions/:id/group` sub-route. */
-export async function updateSessionGroup(id: string, group: string): Promise<boolean> {
+export async function updateSessionGroup(id: string, group: string): Promise<SessionMutation | null> {
   try {
-    return await fetchOk(`/api/sessions/${encodeURIComponent(id)}/group`, jsonInit("PATCH", { group }));
+    const res = await fetch(`/api/sessions/${encodeURIComponent(id)}/group`, jsonInit("PATCH", { group }));
+    return await sessionMutation(res);
   } catch {
-    return false;
+    return null;
   }
 }
 
@@ -2467,11 +2510,7 @@ export async function setSessionNotifications(
   }
 }
 
-/** Set the diff-base override for one repo. Pass `null` as the branch to
- *  clear it and fall back to the repo's recorded creation base, then the
- *  profile default, then auto-detection. `repo` names a workspace member;
- *  omit it for a single-repo session's own checkout, which is the only entry
- *  such a session has. See #970, #3329. */
+/** Set or clear (`null`) one repo's diff base; omit `repo` for a single-repo session. */
 export async function setSessionDiffBase(
   id: string,
   baseBranch: string | null,
@@ -2739,6 +2778,38 @@ export async function keepMcpServer(name: string, agent: string): Promise<boolea
 
 export async function dropMcpServer(name: string, agent: string): Promise<boolean> {
   return fetchOk(mcpPath(name, "drop"), jsonInit("POST", { agent }));
+}
+
+/** `value` omitted keeps the stored secret on edit. */
+export interface McpSecretEntry {
+  name: string;
+  value?: string;
+}
+
+export type McpServerInput =
+  | { transport: "stdio"; command: string; args: string[]; env: McpSecretEntry[] }
+  | { transport: "http" | "sse"; url: string; headers: McpSecretEntry[] };
+
+export interface McpMutationResult {
+  ok: boolean;
+  error?: string;
+  status?: number;
+}
+
+function mcpMutation(url: string, method: string, body?: unknown): Promise<McpMutationResult> {
+  return skillRequest<McpMutationResult>(url, body === undefined ? { method } : jsonInit(method, body), () => ({}));
+}
+
+export function createMcpServer(name: string, input: McpServerInput): Promise<McpMutationResult> {
+  return mcpMutation("/api/mcp/servers", "POST", { name, ...input });
+}
+
+export function updateMcpServer(name: string, input: McpServerInput): Promise<McpMutationResult> {
+  return mcpMutation(`/api/mcp/servers/${encodeURIComponent(name)}`, "PUT", input);
+}
+
+export function deleteMcpServer(name: string): Promise<McpMutationResult> {
+  return mcpMutation(`/api/mcp/servers/${encodeURIComponent(name)}`, "DELETE");
 }
 
 // --- Skills (#3050) ---

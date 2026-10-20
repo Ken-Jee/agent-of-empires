@@ -8,10 +8,12 @@ import { SessionWizard, type WizardPrefill } from "../SessionWizard";
 import {
   fetchAgents,
   fetchCreateProgress,
+  fetchDockerStatus,
   fetchIsGitRepo,
   fetchProfiles,
   fetchProjects,
   fetchSettings,
+  type SettingsResponse,
 } from "../../../lib/api";
 import { agent } from "./fixtures";
 import { toastBus } from "../../../lib/toastBus";
@@ -194,7 +196,6 @@ describe("SessionWizard structured view payload", () => {
   it("sends profile-resolved agent model and effort defaults", async () => {
     vi.mocked(fetchSettings).mockResolvedValueOnce({
       session: { default_tool: "opencode" },
-      // `acp_defaults` moved to the [acp] section in v019.
       acp: { acp_defaults: { opencode: { model: "openai/gpt-5.5", effort: "high" } } },
       sandbox: {},
     } as never);
@@ -437,6 +438,49 @@ describe("SessionWizard rows", () => {
       await launch();
       await waitFor(() => expect(createSession).toHaveBeenCalled());
       expect(payload()).toMatchObject({ profile: "work" });
+    });
+
+    // #4086: a view toggled while the settings response is pending is newer than the response.
+    it("keeps a view toggled while the profile response is pending", async () => {
+      vi.mocked(fetchProfiles).mockResolvedValue(PROFILES);
+      const terminal = { acp: { default_new_session_view: "terminal" } } as never;
+      let release!: (v: never) => void;
+      vi.mocked(fetchSettings)
+        .mockResolvedValueOnce(terminal)
+        .mockReturnValueOnce(new Promise((r) => (release = r)));
+      renderWizard();
+      const view = () => screen.getByRole("switch", { name: "Use structured view" });
+      await screen.findByRole("switch", { name: "Use structured view" });
+      await waitFor(() => expect(view().getAttribute("aria-checked")).toBe("false"));
+      fireEvent.click(screen.getByText("Profile"));
+      fireEvent.click(screen.getByRole("radio", { name: /work/ }));
+      await waitFor(() => expect(fetchSettings).toHaveBeenCalledWith("work"));
+      fireEvent.click(view());
+      expect(view().getAttribute("aria-checked")).toBe("true");
+      release(terminal);
+      await launch();
+      await waitFor(() => expect(createSession).toHaveBeenCalled());
+      expect(view().getAttribute("aria-checked")).toBe("true");
+      expect(payload()).toMatchObject({ profile: "work", view: "structured" });
+    });
+
+    it("resets a view set before the profile was picked", async () => {
+      vi.mocked(fetchProfiles).mockResolvedValue(PROFILES);
+      const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(true);
+      try {
+        vi.mocked(fetchSettings)
+          .mockResolvedValueOnce({} as never)
+          .mockResolvedValueOnce({ acp: { default_new_session_view: "terminal" } } as never);
+        renderWizard();
+        fireEvent.click(await screen.findByRole("switch", { name: "Use structured view" }));
+        fireEvent.click(screen.getByText("Profile"));
+        fireEvent.click(screen.getByRole("radio", { name: /work/ }));
+        await launch();
+        await waitFor(() => expect(createSession).toHaveBeenCalled());
+        expect(payload()).toMatchObject({ profile: "work", view: "terminal" });
+      } finally {
+        confirmSpy.mockRestore();
+      }
     });
 
     it("confirms before a profile overwrites edits", async () => {
@@ -837,32 +881,102 @@ describe("SessionWizard served-profile authority", () => {
     expect(vi.mocked(fetchSettings).mock.calls.some(([profile]) => profile === "Main")).toBe(false);
   });
 
-  it("resolves Server default after explicit Beta without retaining the old prefill defaults", async () => {
-    vi.mocked(fetchProfiles).mockResolvedValueOnce(profiles as never);
-    vi.mocked(fetchSettings).mockImplementation(async (profile) => settings(profile!));
-    let publish!: (profile: string) => void;
-    const retry = async () => publish("Alpha");
-    function Harness() {
-      const [served, setServed] = useState<string>();
-      publish = setServed;
-      return (
-        <SessionWizard
-          servedProfile={served}
-          onRetryServedProfile={retry}
-          prefill={{ path: "/tmp/proj", tool: "claude", profile: "Beta", yoloMode: true }}
-          onClose={() => {}}
-          onCreated={() => {}}
-        />
-      );
-    }
-    render(<Harness />);
-    await waitFor(() =>
-      expect(screen.getByRole("switch", { name: "Auto-approve actions" }).getAttribute("aria-checked")).toBe("true"),
-    );
-    await chooseProfile("");
-    await launch();
-    await waitFor(() => expect(createSession).toHaveBeenCalled());
-    expect(payload()).toMatchObject({ yolo_mode: false });
-    expect(payload().profile).toBeUndefined();
+  it.each([false, true])(
+    "resolves Server default after explicit Beta and preserves newer view edits (%s)",
+    async (editWhilePending) => {
+      const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(true);
+      try {
+        vi.mocked(fetchProfiles).mockResolvedValueOnce(profiles as never);
+        const pending = Promise.withResolvers<SettingsResponse | null>();
+        vi.mocked(fetchSettings).mockImplementation(async (profile) =>
+          profile === "Alpha" ? pending.promise : settings(profile!),
+        );
+        let publish!: (profile: string) => void;
+        const retry = async () => publish("Alpha");
+        function Harness() {
+          const [served, setServed] = useState<string>();
+          publish = setServed;
+          return (
+            <SessionWizard
+              servedProfile={served}
+              onRetryServedProfile={retry}
+              prefill={{ path: "/tmp/proj", tool: "claude", profile: "Beta", yoloMode: true }}
+              onClose={() => {}}
+              onCreated={() => {}}
+            />
+          );
+        }
+        render(<Harness />);
+        const view = () => screen.getByRole("switch", { name: "Use structured view" });
+        await waitFor(() => expect(view().getAttribute("aria-checked")).toBe("false"));
+        fireEvent.click(view());
+        open("Profile");
+        fireEvent.click(screen.getByRole("radio", { name: /Server default/ }));
+        await waitFor(() => expect(fetchSettings).toHaveBeenCalledWith("Alpha"));
+        if (editWhilePending) {
+          fireEvent.click(view());
+          fireEvent.click(view());
+        }
+        await act(async () => pending.resolve(settings("Alpha")));
+        await launch();
+        await waitFor(() => expect(createSession).toHaveBeenCalled());
+        expect(payload()).toMatchObject({ yolo_mode: false, view: editWhilePending ? "structured" : "terminal" });
+        expect(payload().profile).toBeUndefined();
+        expect(confirmSpy).toHaveBeenCalledTimes(1);
+      } finally {
+        confirmSpy.mockRestore();
+      }
+    },
+  );
+});
+// #4517: only a sandboxed launch has to wait on the Docker probe.
+describe("SessionWizard Docker readiness", () => {
+  const launchButton = () => screen.getByText(/Launch session/).closest("button") as HTMLButtonElement;
+  const pendingProbe = () => {
+    let answer!: (v: { available: boolean; runtime: string | null }) => void;
+    vi.mocked(fetchDockerStatus).mockReturnValueOnce(new Promise((r) => (answer = r)));
+    return (available: boolean) => answer({ available, runtime: null });
+  };
+
+  it("enables Launch without waiting for Docker when the sandbox is off", async () => {
+    pendingProbe();
+    renderWizard();
+    await waitFor(() => expect(launchButton().disabled).toBe(false));
+  });
+
+  it("holds a sandboxed Launch for the probe, then reports an unavailable runtime", async () => {
+    const answer = pendingProbe();
+    vi.mocked(fetchSettings).mockResolvedValueOnce({ session: { default_tool: "opencode" }, sandbox: {} } as never);
+    renderWizard({ path: "/tmp/proj", sandboxEnabled: true });
+    // The seeded defaults are applied, so only the Docker probe can still hold Launch.
+    await waitFor(() => expect(screen.getByTestId("wizard-agent-row").textContent).toContain("opencode"));
+    await act(async () => {});
+    expect(launchButton().disabled).toBe(true);
+    answer(false);
+    await waitFor(() => expect(launchButton().disabled).toBe(false));
+    fireEvent.click(launchButton());
+    expect(await screen.findByText(/Sandbox unavailable: Docker is not running/)).toBeTruthy();
+    expect(createSession).not.toHaveBeenCalled();
+  });
+
+  it("re-holds Launch when a profile switch turns the sandbox on while the probe is pending", async () => {
+    const answer = pendingProbe();
+    vi.mocked(fetchProfiles).mockResolvedValue([
+      { name: "default", is_default: true },
+      { name: "work", is_default: false },
+    ]);
+    vi.mocked(fetchSettings).mockImplementation((async (profile?: string) =>
+      profile === "work" ? { sandbox: { enabled_by_default: true } } : {}) as never);
+    renderWizard();
+    await waitFor(() => expect(launchButton().disabled).toBe(false));
+
+    fireEvent.click(await screen.findByText("Profile"));
+    fireEvent.click(screen.getByRole("radio", { name: /work/ }));
+    const sandbox = () => screen.getByRole("switch", { name: "Run in a safe container" });
+    await waitFor(() => expect(sandbox().getAttribute("aria-checked")).toBe("true"));
+    expect(launchButton().disabled).toBe(true);
+
+    answer(true);
+    await waitFor(() => expect(launchButton().disabled).toBe(false));
   });
 });

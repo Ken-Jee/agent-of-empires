@@ -1,7 +1,14 @@
 import { describe, expect, it } from "vitest";
 
 import { reducer, transcriptDeltaAction } from "../../hooks/useAcpSession";
-import { emptyAcpState, type AcpState, type ActivityRow, type ToolCall, type TranscriptRow } from "../../lib/acpTypes";
+import {
+  emptyAcpState,
+  type AcpState,
+  type ActivityRow,
+  type ToolCall,
+  type ToolOutputBlock,
+  type TranscriptRow,
+} from "../../lib/acpTypes";
 import { resolveAgentProfile } from "../../lib/agentProfiles";
 import {
   activityToThreadMessages,
@@ -246,6 +253,51 @@ describe("subagents", () => {
     expect(names(toolParts([child("ch-1", "elsewhere")]))).toEqual(["read"]);
   });
 
+  describe("children after a mid-turn split", () => {
+    const answered = row("e1", "elicitation_answered", "yes");
+    const done = (id: string, extra: Partial<ActivityRow> = {}) =>
+      row(`done-${id}`, "tool_complete", `out-${id}`, { toolCallId: id, ...extra });
+    const assistants = (rows: ActivityRow[]) =>
+      activityToThreadMessages([user(), ...rows], true).filter((m) => m.role === "assistant");
+
+    it("keeps async children out of every later message", () => {
+      const msgs = assistants([
+        task(),
+        done("task-1", { asyncSubagent: true }),
+        answered,
+        message("Next.", "m2"),
+        child("a", "task-1"),
+        done("a"),
+        child("b", "task-1"),
+      ]);
+      expect(msgs).toHaveLength(2);
+      const parts = msgs[0]!.content as Part[];
+      expect(names(parts)).toEqual([SUBAGENT_TASK_NAME]);
+      expect(payload(parts[0]!)).toMatchObject({ async: true, children: [], parent: { toolCallId: "task-1" } });
+      expect(msgs[1]!.content).toEqual([{ type: "text", text: "Next." }]);
+    });
+
+    it("folds sync children into the parent card in the earlier message", () => {
+      const msgs = assistants([task(), answered, child("a", "task-1"), done("a"), done("task-1")]);
+      expect(msgs).toHaveLength(1);
+      const p = payload((msgs[0]!.content as Part[])[0]!);
+      expect(p.parent).toMatchObject({ toolCallId: "task-1", result: { content: "out-task-1" } });
+      expect(p.children).toMatchObject([{ toolCallId: "a", result: { content: "out-a" } }]);
+    });
+
+    it("does not split streamed text around a child call", () => {
+      const msgs = assistants([
+        task(),
+        message("🐤 plugin-", "m2"),
+        child("a", "task-1"),
+        message("linear#4 reviewed", "m3"),
+      ]);
+      expect((msgs[0]!.content as Part[]).filter((p) => p.type === "text")).toEqual([
+        { type: "text", text: "🐤 plugin-linear#4 reviewed" },
+      ]);
+    });
+  });
+
   it("collapses a childless async launch with async set", () => {
     const done = row("done-task-1", "tool_complete", "Async agent launched\nagentId: secret", {
       toolCallId: "task-1",
@@ -384,5 +436,37 @@ describe("user and callout rows", () => {
     expect(assistantParts(state.activity)[0]!.text).toBe(
       "> ℹ️ **Notice**; warning: Model fallback: Switched to Sonnet.",
     );
+  });
+});
+
+describe("tool output media", () => {
+  const resultOf = (content: string, output: ToolOutputBlock[]) => {
+    const [msg] = activityToThreadMessages(
+      [user(), toolStart("t1"), row("done-t1", "tool_complete", content, { toolCallId: "t1", output })],
+      false,
+    ).filter((m) => m.role === "assistant");
+    const part = (msg!.content as { type: string; result?: Record<string, unknown> }[]).find(
+      (p) => p.type === "tool-call",
+    );
+    return part?.result;
+  };
+
+  it("carries a completion's media blocks onto the tool part's result, minus text that content repeats", () => {
+    const media: ToolOutputBlock[] = [
+      { kind: "image", mime_type: "image/png", data: "AAAA" },
+      { kind: "resource_link", uri: "https://example.com/r", name: "Report" },
+      // An embedded terminal has no text in `content`, so its placeholder is the only trace of it.
+      { kind: "text", text: "[terminal t-1]" },
+    ];
+    const result = resultOf("Captured", [{ kind: "text", text: "Captured" }, ...media]);
+    expect(result?.output).toEqual(media);
+    expect(result?.content).toBe("Captured");
+  });
+
+  it.each<[string, ToolOutputBlock[]]>([
+    ["no media", []],
+    ["only text that content repeats", [{ kind: "text", text: "Captured" }]],
+  ])("leaves the result without an output key for %s", (_name, output) => {
+    expect(resultOf("Captured", output)).not.toHaveProperty("output");
   });
 });

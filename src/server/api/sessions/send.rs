@@ -297,6 +297,8 @@ pub async fn send_message(
     };
 
     crate::server::live_ws::strip_paste_escapes(&mut req.message);
+    let len = req.message.trim_end_matches(['\r', '\n']).len();
+    req.message.truncate(len);
     if req.message.trim().is_empty() {
         return (
             StatusCode::BAD_REQUEST,
@@ -666,11 +668,11 @@ mod send_output_tests {
         let metadata = state.canonical_metadata.read().await.clone();
         crate::server::reload::reload_state_instances_from_disk(
             &state,
-            vec![stale],
+            (vec![stale]).into(),
             Vec::new(),
             crate::server::state::StatusSource::DiskOnly,
             read_epoch,
-            metadata,
+            Ok(metadata),
             Default::default(),
         )
         .await;

@@ -526,7 +526,7 @@ async fn delete_selected_refused_during_restart() {
     env.view.selected_group_profile = Some("test".to_string());
     env.view.info_dialog = None;
     let options = GroupDeleteOptions {
-        delete_sessions: true,
+        action: crate::tui::dialogs::GroupDeleteAction::DeleteSessions,
         delete_worktrees: false,
         delete_branches: false,
         delete_containers: false,
@@ -536,6 +536,7 @@ async fn delete_selected_refused_during_restart() {
     assert!(env.view.delete_group_with_sessions(&options).is_err());
     assert!(respond(Err("unexpected admission".into())).is_none());
     assert_eq!(payload_bytes("test"), before);
+
     assert_eq!(env.view.selected_group.as_deref(), Some("work"));
     assert_eq!(env.view.selected_group_profile.as_deref(), Some("test"));
     assert_eq!(env.view.get_instance(&id).unwrap().group_path, "work");
@@ -568,6 +569,7 @@ async fn delete_selected_refused_during_restart() {
     assert!(env.view.delete_group_with_sessions(&options).is_err());
     assert!(respond(Err("unexpected admission".into())).is_none());
     assert_eq!(payload_bytes("test"), before);
+
     assert_eq!(env.view.selected_group.as_deref(), Some("work"));
     assert_eq!(env.view.get_instance(&id).unwrap().group_path, "work");
     assert_eq!(

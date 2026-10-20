@@ -105,6 +105,8 @@ pub struct AppState {
     pub(crate) canonical_metadata: RwLock<super::reload::CanonicalMetadata>,
     pub(crate) canonical_health: RwLock<crate::daemon::RuntimeHealth>,
     pub(crate) runtime: super::runtime::NativeRuntime,
+    // Lock instances before the cache for coherent reads and reload commits.
+    pub(crate) runtime_read_cache: std::sync::RwLock<super::reload::RuntimeReadCache>,
     /// Shared session-domain service for HTTP and plugin entry points.
     pub session_service: Arc<session_service::SessionService>,
     pub token_manager: Arc<TokenManager>,
@@ -183,16 +185,15 @@ pub struct AppState {
     /// title call; a dedicated single slot keeps heavy background summaries
     /// from starving the snappy first-prompt rename. See #2808.
     pub summary_semaphore: tokio::sync::Semaphore,
-    /// Suppression set for the startup-recovery cascade. While an entry is
-    /// present and younger than `recovery::RECENTLY_RESTARTED_TTL`, the
-    /// `status_poll_loop` skips `update_status_with_metadata` for that
-    /// instance and surfaces `Status::Starting` instead. Without this,
-    /// `last_start_time` (which is `#[serde(skip)]`) is lost on the loop's
-    /// `load_all_instances` reload, and a freshly-recovered session
-    /// transitions to `Status::Error` for up to 8 seconds while the agent
-    /// is still settling. Periodically GC'd by a background task.
+    /// Global cap on concurrent runtime-read connections, so a burst of clients
+    /// cannot each hold a connection slot and a cloned row set while they wait
+    /// for the one sample in flight. Shared rather than owned because the permit
+    /// is handed to the blocking sample itself, which outlives the connection
+    /// that was admitted against it.
+    pub runtime_read_semaphore: Arc<tokio::sync::Semaphore>,
+    /// Suppression set for the startup-recovery cascade.
     pub recently_restarted: crate::session::recovery::RecentlyRestarted,
-    /// Invalidates earlier disk snapshots at memory mutation and queue persistence completion.
+    /// Invalidates earlier disk snapshots at memory mutation and deferred persistence completion.
     pub mutation_epoch: Arc<std::sync::atomic::AtomicU64>,
     /// Ids whose startup-recovery cascade is scheduled but not yet complete.
     /// Phase A seeds it; each Phase B worker drains its id on completion. The
@@ -252,6 +253,8 @@ pub struct AppState {
     /// point and shared with `ChannelSink`. Prompt dispatch reads it instead
     /// of replaying the log on every POST; see `crate::acp::control_cache`.
     pub acp_control_cache: Arc<crate::acp::control_cache::ControlStateCache>,
+    /// One orphan teardown per exact runner identity until its cleanup completes.
+    pub(crate) acp_orphan_cleanups: std::sync::Mutex<std::collections::HashSet<(String, u32, u64)>>,
     /// Owns the per-session ACP agent subprocesses.
     pub acp_supervisor:
         Arc<crate::acp::supervisor::Supervisor<crate::acp::supervisor::ChannelSink>>,

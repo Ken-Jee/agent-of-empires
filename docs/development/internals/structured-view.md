@@ -41,6 +41,8 @@ Purge captures the selected row's path, branch and runner references before dest
 
 After journal ownership and row removal are durable, a committed purge releases identity and instance lifecycle flocks before awaiting its captured lease and runner retirement. The durable journal and frozen retirement target preserve the original cleanup and process authority across that wait. Initial and recovered cleanup reacquire identity then lifecycle exclusion and revalidate store health, row absence, and the exact live journal owner before touching resources. A replacement lease or runner is never adopted as the old purge target; any unproven retirement, reused row, or changed owner keeps the journal and resources.
 
+A committed purge marks its frozen constructor for journal acknowledgement only after durable owner validation. If that constructor is cancelled before child birth, its exact lifecycle entry remains until completion proof is durably recorded and acknowledged. The producer epoch and construction UUID prevent a reused session ID or numeric epoch from borrowing that authority. Recovery can finish after every request-owned target was dropped, including interruptions before or after the durable completion write. Ordinary cancellation and adapter deletion do not arm journal debt. Historical uncaptured ownership remains unresolved; a missing record alone never proves that no child was born.
+
 Recovery freezes that retirement target while its short absent-row and journal-owner preparation exclusions still hold, then releases both before waiting. Native supervisor bookkeeping and event-store projection deletion are cleanup effects too: they run only under the reacquired cleanup fence after process exit, health, live-owner, and row-absence validation, so a reused ID without a replacement worker keeps its transcript and counters.
 
 The schema-45 purge journal retains exact captured scope ownership too, so a
@@ -93,6 +95,8 @@ If context restoration fails (the agent's stored session is gone) the view falls
 Modes come from `NewSessionResponse.modes`, and the picker shows whatever the adapter reports; Gemini's `auto_edit` / `yolo` fold onto `acceptEdits` / `bypassPermissions`. YOLO fires `session/set_mode("bypassPermissions")` after `session/new`, best-effort. `claude-agent-acp` gates that mode on `ALLOW_BYPASS=1` in the daemon's environment; without it `set_mode` returns "not available" and the session stays `default`, surfaced as an amber notice.
 
 Model and reasoning-effort selectors arrive over two wire mechanisms, normalized into one dropdown: `SessionUpdate::ConfigOptionUpdate` (a full snapshot of every selector whenever one changes, so the client replaces its cached list) and the `unstable_session_model` capability (`SessionModelState` on `session/new` and `session/load`, switched with `session/set_model`). With both present, `config_option` wins, since it has a push path; `session/set_model` only acks, so the client synthesizes the confirming update. The UI is pessimistic (the chip keeps the prior value until a confirming update arrives) to avoid snap-back on slow tunnels. The cached list clears on `AgentSwitched` but survives `/clear`, since capabilities are process-scoped.
+
+Selector persistence and backend changes are fenced against disk reloads. Model/config-option and legacy mode requests share the provider switch's per-session submission lock; worker readiness waits run outside the instance mutation lock.
 
 Session notices (`SessionUpdate::Notice`) are live advisories, not conversation history. The adapter only sends them when the client advertises `clientCapabilities.session.notices`; without that it folds each one into a bold-label agent message indistinguishable from the model's reply, so advertising the capability is what makes them identifiable. They ride on `AcpState` capped and scoped to the current turn, which is what feeds the dismissible strip on both surfaces, and they also land in the transcript as an `advisory` row, which unlike a `notice` row both surfaces render, so the history survives a dismissal. Dismissal is client-local: the folded list is shared, so clearing it server-side would blank every other client.
 
@@ -156,6 +160,8 @@ show_tool_durations = true
 wrap_tool_output = false          # initial line wrap of tool output blocks; each block can toggle
 compaction_reminder = false       # opt-in /compact nudge past the threshold
 compaction_reminder_percent = 75  # 1..99
+notice_display = "persistent"     # persistent | timeout | hidden; errors always persist
+notice_timeout_secs = 10          # auto-dismiss delay for notice_display = "timeout"; 1..2147483
 silent_orphan_grace_secs = 120    # 0 disables
 auto_stop_idle_secs = 3600        # 0 disables; the next prompt respawns the worker
 rate_limit_auto_resume = false

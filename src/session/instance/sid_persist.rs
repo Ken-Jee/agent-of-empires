@@ -1,6 +1,55 @@
 //! CAS-guarded persistence of `agent_session_id` and `resume_intent`.
 
 use super::*;
+
+#[cfg(test)]
+pub(super) mod test_support {
+    use crate::session::storage::Storage;
+    #[derive(Clone, Copy)]
+    pub(super) enum Stage {
+        Adoption,
+        Finalize,
+    }
+    thread_local! { static FAIL_WRITES: std::cell::RefCell<Option<(String, bool, bool)>> = const { std::cell::RefCell::new(None) }; }
+    pub(in crate::session::instance) struct WriteFailures;
+    impl WriteFailures {
+        pub(in crate::session::instance) fn install(
+            id: String,
+            adoption: bool,
+            finalize: bool,
+        ) -> Self {
+            FAIL_WRITES.with(|slot| {
+                assert!(slot.borrow().is_none());
+                *slot.borrow_mut() = Some((id, adoption, finalize));
+            });
+            Self
+        }
+    }
+    impl Drop for WriteFailures {
+        fn drop(&mut self) {
+            FAIL_WRITES.with(|slot| {
+                slot.borrow_mut().take();
+            });
+        }
+    }
+    pub(super) fn apply(
+        storage: &Storage,
+        id: &str,
+        stage: Stage,
+    ) -> Option<crate::session::storage::WriteFailureGuard> {
+        let fail = FAIL_WRITES.with(|slot| {
+            slot.borrow()
+                .as_ref()
+                .filter(|(target, _, _)| target == id)
+                .is_some_and(|(_, adoption, finalize)| match stage {
+                    Stage::Adoption => *adoption,
+                    Stage::Finalize => *finalize,
+                })
+        });
+        fail.then(|| storage.fail_writes_for_test())
+    }
+}
+
 /// Outcome of a CAS-guarded `agent_session_id` or `resume_intent` write.
 #[must_use]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -140,6 +189,9 @@ impl Instance {
         let new_sid_for_closure = new_sid.clone();
         let expected_prior_intent_for_closure = expected_prior_intent.clone();
         let mut cleared_holder_ids = Vec::new();
+        #[cfg(test)]
+        let _fail_guard =
+            test_support::apply(storage.storage(), &self.id, test_support::Stage::Finalize);
         let outcome = storage.update(|instances, _groups| {
             let Some(index) = instances
                 .iter()
@@ -337,6 +389,7 @@ impl Instance {
             }
         }
     }
+
     #[cfg(test)]
     pub(crate) fn persist_session_id(
         &mut self,
@@ -348,6 +401,65 @@ impl Instance {
             return SidPersistOutcome::Skip;
         };
         self.persist_session_id_with_storage(&storage, expected)
+    }
+
+    /// Publish the child without changing the Fork target still being validated.
+    /// Advance the finalization baseline only after the durable commit succeeds.
+    pub(super) fn persist_fork_adoption(
+        &self,
+        profile: &str,
+        expected: &mut ConversationState,
+    ) -> SidPersistOutcome {
+        let Some(sid) = self.agent_session_id.clone() else {
+            return SidPersistOutcome::Skip;
+        };
+        if !is_valid_session_id(&sid) {
+            tracing::warn!(target: "session.store", instance = %self.id, sid = ?sid,
+                "refusing to persist an invalid forked session ID");
+            return SidPersistOutcome::Skip;
+        }
+        let storage =
+            match crate::session::storage::Storage::new(profile, self.resolve_file_watch()) {
+                Ok(storage) => storage,
+                Err(error) => {
+                    tracing::warn!(target: "session.store", instance = %self.id, %error,
+                        "failed to create storage for fork adoption");
+                    return SidPersistOutcome::Skip;
+                }
+            };
+        #[cfg(test)]
+        let _fail_guard = test_support::apply(&storage, &self.id, test_support::Stage::Adoption);
+        let instance_id = self.id.clone();
+        let binding = self.agent_session_binding.clone();
+        let pi_session_path = self.pi_session_path.clone();
+        let outcome = storage.update(|instances, _groups| {
+            let Some(index) = instances
+                .iter()
+                .position(|instance| instance.id == instance_id)
+            else {
+                return Ok(None);
+            };
+            if !expected.matches(&instances[index]) {
+                return Ok(None);
+            }
+            instances[index].set_agent_conversation(Some(sid), binding, pi_session_path);
+            // Keep the child reusable even if the process stops before finalization.
+            instances[index].resume_intent = ResumeIntent::Default;
+            instances[index].resume_binding = None;
+            Ok(Some(instances[index].conversation_state()))
+        });
+        match outcome {
+            Ok(Some(committed)) => {
+                *expected = committed;
+                SidPersistOutcome::Published
+            }
+            Ok(None) => SidPersistOutcome::Skip,
+            Err(error) => {
+                tracing::warn!(target: "session.store", instance = %self.id, %error,
+                    "failed to persist fork adoption");
+                SidPersistOutcome::Skip
+            }
+        }
     }
 }
 
@@ -477,8 +589,9 @@ mod tests {
 
     const VALID_SID: &str = "019342ab-1234-7def-8901-abcdef012345";
 
-    fn expected_state(sid: Option<&str>, intent: ResumeIntent) -> ConversationState {
+    fn expected_state(tool: &str, sid: Option<&str>, intent: ResumeIntent) -> ConversationState {
         ConversationState {
+            tool: tool.to_owned(),
             session_id: sid.map(str::to_owned),
             binding: None,
             intent,
@@ -533,6 +646,118 @@ mod tests {
 
     #[test]
     #[serial]
+    fn fork_publication_advances_finalization_without_overwriting_peer_changes() {
+        use crate::session::{ConversationBinding, ConversationProvenance, ExecutionBinding};
+        for conflict in ["none", "before", "after"] {
+            let profile = "fork-finalization";
+            let mut inst = make_inst(profile, "fork");
+            inst.tool = "opencode".into();
+            inst.resume_intent = ResumeIntent::Fork {
+                from: "ses_parent".into(),
+            };
+            let original = inst.conversation_state();
+            let (_temp, _home, storage) = seeded(profile, &[&inst]);
+            let mut expected = original.clone();
+            let binding = ExecutionBinding {
+                agent: "opencode".into(),
+                stores: vec!["/tmp/store-a".into()],
+                configuration: Vec::new(),
+                exported_default_store: None,
+                cwd: "/tmp/x".into(),
+                cwd_filesystem: "host".into(),
+                filesystem: "host".into(),
+            };
+            inst.set_agent_conversation(
+                Some(VALID_SID.into()),
+                Some(ConversationBinding {
+                    session_id: VALID_SID.into(),
+                    execution: Some(binding.clone()),
+                    provenance: ConversationProvenance::Observed,
+                    transcript_path: None,
+                }),
+                None,
+            );
+            if conflict == "before" {
+                storage
+                    .update(|rows, _| {
+                        rows[0].resume_intent = ResumeIntent::Cleared;
+                        Ok(())
+                    })
+                    .unwrap();
+            }
+            let outcome = inst.persist_fork_adoption(profile, &mut expected);
+            if conflict == "before" {
+                assert_eq!(outcome, SidPersistOutcome::Skip);
+                let mut old = inst.clone();
+                old.adopt_conversation_state(original.clone());
+                assert!(expected.matches(&old));
+                assert_eq!(
+                    storage.load().unwrap()[0].resume_intent,
+                    ResumeIntent::Cleared
+                );
+                continue;
+            }
+            assert_eq!(outcome, SidPersistOutcome::Published);
+            assert!(expected.matches(&storage.load().unwrap()[0]));
+            assert!(matches!(inst.resume_intent, ResumeIntent::Fork { .. }));
+            inst.active_execution = Some(ActiveExecution {
+                launch_id: "new-launch".into(),
+                binding,
+                capture: None,
+                container: None,
+            });
+            if conflict == "after" {
+                storage
+                    .update(|rows, _| {
+                        rows[0].resume_intent = ResumeIntent::Cleared;
+                        Ok(())
+                    })
+                    .unwrap();
+            }
+            let _ = inst.persist_session_id_with_storage(&storage, &expected);
+            let disk = storage.load().unwrap();
+            if conflict == "after" {
+                assert_eq!(disk[0].resume_intent, ResumeIntent::Cleared);
+                assert!(disk[0].active_execution.is_none());
+            } else {
+                assert_eq!(
+                    disk[0]
+                        .active_execution
+                        .as_ref()
+                        .map(|active| active.launch_id.as_str()),
+                    Some("new-launch")
+                );
+                assert_eq!(disk[0].agent_session_id.as_deref(), Some(VALID_SID));
+                assert_eq!(disk[0].resume_intent, ResumeIntent::Default);
+            }
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn legacy_capture_does_not_cross_a_tool_swap() {
+        let profile = "capture-tool-swap";
+        let mut snapshot = make_inst(profile, "legacy");
+        snapshot.tool = "claude".into();
+        let expected = snapshot.conversation_state();
+        let (_temp, _home, storage) = seeded(profile, &[&snapshot]);
+        storage
+            .update(|rows, _| {
+                rows[0].tool = "codex".into();
+                Ok(())
+            })
+            .unwrap();
+        let observed =
+            crate::session::poller::SessionIdObservation::instance_sidecar(VALID_SID.into(), None);
+        assert_eq!(
+            persist_session_with_storage(&storage, &snapshot.id, &observed, &expected),
+            SidWrite::Skipped
+        );
+        assert!(storage.load().unwrap()[0].agent_session_id.is_none());
+    }
+
+    #[test]
+    #[serial]
     fn persist_session_to_storage_is_cas_guarded() {
         for (prior, expected, disk) in [
             (Some("old"), SidWrite::Applied, "new"),
@@ -546,7 +771,7 @@ mod tests {
                 profile,
                 &inst.id,
                 &observation("new"),
-                &expected_state(prior, ResumeIntent::Default),
+                &expected_state(&inst.tool, prior, ResumeIntent::Default),
                 &FileWatchService::noop(),
             );
             assert_eq!(write, expected);
@@ -1026,7 +1251,7 @@ mod tests {
             profile,
             &inst.id,
             &observation("new-sid"),
-            &expected_state(Some("old"), ResumeIntent::Default),
+            &expected_state(&inst.tool, Some("old"), ResumeIntent::Default),
             &svc,
         );
         assert_eq!(write, SidWrite::Applied);
@@ -1065,7 +1290,7 @@ mod tests {
 
         let outcome = inst.persist_session_id_with_storage(
             &storage,
-            &expected_state(None, ResumeIntent::Default),
+            &expected_state(&inst.tool, None, ResumeIntent::Default),
         );
         assert_eq!(outcome, SidPersistOutcome::Published);
         let loaded = storage.load().unwrap();
@@ -1165,7 +1390,7 @@ mod tests {
         inst.resume_intent = ResumeIntent::Use(VALID_SID.into());
         let (_temp, _home, storage) = seeded(profile, &[&inst]);
 
-        let expected = expected_state(Some(VALID_SID), inst.resume_intent.clone());
+        let expected = expected_state(&inst.tool, Some(VALID_SID), inst.resume_intent.clone());
         let _ = inst.persist_session_id(profile, &expected);
         assert_eq!(
             inst.resume_intent,
@@ -1173,7 +1398,7 @@ mod tests {
             "configured capture support is not enough without a launch publisher"
         );
         inst.identity_publisher_launched = true;
-        let expected = expected_state(Some(VALID_SID), inst.resume_intent.clone());
+        let expected = expected_state(&inst.tool, Some(VALID_SID), inst.resume_intent.clone());
         let _ = inst.persist_session_id(profile, &expected);
         assert_eq!(inst.resume_intent, ResumeIntent::Default);
         assert_eq!(
@@ -1650,7 +1875,7 @@ mod tests {
                 inst.finalize_launch(
                     tmux.name(),
                     profile,
-                    &expected_state(prior, prior_intent),
+                    &expected_state(&inst.tool, prior, prior_intent),
                     None,
                     false,
                 )

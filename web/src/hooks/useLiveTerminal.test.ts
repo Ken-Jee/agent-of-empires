@@ -59,15 +59,15 @@ function mount(openSocket = true) {
   return { ...hook, ws };
 }
 
-const frame = (seq: number, content: string) => ({ type: "frame", seq, content, rows: 3, history: 5, cursor: null });
+const meta = { rows: 3, history: 5, cursor: null, altScreen: false, mouse: false, mouseSgr: false, pane0: null };
+const frame = (seq: number, content: string) => ({ type: "frame", seq, content, ...meta });
 const patch = (seq: number, base: number, lines: [number, string][], shift = 0) => ({
   type: "patch",
   seq,
   base,
   shift,
   lines,
-  rows: 3,
-  history: 5,
+  ...meta,
 });
 
 describe("row patches", () => {
@@ -183,6 +183,35 @@ describe("clipboard", () => {
   });
 });
 
+describe("reconnect", () => {
+  it("replays the desired grid, window and cadence on the new socket", () => {
+    vi.useFakeTimers();
+    try {
+      const { result, ws } = mount();
+      act(() => {
+        result.current.sendResize(100, 30);
+        result.current.setWindow(500);
+        result.current.setCadence(false);
+      });
+      ws.readyState = FakeWS.CLOSED;
+      act(() => ws.onclose?.(new CloseEvent("close", { code: 1006 })));
+      act(() => vi.advanceTimersByTime(60_000));
+      const next = FakeWS.sockets[1]!;
+      next.open();
+      expect(next.json()).toEqual(
+        expect.arrayContaining([
+          { type: "resize", cols: 100, rows: 30 },
+          { type: "window", lines: 500 },
+          { type: "cadence", fast: false },
+        ]),
+      );
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  });
+});
+
 describe("size owner", () => {
   it("claims a vacant lock on open and waits for the owner verdict", () => {
     const { result, ws } = mount();
@@ -273,6 +302,36 @@ describe("size owner", () => {
       ws.deliver({ type: "size_owner", is_owner: true });
       act(() => ws.onclose?.(new CloseEvent("close")));
       expect(result.current.state).toMatchObject({ isOwner: false, ownerKnown: false });
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  });
+  it("flags a dead pane on close 4001 without redialing, and clears it when a socket opens again", () => {
+    vi.useFakeTimers();
+    try {
+      const { result, ws } = mount();
+      ws.readyState = FakeWS.CLOSED;
+      act(() => ws.onclose?.(new CloseEvent("close", { code: 4001 })));
+      expect(result.current.state).toMatchObject({ paneDead: true, reconnecting: false });
+      act(() => vi.advanceTimersByTime(60_000));
+      expect(FakeWS.sockets).toHaveLength(1);
+
+      act(() => result.current.manualReconnect());
+      FakeWS.sockets[1]!.open();
+      expect(result.current.state.paneDead).toBe(false);
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps retrying other closes without flagging a dead pane", () => {
+    vi.useFakeTimers();
+    try {
+      const { result, ws } = mount();
+      act(() => ws.onclose?.(new CloseEvent("close", { code: 1006 })));
+      expect(result.current.state).toMatchObject({ paneDead: false, reconnecting: true });
     } finally {
       vi.clearAllTimers();
       vi.useRealTimers();

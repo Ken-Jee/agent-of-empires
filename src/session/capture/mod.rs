@@ -35,11 +35,12 @@ pub(crate) use gemini::{
 pub(crate) use hermes::hermes_poll_fn_sandboxed_store;
 pub(crate) use kimi::{kimi_poll_fn_sandboxed_store, selected_index_record, KIMI_INDEX_MAX_BYTES};
 pub(crate) use omp::*;
-pub(crate) use opencode::preassign_opencode_session_id;
+pub(crate) use opencode::{fork_opencode_session_id, preassign_opencode_session_id};
 pub(crate) use pi::{extract_pi_header_fields, pi_sidecar_poll_fn, read_pi_session_observation};
 pub(crate) use prime::{
-    prime_agent_poll_fn_sandboxed, root_session_header, PrimeRootPublication,
-    PRIME_AGENT_HEADER_SCAN_BYTES, PRIME_AGENT_MAX_SESSION_FILES,
+    hand_off_root_transcript as hand_off_prime_root_transcript, prime_agent_poll_fn_sandboxed,
+    root_session_header, PrimeRootPublication, PRIME_AGENT_HEADER_SCAN_BYTES,
+    PRIME_AGENT_MAX_SESSION_FILES,
 };
 
 pub(crate) fn canonicalize_allowing_missing_leaf(path: &Path) -> Option<PathBuf> {
@@ -247,7 +248,7 @@ pub(crate) fn owner_excludes(
 }
 
 /// Runs `cmd` to completion with a deadline and a stdout byte cap, killing it on timeout.
-pub(super) fn run_with_timeout_limit(
+pub(crate) fn run_with_timeout_limit(
     mut cmd: std::process::Command,
     timeout: Duration,
     label: &str,

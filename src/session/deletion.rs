@@ -972,6 +972,13 @@ impl<S: SessionStore> CommittedPurge<S> {
         self.owner.ensure_retirement_target(target)
     }
 
+    pub(crate) fn complete_retirement(
+        &mut self,
+        target: &crate::acp::supervisor::RetirementTarget,
+    ) -> Result<()> {
+        self.owner.complete_retirement(target)
+    }
+
     /// Durable journal token of the owner backing this purge, so a caller can
     /// record that it already attempted this owner during a recovery pass.
     pub(crate) fn owner_token(&self) -> &str {
@@ -2925,7 +2932,7 @@ mod tests {
         let root = crate::session::get_app_dir().unwrap();
         super::super::purge_owners::initialize(&root).unwrap();
         let profile = "purge-failed-commit-owner";
-        let mut storage = Storage::new_unwatched(profile).unwrap();
+        let storage = Storage::new_unwatched(profile).unwrap();
         let mut instance = create_test_instance();
         instance.source_profile = profile.into();
         storage

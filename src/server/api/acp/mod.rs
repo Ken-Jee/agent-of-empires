@@ -658,13 +658,13 @@ mod tests {
                         let metadata = state.canonical_metadata.read().await.clone();
                         crate::server::reload::reload_state_instances_from_disk(
                             &state,
-                            vec![fresh],
+                            vec![fresh].into(),
                             Vec::new(),
                             crate::server::state::StatusSource::DiskOnly,
                             state
                                 .mutation_epoch
                                 .load(std::sync::atomic::Ordering::SeqCst),
-                            metadata,
+                            Ok(metadata),
                             Default::default(),
                         )
                         .await;

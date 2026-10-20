@@ -1,8 +1,7 @@
-//! Per-session transient systemd scopes via systemd-run --user --scope. New
-//! scope creation is best effort and falls back to unscoped launch. Retirement
-//! is fallible: only exact captured units with proven empty cgroups authorize
-//! releasing owned resources; unknown ownership or manager errors retain them.
-//! Compiled on every OS, with scope creation supported only on Linux.
+//! Unix daemon notifications and Linux transient session scopes.
+//! New scopes are best effort and may fall back to unscoped launch.
+//! Retirement requires exact captured units and proven empty cgroups.
+//! Unknown ownership or manager errors retain owned resources.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -11,6 +10,9 @@ use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::session::config::SystemdSettings;
+
+#[cfg(unix)]
+pub(crate) mod notify;
 
 pub(crate) const DEFAULT_SLICE_TEMPLATE: &str = "background-aoe-{profile}.slice";
 const UNIT_PREFIX: &str = "aoe-session-";
@@ -64,8 +66,17 @@ pub(crate) fn unit_glob(session_id: &str, namespace: &str) -> String {
 
 /// Application-directory consistency, not instance authentication or attestation.
 pub(crate) fn scope_namespace() -> anyhow::Result<String> {
+    scope_namespace_for(&crate::session::get_app_dir()?)
+}
+
+/// Read an existing namespace without creating application directories.
+pub(crate) fn existing_scope_namespace() -> anyhow::Result<String> {
+    scope_namespace_for(&crate::session::get_app_dir_path()?)
+}
+
+fn scope_namespace_for(app: &Path) -> anyhow::Result<String> {
     use sha2::Digest;
-    let app = crate::session::get_app_dir()?.canonicalize()?;
+    let app = app.canonicalize()?;
     let digest = sha2::Sha256::digest(app.as_os_str().as_encoded_bytes());
     let mut namespace = String::with_capacity(digest.len() * 2);
     const HEX: &[u8; 16] = b"0123456789abcdef";
@@ -588,15 +599,13 @@ pub(crate) fn retire_scope(
     command.args(["--user", "stop", unit]);
     let output = crate::process::run_with_timeout(&mut command, Duration::from_secs(3))?
         .ok_or_else(|| anyhow::anyhow!("scope stop timed out"))?;
+    let proven_empty = scope_stopped(session_id, scope)?;
     anyhow::ensure!(
-        output.status.success(),
+        output.status.success() || proven_empty,
         "scope stop rejected: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    anyhow::ensure!(
-        scope_stopped(session_id, scope)?,
-        "captured scope is not empty after stop"
-    );
+    anyhow::ensure!(proven_empty, "captured scope is not empty after stop");
     Ok(())
 }
 
@@ -686,6 +695,87 @@ mod tests {
             .and_set("XDG_RUNTIME_DIR", path);
         assert_eq!(scopes_expected(true), cfg!(target_os = "linux"));
         assert!(!scopes_expected(false));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[serial_test::serial]
+    fn retire_scope_requires_positive_empty_proof_after_rejected_stop() {
+        use crate::process::worker_registry::ScopeOwnership;
+        use std::os::unix::fs::PermissionsExt;
+
+        let manager = tempfile::tempdir().unwrap();
+        let executable = manager.path().join("systemctl");
+        std::fs::write(
+            &executable,
+            r#"#!/bin/sh
+root=${0%/*}
+for unit in "$@"; do :; done
+case "$2" in
+  show)
+    IFS= read -r state < "$root/$unit" || exit 2
+    case "$state" in
+      active) printf 'LoadState=loaded\nActiveState=active\nControlGroup=/owned\n' ;;
+      collected) printf 'LoadState=not-found\nActiveState=inactive\nControlGroup=\n' ;;
+      nonempty) printf 'LoadState=loaded\nActiveState=inactive\nControlGroup=/owned\n' ;;
+      unknown) printf 'LoadState=loaded\nControlGroup=\n' ;;
+      unavailable) exit 7 ;;
+      *) exit 2 ;;
+    esac
+    ;;
+  stop)
+    IFS= read -r mode < "$root/mode" || exit 2
+    case "$mode" in
+      collected|unknown|unavailable)
+        printf '%s\n' "$mode" > "$root/$unit"
+        exit 1
+        ;;
+      nonempty)
+        printf 'nonempty\n' > "$root/$unit"
+        exit 0
+        ;;
+      active) exit 1 ;;
+      *) exit 2 ;;
+    esac
+    ;;
+  *) exit 2 ;;
+esac
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _env = crate::session::test_support::path_prepended(manager.path());
+        let id = "retire-race";
+        let unit = format!("{}-original.scope", escaped_id(id));
+        let unrelated = format!("{}-replacement.scope", escaped_id(id));
+        let scope = ScopeOwnership::Owned { unit: unit.clone() };
+        for (mode, succeeds, expected) in [
+            ("collected", true, "collected\n"),
+            ("active", false, "active\n"),
+            ("nonempty", false, "nonempty\n"),
+            ("unknown", false, "unknown\n"),
+            ("unavailable", false, "unavailable\n"),
+        ] {
+            std::fs::write(manager.path().join("mode"), format!("{mode}\n")).unwrap();
+            std::fs::write(manager.path().join(&unit), b"active\n").unwrap();
+            std::fs::write(manager.path().join(&unrelated), b"active\n").unwrap();
+            assert!(!scope_stopped(id, &scope).unwrap(), "{mode}: starts active");
+            let result = retire_scope(id, &scope);
+            assert_eq!(result.is_ok(), succeeds, "{mode}: {result:?}");
+            assert_eq!(
+                std::fs::read(manager.path().join(&unit)).unwrap(),
+                expected.as_bytes(),
+                "{mode}: owned manager state"
+            );
+            assert_eq!(
+                std::fs::read(manager.path().join(&unrelated)).unwrap(),
+                b"active\n",
+                "{mode}: unrelated unit must remain untouched"
+            );
+            if succeeds {
+                assert!(scope_stopped(id, &scope).unwrap());
+            }
+        }
     }
 
     #[test]

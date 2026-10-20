@@ -87,6 +87,14 @@ When tied:
 - A title-only rename whose slug leaves the directory unchanged moves no checkout. `PATCH /api/sessions/{id}` and `aoe session rename` accept it while the session runs unless `rename_branch: true` would change the branch. The PATCH also leaves a live structured-view worker alone. The TUI requires a stopped session for a title-changing tied rename.
 - Naming collapses into the single rename action: the standalone "edit workdir name" affordance is hidden (TUI and web) and the standalone CLI / REST workdir-name edit is rejected, since the directory now follows the title.
 
+`aoe add -w <branch>` names the session and directory after the branch. Pass `--generated-name` to get a generated name instead (as the TUI and web do without a branch): the title is a civilization name unused by any session, and it fills `{branch}` in the worktree path template, choosing a name whose resulting path is free. The git branch stays exactly as given. A template without `{branch}`, such as `../wt/{session-id}`, never contains the name.
+
+```bash
+aoe add . -w feat/my-feature -b --generated-name
+```
+
+It conflicts with `--title`. When attaching to a branch that already has a worktree, that directory is kept and only the title is generated. It is refused with `--repo`/`--project`, whose workspace directory comes from `workspace_path_template`. With `session.tie_workdir_to_name` off, the new directory still uses the generated name.
+
 Toggle the setting off (TUI settings, web settings, or the toml above) to relabel sessions freely while running and to edit the directory name independently of the title.
 
 ## Editing the Workdir Name After Creation

@@ -18,7 +18,16 @@ async fn structured_purge_waits_for_a_pending_runner_retirement() -> anyhow::Res
     let control = Arc::new(FakeProcessControl::default());
     control.alive(4848);
     let gate = Gate::default();
-    let (launcher, deleted) = recording_gated_launcher(&gate, 4848, &row.id, "native-purge-id");
+    let (launcher, deleted) = recording_gated_launcher(
+        &gate,
+        4848,
+        &row.id,
+        "native-purge-id",
+        Some(crate::process::ProcessBirthIdentity {
+            boot_id: "fixture-boot".into(),
+            start_id: format!("gated-original-4848-{}", row.id),
+        }),
+    );
     let state = crate::server::test_support::build_test_app_state_impl(
         vec![row.clone()],
         Vec::new(),
@@ -32,7 +41,13 @@ async fn structured_purge_waits_for_a_pending_runner_retirement() -> anyhow::Res
                 .with_launcher(launcher)
         },
     );
-    let reservation = state.acp_supervisor.reserve_spawn(&row.id).await?;
+    let reservation = state
+        .acp_supervisor
+        .reserve_spawn(
+            &row.id,
+            crate::process::worker_registry::ResumeAuthority::Explicit,
+        )
+        .await?;
     let lease = reservation.lease().clone();
     let mut request = spawn_request(&row.id);
     request.source_profile = Some(row.source_profile.clone());
@@ -40,6 +55,7 @@ async fn structured_purge_waits_for_a_pending_runner_retirement() -> anyhow::Res
     let spawner = tokio::spawn(async move { supervisor.spawn_inner(request, reservation).await });
     gate.entered.notified().await;
     let retirement = state.acp_supervisor.capture_retirement(&row.id)?;
+    let identity = retirement.identity.expect("the gated runner was born");
     let finishing = super::delete::finish_structured_purge(&state, &row.id, &retirement);
     tokio::pin!(finishing);
     assert!(
@@ -56,7 +72,7 @@ async fn structured_purge_waits_for_a_pending_runner_retirement() -> anyhow::Res
     assert!(spawner.await?.is_err());
     assert!(deleted.load(Ordering::SeqCst));
     assert!(control.signals().contains(&(4848, "TERM")));
-    assert!(!control.is_alive(4848));
+    assert!(!control.is_alive(identity));
     assert!(worker_registry::load(&row.id)?.is_none());
     assert!(!state.acp_supervisor.is_owned(&row.id).await);
     Ok(())
@@ -289,6 +305,286 @@ async fn removed_row_pruning_keeps_held_and_queued_instance_and_submission_autho
 
 #[tokio::test]
 #[serial_test::serial]
+async fn committed_purge_settles_only_its_live_preconfiguration_producer() -> anyhow::Result<()> {
+    use crate::session::deletion::{DeletionRequest, PurgeTransaction};
+    for (tool, window, replacement) in [
+        ("claude", 0, false),
+        ("prime-agent", 0, false),
+        ("claude", 1, false),
+        ("prime-agent", 1, false),
+        ("claude", 2, false),
+        ("prime-agent", 2, false),
+        ("claude", 3, false),
+        ("prime-agent", 3, false),
+        ("claude", 4, false),
+        ("prime-agent", 4, false),
+        ("claude", 0, true),
+        ("prime-agent", 0, true),
+    ] {
+        let recovered = window != 0;
+        let _home = crate::session::test_support::isolate_app_dir();
+        crate::session::purge_owners::initialize(&crate::session::get_app_dir()?)?;
+        let mut row = Instance::new("preconfiguration producer", "");
+        let scratch = crate::session::scratch::provision_scratch_dir(&row.id)?;
+        row.project_path = scratch.to_string_lossy().into_owned();
+        row.scratch = true;
+        row.view = crate::session::View::Structured;
+        row.source_profile = "default".into();
+        row.tool = tool.into();
+        crate::server::test_support::seed_instances_on_disk_for_test("default", vec![row.clone()]);
+        let state = crate::server::test_support::build_test_app_state(vec![row.clone()]);
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+        let producer = state
+            .acp_supervisor
+            .reserve_spawn(
+                &row.id,
+                crate::process::worker_registry::ResumeAuthority::Explicit,
+            )
+            .await?;
+        let retirement = state.acp_supervisor.capture_retirement(&row.id)?;
+        assert!(retirement.identity.is_none());
+        assert_eq!(
+            retirement.prime,
+            crate::acp::runner_lifecycle::PrimeOwnership::Unresolved
+        );
+        let frozen = retirement.clone();
+        let request = DeletionRequest {
+            session_id: row.id.clone(),
+            instance: row.clone(),
+            delete_worktree: false,
+            delete_branch: false,
+            delete_sandbox: false,
+            force_delete: true,
+            detach_hooks: true,
+            keep_scratch: false,
+        };
+        let committed = tokio::task::spawn_blocking(move || {
+            let Ok(transaction) = PurgeTransaction::reserve_unwatched(request)? else {
+                anyhow::bail!("preconfiguration purge must reserve its row");
+            };
+            transaction
+                .begin_irreversible(Some(&frozen))
+                .map_err(|result| anyhow::anyhow!(result.errors.join("; ")))
+        })
+        .await??;
+        let mut committed = if recovered {
+            drop(committed);
+            tokio::task::spawn_blocking(|| {
+                crate::session::deletion::recover_committed_purge(
+                    &mut std::collections::HashSet::new(),
+                )
+            })
+            .await??
+            .expect("live producer owner must recover")
+        } else {
+            committed
+        };
+        if replacement {
+            drop(producer);
+            let newer = state
+                .acp_supervisor
+                .reserve_spawn(
+                    &row.id,
+                    crate::process::worker_registry::ResumeAuthority::Explicit,
+                )
+                .await?;
+            let mut current = state.acp_supervisor.capture_retirement(&row.id)?;
+            assert!(
+                committed.ensure_retirement_target(&mut current).is_err(),
+                "an old owner cannot cancel a newer producer epoch"
+            );
+            assert!(
+                super::delete::finish_structured_purge(&state, &row.id, &retirement)
+                    .await
+                    .is_err()
+            );
+            assert!(
+                !newer.lease().cancellation().is_cancelled(),
+                "a frozen old request cannot cancel an unborn replacement"
+            );
+            let storage = Storage::open_unwatched("default")?;
+            let mut newer_row = row.clone();
+            newer_row.title = "replacement row".into();
+            newer_row.lifecycle_generation += 2;
+            storage.update(|rows, _| {
+                rows.push(newer_row.clone());
+                Ok(())
+            })?;
+            committed.complete_retirement(&retirement)?;
+            assert!(
+                state
+                    .acp_supervisor
+                    .acknowledge_retirement(&retirement)
+                    .is_err(),
+                "an old durable receipt cannot acknowledge the newer lease"
+            );
+            let result =
+                tokio::task::spawn_blocking(move || committed.finish(|_, _| Ok(()))).await?;
+            assert!(
+                !result.success,
+                "positive old no-child proof cannot erase a replacement row"
+            );
+            assert!(scratch.exists());
+            assert_eq!(storage.load()?[0].title, "replacement row");
+            drop(newer);
+            continue;
+        }
+        let mut retirement = if recovered {
+            drop(retirement);
+            committed.capture_retirement_target(|id| {
+                state
+                    .acp_supervisor
+                    .capture_retirement(id)
+                    .map_err(Into::into)
+            })?
+        } else {
+            retirement
+        };
+        committed.ensure_retirement_target(&mut retirement)?;
+        committed.release_retirement_exclusion();
+        let cancellation = producer.lease().cancellation().clone();
+        let producer = if window == 4 {
+            drop(producer);
+            None
+        } else {
+            Some(producer)
+        };
+        let cleanup_state = state.clone();
+        let target = retirement.clone();
+        let id = row.id.clone();
+        let finishing = tokio::spawn(async move {
+            super::delete::finish_structured_purge(&cleanup_state, &id, &target).await
+        });
+        cancellation.cancelled().await;
+        if window != 4 {
+            assert!(
+                !finishing.is_finished(),
+                "cancellation alone must not finish a live producer"
+            );
+        }
+        let (mut committed, retirement) = if recovered {
+            if window >= 2 {
+                drop(producer);
+                finishing.await??;
+                committed.complete_retirement(&retirement)?;
+                if window == 2 {
+                    use crate::acp::runner_lifecycle::{
+                        LifecycleTable, PrimeOwnership, ResumeKind,
+                    };
+                    let epoch = retirement.lease.as_ref().unwrap().epoch();
+                    let mut restarted = LifecycleTable::new(epoch);
+                    let replacement = restarted.admit(&row.id, ResumeKind::Spawn).unwrap();
+                    assert_eq!(replacement.epoch(), epoch);
+                    restarted.begin_stop(&row.id, "user_stopped", true);
+                    assert!(restarted.abandon(&replacement));
+                    let mut foreign = crate::acp::supervisor::RetirementTarget {
+                        lease: Some(replacement.clone()),
+                        identity: None,
+                        scopes: Vec::new(),
+                        prime: PrimeOwnership::NotPrime,
+                        journalled: false,
+                    };
+                    assert!(committed.ensure_retirement_target(&mut foreign).is_err(),
+                        "same SID and numeric epoch in a new construction cannot borrow the old durable proof");
+                    assert!(scratch.exists());
+                    assert!(
+                        replacement.was_cancelled_before_birth(),
+                        "the foreign construction completed its own real cancellation barrier"
+                    );
+                    assert!(
+                        state
+                            .acp_supervisor
+                            .capture_retirement(&row.id)?
+                            .lease
+                            .is_some(),
+                        "rejected foreign authority cannot release the original journal debt"
+                    );
+                }
+                if window == 3 {
+                    state.acp_supervisor.acknowledge_retirement(&retirement)?;
+                }
+                drop(retirement);
+                drop(committed);
+            } else {
+                finishing.abort();
+                assert!(finishing.await.unwrap_err().is_cancelled());
+                drop(retirement);
+                drop(committed);
+                drop(producer);
+            }
+            let mut committed = tokio::task::spawn_blocking(|| {
+                crate::session::deletion::recover_committed_purge(
+                    &mut std::collections::HashSet::new(),
+                )
+            })
+            .await??
+            .expect("interrupted exact-epoch owner must recover");
+            let retirement = committed.capture_retirement_target(|id| {
+                state
+                    .acp_supervisor
+                    .capture_retirement(id)
+                    .map_err(Into::into)
+            })?;
+            super::delete::finish_structured_purge(&state, &row.id, &retirement).await?;
+            (committed, retirement)
+        } else {
+            drop(producer);
+            finishing.await??;
+            (committed, retirement)
+        };
+        if window != 3 {
+            assert!(
+                matches!(
+                    state
+                        .acp_supervisor
+                        .reserve_spawn(
+                            &row.id,
+                            crate::process::worker_registry::ResumeAuthority::Explicit
+                        )
+                        .await,
+                    Err(crate::acp::supervisor::SupervisorError::TeardownPending(_))
+                ),
+                "completed construction remains admission-fenced before durable acknowledgement"
+            );
+        }
+        committed.complete_retirement(&retirement)?;
+        state.acp_supervisor.acknowledge_retirement(&retirement)?;
+        let result = tokio::task::spawn_blocking(move || committed.finish(|_, _| Ok(()))).await?;
+        assert!(result.success, "{result:?}");
+        assert!(!scratch.exists());
+        assert!(Storage::open_unwatched("default")?.load()?.is_empty());
+        assert!(!state.acp_supervisor.is_owned(&row.id).await);
+        assert!(crate::session::deletion::recover_committed_purge(
+            &mut std::collections::HashSet::new()
+        )?
+        .is_none());
+        assert!(state
+            .acp_supervisor
+            .capture_retirement(&row.id)?
+            .lease
+            .is_none());
+        let next = state
+            .acp_supervisor
+            .reserve_spawn(
+                &row.id,
+                crate::process::worker_registry::ResumeAuthority::Explicit,
+            )
+            .await?;
+        drop(next);
+        assert!(
+            state
+                .acp_supervisor
+                .capture_retirement(&row.id)?
+                .lease
+                .is_none(),
+            "ordinary cancellation cannot retain a journal acknowledgement debt"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+#[serial_test::serial]
 async fn committed_structured_purge_releases_admission_exclusion_before_retirement(
 ) -> anyhow::Result<()> {
     use crate::acp::runner_lifecycle::{test_support::FakeProcessControl, ProcessControl};
@@ -296,7 +592,7 @@ async fn committed_structured_purge_releases_admission_exclusion_before_retireme
     use crate::session::deletion::{DeletionRequest, PurgeTransaction};
     let _home = crate::session::test_support::isolate_app_dir();
     crate::session::purge_owners::initialize(&crate::session::get_app_dir()?)?;
-    for recovered in [false, true] {
+    for (recovered, running) in [(false, false), (true, false), (false, true), (true, true)] {
         let mut row = Instance::new("purge admission", "");
         let scratch = crate::session::scratch::provision_scratch_dir(&row.id)?;
         row.project_path = scratch.to_string_lossy().into_owned();
@@ -307,8 +603,16 @@ async fn committed_structured_purge_releases_admission_exclusion_before_retireme
         let control = Arc::new(FakeProcessControl::default());
         control.alive(4849);
         let gate = Gate::default();
-        let (launcher, _) =
-            recording_gated_launcher(&gate, 4849, &row.id, "native-purge-admission");
+        let (launcher, _) = recording_gated_launcher(
+            &gate,
+            4849,
+            &row.id,
+            "native-purge-admission",
+            Some(crate::process::ProcessBirthIdentity {
+                boot_id: "fixture-boot".into(),
+                start_id: format!("gated-original-4849-{}", row.id),
+            }),
+        );
         let state = crate::server::test_support::build_test_app_state_impl(
             vec![row.clone()],
             Vec::new(),
@@ -323,13 +627,30 @@ async fn committed_structured_purge_releases_admission_exclusion_before_retireme
             },
         );
         crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
-        let reservation = state.acp_supervisor.reserve_spawn(&row.id).await?;
+        let reservation = state
+            .acp_supervisor
+            .reserve_spawn(
+                &row.id,
+                crate::process::worker_registry::ResumeAuthority::Explicit,
+            )
+            .await?;
         let mut request = spawn_request(&row.id);
         request.source_profile = Some(row.source_profile.clone());
         let supervisor = state.acp_supervisor.clone();
         let spawner =
             tokio::spawn(async move { supervisor.spawn_inner(request, reservation).await });
         gate.entered.notified().await;
+        let spawner = if running {
+            gate.open.notify_one();
+            spawner.await??;
+            assert_eq!(
+                state.acp_supervisor.worker_state(&row.id).await,
+                crate::daemon::AcpWorkerState::Running
+            );
+            None
+        } else {
+            Some(spawner)
+        };
         let deletion = DeletionRequest {
             session_id: row.id.clone(),
             instance: row.clone(),
@@ -341,6 +662,7 @@ async fn committed_structured_purge_releases_admission_exclusion_before_retireme
             keep_scratch: false,
         };
         let retirement = state.acp_supervisor.capture_retirement(&row.id)?;
+        let identity = retirement.identity.expect("the gated runner was born");
         let committed = tokio::task::spawn_blocking(move || {
             let Ok(transaction) = PurgeTransaction::reserve_unwatched(deletion)? else {
                 anyhow::bail!("purge must reserve the selected row");
@@ -362,7 +684,7 @@ async fn committed_structured_purge_releases_admission_exclusion_before_retireme
         } else {
             committed
         };
-        let retirement = if recovered {
+        let mut retirement = if recovered {
             committed.capture_retirement_target(|id| {
                 state
                     .acp_supervisor
@@ -372,6 +694,7 @@ async fn committed_structured_purge_releases_admission_exclusion_before_retireme
         } else {
             retirement
         };
+        committed.ensure_retirement_target(&mut retirement)?;
         committed.release_retirement_exclusion();
         let storage = Storage::open_unwatched("default")?;
         assert!(
@@ -383,20 +706,46 @@ async fn committed_structured_purge_releases_admission_exclusion_before_retireme
         gate.open.notify_one();
         assert!(!held, "committed purge must release the launch admission flock before retirement (recovered={recovered})");
         super::delete::finish_structured_purge(&state, &row.id, &retirement).await?;
-        assert!(matches!(
-            spawner.await?,
-            Err(crate::acp::supervisor::SupervisorError::SessionGone(_))
-        ));
+        if let Some(spawner) = spawner {
+            assert!(matches!(
+                spawner.await?,
+                Err(crate::acp::supervisor::SupervisorError::SessionGone(_))
+            ));
+        }
+        assert!(!control.is_alive(identity));
+        assert!(
+            matches!(
+                state
+                    .acp_supervisor
+                    .reserve_spawn(
+                        &row.id,
+                        crate::process::worker_registry::ResumeAuthority::Explicit,
+                    )
+                    .await,
+                Err(crate::acp::supervisor::SupervisorError::TeardownPending(_))
+            ),
+            "physical retirement must retain the journal fence until durable acknowledgement (running={running}, recovered={recovered})"
+        );
+        committed.complete_retirement(&retirement)?;
+        state.acp_supervisor.acknowledge_retirement(&retirement)?;
         let result = tokio::task::spawn_blocking(move || committed.finish(|_, _| Ok(()))).await?;
         assert!(result.success, "{result:?}");
         assert!(!scratch.exists());
-        assert!(!control.is_alive(4849));
+        assert!(!control.is_alive(identity));
         assert!(crate::process::worker_registry::load(&row.id)?.is_none());
         assert!(!state.acp_supervisor.is_owned(&row.id).await);
         assert!(crate::session::deletion::recover_committed_purge(
             &mut std::collections::HashSet::new()
         )?
         .is_none());
+        let next = state
+            .acp_supervisor
+            .reserve_spawn(
+                &row.id,
+                crate::process::worker_registry::ResumeAuthority::Explicit,
+            )
+            .await?;
+        drop(next);
     }
     Ok(())
 }
@@ -3859,6 +4208,124 @@ fn diff_repos_of_scopes_bases_per_workspace_repo() {
     assert_eq!(repos[0].recorded_base.as_deref(), Some("develop"));
 }
 
+/// #4574: a Working directory that is not itself a Repository gets a typed
+/// flag instead of a warning and a fake `main` base; every other path keeps
+/// today's response.
+#[tokio::test]
+#[serial_test::serial]
+async fn session_diff_files_flags_a_working_directory_outside_any_repository() {
+    use axum::body::to_bytes;
+    use axum::extract::Path as AxumPath;
+
+    let _guard = crate::session::test_support::isolate_app_dir();
+    let plain = tempfile::tempdir().unwrap();
+    let (repo, _repo) = crate::git::test_support::init_repo();
+    let subdir = repo.path().join("pkg");
+    std::fs::create_dir(&subdir).unwrap();
+    let broken_worktree = plain.path().join("broken-worktree");
+    std::fs::create_dir(&broken_worktree).unwrap();
+    std::fs::write(
+        broken_worktree.join(".git"),
+        "gitdir: /nonexistent/repo/.git/worktrees/w\n",
+    )
+    .unwrap();
+    let (unreadable, _unreadable_repo) = crate::git::test_support::init_repo();
+    let unreadable_git = unreadable.path().join(".git");
+    let set_mode = |mode| {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&unreadable_git, std::fs::Permissions::from_mode(mode)).unwrap();
+    };
+    set_mode(0o000);
+    let cases = [
+        // (label, Working directory, outside a Repository)
+        ("plain dir", plain.path().to_path_buf(), true),
+        // The diff never searches parents, so it cannot diff a subdirectory.
+        ("subdir of a repository", subdir, true),
+        ("repository root", repo.path().to_path_buf(), false),
+        ("missing dir", plain.path().join("gone"), false),
+        // Git metadata that exists but cannot be opened is not evidence of no Repository.
+        (
+            "linked worktree with a missing gitdir",
+            broken_worktree,
+            false,
+        ),
+        ("unreadable .git", unreadable.path().to_path_buf(), false),
+    ];
+    let instances: Vec<Instance> = cases
+        .iter()
+        .map(|(label, path, _)| Instance::new(label, path.to_str().unwrap()))
+        .collect();
+    let state = crate::server::test_support::build_test_app_state(instances.clone());
+
+    for ((label, path, outside), inst) in cases.iter().zip(&instances) {
+        let resp = session_diff_files(State(state.clone()), AxumPath(inst.id.clone()))
+            .await
+            .into_response();
+        let body = to_bytes(resp.into_body(), 1 << 16).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let base = &body["per_repo_bases"][0];
+        if *outside {
+            assert_eq!(base["outside_repository"], true, "{label}");
+            assert!(base.get("base_branch").is_none(), "{label}: no fake base");
+            assert!(body.get("warning").is_none(), "{label}");
+        } else {
+            assert!(base.get("outside_repository").is_none(), "{label}");
+            let base_branch = base["base_branch"].as_str().expect(label);
+            assert_eq!(
+                body["warning"].as_str().map(str::to_string),
+                crate::git::diff::check_merge_base_status(path, base_branch),
+                "{label}: warning unchanged"
+            );
+        }
+    }
+    set_mode(0o755);
+}
+
+/// #4574: the Web dashboard skips Diff auto-open for a Session outside any
+/// Repository. Worktree and workspace Sessions are Repositories by
+/// construction, and a path this host cannot see is never claimed as outside.
+#[test]
+fn session_response_flags_a_working_directory_outside_any_repository() {
+    let plain = tempfile::tempdir().unwrap();
+    let plain_path = plain.path().to_str().unwrap();
+    let (repo, _repo) = crate::git::test_support::init_repo();
+    let missing = plain.path().join("gone");
+
+    let mut in_worktree = Instance::new("t", plain_path);
+    in_worktree.worktree_info = Some(worktree("feature/x", "/src/only", None));
+    let mut in_workspace = Instance::new("t", plain_path);
+    in_workspace.workspace_info = Some(crate::session::WorkspaceInfo {
+        branch: "feature/x".to_string(),
+        workspace_dir: plain_path.to_string(),
+        repos: Vec::new(),
+        created_at: chrono::Utc::now(),
+        cleanup_on_delete: true,
+    });
+
+    let cases = [
+        ("plain dir", Instance::new("t", plain_path), true),
+        (
+            "repository root",
+            Instance::new("t", repo.path().to_str().unwrap()),
+            false,
+        ),
+        (
+            "missing dir",
+            Instance::new("t", missing.to_str().unwrap()),
+            false,
+        ),
+        ("worktree session", in_worktree, false),
+        ("workspace session", in_workspace, false),
+    ];
+    for (label, inst, outside) in cases {
+        assert_eq!(
+            SessionResponse::from_instance(&inst, false).outside_repository,
+            outside,
+            "{label}"
+        );
+    }
+}
+
 /// The PATCH write lands on exactly the named repo, and the unnamed
 /// target still writes the session field. See #3329.
 #[test]
@@ -6380,7 +6847,7 @@ async fn tied_rename_persist_failure_reports_actual_git_effects_without_rollback
     row.status = Status::Stopped;
     row.worktree_info = Some(worktree("old", main.to_string_lossy().into_owned(), None));
     let id = row.id.clone();
-    let (mut storage, state) = build_rename_test_state(vec![row.clone()], vec![row]);
+    let (storage, state) = build_rename_test_state(vec![row.clone()], vec![row]);
     crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
     let _failure = storage.fail_writes_for_test();
     let response = rename_session(
@@ -7485,6 +7952,114 @@ async fn post_create_raw(
         .await
         .unwrap();
     (status, code, serde_json::from_slice(&bytes).unwrap())
+}
+#[tokio::test]
+async fn scratch_create_resolves_profile_before_publication_and_purge() {
+    use axum::response::IntoResponse;
+
+    let _home = crate::session::test_support::isolate_app_dir();
+    crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
+    crate::session::config::update_config(|config| {
+        config.default_profile = "chosen-default".to_string();
+    })
+    .unwrap();
+    crate::session::config::update_app_state(|state| {
+        state.has_acknowledged_agent_hooks = true;
+    })
+    .expect("acknowledge the agent hook paths");
+
+    for profile in ["chosen-default", "explicit-other", "server-only"] {
+        crate::session::Storage::new_unwatched(profile).unwrap();
+    }
+
+    for (server_profile, requested_profile, expected_profile) in [
+        ("", None, Some("chosen-default")),
+        ("", Some(""), None),
+        ("", Some("explicit-other"), Some("explicit-other")),
+        ("server-only", None, Some("server-only")),
+    ] {
+        let (launcher, _launches) = crate::server::test_support::counting_failing_launcher();
+        let state = crate::server::test_support::build_test_app_state_impl(
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            None,
+            false,
+            |state| {
+                state.profile = std::sync::RwLock::new(crate::session::config::effective_profile(
+                    server_profile,
+                ));
+            },
+            |supervisor| supervisor.with_launcher(launcher),
+        );
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+        let mut body = serde_json::json!({
+            "title": "profile-scratch", "path": "", "tool": "claude",
+            "scratch": true, "view": "structured",
+        });
+        if let Some(profile) = requested_profile {
+            body["profile"] = profile.into();
+        }
+        let (status, session) = post_create(&state, body).await;
+        let Some(expected_profile) = expected_profile else {
+            assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{session}");
+            assert_eq!(session["error"], "profile_not_found");
+            assert!(state.instances.read().await.is_empty());
+            continue;
+        };
+        assert_eq!(status, axum::http::StatusCode::CREATED, "{session}");
+        let id = session["id"].as_str().unwrap();
+        wait_for("launcher-rejected startup", || {
+            state
+                .acp_event_store
+                .replay_from(id, 0)
+                .iter()
+                .any(|(_, event)| matches!(event, crate::acp::Event::AgentStartupError { .. }))
+        })
+        .await;
+
+        assert_eq!(session["profile"], expected_profile);
+        let path = std::path::PathBuf::from(session["project_path"].as_str().unwrap());
+        assert!(path.is_dir());
+        assert_eq!(
+            state
+                .instances
+                .read()
+                .await
+                .iter()
+                .find(|row| row.id == id)
+                .unwrap()
+                .source_profile,
+            expected_profile,
+        );
+
+        let response = delete_workspace(
+            State(state.clone()),
+            Some(Json(DeleteWorkspaceBody {
+                session_ids: vec![id.to_string()],
+                ..Default::default()
+            })),
+        )
+        .await
+        .into_response();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+        assert!(
+            !path.exists(),
+            "scratch directory survived permanent deletion"
+        );
+        assert!(state.instances.read().await.iter().all(|row| row.id != id));
+        assert!(crate::session::Storage::open_unwatched(expected_profile)
+            .unwrap()
+            .load()
+            .unwrap()
+            .iter()
+            .all(|row| row.id != id));
+    }
 }
 
 async fn wait_for(what: &str, mut ready: impl FnMut() -> bool) {

@@ -11,6 +11,7 @@ function makeState(data: Partial<WizardData> = {}): WizardState {
     groups: [],
     profiles: [],
     dockerAvailable: false,
+    dockerChecked: false,
   };
 }
 
@@ -101,9 +102,16 @@ describe("APPLY_PROFILE_DEFAULTS", () => {
     [
       "confirmed profile change",
       {},
-      [set("useStructuredView", true)],
-      defaults({ useStructuredView: false, resetStructuredViewDirty: true, skipIfDirty: undefined }),
+      [set("useStructuredView", true), { type: "RESET_STRUCTURED_VIEW_DIRTY" }],
+      defaults({ useStructuredView: false, skipIfDirty: undefined }),
       false,
+    ],
+    [
+      "view edited after confirmed profile selection",
+      {},
+      [set("useStructuredView", false), { type: "RESET_STRUCTURED_VIEW_DIRTY" }, set("useStructuredView", true)],
+      defaults({ useStructuredView: false, skipIfDirty: undefined }),
+      true,
     ],
     ["import", { importAcpSessionId: "abc" }, [], defaults({ useStructuredView: false }), true],
   ] as const)("seeds the configured view: %s", (_, data, edits, seed, view) => {

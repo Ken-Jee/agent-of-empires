@@ -267,7 +267,7 @@ fn fork_from_refusals_persist_nothing() {
             parent: Parent::Seeded("gemini"),
             title: "Parent",
             args: &["--tool", "gemini"],
-            expect: "Forkable agents: claude, codex, opencode",
+            expect: "no native fork capability",
         },
         Case {
             parent: Parent::Seeded("claude"),
@@ -430,7 +430,7 @@ fn fork_from_an_unattributed_parent_dispatches_against_the_configured_store() {
     let project = h.project_path();
     let store = h.home_path().join("claude-store");
     std::fs::create_dir_all(&store).unwrap();
-    h.set_env("CLAUDE_CONFIG_DIR", &store.display().to_string());
+    h.set_env("CLAUDE_CONFIG_DIR", store.as_os_str());
     h.run_cli_ok(&[
         "add",
         project.to_str().unwrap(),

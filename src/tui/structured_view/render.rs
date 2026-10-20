@@ -1077,9 +1077,17 @@ fn render_status(
     }
     // Plugin status-bar segments and this session's badges; icons, tooltips,
     // and links have no terminal surface.
-    for entry in plugin_ui::global_entries(&state.plugin_ui, UiSlot::StatusBar).chain(
-        plugin_ui::session_entries(&state.plugin_ui, UiSlot::DetailBadge, &state.session_id),
-    ) {
+    let chips = |slot| plugin_ui::by_order(plugin_ui::global_entries(&state.plugin_ui, slot));
+    let detail = plugin_ui::by_order(plugin_ui::session_entries(
+        &state.plugin_ui,
+        UiSlot::DetailBadge,
+        &state.session_id,
+    ));
+    for entry in chips(UiSlot::HeaderStart)
+        .into_iter()
+        .chain(chips(UiSlot::StatusBar))
+        .chain(detail)
+    {
         if let Some(text) = plugin_ui::entry_text(entry) {
             spans.push(Span::styled(
                 format!(" {text} "),
@@ -1971,6 +1979,43 @@ mod tests {
         state.transcript.session_notices.clear();
         state.prune_dismissed_notices();
         assert!(state.dismissed_notices.is_empty());
+    }
+
+    #[test]
+    fn notice_policy_hides_advisories_but_never_errors() {
+        use crate::session::config::{NoticeDisplay, NoticePolicy};
+
+        let notice = |id: &str, severity: &str| SessionNotice {
+            id: id.into(),
+            severity: severity.into(),
+            title: id.into(),
+            description: None,
+        };
+        let mut state = test_state();
+        state.transcript.session_notices = vec![
+            notice("info", "info"),
+            notice("warning", "warning"),
+            notice("error", "error"),
+        ];
+        let visible = |state: &StructuredViewState| -> Vec<String> {
+            state.visible_notices().map(|n| n.id.clone()).collect()
+        };
+
+        assert_eq!(visible(&state), ["info", "warning", "error"]);
+
+        for display in [NoticeDisplay::Hidden, NoticeDisplay::Timeout] {
+            state.notice_policy = NoticePolicy {
+                display,
+                timeout_secs: 0,
+            };
+            assert_eq!(visible(&state), ["error"], "{display:?}");
+        }
+
+        state.notice_policy = NoticePolicy {
+            display: NoticeDisplay::Timeout,
+            timeout_secs: 3600,
+        };
+        assert_eq!(visible(&state), ["info", "warning", "error"]);
     }
 
     fn line_text(line: &Line) -> String {

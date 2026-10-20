@@ -1452,18 +1452,20 @@ async fn finish_structured_restart(
                 };
             started.sandbox_info = sandbox_info;
             let prepared = (|| {
-                supervisor.forget_stale_cancel(&started.id);
-                let reservation = match tokio::runtime::Handle::current().block_on(
-                    supervisor.begin_resume(&started.id, crate::acp::supervisor::ResumeKind::Spawn),
-                )? {
-                    crate::acp::supervisor::ResumeReservationOutcome::Reserved(lease) => lease,
-                    crate::acp::supervisor::ResumeReservationOutcome::AlreadyPresent => {
-                        return Err(crate::acp::supervisor::SupervisorError::AlreadyRunning(
-                            started.id.clone(),
-                        )
-                        .into());
-                    }
-                };
+                let reservation =
+                    match tokio::runtime::Handle::current().block_on(supervisor.begin_resume(
+                        &started.id,
+                        crate::acp::supervisor::ResumeKind::Spawn,
+                        crate::process::worker_registry::ResumeAuthority::Explicit,
+                    ))? {
+                        crate::acp::supervisor::ResumeReservationOutcome::Reserved(lease) => lease,
+                        crate::acp::supervisor::ResumeReservationOutcome::AlreadyPresent => {
+                            return Err(crate::acp::supervisor::SupervisorError::AlreadyRunning(
+                                started.id.clone(),
+                            )
+                            .into());
+                        }
+                    };
                 if let Some(carry) = carry {
                     carry.run_for(&mut started)?;
                 }
@@ -1580,6 +1582,8 @@ async fn finish_structured_restart(
                                 &crate::server::session_service::SessionCaller::User,
                                 &id,
                                 crate::server::session_service::SendTurnRequest {
+                                    resume_authority:
+                                        crate::process::worker_registry::ResumeAuthority::Automatic,
                                     text: &wake,
                                     attachments: &[],
                                     woke_idle_dormant: false,

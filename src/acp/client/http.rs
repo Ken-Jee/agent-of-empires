@@ -588,16 +588,48 @@ impl HttpClient {
         check_resolve_status(res, session_id)
     }
 
-    /// Session title, resolved ACP agent, and path roots used by the native
-    /// structured view, projected from the shared `GET /api/sessions` read.
-    pub async fn session_view_info(
+    /// Read sessions with the endpoint's bearer token or passphrase session.
+    pub async fn list_sessions(
         &self,
-        session_id: &str,
-    ) -> Result<crate::acp::session_paths::SessionViewInfo, HttpError> {
-        let envelope = self
-            .endpoint
-            .daemon_client()?
-            .list_sessions(None)
+        state: Option<crate::session::SessionScope>,
+    ) -> Result<crate::daemon::SessionsEnvelope, HttpError> {
+        let had_cached_session = self.endpoint.bearer_token().is_none()
+            && self.passphrase_session.get(&self.endpoint).is_some();
+        match self.list_sessions_once(state).await {
+            Err(HttpError::Unauthorized) if had_cached_session => {
+                self.passphrase_session.invalidate(&self.endpoint);
+                self.list_sessions_once(state).await
+            }
+            result => result,
+        }
+    }
+
+    pub(crate) async fn daemon_client(&self) -> Result<crate::daemon::DaemonClient, HttpError> {
+        let base_url = &self.endpoint.base_url;
+        let client = if let Some(path) = self.endpoint.unix_path() {
+            crate::daemon::DaemonClient::new_unix(path)
+        } else if let Some(token) = self.endpoint.bearer_token() {
+            crate::daemon::DaemonClient::new(base_url, Some(token))
+        } else if self.endpoint.resolved_passphrase().is_some() {
+            let session = self.ensure_passphrase_session().await?;
+            crate::daemon::DaemonClient::with_session(
+                base_url,
+                &session.cookie,
+                &session.binding_secret,
+            )
+        } else {
+            crate::daemon::DaemonClient::new(base_url, None)
+        }?;
+        Ok(client)
+    }
+
+    async fn list_sessions_once(
+        &self,
+        state: Option<crate::session::SessionScope>,
+    ) -> Result<crate::daemon::SessionsEnvelope, HttpError> {
+        let client = self.daemon_client().await?;
+        client
+            .list_sessions(state)
             .await
             .map_err(|error| match error {
                 crate::daemon::DaemonClientError::Status { status, .. }
@@ -606,7 +638,15 @@ impl HttpClient {
                     HttpError::Unauthorized
                 }
                 error => HttpError::Daemon(error),
-            })?;
+            })
+    }
+
+    /// Title, resolved agent, and path roots, from the shared session list.
+    pub async fn session_view_info(
+        &self,
+        session_id: &str,
+    ) -> Result<crate::acp::session_paths::SessionViewInfo, HttpError> {
+        let envelope = self.list_sessions(None).await?;
         envelope
             .sessions
             .into_iter()
@@ -637,6 +677,24 @@ impl HttpClient {
             .acp_compaction_reminder
             .then_some(about.acp_compaction_reminder_percent)
             .filter(|pct| (1..=99).contains(pct)))
+    }
+
+    /// The daemon's notice display policy, for the same reason as
+    /// [`Self::compaction_reminder`].
+    pub async fn notice_policy(&self) -> Result<crate::session::config::NoticePolicy, HttpError> {
+        #[derive(serde::Deserialize)]
+        struct NoticeAbout {
+            acp_notice_display: crate::session::config::NoticeDisplay,
+            acp_notice_timeout_secs: u32,
+        }
+        let url = format!("{}/api/about", self.endpoint.base_url);
+        let response = self.execute(self.http.get(&url)).await?;
+        let response = check_status(response, "<about>")?;
+        let about = crate::daemon::decode_json::<NoticeAbout>(response).await?;
+        Ok(crate::session::config::NoticePolicy {
+            display: about.acp_notice_display,
+            timeout_secs: about.acp_notice_timeout_secs,
+        })
     }
 
     /// Lightweight reachability probe used by `require_daemon` (when
@@ -1446,5 +1504,43 @@ mod tests {
                 crate::daemon::DaemonClientError::InvalidPathSegment
             ))
         ));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn session_list_logs_in_renews_once_and_fails_clearly() {
+        use super::passphrase_session::test_daemon::{TestDaemon, PASSPHRASE};
+        let _env = crate::session::test_support::EnvGuard::unset(&["AOE_DAEMON_PASSPHRASE"]);
+
+        let daemon = TestDaemon::start(PASSPHRASE).await;
+        let client = HttpClient::new(daemon.endpoint.clone()).unwrap();
+
+        let info = client.session_view_info("s-1").await.unwrap();
+        assert_eq!(info.title, "one");
+        assert_eq!(daemon.logins(), 1);
+        let requests = daemon.list_requests();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0]
+            .0
+            .as_deref()
+            .is_some_and(|c| c.starts_with("aoe_session=")));
+        assert!(requests[0].1.is_some());
+
+        // Cached session is reused without another login.
+        client.list_sessions(None).await.unwrap();
+        assert_eq!(daemon.logins(), 1);
+
+        // Expired session: one re-login, one retry.
+        daemon.expire_session();
+        client.list_sessions(None).await.unwrap();
+        assert_eq!(daemon.logins(), 2);
+
+        // Wrong passphrase: a single login attempt and a clear 401.
+        let wrong = TestDaemon::start("other").await;
+        let client = HttpClient::new(wrong.endpoint.clone()).unwrap();
+        let error = client.list_sessions(None).await.unwrap_err();
+        assert!(matches!(error, HttpError::Unauthorized), "{error}");
+        assert_eq!(wrong.logins(), 1);
+        assert!(!error.to_string().contains(PASSPHRASE));
     }
 }

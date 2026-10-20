@@ -412,10 +412,16 @@ impl Instance {
         conversation_carry: Option<ConversationCarry>,
         expected: ConversationState,
     ) -> Result<PreparedLaunch> {
+        let publication = if restart {
+            self.prime_root_publication(true)
+        } else {
+            None
+        };
         if restart {
             self.kill_clean_locked()?;
         }
         if let Some(carry) = conversation_carry {
+            self.absorb_published_prime_session(publication);
             // Only the default conversation may be refreshed from a final
             // observation: under Use/Fork/Cleared the launch names a specific
             // conversation, and an outgoing sidecar must not rebind it
@@ -442,13 +448,17 @@ impl Instance {
             if let Some(binding) = excluded {
                 self.retroactive_capture_excludes.remove(&binding);
             }
-            prepared.carry_relocated = relocated;
+            prepared.require_conversation_publication |= relocated;
             return Ok(prepared);
         }
         let stores = CaptureStorage::Scoped(storage);
         let prepared = self.prepare_launch_command_in(stores, expected)?;
         if restart {
-            return self.refresh_prepared_prime_launch_after_pane_stop_in(stores, prepared);
+            return self.refresh_prepared_prime_launch_after_pane_stop_in(
+                stores,
+                prepared,
+                publication,
+            );
         }
         Ok(prepared)
     }
@@ -1016,8 +1026,18 @@ mod tests {
                 .unwrap()
                 .launch_base_command();
             let base_command = command.clone();
-            let resumed =
-                inst.apply_session_flags(&mut command, "test", inst.resolved_agent(), None);
+            let resumed = inst.apply_session_flags(
+                &mut command,
+                inst.resolved_agent(),
+                None,
+                &super::execution::AgentLaunchContext::host(
+                    inst.resolved_agent(),
+                    inst.default_selector_agent()
+                        .and_then(|agent| inst.host_agent_command(agent, None))
+                        .as_ref(),
+                ),
+                &mut inst.conversation_state(),
+            );
             if resume_supported {
                 assert!(resumed.unwrap(), "{tool}: launch resume decision");
                 assert_ne!(command, base_command, "{tool}: resume selector missing");

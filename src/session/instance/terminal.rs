@@ -410,6 +410,7 @@ impl Instance {
                     ownership = Some((title, lifecycle));
                     store.check_available()?;
                     instance.reconcile_from_store(store)?;
+                    instance.ensure_startable()?;
                     anyhow::ensure!(
                         instance
                             .lifecycle_reservation_is_owned(LifecycleOperation::Launch, generation),
@@ -452,6 +453,7 @@ impl Instance {
                     &env_part,
                 )),
                 &resolver_command,
+                true,
             );
 
             // Values ride the protected env-file, never the host shell or runtime
@@ -760,7 +762,8 @@ exec /usr/bin/env -i PATH="$TARGET_PATH" SHELL="$FALLBACK_SHELL" "$@"
             ),
         ] {
             let args_file = temp.path().join(format!("args-{binary}"));
-            let command = runtime.exec_command("test-container", Some(&options), &resolver_command);
+            let command =
+                runtime.exec_command("test-container", Some(&options), &resolver_command, true);
             let output = Command::new("/bin/sh")
                 .args(["-c", &command])
                 .env_clear()

@@ -1937,6 +1937,26 @@ fn tui_serve_dialog_escape_returns_home() {
     h.wait_for("No sessions yet");
 }
 
+/// Core-only runtime leaves Web idle; promotion requires explicit TUI reconnect.
+#[test]
+#[parallel]
+fn tui_footer_web_entry_tracks_core_to_web_promotion() {
+    require_tmux!();
+    let what = if cfg!(feature = "web") { "Web" } else { "API" };
+    let mut h = TuiTestHarness::new("serve_footer_entry");
+    h.stop_daemon_on_drop();
+    h.spawn_tui();
+    h.wait_for(" aoe ");
+    h.wait_for(&format!("R {what}"));
+    assert!(!h.capture_screen().contains(&format!("R \u{25CF} {what}")));
+
+    h.start_daemon();
+    h.wait_for("Runtime unavailable");
+    h.send_keys("r");
+    h.wait_for_absent("Runtime unavailable", Duration::from_secs(10));
+    h.wait_for(&format!("R \u{25CF} {what}"));
+}
+
 /// `aoe serve --daemon` must spawn a child that actually binds the port and
 /// stays alive. Regression guard for the self-detection bug where the parent
 /// pre-wrote the child's PID into `serve.pid`, then the child re-entered
@@ -3357,7 +3377,7 @@ fn cli_plugin_enable_disable_steps_up_an_unelevated_passphrase_session() {
         "daemon never bound port {port}"
     );
 
-    h.set_env("AOE_DAEMON_URL", &format!("http://127.0.0.1:{port}"));
+    h.set_env("AOE_DAEMON_URL", format!("http://127.0.0.1:{port}"));
     h.set_env("AOE_DAEMON_PASSPHRASE", "e2e-pass");
     let disable = h.run_cli(&["plugin", "disable", "aoe.web"]);
     let disable_stdout = String::from_utf8_lossy(&disable.stdout);

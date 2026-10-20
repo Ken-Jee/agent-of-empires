@@ -4,7 +4,9 @@
 use crate::file_watch::{FileMatcher, WatchSpec};
 use std::sync::Arc;
 
-use super::reload::{load_all_profiles, reload_state_instances_from_disk};
+#[cfg(test)]
+use super::reload::load_all_profiles;
+use super::reload::reload_state_instances_from_disk;
 use super::state::{AppState, DiskWatchEntry, StatusSource};
 use super::structured_repair::live_structured_worker_records;
 
@@ -273,22 +275,13 @@ pub(super) async fn disk_watcher_consumer(state: Arc<AppState>) {
             .load(std::sync::atomic::Ordering::SeqCst);
         let file_watch_for_load = state.file_watch.clone();
         let loaded = match tokio::task::spawn_blocking(move || {
-            let fresh = load_all_profiles(&file_watch_for_load);
+            let fresh = super::reload::load_profiles_for_reload(&file_watch_for_load);
             drop(snapshot_guard);
-            fresh.map(|fresh| (fresh, live_structured_worker_records()))
+            (fresh, live_structured_worker_records())
         })
         .await
         {
-            Ok(Ok(v)) => v,
-            Ok(Err(e)) => {
-                tracing::warn!(
-                    target: "server.file_watch",
-                    error = %e,
-                    "disk reload failed"
-                );
-                state.mark_reload_failure(e.health).await;
-                continue;
-            }
+            Ok(value) => value,
             Err(e) => {
                 tracing::warn!(
                     target: "server.file_watch",
@@ -304,15 +297,15 @@ pub(super) async fn disk_watcher_consumer(state: Arc<AppState>) {
                 continue;
             }
         };
-        let (fresh, live_worker_records) = loaded;
+        let ((fresh, metadata), live_worker_records) = loaded;
         let count = fresh.instances.len();
         reload_state_instances_from_disk(
             &state,
-            fresh.instances,
+            fresh,
             live_worker_records,
             StatusSource::DiskOnly,
             read_epoch,
-            fresh.metadata,
+            metadata,
             Default::default(),
         )
         .await;
@@ -549,14 +542,14 @@ mod tests {
         let fresh = tokio::task::spawn_blocking(move || load_all_profiles(&file_watch))
             .await
             .expect("join")
-            .expect("load");
+            .expect("load profiles");
         reload_state_instances_from_disk(
             &state,
-            fresh.instances,
+            fresh.instances.into(),
             Vec::new(),
             StatusSource::DiskOnly,
             read_epoch,
-            fresh.metadata,
+            Ok(fresh.metadata),
             Default::default(),
         )
         .await;
@@ -594,16 +587,14 @@ mod tests {
             .mutation_epoch
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
+        let metadata = state.canonical_metadata.read().await.clone();
         reload_state_instances_from_disk(
             &state,
-            stale_snapshot,
+            stale_snapshot.into(),
             Vec::new(),
             StatusSource::DiskOnly,
             read_epoch,
-            {
-                let metadata = state.canonical_metadata.read().await.clone();
-                metadata
-            },
+            Ok(metadata),
             Default::default(),
         )
         .await;
@@ -637,19 +628,21 @@ mod tests {
             .mutation_epoch
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
-        reload_state_instances_from_disk(
-            &state,
-            stale_snapshot.clone(),
-            Vec::new(),
-            StatusSource::DiskOnly,
-            0,
-            {
-                let metadata = state.canonical_metadata.read().await.clone();
-                metadata
-            },
-            Default::default(),
+        let metadata = state.canonical_metadata.read().await.clone();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            reload_state_instances_from_disk(
+                &state,
+                stale_snapshot.clone().into(),
+                Vec::new(),
+                StatusSource::DiskOnly,
+                0,
+                Ok(metadata),
+                Default::default(),
+            ),
         )
-        .await;
+        .await
+        .expect("stale create reload did not finish within 30 seconds");
 
         let titles: Vec<String> = state
             .instances
@@ -669,19 +662,21 @@ mod tests {
         let unbumped = test_support::build_test_app_state(vec![existing.clone(), created.clone()]);
         let mut current_snapshot = stale_snapshot;
         current_snapshot.push(Instance::new("created-elsewhere", "/tmp/elsewhere"));
-        reload_state_instances_from_disk(
-            &unbumped,
-            current_snapshot,
-            Vec::new(),
-            StatusSource::DiskOnly,
-            0,
-            {
-                let metadata = unbumped.canonical_metadata.read().await.clone();
-                metadata
-            },
-            Default::default(),
+        let metadata = unbumped.canonical_metadata.read().await.clone();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            reload_state_instances_from_disk(
+                &unbumped,
+                current_snapshot.into(),
+                Vec::new(),
+                StatusSource::DiskOnly,
+                0,
+                Ok(metadata),
+                Default::default(),
+            ),
         )
-        .await;
+        .await
+        .expect("current create reload did not finish within 30 seconds");
         let titles: Vec<String> = unbumped
             .instances
             .read()
@@ -714,16 +709,14 @@ mod tests {
 
         let reload_state = Arc::clone(&state);
         let reload = async move {
+            let metadata = reload_state.canonical_metadata.read().await.clone();
             reload_state_instances_from_disk(
                 &reload_state,
-                stale_snapshot,
+                stale_snapshot.into(),
                 Vec::new(),
                 StatusSource::DiskOnly,
                 read_epoch,
-                {
-                    let metadata = reload_state.canonical_metadata.read().await.clone();
-                    metadata
-                },
+                Ok(metadata),
                 Default::default(),
             )
             .await;

@@ -210,7 +210,7 @@ pub struct SessionService {
     /// the other two: the drains hold `prompt_locks` across `send_turn` and
     /// then call this path, so reusing either would self-deadlock.
     persist_locks: RwLock<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
-    /// Shared by queue transactions, exclusive for disk sampling and reload application.
+    /// Shared by mirrored mutations, exclusive for disk sampling and reload application.
     reload_gate: Arc<RwLock<()>>,
     /// Per-session prompt-submission locks. See
     /// [`SessionService::prompt_submission`].
@@ -328,6 +328,7 @@ pub(crate) enum PromptTouch {
 /// session id, bundled so the function stays under clippy's argument-count
 /// lint.
 pub(crate) struct SendTurnRequest<'a> {
+    pub resume_authority: crate::process::worker_registry::ResumeAuthority,
     pub text: &'a str,
     pub attachments: &'a [crate::acp::event_store::AttachmentBlob],
     /// Forces the resume trigger even when the worker looks alive, mirroring
@@ -838,6 +839,7 @@ impl SessionService {
         turn: SendTurnRequest<'_>,
     ) -> Result<(), SendTurnError> {
         let SendTurnRequest {
+            resume_authority,
             text,
             attachments,
             woke_idle_dormant,
@@ -863,13 +865,24 @@ impl SessionService {
             }
             (inst.acp_mode_id.clone(), inst.yolo_mode)
         };
+        if resume_authority == crate::process::worker_registry::ResumeAuthority::Automatic
+            && crate::process::worker_registry::stop_requested(id)
+        {
+            return Err(SendTurnError::RevivalRefused);
+        }
         // Resume a worker that is not currently live.
         let needs_resume = woke_idle_dormant || !self.acp_supervisor.is_running(id).await;
         if no_revive && needs_resume {
             return Err(SendTurnError::RevivalRefused);
         }
         if needs_resume {
-            match crate::server::acp_reconciler::trigger_resume_background(self, id).await {
+            match crate::server::acp_reconciler::trigger_resume_background(
+                self,
+                id,
+                resume_authority,
+            )
+            .await
+            {
                 Ok(ResumeTrigger::NotFound) => return Err(SendTurnError::SessionNotFound),
                 Ok(_) => {}
                 Err(e) => return Err(SendTurnError::ResumeFailed(e)),
@@ -895,8 +908,12 @@ impl SessionService {
                 }
             }
         }
-        // Publish the user's prompt into the event stream BEFORE forwarding to the agent so
-        // the replay buffer / on-disk store captures it even if the agent forward fails.
+        if resume_authority == crate::process::worker_registry::ResumeAuthority::Automatic
+            && crate::process::worker_registry::stop_requested(id)
+        {
+            return Err(SendTurnError::RevivalRefused);
+        }
+        // Persist the admitted turn before forwarding it to the agent.
         let disposition = self
             .acp_supervisor
             .publish_user_prompt_with_attachments(
@@ -1019,6 +1036,7 @@ impl SessionService {
                 &caller,
                 id,
                 SendTurnRequest {
+                    resume_authority: crate::process::worker_registry::ResumeAuthority::Automatic,
                     text: &text,
                     attachments: &attachments,
                     woke_idle_dormant: false,
@@ -1186,6 +1204,11 @@ impl SessionService {
     /// Hold through epoch sampling and disk load, or through reload application.
     pub(super) async fn disk_reload_guard(&self) -> tokio::sync::OwnedRwLockWriteGuard<()> {
         Arc::clone(&self.reload_gate).write_owned().await
+    }
+
+    /// Exclude disk sampling and reload application through a mirrored mutation.
+    pub(super) async fn disk_mutation_guard(&self) -> tokio::sync::OwnedRwLockReadGuard<()> {
+        Arc::clone(&self.reload_gate).read_owned().await
     }
 
     /// Apply `mutate` to a session's in-memory `Instance`, then mirror the
@@ -1643,6 +1666,7 @@ impl SessionService {
                 &caller,
                 id,
                 SendTurnRequest {
+                    resume_authority: crate::process::worker_registry::ResumeAuthority::Automatic,
                     text: &combined,
                     attachments: &attachments,
                     woke_idle_dormant: false,
@@ -2623,6 +2647,8 @@ mod tests {
                     &cron,
                     "sess-user",
                     SendTurnRequest {
+                        resume_authority:
+                            crate::process::worker_registry::ResumeAuthority::Explicit,
                         text: "hi",
                         attachments: &[],
                         woke_idle_dormant: false,
@@ -2640,6 +2666,8 @@ mod tests {
                     &other,
                     "sess-cron",
                     SendTurnRequest {
+                        resume_authority:
+                            crate::process::worker_registry::ResumeAuthority::Explicit,
                         text: "hi",
                         attachments: &[],
                         woke_idle_dormant: false,
@@ -2657,6 +2685,8 @@ mod tests {
                     &cron,
                     "sess-gone",
                     SendTurnRequest {
+                        resume_authority:
+                            crate::process::worker_registry::ResumeAuthority::Explicit,
                         text: "hi",
                         attachments: &[],
                         woke_idle_dormant: false,
@@ -2678,6 +2708,8 @@ mod tests {
                     &cron,
                     "sess-cron",
                     SendTurnRequest {
+                        resume_authority:
+                            crate::process::worker_registry::ResumeAuthority::Explicit,
                         text: "hi",
                         attachments: &[],
                         woke_idle_dormant: false,
@@ -2695,6 +2727,8 @@ mod tests {
                     &SessionCaller::User,
                     "sess-user",
                     SendTurnRequest {
+                        resume_authority:
+                            crate::process::worker_registry::ResumeAuthority::Explicit,
                         text: "hi",
                         attachments: &[],
                         woke_idle_dormant: false,
@@ -2729,7 +2763,60 @@ mod tests {
             "drain must release its claim on the no-op paths"
         );
     }
-
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_stopped_running_worker_keeps_queued_prompts_instead_of_delivering_them() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let id = "stopped-queue";
+        let mut row = Instance::new("stopped", "/tmp/aoe-stopped-queue");
+        row.id = id.into();
+        row.view = crate::session::View::Structured;
+        row.status = crate::session::Status::Idle;
+        let service = crate::server::test_support::build_test_app_state(vec![row])
+            .session_service
+            .clone();
+        let commands = service
+            .acp_supervisor
+            .test_insert_worker_cmd_recording(id)
+            .await;
+        let record = crate::process::worker_registry::WorkerRecord::new(
+            id.into(),
+            std::process::id(),
+            crate::process::worker_registry::socket_path_for(id).unwrap(),
+            "agent".into(),
+            "agent".into(),
+            "/tmp".into(),
+            None,
+            Vec::new(),
+            Vec::new(),
+            None,
+            None,
+        );
+        crate::process::worker_registry::save(&record).unwrap();
+        crate::process::worker_registry::request_stop(&record).unwrap();
+        let queued = service
+            .enqueue_prompt(
+                id,
+                "pending".into(),
+                "keep this turn queued".into(),
+                Vec::new(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(service.acp_supervisor.is_running(id).await);
+        service.drain_queued_prompts_once(id).await;
+        let retained = service.queued_prompts_snapshot(id).await;
+        assert_eq!(
+            retained
+                .iter()
+                .map(|row| (&row.id, &row.text))
+                .collect::<Vec<_>>(),
+            vec![(&queued.id, &queued.text)]
+        );
+        assert!(commands.lock().unwrap().is_empty());
+    }
     /// The drain must not deliver into a turn prompt dispatch parked the
     /// prompt behind.
     ///
@@ -2865,7 +2952,11 @@ mod tests {
         // Hold the reservation for the whole probe so no worker can land.
         let reservation = match service
             .acp_supervisor
-            .begin_resume("sess-3621", ResumeKind::Spawn)
+            .begin_resume(
+                "sess-3621",
+                ResumeKind::Spawn,
+                crate::process::worker_registry::ResumeAuthority::Automatic,
+            )
             .await
             .expect("begin_resume must not error under capacity")
         {
@@ -3410,10 +3501,7 @@ mod tests {
                         std::fs::rename(&saved_path, storage.sessions_path()).unwrap();
                     }
                     let metadata = state.canonical_metadata.read().await.clone();
-                    crate::server::reload::reload_state_instances_from_disk(
-                        &state, stale, vec![], crate::server::state::StatusSource::DiskOnly, read_epoch,
-                        metadata, Default::default(),
-                    ).await;
+                    crate::server::reload::reload_state_instances_from_disk(&state, (stale).into(), vec![], crate::server::state::StatusSource::DiskOnly, read_epoch, Ok(metadata), Default::default()).await;
                     assert_eq!(ids(&service.queued_prompts_snapshot(&id).await), ["A"], "stale reload, cancel={cancel}");
                     let b = match successor.take() {
                         Some(b) => tokio::time::timeout(Duration::from_secs(10), b).await.unwrap(),
@@ -3426,10 +3514,7 @@ mod tests {
                     assert_eq!(ids(&fresh[0].queued_prompts), ["A", "B"]);
                     let metadata = state.canonical_metadata.read().await.clone();
                     drop(guard);
-                    crate::server::reload::reload_state_instances_from_disk(
-                        &state, fresh, vec![], crate::server::state::StatusSource::DiskOnly, epoch,
-                        metadata, Default::default(),
-                    ).await;
+                    crate::server::reload::reload_state_instances_from_disk(&state, (fresh).into(), vec![], crate::server::state::StatusSource::DiskOnly, epoch, Ok(metadata), Default::default()).await;
                     let memory = state.instances.read().await;
                     assert_eq!(ids(&memory[0].queued_prompts), ["A", "B"]);
                     assert_eq!(memory[0].title, "disk title", "fresh reload must apply, cancel={cancel}");
@@ -3443,7 +3528,6 @@ mod tests {
     fn reload_during_queue_persistence_keeps_acknowledged_prompts() {
         use std::{future::Future, task::Poll, time::Duration};
 
-        let _app_dir = crate::session::test_support::isolate_app_dir();
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .max_blocking_threads(1)
@@ -3455,6 +3539,7 @@ mod tests {
                 };
                 let mut outcomes = Vec::new();
                 for apply_before_completion in [true, false] {
+                    let _app_dir = crate::session::test_support::isolate_app_dir();
                     let mut inst = Instance::new("reload-queue", "/tmp/aoe-reload-queue");
                     inst.source_profile = "default".into();
                     inst.view = crate::session::View::Structured;
@@ -3464,7 +3549,24 @@ mod tests {
                         *rows = vec![inst.clone()];
                         Ok(())
                     }).unwrap();
+                    let outside = tempfile::tempdir().unwrap();
+                    let root = crate::session::get_profile_dir_path("default").unwrap()
+                        .parent().unwrap().to_path_buf();
+                    std::os::unix::fs::symlink(outside.path(), root.join("external-old")).unwrap();
+                    let alias_path = outside.path().join("sessions.json");
+                    let mut alias = Instance::new("alias accepted", "/tmp/aoe-reload-alias");
+                    std::fs::write(&alias_path, serde_json::to_vec(std::slice::from_ref(&alias)).unwrap()).unwrap();
                     let state = crate::server::test_support::build_test_app_state(vec![inst]);
+                    crate::server::test_support::accept_runtime_read_cache_for_test(&state).await;
+                    storage.update(|rows, _| {
+                        rows[0].title = "canonical sampled".into();
+                        Ok(())
+                    }).unwrap();
+                    alias.title = "alias sampled".into();
+                    std::fs::write(&alias_path, serde_json::to_vec(std::slice::from_ref(&alias)).unwrap()).unwrap();
+                    std::fs::rename(root.join("external-old"), root.join("external-new")).unwrap();
+                    let unreadable = crate::session::get_profile_dir("unreadable").unwrap();
+                    std::fs::write(unreadable.join("sessions.json"), b"[").unwrap();
                     let service = &state.session_service;
                     let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
                     let (release_tx, release_rx) = std::sync::mpsc::channel();
@@ -3481,14 +3583,15 @@ mod tests {
                         Poll::Ready(())
                     }).await;
                     let read_epoch = state.mutation_epoch.load(std::sync::atomic::Ordering::SeqCst);
-                    let fresh = storage.load().unwrap();
+                    let (fresh, fresh_metadata) = crate::server::reload::load_profiles_for_reload(&state.file_watch);
                     assert_eq!(contents(&service.queued_prompts_snapshot(&id).await), [("A".into(), 0)]);
-                    assert!(fresh[0].queued_prompts.is_empty());
-                    let metadata = state.canonical_metadata.read().await.clone();
-                    let mut reload = Box::pin(crate::server::reload::reload_state_instances_from_disk(
-                        &state, fresh, vec![], crate::server::state::StatusSource::DiskOnly, read_epoch,
-                        metadata, Default::default(),
-                    ));
+                    assert!(fresh.instances[0].queued_prompts.is_empty());
+                    assert_eq!(fresh.instances[0].title, "canonical sampled");
+                    assert_eq!(fresh.cache.alias_only_instances[0].title, "alias sampled");
+                    assert_eq!(fresh.cache.alias_only_instances[0].source_profile, "external-new");
+                    assert!(fresh.cache.health.unreadable_profiles.contains("unreadable"));
+                    assert_eq!(fresh.cache.inventory.iter().map(|profile| profile.name.as_str()).collect::<Vec<_>>(), ["default", "external-new", "unreadable"]);
+                    let mut reload = Box::pin(crate::server::reload::reload_state_instances_from_disk(&state, fresh, vec![], crate::server::state::StatusSource::DiskOnly, read_epoch, fresh_metadata, Default::default()));
                     let applied = if apply_before_completion {
                         std::future::poll_fn(|cx| Poll::Ready(reload.as_mut().poll(cx).is_ready())).await
                     } else {
@@ -3504,8 +3607,37 @@ mod tests {
                     if !applied {
                         tokio::time::timeout(Duration::from_secs(10), reload).await.unwrap();
                     }
+                    {
+                        let rows = state.instances.read().await;
+                        let cache = state.runtime_read_cache.read().unwrap();
+                        assert_eq!(rows[0].title, "reload-queue", "stale canonical row must not publish");
+                        assert_eq!(contents(&rows[0].queued_prompts), [("A".into(), 0)]);
+                        assert_eq!(cache.alias_only_instances[0].title, "alias accepted");
+                        assert_eq!(cache.alias_only_instances[0].source_profile, "external-old");
+                        assert!(!cache.health.enumeration_failed);
+                        assert!(cache.health.unreadable_profiles.is_empty());
+                        assert_eq!(cache.inventory.iter().map(|profile| profile.name.as_str()).collect::<Vec<_>>(), ["default", "external-old"]);
+                    }
                     let _submission = service.prompt_submission(&id).await;
                     service.enqueue_prompt(&id, "B".into(), "second".into(), vec![], None, None).await.unwrap();
+                    let snapshot_guard = service.disk_reload_guard().await;
+                    let epoch = state.mutation_epoch.load(std::sync::atomic::Ordering::SeqCst);
+                    let (fresh, fresh_metadata) = crate::server::reload::load_profiles_for_reload(&state.file_watch);
+                    drop(snapshot_guard);
+                    crate::server::reload::reload_state_instances_from_disk(&state, fresh, vec![], crate::server::state::StatusSource::DiskOnly, epoch, fresh_metadata, Default::default()).await;
+                    {
+                        let rows = state.instances.read().await;
+                        let cache = state.runtime_read_cache.read().unwrap();
+                        assert_eq!(rows[0].title, "canonical sampled", "following reload must publish");
+                        assert_eq!(cache.alias_only_instances[0].title, "alias sampled");
+                        assert_eq!(cache.alias_only_instances[0].source_profile, "external-new");
+                        assert!(!cache.health.enumeration_failed);
+                        assert_eq!(cache.health.unreadable_profiles, std::collections::HashSet::from(["unreadable".to_owned()]));
+                        assert_eq!(cache.inventory.iter().map(|profile| profile.name.as_str()).collect::<Vec<_>>(), ["default", "external-new", "unreadable"]);
+                    }
+                    assert!(matches!(*state.canonical_health.read().await, crate::daemon::RuntimeHealth::Degraded { .. }));
+                    let snapshot = state.runtime.publish(&state).await.unwrap();
+                    assert!(!snapshot.value.contents.capabilities.mutations);
                     let memory = contents(&service.queued_prompts_snapshot(&id).await);
                     let disk = contents(&storage.load().unwrap()[0].queued_prompts);
                     eprintln!("apply_before_completion={apply_before_completion}, captured_epoch={read_epoch}, during={during:?}, memory={memory:?}, disk={disk:?}");
@@ -3600,11 +3732,11 @@ mod tests {
             mutate(Arc::clone(&state.session_service)).await;
             crate::server::reload::reload_state_instances_from_disk(
                 &state,
-                vec![inst],
+                vec![inst].into(),
                 vec![],
                 crate::server::state::StatusSource::DiskOnly,
                 read_epoch,
-                metadata,
+                Ok(metadata),
                 std::collections::HashMap::new(),
             )
             .await;

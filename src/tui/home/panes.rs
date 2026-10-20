@@ -423,4 +423,17 @@ impl HomeView {
             _ => TerminalMode::Host,
         }
     }
+
+    /// Use the canonical observation of the selected paired terminal.
+    pub(super) fn paired_terminal_running_for_display(&self, inst: &Instance) -> bool {
+        use crate::session::{AuxiliaryTarget, PanePresence};
+        let target = match self.effective_terminal_mode(&inst.id) {
+            TerminalMode::Container => AuxiliaryTarget::Container { index: 0 },
+            TerminalMode::Host => AuxiliaryTarget::Host { index: 0 },
+        };
+        matches!(
+            inst.auxiliary_presence(&target),
+            PanePresence::Alive | PanePresence::Dead
+        )
+    }
 }

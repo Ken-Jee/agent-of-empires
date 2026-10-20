@@ -138,7 +138,8 @@ impl CommandFailure {
             DaemonClientError::InvalidBaseUrl { .. }
             | DaemonClientError::InvalidPathSegment
             | DaemonClientError::InvalidBearerToken
-            | DaemonClientError::InsecureBearerTransport
+            | DaemonClientError::InvalidSessionCredential
+            | DaemonClientError::InsecureCredentialTransport
             | DaemonClientError::ClientBuild => !submitted,
             DaemonClientError::Timeout
             | DaemonClientError::Transport
@@ -617,12 +618,14 @@ impl SessionFeed {
         self.task = Some(tokio::spawn(async move {
             let result: anyhow::Result<()> = async {
                 let endpoint = crate::acp::client::daemon_manager::ensure_daemon(&profile).await?;
-                let client = endpoint.daemon_client()?;
                 let mut connection = RuntimeConnection::connect(
                     &endpoint,
                     (!profile.is_empty()).then_some(profile.as_str()),
                 )
                 .await?;
+                let client = crate::acp::client::HttpClient::new(endpoint)?
+                    .daemon_client()
+                    .await?;
                 let epoch = connection.info().epoch.clone();
                 cityhall.store(connection.info().cityhall_mode, Ordering::SeqCst);
                 set_grant(&grant, connection.mutations_allowed());

@@ -84,6 +84,12 @@ impl RuntimeExecutionSnapshot {
         command
     }
 
+    pub(crate) fn container_exists(&self, id: &str) -> anyhow::Result<bool> {
+        Ok(self
+            .runtime()
+            .does_container_exist_with_command(id, &mut self.command(&[]))?)
+    }
+
     fn probe(&self, args: &[&str]) -> anyhow::Result<Vec<u8>> {
         let args = args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
         let output = self.runtime().base.probe_output(&mut self.command(&args))?;
@@ -320,14 +326,37 @@ impl RuntimeExecutionSnapshot {
         self.command(&argv[1..])
     }
 
+    pub(crate) fn exec_with_env_file(
+        &self,
+        name: &str,
+        cwd: &str,
+        args: &[String],
+        env_file: &std::path::Path,
+    ) -> std::process::Command {
+        let mut argv = self.runtime().build_exec_argv(name, cwd, args);
+        let container_index = argv
+            .iter()
+            .position(|argument| argument == name)
+            .expect("exec argv includes its container");
+        argv.splice(
+            container_index..container_index,
+            [
+                "--env-file".to_owned(),
+                env_file.to_string_lossy().into_owned(),
+            ],
+        );
+        self.command(&argv[1..])
+    }
+
     pub(crate) fn exec_shell_command(
         &self,
         name: &str,
         options: Option<&str>,
         command: &str,
+        interactive: bool,
     ) -> String {
         let runtime = self.runtime();
-        let command = runtime.exec_command(name, options, command);
+        let command = runtime.exec_command(name, options, command, interactive);
         format!(
             "{}{}{}",
             crate::session::environment::shell_escape(
@@ -401,7 +430,11 @@ impl ContainerExecutionSnapshot {
                 "container",
                 "inspect",
                 "--format",
-                "{\"id\":{{json .Id}},\"mounts\":{{json .Mounts}}}",
+                if runtime.kind == Name::Podman {
+                    "{\"id\":{{json .ID}},\"mounts\":{{json .Mounts}}}"
+                } else {
+                    "{\"id\":{{json .Id}},\"mounts\":{{json .Mounts}}}"
+                },
                 name,
             ])?,
             Name::AppleContainer => runtime.probe_json(&["inspect", name])?,
@@ -646,7 +679,7 @@ mod tests {
         assert!(direct.status.success());
         let shell = std::process::Command::new("/bin/sh")
             .arg("-c")
-            .arg(snapshot.exec_shell_command("fixture", None, "true"))
+            .arg(snapshot.exec_shell_command("fixture", None, "true", true))
             .output()
             .unwrap();
         assert!(shell.status.success());

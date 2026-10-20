@@ -7,17 +7,17 @@ use agent_of_empires::tui;
 use anyhow::Result;
 use clap::{CommandFactory, FromArgMatches, Parser};
 use clap_complete::generate;
+use std::io::Write;
 
 fn is_serve_command(cli: &Cli) -> bool {
     matches!(cli.command, Some(Commands::Serve(_)))
 }
 
-/// Runs before the tokio worker pool exists, so `set_var` is sound.
+/// Seed CityHall before constructing the runtime.
 fn seed_cityhall_env(cli: &Cli) {
     if let Some(Commands::Serve(args)) = &cli.command {
         if args.cityhall {
-            // SAFETY: single-threaded here, same invariant as the
-            // AOE_DAEMON_URL seed above (no worker threads spawned yet).
+            // SAFETY: main calls this before any runtime or background work starts.
             unsafe {
                 std::env::set_var("AOE_CITYHALL_MODE", "1");
             }
@@ -41,23 +41,25 @@ fn serve_unavailable_error(cli: &Cli) -> Option<clap::Error> {
     })
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    // Hidden helper for the VT live preview, handled before clap so it stays off the CLI surface.
-    {
-        let mut a = std::env::args();
-        let _ = a.next();
-        if a.next().as_deref() == Some("__vt-pipe") {
-            let sock = a.next().unwrap_or_default();
-            return agent_of_empires::tui::run_vt_pipe(&sock).map_err(Into::into);
-        }
+fn main() -> Result<()> {
+    let mut args = std::env::args();
+    let _ = args.next();
+    let helper = args.next();
+    if helper.as_deref() == Some("__frozen-env") {
+        return agent_of_empires::process::exec_frozen_environment();
+    }
+    if helper.as_deref() == Some("__opencode-yolo") {
+        return agent_of_empires::process::exec_post_login_opencode_yolo();
+    }
+    let mut a = args;
+    if helper.as_deref() == Some("__vt-pipe") {
+        let sock = a.next().unwrap_or_default();
+        return agent_of_empires::tui::run_vt_pipe(&sock).map_err(Into::into);
     }
 
-    // Hidden smart-rename helper, handled before clap so it stays off the CLI surface.
+    // Hidden smart-rename helper bypasses clap.
     {
-        let mut a = std::env::args();
-        let _ = a.next();
-        if a.next().as_deref() == Some("__smart-rename") {
+        if helper.as_deref() == Some("__smart-rename") {
             let mut next = a.next();
             let force = next.as_deref() == Some("--force");
             if force {
@@ -65,12 +67,13 @@ async fn main() -> Result<()> {
             }
             let profile = next.unwrap_or_default();
             let session_id = a.next().unwrap_or_default();
-            let _ = agent_of_empires::session::smart_rename::run_smart_rename_now(
-                &profile,
-                &session_id,
-                force,
-            )
-            .await;
+            let _ = tokio::runtime::Runtime::new()?.block_on(
+                agent_of_empires::session::smart_rename::run_smart_rename_now(
+                    &profile,
+                    &session_id,
+                    force,
+                ),
+            );
             return Ok(());
         }
     }
@@ -87,21 +90,53 @@ async fn main() -> Result<()> {
         }
     };
 
+    if let Some(Commands::PrimeRunner(args)) = cli.command {
+        return tokio::runtime::Runtime::new()?
+            .block_on(agent_of_empires::process::prime::run(args));
+    }
+    let read_source = cli::runtime_read::read_request_source(&cli);
     if let Some(err) = serve_unavailable_error(&cli) {
         err.exit();
     }
-
     if let Some(url) = &cli.daemon_url {
-        // SAFETY: single-threaded at this point — we haven't entered
-        // the tokio runtime's worker pool yet (the runtime is owned by
-        // the `#[tokio::main]` wrapper that called us, and clap's
-        // parsing was synchronous).
+        // SAFETY: no runtime or background work has started.
         unsafe {
             std::env::set_var("AOE_DAEMON_URL", url);
         }
     }
-
     seed_cityhall_env(&cli);
+    tokio::runtime::Runtime::new()?.block_on(run_cli(cli, read_source))
+}
+
+async fn run_cli(mut cli: Cli, read_source: cli::runtime_read::ReadRequestSource) -> Result<()> {
+    // Keep daemon-served reads on the normal CLI preflight path.
+    let answered = match cli::runtime_read::classify(cli.command.as_ref()) {
+        Some(command) => match cli::runtime_read::attempt(command, &read_source).await {
+            cli::runtime_read::ScopedRead::Answered(outcome) => Some(outcome),
+            cli::runtime_read::ScopedRead::NoLocalPublication(notice) => {
+                // A fallback notice precedes the local answer on stderr.
+                if let Some(notice) = notice {
+                    let _ = std::io::stderr().lock().write_all(notice.as_bytes());
+                }
+                None
+            }
+        },
+        None => None,
+    };
+
+    if cli.profile.is_none() {
+        if let Some(profile) = read_source.env_profile.as_deref() {
+            match profile.to_str() {
+                Some(profile) => cli.profile = Some(profile.to_string()),
+                None => Cli::command()
+                    .error(
+                        clap::error::ErrorKind::InvalidValue,
+                        "AGENT_OF_EMPIRES_PROFILE must be valid UTF-8",
+                    )
+                    .exit(),
+            }
+        }
+    }
 
     // Before anything calls `get_app_dir()`, which would create the dev dir.
     let debug_namespace_drift = agent_of_empires::session::debug_namespace_drift();
@@ -213,32 +248,70 @@ async fn main() -> Result<()> {
 
     // `{e:#}` keeps the cause chain on one line for the line-oriented sink. The detached
     // daemon child skips `eprintln!` because its stderr already goes to the log.
-    if let Err(e) = run(
+    let exit = match run(
         cli,
         is_daemon_child,
         should_init,
         debug_namespace_drift,
         debug_log_warning,
+        answered,
     )
     .await
     {
-        tracing::error!(target: "log.runtime", "fatal: {e:#}");
-        if !is_daemon_child {
-            eprintln!("Error: {e:#}");
+        Ok(exit) => exit,
+        Err(e) => {
+            tracing::error!(target: "log.runtime", "fatal: {e:#}");
+            if !is_daemon_child {
+                eprintln!("Error: {e:#}");
+            }
+            std::process::exit(1);
         }
-        std::process::exit(1);
+    };
+    // The one exit a served read takes, once the preflight has run. Every
+    // other command exits from inside its own handler.
+    if exit != 0 {
+        std::process::exit(exit);
     }
 
     Ok(())
 }
 
+/// Print a served read's answer and name the exit code to leave with. Writing
+/// the streams before returning is what lets `run` finish the shared
+/// post-command steps first, so the daemon's bytes and the CLI's own warnings
+/// reach the user in the order they are read.
+fn emit_read_outcome(outcome: cli::runtime_read::ReadOutcome) -> i32 {
+    if let Some(stdout) = outcome.stdout {
+        if std::io::stdout()
+            .lock()
+            .write_all(stdout.as_bytes())
+            .and_then(|()| std::io::stdout().lock().flush())
+            .is_err()
+        {
+            eprint!(
+                "{}",
+                cli::runtime_read::read_sentence(cli::runtime_read::RENDERER_INTERNAL)
+            );
+            return 1;
+        }
+    }
+    if let Some(stderr) = outcome.stderr {
+        let _ = std::io::stderr().lock().write_all(stderr.as_bytes());
+    }
+    outcome.exit
+}
+
+/// Runs the command and returns the process exit code, which is 0 for every
+/// command that exits from its own handler and the served read's own code when
+/// a daemon already answered.
 async fn run(
-    cli: Cli,
+    mut cli: Cli,
     is_daemon_child: bool,
     should_init: bool,
     debug_namespace_drift: Option<(std::path::PathBuf, std::path::PathBuf)>,
     debug_log_warning: Option<String>,
-) -> Result<()> {
+    answered: Option<cli::runtime_read::ReadOutcome>,
+) -> Result<i32> {
     if cli.command.is_some() {
         if let Some((release, dev)) = debug_namespace_drift.as_ref() {
             eprintln!(
@@ -250,7 +323,7 @@ async fn run(
 
     // `settings explain` and `mcp list` answer from `config.toml`, which every
     // pending migration is free to rewrite in place: v009 renames
-    // `updates.check_enabled`, v021 moves `[app_state]` into `state.toml`, v038
+    // `updates.check_enabled`, v021 moves `[app_state]` into `state.toml`, v046
     // drops `session.daemon_sidebar`. Asked before the migrations below, they
     // read that pre-migration file, so `settings explain` reports the schema
     // default for a value the user did set and calls a live setting "not a
@@ -263,7 +336,7 @@ async fn run(
         cli.command,
         Some(Commands::Settings { .. }) | Some(Commands::Mcp { .. })
     ) {
-        run_startup_migrations(command_name, is_daemon_child)?;
+        run_startup_migrations(command_name, is_daemon_child, None)?;
     }
 
     // Skipped for the detached daemon child so `aoe serve --daemon` counts once.
@@ -277,23 +350,25 @@ async fn run(
     match cli.command {
         Some(Commands::Completion { shell }) => {
             generate(shell, &mut Cli::command(), "aoe", &mut std::io::stdout());
-            return Ok(());
+            return Ok(0);
         }
-        Some(Commands::Init(args)) => return cli::init::run(args).await,
-        Some(Commands::ExtractSessionId(args)) => return cli::extract_session_id::run(args).await,
+        Some(Commands::Init(args)) => return exit_zero(cli::init::run(args).await),
+        Some(Commands::ExtractSessionId(args)) => {
+            return exit_zero(cli::extract_session_id::run(args).await)
+        }
         Some(Commands::Tmux { command }) => {
             use cli::tmux::TmuxCommands;
-            return match command {
+            return exit_zero(match command {
                 TmuxCommands::Status(args) => cli::tmux::run_status(args),
-            };
+            });
         }
-        Some(Commands::Agents) => return cli::agents::run(),
-        Some(Commands::Logs(args)) => return cli::logs::run(args).await,
-        Some(Commands::LogLevel(args)) => return cli::log_level::run(args).await,
-        Some(Commands::Sounds { command }) => return cli::sounds::run(command).await,
+        Some(Commands::Agents) => return exit_zero(cli::agents::run()),
+        Some(Commands::Logs(args)) => return exit_zero(cli::logs::run(args).await),
+        Some(Commands::LogLevel(args)) => return exit_zero(cli::log_level::run(args).await),
+        Some(Commands::Sounds { command }) => return exit_zero(cli::sounds::run(command).await),
         Some(Commands::Theme { command }) => {
             use cli::theme::ThemeCommands;
-            return match command {
+            return exit_zero(match command {
                 ThemeCommands::List => {
                     cli::theme::run_list();
                     Ok(())
@@ -302,35 +377,32 @@ async fn run(
                     cli::theme::run_export(&name, output.as_deref())
                 }
                 ThemeCommands::Dir => cli::theme::run_dir(),
-            };
+            });
         }
-        // Migrations ran above (see the hoist before this match): both answer
-        // from config.toml, which a pending migration rewrites in place, so
-        // they must not read the pre-migration file.
-        Some(Commands::Settings { command }) => return cli::settings::run(command),
+        Some(Commands::Settings { command }) => return exit_zero(cli::settings::run(command)),
         Some(Commands::Mcp { command }) => {
             let profile = cli.profile.clone().unwrap_or_default();
-            return cli::mcp::run(&profile, command).await;
+            return exit_zero(cli::mcp::run(&profile, command).await);
         }
-        // Deliberately migration-free, unlike its neighbours above: every
-        // skill verb reads and writes only `<app_dir>/skills` and the agent
-        // skill roots, which no migration creates, renames or reads. There is
-        // no pre-migration spelling of a skill to get wrong, so running the
-        // migrations would only make `aoe skill list` fail on a read-only
-        // install for nothing.
-        Some(Commands::Skill { command }) => return cli::skill::run(command),
-        Some(Commands::Uninstall(args)) => return cli::uninstall::run(args).await,
-        Some(Commands::Update(args)) => return cli::update::run(args).await,
-        Some(Commands::Migrate) => return cli::migrate::run(),
-        Some(Commands::Stop { .. }) => return cli::killall::stop_trap(),
+        Some(Commands::Skill { command }) => return exit_zero(cli::skill::run(command)),
+        Some(Commands::Uninstall(args)) => return exit_zero(cli::uninstall::run(args).await),
+        Some(Commands::Update(args)) => return exit_zero(cli::update::run(args).await),
+        Some(Commands::Migrate) => return exit_zero(cli::migrate::run().await),
+
+        Some(Commands::Stop { .. }) => return exit_zero(cli::killall::stop_trap()),
         _ => {}
     }
 
     let profile_explicit = cli.profile.is_some();
     let profile = cli.profile.unwrap_or_default();
 
+    let serve_lock = match &mut cli.command {
+        Some(Commands::Serve(args)) => cli::serve::lock_for_startup(&profile, args).await?,
+        _ => None,
+    };
+
     if cli.command.is_some() {
-        run_startup_migrations(command_name, is_daemon_child)?;
+        run_startup_migrations(command_name, is_daemon_child, serve_lock.as_ref())?;
         agent_of_empires::session::poller::configure_session_id_poller_max_threads(
             agent_of_empires::session::poller::configured_session_id_poller_max_threads(&profile),
         );
@@ -347,6 +419,11 @@ async fn run(
         if let Some(w) = warning {
             eprintln!("{w}");
         }
+    }
+    // A served read is finished at this point, with every shared step above
+    // already run: the command's own handler is not entered a second time.
+    if let Some(outcome) = answered {
+        return Ok(emit_read_outcome(outcome));
     }
 
     let result = match cli.command {
@@ -369,8 +446,8 @@ async fn run(
         Some(Commands::Cityhall { command }) => cli::cityhall::run(command),
         // After migrations: enable/disable rewrite config.toml through the
         // current schema, which drops any key a pending migration would carry.
-        Some(Commands::Telemetry { command }) => cli::telemetry::run(command),
-        Some(Commands::Serve(args)) => cli::serve::run(&profile, args).await,
+        Some(Commands::Telemetry { command }) => return exit_zero(cli::telemetry::run(command)),
+        Some(Commands::Serve(args)) => cli::serve::run(&profile, args, serve_lock).await,
         Some(Commands::Url(args)) => cli::url::run(args),
         Some(Commands::Sandbox { command }) => cli::sandbox::run(command),
         // Runs after migrations, which run for every command: `approve` writes
@@ -393,8 +470,7 @@ async fn run(
         }
         _ => unreachable!(),
     };
-
-    result
+    exit_zero(result)
 }
 
 /// Advance the schema, or verify it where migrating is the parent's job.
@@ -405,10 +481,22 @@ async fn run(
 /// the parent on `.schema_version` and, for the one that writes the launch
 /// record, wait on the very lock the parent holds. Verify the schema instead
 /// of migrating, and fail closed.
-fn run_startup_migrations(command_name: Option<&str>, is_daemon_child: bool) -> Result<()> {
+fn run_startup_migrations(
+    command_name: Option<&str>,
+    is_daemon_child: bool,
+    startup: Option<&cli::serve::ServeStartup>,
+) -> Result<()> {
     if is_daemon_child {
         return migrations::assert_schema_current();
     }
     let reporter = command_name.is_some().then(cli::migrate::stderr_reporter);
-    migrations::run_migrations_with(reporter)
+    match startup {
+        Some(startup) => startup.run_migrations(reporter),
+        None => migrations::run_migrations_with(reporter),
+    }
+}
+/// Every command above exits from inside its own handler, so completing one
+/// leaves the process with the ordinary success code.
+fn exit_zero(result: Result<()>) -> Result<i32> {
+    result.map(|()| 0)
 }

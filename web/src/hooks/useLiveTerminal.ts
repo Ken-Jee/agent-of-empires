@@ -7,22 +7,15 @@ import { buttonMouseBytes, wheelMouseBytes } from "../lib/liveMouse";
 import { createFrameInflater, supportsFrameDeflate, type FrameInflater } from "../lib/frameStream";
 import { MAX_RETRIES, retryDelayMs } from "../lib/wsBackoff";
 import { reportTelemetrySeen } from "../lib/api";
+import type { LiveClientMessage, LivePane0, LiveServerMessage } from "../lib/generated/liveWire";
+
+export type { LiveCursor, LivePane0 as LivePaneRect } from "../lib/generated/liveWire";
+
+const encodeControl = (message: LiveClientMessage) => JSON.stringify(message);
 
 // Mirrors CLOSE_CODE_PTY_DEAD in src/server/pane.rs.
 const CLOSE_CODE_PTY_DEAD = 4001;
 const MAX_PENDING_INPUT_BYTES = 64 * 1024;
-
-export interface LiveCursor {
-  x: number;
-  y: number;
-}
-
-export interface LivePaneRect {
-  cols: number;
-  rows: number;
-  left?: number;
-  top?: number;
-}
 
 export interface LiveStats {
   frames: number;
@@ -31,19 +24,14 @@ export interface LiveStats {
   resyncs: number;
 }
 
-export interface LiveFrame {
-  content: string;
+type FrameMessage = Extract<LiveServerMessage, { type: "frame" }>;
+
+export type LiveFrame = Omit<FrameMessage, "type" | "seq" | "pane0"> & {
   lines?: string[];
   seq?: number;
   receivedAt?: number;
-  rows: number;
-  history: number;
-  cursor: LiveCursor | null;
-  altScreen: boolean;
-  mouse: boolean;
-  mouseSgr: boolean;
-  pane0?: LivePaneRect | null;
-}
+  pane0?: LivePane0 | null;
+};
 
 export interface LiveTerminalState {
   connected: boolean;
@@ -55,6 +43,8 @@ export interface LiveTerminalState {
   isOwner: boolean;
   ownerKnown: boolean;
   transport: "grid" | "snapshot" | null;
+  /** The agent exited and left a dead pane; redialing cannot help until it is restarted. */
+  paneDead: boolean;
   stats: LiveStats;
 }
 
@@ -68,6 +58,7 @@ const INITIAL_STATE: LiveTerminalState = {
   isOwner: false,
   ownerKnown: false,
   transport: null,
+  paneDead: false,
   stats: { frames: 0, patches: 0, wireBytes: 0, resyncs: 0 },
 };
 
@@ -105,7 +96,7 @@ export function useLiveTerminal(
     (lines: number) => {
       if (desiredRef.current.window === lines) return;
       desiredRef.current.window = lines;
-      sendIfOpen(JSON.stringify({ type: "window", lines }));
+      sendIfOpen(encodeControl({ type: "window", lines }));
     },
     [sendIfOpen],
   );
@@ -172,17 +163,18 @@ export function useLiveTerminal(
           ...prev,
           connected: true,
           reconnecting: false,
+          paneDead: false,
         }));
-        ws.send(JSON.stringify({ type: "claim_if_vacant" }));
+        ws.send(encodeControl({ type: "claim_if_vacant" }));
         const desired = desiredRef.current;
         if (desired.resize) {
-          ws.send(JSON.stringify({ type: "resize", ...desired.resize }));
+          ws.send(encodeControl({ type: "resize", ...desired.resize }));
         }
         if (desired.window != null) {
-          ws.send(JSON.stringify({ type: "window", lines: desired.window }));
+          ws.send(encodeControl({ type: "window", lines: desired.window }));
         }
-        ws.send(JSON.stringify({ type: "cadence", fast: desired.fast }));
-        ws.send(JSON.stringify({ type: "caps", deflate: supportsFrameDeflate(), patch: true }));
+        ws.send(encodeControl({ type: "cadence", fast: desired.fast }));
+        ws.send(encodeControl({ type: "caps", deflate: supportsFrameDeflate(), patch: true }));
       };
 
       let hasReceivedData = false;
@@ -190,31 +182,14 @@ export function useLiveTerminal(
       let resyncPending = false;
       const handleMessageText = (text: string) => {
         if (wsRef.current !== ws) return;
-        let msg: {
-          type?: string;
-          grid?: boolean;
-          content?: string;
-          seq?: number;
-          base?: number;
-          shift?: number;
-          lines?: [number, string][];
-          text?: string;
-          rows?: number;
-          history?: number;
-          cursor?: LiveCursor | null;
-          is_owner?: boolean;
-          altScreen?: boolean;
-          mouse?: boolean;
-          mouseSgr?: boolean;
-          pane0?: LivePaneRect | null;
-        };
+        let msg: LiveServerMessage;
         try {
-          msg = JSON.parse(text) as typeof msg;
+          msg = JSON.parse(text) as LiveServerMessage;
         } catch {
           return;
         }
         if (msg.type === "size_owner") {
-          const owner = msg.is_owner ?? true;
+          const owner = msg.is_owner;
           ownerKnownRef.current = true;
           setState((prev) =>
             prev.isOwner === owner && prev.ownerKnown ? prev : { ...prev, isOwner: owner, ownerKnown: true },
@@ -228,7 +203,7 @@ export function useLiveTerminal(
           return;
         }
         if (msg.type === "clipboard") {
-          if (typeof msg.text !== "string" || msg.text.length === 0) return;
+          if (msg.text.length === 0) return;
           handleClipboard(msg.text);
           return;
         }
@@ -245,32 +220,32 @@ export function useLiveTerminal(
             if (!resyncPending) {
               resyncPending = true;
               stats.resyncs += 1;
-              ws.send(JSON.stringify({ type: "resync" }));
+              ws.send(encodeControl({ type: "resync" }));
             }
             return;
           }
-          lines = applyPatch(prev.lines, msg.shift ?? 0, msg.lines ?? []);
+          lines = applyPatch(prev.lines, msg.shift, msg.lines);
           content = lines.join("\n") + "\n";
           stats.patches += 1;
         } else {
-          content = msg.content ?? "";
+          content = msg.content;
           lines = frameLines(content);
           resyncPending = false;
           stats.frames += 1;
         }
-        lastSeq = msg.seq ?? null;
+        lastSeq = msg.seq;
         const incoming: LiveFrame = {
           content,
           lines,
           seq: msg.seq,
           receivedAt: performance.now(),
-          rows: msg.rows ?? 0,
-          history: msg.history ?? 0,
-          cursor: msg.cursor ?? null,
-          altScreen: msg.altScreen ?? false,
-          mouse: msg.mouse ?? false,
-          mouseSgr: msg.mouseSgr ?? false,
-          pane0: msg.pane0 ?? null,
+          rows: msg.rows,
+          history: msg.history,
+          cursor: msg.cursor,
+          altScreen: msg.altScreen,
+          mouse: msg.mouse,
+          mouseSgr: msg.mouseSgr,
+          pane0: msg.pane0,
         };
         // Keep the capture window covering the full history while reading, or old lines fall out.
         if (readingRef.current) {
@@ -302,8 +277,9 @@ export function useLiveTerminal(
         if (disposed || wsRef.current !== ws) return;
         disposeInflater();
         ownerKnownRef.current = false;
-        setState((prev) => ({ ...prev, connected: false, isOwner: false, ownerKnown: false }));
-        if (event.code === CLOSE_CODE_PTY_DEAD) {
+        const paneDead = event.code === CLOSE_CODE_PTY_DEAD;
+        setState((prev) => ({ ...prev, connected: false, isOwner: false, ownerKnown: false, paneDead }));
+        if (paneDead) {
           retryCountRef.current = MAX_RETRIES;
         }
         if (retryCountRef.current < MAX_RETRIES) {
@@ -399,11 +375,11 @@ export function useLiveTerminal(
 
   /** tmux pastes `text` (bracketed only if the pane asked for it), then presses Enter when `submit`. */
   const sendPaste = useCallback(
-    (text: string, submit: boolean) => sendInput(JSON.stringify({ type: "paste", text, submit })),
+    (text: string, submit: boolean) => sendInput(encodeControl({ type: "paste", text, submit })),
     [sendInput],
   );
 
-  const claim = useCallback(() => sendIfOpen(JSON.stringify({ type: "claim" })), [sendIfOpen]);
+  const claim = useCallback(() => sendIfOpen(encodeControl({ type: "claim" })), [sendIfOpen]);
 
   const forwardWheel = useCallback(
     (up: boolean, sgr: boolean, col: number, row: number) => sendIfOpen(wheelMouseBytes(up, sgr, col, row)),
@@ -421,7 +397,7 @@ export function useLiveTerminal(
       const prev = desiredRef.current.resize;
       if (prev && prev.cols === cols && prev.rows === rows) return;
       desiredRef.current.resize = { cols, rows };
-      sendIfOpen(JSON.stringify({ type: "resize", cols, rows }));
+      sendIfOpen(encodeControl({ type: "resize", cols, rows }));
     },
     [sendIfOpen],
   );
@@ -432,7 +408,7 @@ export function useLiveTerminal(
     (fast: boolean) => {
       if (desiredRef.current.fast === fast) return;
       desiredRef.current.fast = fast;
-      sendIfOpen(JSON.stringify({ type: "cadence", fast }));
+      sendIfOpen(encodeControl({ type: "cadence", fast }));
     },
     [sendIfOpen],
   );

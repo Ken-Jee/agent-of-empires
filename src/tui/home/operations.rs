@@ -1,7 +1,7 @@
 //! Session operations for HomeView (create, delete, rename)
 
 use crate::session::{Instance, Item, LifecycleOperation, StartBlocked, Status};
-use crate::tui::dialogs::{DeleteOptions, GroupDeleteOptions, InfoDialog};
+use crate::tui::dialogs::{DeleteOptions, GroupDeleteAction, GroupDeleteOptions, InfoDialog};
 
 use super::{HomeView, PendingArchiveCursor};
 
@@ -386,7 +386,13 @@ impl HomeView {
             .submit_request(id, crate::tui::session_feed::SessionRequest::Purge(body))
     }
 
-    pub(super) fn delete_selected_group(&mut self) -> anyhow::Result<()> {
+    pub(super) fn delete_selected_group(
+        &mut self,
+        options: &GroupDeleteOptions,
+    ) -> anyhow::Result<()> {
+        if options.action == GroupDeleteAction::DeleteSessions {
+            return self.delete_group_with_sessions(options);
+        }
         let Some(path) = self.selected_group.clone() else {
             return Ok(());
         };
@@ -399,7 +405,11 @@ impl HomeView {
             crate::daemon::NamespaceMutation::DeleteGroup(crate::daemon::DeleteGroupBody {
                 group,
                 mode: if has_members {
-                    crate::daemon::DeleteGroupMode::KeepSessions
+                    if options.action == GroupDeleteAction::MoveToParent {
+                        crate::daemon::DeleteGroupMode::MoveToParent
+                    } else {
+                        crate::daemon::DeleteGroupMode::KeepSessions
+                    }
                 } else {
                     crate::daemon::DeleteGroupMode::EmptyOnly
                 },

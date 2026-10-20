@@ -54,6 +54,7 @@
                 ./acp-worker/test-shim/shim.mjs
                 ./assets
                 ./docker
+                ./tests/fixtures/cli-read
                 ./web/tests/helpers/fakeAcpAgent.mjs
               ];
             };
@@ -104,7 +105,7 @@
             pname = "agent-of-empires-web";
             version = "0";
             src = ./web;
-            npmDepsHash = "sha256-335L1+uhsKTXXkoNqlTTpVsRcvzXR/hynQIGSwikl4A=";
+            npmDepsHash = "sha256-Ch439r2CEiTaqTZR0NpzrZknm9/YqX4uv/COCQwzYkA=";
             # tsc -b && vite build; output goes to web/dist
             installPhase = ''
               mkdir $out

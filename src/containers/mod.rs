@@ -194,6 +194,10 @@ impl DockerContainer {
         self.runtime.container_working_dir(&self.name)
     }
 
+    pub(crate) fn id(&self) -> Result<String> {
+        self.runtime.inspect_container_id(&self.name)
+    }
+
     pub fn sandbox_store_generation_matches(&self) -> Result<Option<bool>> {
         self.runtime.sandbox_store_generation_matches(&self.name)
     }
@@ -386,8 +390,9 @@ impl DockerContainer {
         classify_running_probe(self.is_running())
     }
 
-    pub fn exec_command(&self, options: Option<&str>, cmd: &str) -> String {
-        self.runtime.exec_command(&self.name, options, cmd)
+    pub fn exec_command(&self, options: Option<&str>, cmd: &str, interactive: bool) -> String {
+        self.runtime
+            .exec_command(&self.name, options, cmd, interactive)
     }
 
     /// Argv that runs `cmd` inside this container, for a caller that spawns and

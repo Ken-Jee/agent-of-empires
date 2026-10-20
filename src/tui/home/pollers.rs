@@ -14,4 +14,26 @@ impl HomeView {
             .retain(|id| self.session_feed.has_pending(id));
         before != self.restart_in_flight.len() || presented
     }
+
+    pub fn request_serve_probe(&mut self) {
+        if !self.serve_probe_in_flight {
+            self.serve_probe_in_flight = true;
+            self.serve_probe.request(());
+        }
+    }
+
+    /// True when the running state changed.
+    pub fn apply_serve_probe(&mut self) -> bool {
+        match self.serve_probe.try_recv() {
+            Ok(running) => {
+                self.serve_probe_in_flight = false;
+                std::mem::replace(&mut self.serve_running, running) != running
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => false,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.serve_probe_in_flight = false;
+                false
+            }
+        }
+    }
 }

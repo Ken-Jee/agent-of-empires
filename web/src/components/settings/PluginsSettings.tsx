@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import {
   fetchPlugins,
@@ -7,7 +7,8 @@ import {
   type PluginListResponse,
   type PluginView,
 } from "../../lib/api";
-import { reportInfo } from "../../lib/toastBus";
+import { CancelButton, ConfirmButton, DANGER_BUTTON, Dialog } from "../Dialog";
+import { useConfirmKeys, useDialogFocus } from "../dialogHooks";
 import { PluginCard } from "./PluginCard";
 import { PluginDetailModal } from "./PluginDetailModal";
 import { PluginInstallConsentModal } from "./PluginInstallConsentModal";
@@ -15,6 +16,8 @@ import { PluginJobProgressModal } from "./PluginJobProgressModal";
 import { PluginMarketplace } from "./PluginMarketplace";
 import { PluginUpdateConsentModal } from "./PluginUpdateConsentModal";
 import { usePluginMarketplace, usePluginUpdates, type PluginJobRef } from "./pluginFlows";
+
+const WEB_PLUGIN_ID = "aoe.web";
 
 type DetailTarget = Pick<Parameters<typeof PluginDetailModal>[0], "source" | "title" | "fallback" | "installCommand">;
 
@@ -28,6 +31,8 @@ export function PluginsSettings({ readOnly = false }: { readOnly?: boolean } = {
   const [tab, setTab] = useState<"installed" | "marketplace">("installed");
   const [detail, setDetail] = useState<DetailTarget | null>(null);
   const [confirmUninstall, setConfirmUninstall] = useState<PluginView | null>(null);
+  const uninstallDialogRef = useRef<HTMLDivElement | null>(null);
+  const [confirmWebOff, setConfirmWebOff] = useState<PluginView | null>(null);
   const [job, setJob] = useState<PluginJobRef | null>(null);
   const updates = usePluginUpdates(setError, setJob);
   const market = usePluginMarketplace(setJob);
@@ -50,6 +55,20 @@ export function PluginsSettings({ readOnly = false }: { readOnly?: boolean } = {
     return () => clearTimeout(timer);
   }, [reload]);
 
+  useEffect(() => {
+    if (!confirmUninstall) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      const dialog = e
+        .composedPath()
+        .find((node) => node instanceof HTMLElement && node.getAttribute("aria-modal") === "true");
+      if (dialog && dialog !== uninstallDialogRef.current) return;
+      setConfirmUninstall(null);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [confirmUninstall]);
+
   const onToggle = async (plugin: PluginView, enabled: boolean) => {
     setBusy(true);
     setError(null);
@@ -57,10 +76,6 @@ export function PluginsSettings({ readOnly = false }: { readOnly?: boolean } = {
       const result = await setPluginEnabled(plugin.id, enabled);
       if (result.kind === "ok") {
         setData(result.data);
-        // The serve gate is read at startup, so the dashboard keeps running.
-        if (plugin.id === "aoe.web" && !enabled) {
-          reportInfo("Web dashboard stays up until aoe serve is restarted.");
-        }
       } else {
         setError(result.message);
       }
@@ -166,7 +181,9 @@ export function PluginsSettings({ readOnly = false }: { readOnly?: boolean } = {
                   },
                 })
               }
-              onToggle={(enabled) => void onToggle(plugin, enabled)}
+              onToggle={(enabled) =>
+                plugin.id === WEB_PLUGIN_ID && !enabled ? setConfirmWebOff(plugin) : void onToggle(plugin, enabled)
+              }
               onUpdate={() => void updates.preview(plugin)}
               onUninstall={() => setConfirmUninstall(plugin)}
             />
@@ -203,8 +220,19 @@ export function PluginsSettings({ readOnly = false }: { readOnly?: boolean } = {
         />
       )}
 
+      {confirmWebOff && (
+        <WebDashboardOffConfirm
+          onCancel={() => setConfirmWebOff(null)}
+          onConfirm={() => {
+            setConfirmWebOff(null);
+            void onToggle(confirmWebOff, false);
+          }}
+        />
+      )}
+
       {confirmUninstall && (
         <div
+          ref={uninstallDialogRef}
           className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4"
           role="dialog"
           aria-modal="true"
@@ -254,5 +282,45 @@ export function PluginsSettings({ readOnly = false }: { readOnly?: boolean } = {
         />
       )}
     </div>
+  );
+}
+
+/** Disabling the Web dashboard plugin turns off the page the user is on once the Daemon restarts. */
+function WebDashboardOffConfirm({ onConfirm, onCancel }: { onConfirm: () => void; onCancel: () => void }) {
+  const confirmButtonRef = useRef<HTMLButtonElement | null>(null);
+  // A ref, not state, so an Enter+click double fire is blocked before a re-render.
+  const firedRef = useRef(false);
+  const confirm = useCallback(() => {
+    if (firedRef.current) return;
+    firedRef.current = true;
+    onConfirm();
+  }, [onConfirm]);
+  useDialogFocus(confirmButtonRef);
+  useConfirmKeys(onCancel, confirm);
+
+  return (
+    <Dialog
+      id="web-dashboard-off-dialog"
+      title="Turn off the Web dashboard?"
+      onDismiss={onCancel}
+      footer={
+        <>
+          <CancelButton onClick={onCancel} />
+          <ConfirmButton
+            buttonRef={confirmButtonRef}
+            onClick={confirm}
+            testId="web-dashboard-off-confirm"
+            className={DANGER_BUTTON}
+          >
+            Turn off
+          </ConfirmButton>
+        </>
+      }
+    >
+      <p className="text-[13px] text-text-secondary">
+        It keeps running until the Daemon restarts, then <code>aoe serve</code> won&apos;t start until you turn it back
+        on.
+      </p>
+    </Dialog>
   );
 }

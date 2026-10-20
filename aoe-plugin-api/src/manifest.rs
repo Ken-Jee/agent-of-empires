@@ -129,6 +129,9 @@ pub struct SettingContribution {
     pub min_items: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_items: Option<u32>,
+    /// Also settable per registered project, falling back to the global value (API v18).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub per_project: bool,
 }
 
 /// A host option source a `dynamic_select` draws its choices from (API v9).
@@ -509,6 +512,15 @@ pub struct Screenshot {
 }
 
 pub fn screenshot_path_ok(path: &str) -> bool {
+    relative_path_ok(path, &SCREENSHOT_EXTENSIONS)
+}
+
+/// A page `entry`: a plugin-relative `.html` path, same shape rules as screenshots.
+pub fn page_entry_path_ok(path: &str) -> bool {
+    relative_path_ok(path, &["html"])
+}
+
+fn relative_path_ok(path: &str, extensions: &[&str]) -> bool {
     if path.is_empty() || path.len() > 512 {
         return false;
     }
@@ -522,9 +534,7 @@ pub fn screenshot_path_ok(path: &str) -> bool {
         return false;
     }
     match path.rsplit('.').next() {
-        Some(ext) if ext != path => {
-            SCREENSHOT_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str())
-        }
+        Some(ext) if ext != path => extensions.contains(&ext.to_ascii_lowercase().as_str()),
         _ => false,
     }
 }
@@ -546,6 +556,8 @@ pub fn lucide_icon_name_ok(name: &str) -> bool {
 pub enum UiSlot {
     /// A segment in the dashboard status/top bar (global).
     StatusBar,
+    /// A chip beside the logo in the dashboard top bar (global, API v17).
+    HeaderStart,
     /// A badge on a session row (per session).
     RowBadge,
     RowColumn,
@@ -562,6 +574,8 @@ pub enum UiSlot {
     DetailBadge,
     HomePane,
     Notification,
+    /// A full dashboard view rendered from a plugin HTML bundle (global, API v16).
+    Page,
 }
 
 impl UiSlot {
@@ -579,6 +593,7 @@ impl UiSlot {
     pub fn as_str(self) -> &'static str {
         match self {
             UiSlot::StatusBar => "status-bar",
+            UiSlot::HeaderStart => "header-start",
             UiSlot::RowBadge => "row-badge",
             UiSlot::RowColumn => "row-column",
             UiSlot::SortKey => "sort-key",
@@ -589,6 +604,7 @@ impl UiSlot {
             UiSlot::DetailBadge => "detail-badge",
             UiSlot::HomePane => "home-pane",
             UiSlot::Notification => "notification",
+            UiSlot::Page => "page",
         }
     }
 }
@@ -598,6 +614,14 @@ pub struct UiContribution {
     pub slot: UiSlot,
     #[serde(default)]
     pub id: String,
+    /// `page` only, like `icon` and `entry`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
+    /// Plugin-relative path to the page's self-contained HTML file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry: Option<String>,
 }
 
 /// How the plugin's worker is launched.
@@ -700,6 +724,14 @@ impl PluginManifest {
                 "plugin requires aoe {req}; this host is {host_version}"
             ))
         }
+    }
+
+    /// The declared `entry` of page `id`, if the manifest has one.
+    pub fn page_entry(&self, id: &str) -> Option<&str> {
+        self.ui
+            .iter()
+            .find(|u| u.slot == UiSlot::Page && u.id == id)
+            .and_then(|u| u.entry.as_deref())
     }
 
     pub fn validate(&self) -> Result<(), ManifestError> {
@@ -1040,14 +1072,71 @@ impl PluginManifest {
                 "the session.message capability requires api_version >= 15".into(),
             );
         }
+        if self.api_version < 16 {
+            check(
+                self.ui.iter().all(|u| u.slot != UiSlot::Page),
+                "page UI slots require api_version >= 16".into(),
+            );
+        }
+        if self.api_version < 17 {
+            check(
+                self.ui.iter().all(|u| u.slot != UiSlot::HeaderStart),
+                "header-start UI slots require api_version >= 17".into(),
+            );
+        }
+        if self.api_version < 18 {
+            check(
+                self.settings.iter().all(|s| !s.per_project),
+                "per_project settings require api_version >= 18".into(),
+            );
+        }
         for key in self.setting_defaults.keys() {
             check(
                 key.contains('.') && !key.starts_with('.') && !key.ends_with('.'),
                 format!("setting_defaults key {key:?} must be a dotted core path like \"section.field\""),
             );
         }
+        let mut page_ids = std::collections::HashSet::new();
         for (i, u) in self.ui.iter().enumerate() {
             check(!u.id.is_empty(), format!("ui[{i}].id must not be empty"));
+            if u.slot != UiSlot::Page {
+                check(
+                    u.title.is_none() && u.icon.is_none() && u.entry.is_none(),
+                    format!("ui[{i}]: title, icon and entry are only valid on a page slot"),
+                );
+                continue;
+            }
+            // The id is a URL path segment of the page route.
+            check(
+                u.id.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'),
+                format!(
+                    "ui[{i}].id {:?} must use only letters, digits, - and _",
+                    u.id
+                ),
+            );
+            check(
+                page_ids.insert(u.id.as_str()),
+                format!("ui[{i}].id {:?} is declared by another page", u.id),
+            );
+            check(
+                u.title.as_deref().is_some_and(|t| !t.trim().is_empty()),
+                format!("ui[{i}] is a page and requires a title"),
+            );
+            if let Some(icon) = &u.icon {
+                check(
+                    lucide_icon_name_ok(icon),
+                    format!("ui[{i}].icon {icon:?} must be a lucide kebab-case icon name"),
+                );
+            }
+            check(
+                u.entry.as_deref().is_some_and(page_entry_path_ok),
+                format!(
+                    "ui[{i}].entry {:?} must be a plugin-relative .html path, \
+                     not a URL or an absolute/traversing path",
+                    u.entry.as_deref().unwrap_or_default()
+                ),
+            );
         }
 
         if errors.is_empty() {
@@ -1203,6 +1292,110 @@ mod tests {
         };
         rejects(&[("session.message below v15", toml(14), "api_version >= 15")]);
         PluginManifest::from_toml_str(&toml(15)).expect("v15 parses");
+    }
+
+    #[test]
+    fn per_project_setting_requires_api_version_18() {
+        let toml = |v: u32| {
+            format!(
+                "{HEAD}{v}\n\n[[settings]]\nkey = \"depth\"\ntype = \"integer\"\nper_project = true\n"
+            )
+        };
+        rejects(&[(
+            "per_project below v18",
+            toml(17),
+            "per_project settings require api_version >= 18",
+        )]);
+        let m = PluginManifest::from_toml_str(&toml(18)).expect("per_project parses from v18");
+        assert!(m.settings[0].per_project);
+    }
+
+    #[test]
+    fn header_start_slot_requires_api_version_17() {
+        let toml = |v: u32| format!("{HEAD}{v}\n\n[[ui]]\nslot = \"header-start\"\nid = \"h\"\n");
+        rejects(&[(
+            "header-start below v17",
+            toml(16),
+            "header-start UI slots require api_version >= 17",
+        )]);
+        PluginManifest::from_toml_str(&toml(17)).expect("header-start parses from v17");
+    }
+
+    #[test]
+    fn page_slot_validates_its_fields_and_api_version() {
+        let page = |v: u32, body: &str| format!("{HEAD}{v}\n\n[[ui]]\nslot = \"page\"\n{body}");
+        let ok =
+            "id = \"board\"\ntitle = \"Board\"\nicon = \"kanban\"\nentry = \"dist/board.html\"\n";
+        let m = PluginManifest::from_toml_str(&page(16, ok)).expect("v16 page parses");
+        assert_eq!(m.page_entry("board"), Some("dist/board.html"));
+        assert_eq!(m.page_entry("other"), None);
+
+        let with_entry = |entry: &str| {
+            page(
+                16,
+                &format!("id = \"b\"\ntitle = \"B\"\nentry = \"{entry}\"\n"),
+            )
+        };
+        rejects(&[
+            (
+                "page below v16",
+                page(15, ok),
+                "page UI slots require api_version >= 16",
+            ),
+            (
+                "missing entry",
+                page(16, "id = \"b\"\ntitle = \"B\"\n"),
+                "plugin-relative .html",
+            ),
+            (
+                "absolute entry",
+                with_entry("/etc/x.html"),
+                "plugin-relative .html",
+            ),
+            (
+                "traversing entry",
+                with_entry("../x.html"),
+                "plugin-relative .html",
+            ),
+            (
+                "non-html entry",
+                with_entry("x.js"),
+                "plugin-relative .html",
+            ),
+            (
+                "url entry",
+                with_entry("https://e.com/x.html"),
+                "plugin-relative .html",
+            ),
+            (
+                "missing title",
+                page(16, "id = \"b\"\nentry = \"x.html\"\n"),
+                "requires a title",
+            ),
+            (
+                "bad icon",
+                page(
+                    16,
+                    "id = \"b\"\ntitle = \"B\"\nicon = \"Bad Icon\"\nentry = \"x.html\"\n",
+                ),
+                "lucide",
+            ),
+            (
+                "id not url-safe",
+                page(16, "id = \"a/b\"\ntitle = \"B\"\nentry = \"x.html\"\n"),
+                "letters, digits",
+            ),
+            (
+                "duplicate page id",
+                format!("{}\n[[ui]]\nslot = \"page\"\n{ok}", page(16, ok)),
+                "declared by another page",
+            ),
+            (
+                "page fields on another slot",
+                format!("{HEAD}16\n\n[[ui]]\nslot = \"card\"\nid = \"c\"\nentry = \"x.html\"\n"),
+                "only valid on a page slot",
+            ),
+        ]);
     }
 
     #[test]

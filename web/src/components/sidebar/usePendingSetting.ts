@@ -5,6 +5,7 @@ interface Pending<T> {
   identity: string;
   value: T;
   from: T;
+  /** Every pick since the overlay opened; consulted only while a save is in flight. */
   sent: T[];
   receipts: SessionReceipt[] | null;
 }

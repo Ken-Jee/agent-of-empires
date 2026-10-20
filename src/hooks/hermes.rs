@@ -4,21 +4,32 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde_json::Value;
-use yaml_serde::{Mapping, Value as Yaml};
+#[cfg(test)]
+use yaml_serde::Value as Yaml;
 
 use crate::agents::ResolvedHookEvent;
 
-use super::command::{hook_command, is_aoe_hook_command};
+use super::command::{hook_command, hook_command_session_id, is_aoe_hook_command};
 use super::config_io::{log_installed, log_removed, log_unchanged, with_config_lock, write_file};
+use super::hermes_yaml;
 use super::HookInstallTarget;
 
-fn yaml_command_is_aoe(hook: &Yaml) -> bool {
-    hook.as_mapping()
-        .and_then(|m| m.get(Yaml::String("command".into())))
-        .and_then(Yaml::as_str)
+fn yaml_command_is_aoe(hook: &Value) -> bool {
+    hook.get("command")
+        .and_then(Value::as_str)
         .is_some_and(is_aoe_hook_command)
 }
 
+/// Run the identity publisher before the status writer.
+fn event_commands(event: &ResolvedHookEvent, target: HookInstallTarget) -> Vec<String> {
+    let identity = event
+        .identity_field
+        .map(|field| hook_command_session_id(target, field, event.publisher));
+    let status = event
+        .status
+        .map(|status| hook_command(status.as_str(), target));
+    identity.into_iter().chain(status).collect()
+}
 /// Install AoE hooks into `config.yaml` and pre-approve them in
 /// `shell-hooks-allowlist.json` so Hermes does not prompt for consent. The two
 /// writes are not atomic together; a stale allowlist only re-prompts.
@@ -37,44 +48,28 @@ pub fn install_hermes_hooks_with_events(
         } else {
             String::new()
         };
-        let mut config = if content.trim().is_empty() {
-            Yaml::Mapping(Mapping::new())
-        } else {
-            crate::yaml::from_str(&content)
-                .with_context(|| format!("Failed to parse {}", config_path.display()))?
-        };
-        let yaml_before = config.clone();
-
-        let root = config
-            .as_mapping_mut()
-            .ok_or_else(|| anyhow::anyhow!("Hermes config root is not a YAML mapping"))?;
-        let hooks = root
-            .entry(Yaml::String("hooks".to_string()))
-            .or_insert_with(|| Yaml::Mapping(Mapping::new()));
-        if !hooks.is_mapping() {
-            *hooks = Yaml::Mapping(Mapping::new());
-        }
-        let hooks = hooks.as_mapping_mut().expect("ensured mapping above");
-        for event in events {
-            let Some(status) = event.status else {
-                continue;
-            };
-            let entries = hooks
-                .entry(Yaml::String(event.name.clone()))
-                .or_insert_with(|| Yaml::Sequence(Vec::new()));
-            if !entries.is_sequence() {
-                *entries = Yaml::Sequence(Vec::new());
+        let edited = hermes_yaml::edit(&content, |hooks| {
+            for event in events {
+                let commands = event_commands(event, target);
+                if commands.is_empty() {
+                    continue;
+                }
+                let Value::Array(entries) = hooks
+                    .entry(event.name.clone())
+                    .or_insert_with(|| Value::Array(Vec::new()))
+                else {
+                    anyhow::bail!("Hermes hooks.{} is not a YAML sequence", event.name);
+                };
+                entries.retain(|hook| !yaml_command_is_aoe(hook));
+                entries.extend(
+                    commands
+                        .into_iter()
+                        .map(|c| serde_json::json!({ "command": c })),
+                );
             }
-            let entries = entries.as_sequence_mut().expect("ensured sequence above");
-            entries.retain(|hook| !yaml_command_is_aoe(hook));
-            let mut entry = Mapping::new();
-            entry.insert(
-                Yaml::String("command".into()),
-                Yaml::String(hook_command(status.as_str(), target)),
-            );
-            entries.push(Yaml::Mapping(entry));
-        }
-        let yaml_changed = config != yaml_before;
+            Ok(())
+        })
+        .with_context(|| format!("Failed to edit {}", config_path.display()))?;
 
         let config_dir = config_path
             .parent()
@@ -84,12 +79,13 @@ pub fn install_hermes_hooks_with_events(
         let allowlist_changed =
             !allowlist_path.exists() || std::fs::read(&allowlist_path)? != allowlist.as_bytes();
 
+        let yaml_changed = edited.is_some();
         if !yaml_changed && !allowlist_changed {
             log_unchanged(config_path);
             return Ok(());
         }
-        if yaml_changed {
-            write_file(config_path, crate::yaml::to_string(&config)?.as_bytes())?;
+        if let Some(yaml) = &edited {
+            write_file(config_path, yaml.as_bytes())?;
         }
         if allowlist_changed {
             write_file(&allowlist_path, allowlist.as_bytes())?;
@@ -108,38 +104,24 @@ pub fn uninstall_hermes_hooks(config_path: &Path) -> Result<bool> {
         if content.trim().is_empty() {
             return Ok(false);
         }
-        let mut config: Yaml = crate::yaml::from_str(&content)
-            .with_context(|| format!("Failed to parse {}", config_path.display()))?;
-        let hooks_key = Yaml::String("hooks".to_string());
-        let Some(root) = config.as_mapping_mut() else {
-            return Ok(false);
-        };
-        let Some(hooks) = root.get_mut(&hooks_key).and_then(Yaml::as_mapping_mut) else {
+        let edited = hermes_yaml::edit(&content, |hooks| {
+            let mut modified = false;
+            for entries in hooks.values_mut().filter_map(Value::as_array_mut) {
+                let before = entries.len();
+                entries.retain(|hook| !yaml_command_is_aoe(hook));
+                modified |= entries.len() != before;
+            }
+            if modified {
+                hooks.retain(|_, v| !v.as_array().is_some_and(Vec::is_empty));
+            }
+            Ok(())
+        })
+        .with_context(|| format!("Failed to edit {}", config_path.display()))?;
+        let Some(yaml) = edited else {
             return Ok(false);
         };
 
-        let mut modified = false;
-        for entries in hooks.values_mut().filter_map(Yaml::as_sequence_mut) {
-            let before = entries.len();
-            entries.retain(|hook| !yaml_command_is_aoe(hook));
-            modified |= entries.len() != before;
-        }
-        if !modified {
-            return Ok(false);
-        }
-        let empty: Vec<Yaml> = hooks
-            .iter()
-            .filter(|(_, v)| v.as_sequence().is_some_and(Vec::is_empty))
-            .map(|(k, _)| k.clone())
-            .collect();
-        for key in empty {
-            hooks.remove(&key);
-        }
-        if hooks.is_empty() {
-            root.remove(&hooks_key);
-        }
-
-        crate::session::atomic_write(config_path, crate::yaml::to_string(&config)?.as_bytes())?;
+        crate::session::atomic_write(config_path, yaml.as_bytes())?;
         log_removed(config_path);
         Ok(true)
     })
@@ -178,26 +160,24 @@ fn render_hermes_allowlist(
         .ok_or_else(|| anyhow::anyhow!("allowlist root is not a JSON object with approvals[]"))?;
 
     for event in events {
-        let Some(status) = event.status else {
-            continue;
-        };
-        let cmd = hook_command(status.as_str(), target);
-        let same = |entry: &Value| {
-            entry.get("event").and_then(Value::as_str) == Some(event.name.as_str())
-                && entry.get("command").and_then(Value::as_str) == Some(&cmd)
-        };
-        let preserved = approvals.iter().find_map(|entry| {
-            same(entry)
-                .then(|| entry.get("approved_at").cloned())
-                .flatten()
-        });
-        approvals.retain(|entry| !same(entry));
-        approvals.push(serde_json::json!({
-            "event": event.name,
-            "command": cmd,
-            "approved_at": preserved.unwrap_or_else(|| Value::String(now.clone())),
-            "script_mtime_at_approval": Value::Null,
-        }));
+        for cmd in event_commands(event, target) {
+            let same = |entry: &Value| {
+                entry.get("event").and_then(Value::as_str) == Some(event.name.as_str())
+                    && entry.get("command").and_then(Value::as_str) == Some(&cmd)
+            };
+            let preserved = approvals.iter().find_map(|entry| {
+                same(entry)
+                    .then(|| entry.get("approved_at").cloned())
+                    .flatten()
+            });
+            approvals.retain(|entry| !same(entry));
+            approvals.push(serde_json::json!({
+                "event": event.name,
+                "command": cmd,
+                "approved_at": preserved.unwrap_or_else(|| Value::String(now.clone())),
+                "script_mtime_at_approval": Value::Null,
+            }));
+        }
     }
 
     Ok((allowlist_path, serde_json::to_string_pretty(&data)?))
@@ -256,23 +236,37 @@ mod tests {
         for event in &events {
             let entries = config["hooks"][event.name.as_str()].as_sequence().unwrap();
             assert_eq!(
-                entries.iter().filter(|h| yaml_command_is_aoe(h)).count(),
-                1,
+                entries
+                    .iter()
+                    .filter(|h| h["command"].as_str().is_some_and(is_aoe_hook_command))
+                    .count(),
+                1 + usize::from(event.identity_field.is_some()),
                 "{}",
                 event.name
             );
-            assert!(yaml_command_is_aoe(entries.last().unwrap()));
+            assert!(entries.last().unwrap()["command"]
+                .as_str()
+                .is_some_and(is_aoe_hook_command));
         }
+        // The foreground identity publisher runs before the status writer on `pre_llm_call`.
+        let identity = config["hooks"]["pre_llm_call"][0]["command"]
+            .as_str()
+            .unwrap();
+        assert!(
+            identity.contains(
+                "__extract-session-id --field hermes-foreground-session-id --agent hermes"
+            ),
+            "{identity}"
+        );
         assert_eq!(
             config["hooks"]["pre_tool_call"][0]["command"].as_str(),
             Some("echo user-hook")
         );
         let allowlist = read_json(&allowlist_path);
         assert_eq!(allowlist["version"], 7);
-        assert_eq!(
-            allowlist["approvals"].as_array().unwrap().len(),
-            events.len()
-        );
+        let approvals = allowlist["approvals"].as_array().unwrap();
+        assert_eq!(approvals.len(), events.len() + 1);
+        assert!(approvals.iter().any(|entry| entry["command"] == identity));
         let mut unrelated_after = config.clone();
         unrelated_after
             .as_mapping_mut()
@@ -377,7 +371,7 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .len(),
-            events.len()
+            events.len() + 1
         );
 
         uninstall_hermes_hooks(&config_path).unwrap();

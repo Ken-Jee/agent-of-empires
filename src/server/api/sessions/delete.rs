@@ -171,10 +171,18 @@ pub(crate) async fn purge_session_artifacts(
         .await?
         {
             Err(result) => *result,
-            Ok(committed) => {
+            Ok(mut committed) => {
                 // Commit removal before destroying a transcript that cannot be restored.
                 let shutdown = match committed.ensure_retirement_target(&mut retirement) {
-                    Ok(()) => finish_structured_purge(state, id, &retirement).await,
+                    Ok(()) => match finish_structured_purge(state, id, &retirement).await {
+                        Ok(()) => committed.complete_retirement(&retirement).and_then(|()| {
+                            state
+                                .acp_supervisor
+                                .acknowledge_retirement(&retirement)
+                                .map_err(Into::into)
+                        }),
+                        Err(error) => Err(error),
+                    },
                     Err(error) => Err(error),
                 };
                 // Both paths removed the row; neither may retain its prompt lock.
@@ -404,6 +412,16 @@ pub(crate) async fn recover_pending_purges(state: &Arc<AppState>) {
             if let Err(error) = finish_structured_purge(state, &id, &retirement).await {
                 attempted.insert(token);
                 tracing::warn!(target: "session.purge_recovery", session_id = %id, %error, "structured shutdown unproven; purge retained");
+                continue;
+            }
+            if let Err(error) = committed.complete_retirement(&retirement) {
+                attempted.insert(token);
+                tracing::warn!(target: "session.purge_recovery", session_id = %id, %error, "producer settlement capture failed; purge retained");
+                continue;
+            }
+            if let Err(error) = state.acp_supervisor.acknowledge_retirement(&retirement) {
+                attempted.insert(token);
+                tracing::warn!(target: "session.purge_recovery", session_id = %id, %error, "producer acknowledgement refused; purge retained");
                 continue;
             }
         }

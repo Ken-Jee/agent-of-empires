@@ -201,6 +201,7 @@ pub struct CollapseGroupBody {
 pub enum DeleteGroupMode {
     EmptyOnly,
     KeepSessions,
+    MoveToParent,
     DeleteSessions,
 }
 
@@ -892,10 +893,10 @@ pub struct SessionResponse {
     pub is_sandboxed: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox_container_name: Option<String>,
-    /// True when the session was created with `--scratch`; the
-    /// `project_path` points at an auto-provisioned directory under
-    /// `<app_dir>/scratch/<id>/` that the deletion path removes. The web
-    /// wizard filters these out of the Recent-projects list.
+    /// Negative so older daemon rows decode as repositories.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub outside_repository: bool,
+    /// Whether the session uses an auto-provisioned scratch directory.
     #[serde(default)]
     pub scratch: bool,
     /// True when the session is marked as a user favorite. Mirrors

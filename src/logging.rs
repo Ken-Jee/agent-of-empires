@@ -109,6 +109,7 @@ pub const DEFAULT_TARGET_ROOTS: &[&str] = &[
     "http",
     "serve",
     "server",
+    "runtime",
     "hooks",
     "sound",
     "telemetry",
@@ -156,6 +157,8 @@ pub const KNOWN_SUB_TARGETS: &[&str] = &[
     "server.status",
     "server.sessions",
     "server.api.sessions",
+    "runtime.uds",
+    "runtime.ws",
 ];
 
 /// Only the filter hot-swaps; sink and rotation settings apply on restart.

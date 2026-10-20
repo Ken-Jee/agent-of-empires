@@ -1,8 +1,9 @@
-import { Fragment, useState } from "react";
+import { Fragment, useEffect, useRef, useState } from "react";
 import { AlertTriangle, Check, Clock, Info, Paperclip, RotateCcw, SendHorizontal, X } from "lucide-react";
 
 import { useIsCoarsePointer } from "../../hooks/useIsCoarsePointer";
 import type { QueuedPrompt, RejectedPrompt, SessionNotice } from "../../lib/acpTypes";
+import { useAcpPrefs } from "../../lib/acpPrefs";
 import { useClearAliases } from "../../lib/agentProfileContext";
 import { isClearAlias } from "../../lib/agentProfiles";
 import { isQueuedPromptLong, queuedStripLayout } from "./queuedPromptsLayout";
@@ -91,6 +92,10 @@ interface NoticeTone {
 
 // Solid theme surfaces: a translucent severity wash darkens a light theme's
 // surface below AA for the text on it, so severity rides on border and icon.
+// Browsers treat a setTimeout delay above 2^31 - 1 ms as 0, so a config
+// written before the server-side cap could otherwise dismiss notices at once.
+const MAX_TIMER_DELAY_MS = 2_147_483_647;
+
 const NOTICE_ROW = "flex items-start gap-2 rounded-lg border bg-surface-850 px-2.5 py-1.5";
 const NOTICE_DISMISS =
   "inline-flex shrink-0 items-center justify-center rounded-md border border-surface-700 p-1 text-text-primary hover:bg-surface-800";
@@ -126,12 +131,49 @@ function noticeTone(severity: string): NoticeTone {
 /** Live advisories the agent pushed outside the turn flow (an approaching rate
  *  limit, a model fallback). Dismissal is local to this tab. */
 export function SessionNoticesStrip({
-  notices,
+  notices: allNotices,
   onDismiss,
 }: {
   notices: SessionNotice[];
   onDismiss: (id: string) => void;
 }) {
+  const { noticeDisplay, noticeTimeoutSecs } = useAcpPrefs();
+  const notices = noticeDisplay === "hidden" ? allNotices.filter((n) => n.severity === "error") : allNotices;
+
+  // One timer per advisory, started when it first appears and kept across renders so a
+  // later notice cannot postpone an earlier one. Errors are never auto-dismissed.
+  const timers = useRef(new Map<string, ReturnType<typeof setTimeout>>());
+  const onDismissRef = useRef(onDismiss);
+  useEffect(() => {
+    onDismissRef.current = onDismiss;
+  }, [onDismiss]);
+  useEffect(() => {
+    const live = new Set(
+      noticeDisplay === "timeout" ? notices.filter((n) => n.severity !== "error").map((n) => n.id) : [],
+    );
+    for (const [id, timer] of timers.current) {
+      if (!live.has(id)) {
+        clearTimeout(timer);
+        timers.current.delete(id);
+      }
+    }
+    for (const id of live) {
+      if (!timers.current.has(id)) {
+        timers.current.set(
+          id,
+          setTimeout(() => onDismissRef.current(id), Math.min(noticeTimeoutSecs * 1000, MAX_TIMER_DELAY_MS)),
+        );
+      }
+    }
+  }, [notices, noticeDisplay, noticeTimeoutSecs]);
+  useEffect(() => {
+    const pending = timers.current;
+    return () => {
+      for (const timer of pending.values()) clearTimeout(timer);
+      pending.clear();
+    };
+  }, []);
+
   if (notices.length === 0) return null;
   const strongest = notices.some((n) => n.severity === "error")
     ? "error"

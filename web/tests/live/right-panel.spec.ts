@@ -9,6 +9,11 @@ import { listSessions, seedSessionViaAoeAdd } from "../helpers/aoeServe";
 import { commitAll, generateLargeFileContent, pngStubBytes, writeBinaryFile } from "../helpers/gitFixture";
 import { enableStructuredViewAndWait } from "../helpers/acp";
 
+const decodablePng = Buffer.from(
+  "iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAYAAABytg0kAAAAEklEQVR4AWLSSN30H4SZGKAAAAAA//977exuAAAABklEQVQDADoABIHXJwUZAAAAAElFTkSuQmCC",
+  "base64",
+);
+
 async function openSession(page: Page, serve: ServeHandle, title: string) {
   await page.goto(`${serve.baseUrl}/`);
   const row = page.getByRole("link").filter({ hasText: title }).first();
@@ -36,6 +41,58 @@ test("files pane renders a Markdown file in a scratch session", async ({ page, s
   await planRow.click();
   await expect(page.getByRole("heading", { name: "The Plan" }).first()).toBeVisible({ timeout: 10_000 });
   await expect(page.getByRole("listitem").filter({ hasText: "step one" }).first()).toBeVisible();
+});
+
+test("diff pane in a non-git session stays closed until opened, then shows one neutral message", async ({
+  page,
+  spawnServe,
+}) => {
+  // #4574: the git case, where Diff auto-opens, is the diff viewer test below.
+  const serve = await spawnServe({
+    seedFn: seedSessionViaAoeAdd({ title: "rp-non-git", subdir: "plain-project", git: false }),
+  });
+  const [session] = await listSessions(serve.baseUrl);
+  expect(session!.outside_repository).toBe(true);
+  const storedTabs = () =>
+    page.evaluate((id) => {
+      const store = JSON.parse(localStorage.getItem("aoe-pane-layout-v2") ?? "{}");
+      const layout = store.sessions?.[id];
+      return layout ? [...layout.right, ...layout.bottom].flatMap((g: { tabs: string[] }) => g.tabs) : null;
+    }, session!.id);
+
+  // Hold the browser's first Session list so the unknown state is observable: a
+  // deep link mounts the layout before that list arrives.
+  let release!: () => void;
+  const gate = new Promise<void>((r) => (release = r));
+  let held = false;
+  await page.route("**/api/sessions", async (route) => {
+    if (!held && route.request().method() === "GET") {
+      held = true;
+      await gate;
+    }
+    await route.continue();
+  });
+  const diffFilesRequested = page.waitForRequest((r) => r.url().includes(`/sessions/${session!.id}/diff/files`));
+  await page.goto(`${serve.baseUrl}/session/${encodeURIComponent(session!.id)}`);
+  // The diff-files fetch starts from an effect, so the layout effects of that
+  // commit have run: an unknown Session must leave nothing pinned.
+  await diffFilesRequested;
+  expect(held).toBe(true);
+  expect(await storedTabs()).toBeNull();
+  const diffToggle = page.getByTestId("pane-toggle-diff").first();
+  await expect(diffToggle).toHaveAttribute("aria-pressed", "false");
+
+  release();
+  await expect.poll(storedTabs).not.toBeNull();
+  const pinned = (await storedTabs())!;
+  expect(pinned.some((t) => t.startsWith("terminal:"))).toBe(true);
+  expect(pinned).not.toContain("diff");
+  await expect(diffToggle).toHaveAttribute("aria-pressed", "false");
+
+  await diffToggle.click();
+  const neutral = `The working directory (${String(session!.project_path)}) isn't a git repository, so there's nothing to compare.`;
+  await expect(page.getByText(neutral, { exact: true }).first()).toBeVisible({ timeout: 10_000 });
+  await expect(page.getByText(/No changes vs|Could not open repository/)).toHaveCount(0);
 });
 
 test("files pane numbers the lines of a source file", async ({ page, spawnServe }) => {
@@ -106,7 +163,7 @@ test("right panel diff list: Open file shows the worktree copy, saves HTML, and 
       committed: { "notes.txt": "committed copy\n", "gone.txt": "bye\n" },
       files: { "notes.txt": "worktree copy\n", "page.html": "<script>document.title = 'ran';</script>\n" },
       prepare: (dir) => {
-        writeBinaryFile(dir, "image.png", pngStubBytes());
+        writeBinaryFile(dir, "image.png", decodablePng);
         rmSync(join(dir, "gone.txt"));
       },
     }),
@@ -124,7 +181,11 @@ test("right panel diff list: Open file shows the worktree copy, saves HTML, and 
   await textTab.close();
 
   const [imageTab] = await Promise.all([page.waitForEvent("popup"), (await openFileFor(/image\.png/)).click()]);
-  await expect(imageTab.locator("img")).toHaveCount(1, { timeout: 10_000 });
+  const image = imageTab.locator("img");
+  await expect(image).toHaveCount(1, { timeout: 10_000 });
+  await expect
+    .poll(() => image.evaluate((node) => (node as HTMLImageElement).naturalWidth), { timeout: 10_000 })
+    .toBeGreaterThan(0);
   await imageTab.close();
 
   // Active content is saved under its own name rather than rendered in the dashboard's origin.
@@ -140,7 +201,7 @@ test("files pane: Open file shows an unchanged file in a new tab", async ({ page
       title: "rp-files-open",
       committed: { "docs/guide.md": "unchanged guide\n" },
       prepare: (dir, env) => {
-        writeBinaryFile(dir, "logo.png", pngStubBytes());
+        writeBinaryFile(dir, "logo.png", decodablePng);
         commitAll(dir, "logo", env);
       },
     }),
@@ -158,7 +219,43 @@ test("files pane: Open file shows an unchanged file in a new tab", async ({ page
   await textTab.close();
 
   const [imageTab] = await Promise.all([page.waitForEvent("popup"), (await openFileFor("logo.png")).click()]);
-  await expect(imageTab.locator("img")).toHaveCount(1, { timeout: 10_000 });
+  const image = imageTab.locator("img");
+  await expect(image).toHaveCount(1, { timeout: 10_000 });
+  await expect
+    .poll(() => image.evaluate((node) => (node as HTMLImageElement).naturalWidth), { timeout: 10_000 })
+    .toBeGreaterThan(0);
+  await imageTab.close();
+});
+
+test("files pane: a binary file renders an image inline and downloads anything else", async ({ page, spawnServe }) => {
+  const serve = await spawnServe({
+    seedFn: seedSessionViaAoeAdd({
+      title: "rp-files-binary",
+      committed: { "docs/guide.md": "unchanged guide\n" },
+      prepare: (dir, env) => {
+        writeBinaryFile(dir, "logo.png", decodablePng);
+        writeBinaryFile(dir, "blob.bin", Buffer.from([0, 1, 2, 3, 0, 255]));
+        commitAll(dir, "binaries", env);
+      },
+    }),
+  });
+  await openSession(page, serve, "rp-files-binary");
+  await page.getByRole("button", { name: "Toggle Files pane" }).first().click();
+
+  await page.getByRole("button", { name: "logo.png" }).first().click();
+  const image = page.getByRole("img", { name: "logo.png" });
+  await expect(image).toBeVisible({ timeout: 10_000 });
+  await expect
+    .poll(() => image.evaluate((node) => (node as HTMLImageElement).naturalWidth), { timeout: 10_000 })
+    .toBeGreaterThan(0);
+
+  await page.getByRole("button", { name: "Back to files" }).first().click();
+  await page.getByRole("button", { name: "blob.bin" }).first().click();
+  const [download] = await Promise.all([
+    page.waitForEvent("download"),
+    page.getByRole("button", { name: "Download" }).first().click(),
+  ]);
+  expect(download.suggestedFilename()).toBe("blob.bin");
 });
 
 test("right panel notifications: structured view comments banner appears on stage, clears on discard", async ({

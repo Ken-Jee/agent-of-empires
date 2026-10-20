@@ -73,7 +73,7 @@ fn clear_reported_session_creates(reported: u32, outcome: crate::telemetry::Send
         return;
     }
     use std::sync::atomic::Ordering;
-    // `try_update` needs Rust 1.99; this keeps the 1.85 MSRV and the Nix toolchain building.
+    // `try_update` needs Rust 1.99, newer than the MSRV and the Nix toolchain.
     #[allow(deprecated)]
     let _ = TUI_SESSION_CREATES.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
         Some(current.saturating_sub(reported))
@@ -787,10 +787,7 @@ impl App {
         let mut last_spinner_redraw = std::time::Instant::now();
         let mut last_heartbeat = std::time::Instant::now();
         let mut last_presence_refresh = std::time::Instant::now();
-        // Throttle for how often the periodic block re-reads settings;
-        // without this, the inner guards would re-fire on every loop
-        // iteration once any time has passed, hitting the config file at
-        // the 20Hz loop rate.
+        let mut last_serve_probe = std::time::Instant::now();
         let mut last_update_eval = std::time::Instant::now();
         const DISK_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
         // Diagnostics-strip sampling. 1s keeps the sparkline responsive to a
@@ -805,9 +802,8 @@ impl App {
         // "another instance appeared/left" signal responsive without disk I/O
         // on the hot render path.
         const PRESENCE_REFRESH_INTERVAL: Duration = Duration::from_secs(3);
-        // A presence file counts as live while its mtime is within this window.
-        // Larger than the liveness heartbeat so a couple of missed beats (busy loop,
-        // brief stall) don't drop an instance; matches the push consumer.
+        const SERVE_PROBE_INTERVAL: Duration = Duration::from_secs(2);
+        // Wider than the heartbeat so missed beats do not drop an instance.
         const PRESENCE_FRESH_WINDOW: Duration = Duration::from_secs(30);
 
         // Register this TUI as live for the footer, and as recently interacted
@@ -815,6 +811,7 @@ impl App {
         crate::session::write_tui_heartbeat();
         crate::session::write_tui_activity();
         self.home.active_tui_count = crate::session::count_active_tuis(PRESENCE_FRESH_WINDOW);
+        self.home.request_serve_probe();
 
         // Telemetry is opt-in; sends are detached and swallow errors.
         let telemetry_snapshot_interval = crate::telemetry::snapshot_interval();
@@ -1745,11 +1742,16 @@ impl App {
             }
 
             needs_full_refresh |= self.home.tick_dialog();
-
-            // Fade the settings "Settings saved" toast once its window passes,
-            // even if the user has stopped typing. Fires at most once per save,
-            // so a full refresh here is free.
             needs_full_refresh |= self.home.tick_settings_status();
+            needs_full_refresh |= self.home.tick_opener();
+            if self
+                .home
+                .config_watch
+                .link_policy_dirty
+                .swap(false, std::sync::atomic::Ordering::Acquire)
+            {
+                needs_full_refresh |= self.home.refresh_link_policy();
+            }
 
             // Full/config reloads stay deferred during live-send to preserve input
             // policy and mouse-capture state.
@@ -1818,6 +1820,12 @@ impl App {
                 last_telemetry_snapshot = std::time::Instant::now();
                 self.emit_telemetry_snapshot();
             }
+
+            if last_serve_probe.elapsed() >= SERVE_PROBE_INTERVAL {
+                last_serve_probe = std::time::Instant::now();
+                self.home.request_serve_probe();
+            }
+            refresh_needed |= self.home.apply_serve_probe();
 
             if last_presence_refresh.elapsed() >= PRESENCE_REFRESH_INTERVAL {
                 last_presence_refresh = std::time::Instant::now();

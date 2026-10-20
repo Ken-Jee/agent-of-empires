@@ -17,12 +17,57 @@ impl PiSidecarUpdate {
     }
 }
 
+fn combine_teardown_results(pane: Result<()>, native: Result<()>) -> Result<()> {
+    match (pane, native) {
+        (Err(pane), Err(native)) => {
+            Err(native.context(format!("tmux teardown also failed: {pane:#}")))
+        }
+        (Err(error), _) | (_, Err(error)) => Err(error),
+        (Ok(()), Ok(())) => Ok(()),
+    }
+}
+
 impl Instance {
     pub(crate) fn flush_published_conversation(
         &self,
         storage: &dyn crate::session::SessionStore,
     ) -> Option<SidWrite> {
-        let observation = self.final_publication_observation()?;
+        let observation = if self.prime_runtime().is_some() {
+            match self.prime_root_publication(true)? {
+                crate::session::capture::PrimeRootPublication::Ready(id) => {
+                    self.prime_root_observation(id)
+                }
+                crate::session::capture::PrimeRootPublication::Pending(id) => {
+                    if self.is_capture_excluded(
+                        &id,
+                        self.active_execution.as_ref().map(|active| &active.binding),
+                    ) {
+                        return None;
+                    }
+                    let expected = self.conversation_state();
+                    return Some(
+                        storage
+                            .update(|rows, _| {
+                                let Some(row) = rows.iter_mut().find(|row| row.id == self.id)
+                                else {
+                                    return Ok(SidWrite::Failed);
+                                };
+                                if !expected.matches(row) {
+                                    return Ok(SidWrite::Skipped);
+                                }
+                                if !row.resume_intent.is_default() {
+                                    return Ok(SidWrite::PinnedForeign);
+                                }
+                                row.set_agent_conversation(None, None, None);
+                                Ok(SidWrite::Applied)
+                            })
+                            .unwrap_or(SidWrite::Failed),
+                    );
+                }
+            }
+        } else {
+            self.final_publication_observation()?
+        };
         if self.is_capture_excluded(&observation.sid, observation.source()) {
             return None;
         }
@@ -35,15 +80,7 @@ impl Instance {
         if outcome != SidWrite::Skipped {
             return Some(outcome);
         }
-        // `Skipped` reports a peer write between the caller's read and the CAS.
-        // Retry once against the row as it now stands: a peer that committed
-        // the same final observation makes this publication durable, while a
-        // fork intent or another conversation skips again. The retry emits
-        // `PinnedForeign` itself when the pin is the cause, so no post-hoc
-        // inference is needed here: any remaining `Skipped` keeps the doubt.
-        // A retry that cannot read the row leaves the publication in doubt, so
-        // it must fail the flush: `None` would read as "nothing to publish" and
-        // let teardown delete the evidence.
+        // Retry a peer CAS once; a second divergence retains the evidence.
         let Ok(rows) = storage.load() else {
             return Some(SidWrite::Failed);
         };
@@ -80,7 +117,7 @@ impl Instance {
                 .as_ref()
                 .and_then(|active| active.capture.as_ref()),
             Some(CaptureContext::Prime {
-                sidecar: Some(_),
+                runtime: Some(_),
                 ..
             })
         ) {
@@ -112,46 +149,32 @@ impl Instance {
         })
     }
 
-    /// Tear down the current tmux session cleanly so a fresh
-    /// `start_with_size_opts` can recreate it.
-    ///
-    /// `remain-on-exit on` keeps the tmux session alive after the agent
-    /// process exits, leaving a frozen pane. The plain kill-session +
-    /// new-session flow can race against the session cache
-    /// (kill_process_tree on a defunct pid stalls on macOS, and the
-    /// subsequent kill can run while start's exists() check still sees the
-    /// cached entry), leaving the dead pane in place. Respawning the pane
-    /// into a shell first puts it back in a live state so the kill path
-    /// proceeds cleanly. The kill below then sees a live pane and tears it
-    /// down. Caller is responsible for the subsequent
-    /// `start_with_size_opts` to recreate the session with the agent
-    /// command.
     pub(super) fn kill_clean_locked(&self) -> Result<()> {
-        let session = self.tmux_session()?;
-        // The poller watches this pane, so it goes before the pane does, whether or not the pane
-        // is still there to kill.
+        use crate::tmux::utils::{probe_pane, PaneProbe};
         self.stop_poller();
-        if !session.exists() {
-            return Ok(());
-        }
-        if session.is_pane_dead() {
-            tracing::info!(target: "session.store",
-                "restart: pane dead for session {} (remain-on-exit), \
-                 respawning shell before recreate",
-                session.name()
-            );
-            let shell = crate::session::environment::user_shell();
-            if let Err(e) = session.respawn_dead_pane(&self.project_path, Some(&shell)) {
-                tracing::warn!(target: "session.store",
-                    "respawn_dead_pane failed for {}: {}; falling back to kill+start",
-                    session.name(),
-                    e
-                );
+        let pane = self.tmux_session().and_then(|session| {
+            match probe_pane(session.name()) {
+                PaneProbe::Missing => return Ok(()),
+                PaneProbe::Unknown => anyhow::bail!(
+                    "cannot prove tmux pane state for {} before teardown",
+                    session.name()
+                ),
+                PaneProbe::Alive => {}
+                PaneProbe::Dead => {
+                    let shell = crate::session::environment::user_shell();
+                    if let Err(error) = session.respawn_dead_pane(&self.project_path, Some(&shell)) {
+                        tracing::warn!(target: "session.store", %error, "respawn_dead_pane failed before teardown");
+                    }
+                }
             }
-        }
-        session.kill()?;
-        std::thread::sleep(std::time::Duration::from_millis(100));
-        Ok(())
+            session.kill()?;
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            Ok(())
+        });
+        let native = self
+            .prime_runtime()
+            .map_or(Ok(()), |runtime| runtime.cleanup());
+        combine_teardown_results(pane, native)
     }
 
     pub(crate) fn kill_clean_in(&self, storage: &dyn crate::session::SessionStore) -> Result<u64> {
@@ -187,7 +210,11 @@ impl Instance {
 
     pub(crate) fn kill_locked(&self) -> Result<()> {
         self.stop_poller();
-        self.tmux_session()?.kill()
+        let pane = self.tmux_session().and_then(|session| session.kill());
+        let native = self
+            .prime_runtime()
+            .map_or(Ok(()), |runtime| runtime.cleanup());
+        combine_teardown_results(pane, native)
     }
 
     pub fn kill(&self) -> Result<()> {
@@ -439,22 +466,27 @@ impl Instance {
             Some(Status::Stopped),
         )?;
         self.stop_poller();
-        let killed = lifecycle
-            .kill_locked()
-            .and_then(|()| lifecycle.release_scope());
-        let teardown = killed.and_then(|()| {
+        let teardown = (|| {
             let mut current = storage
                 .load()?
                 .into_iter()
                 .find(|row| row.id == self.id)
                 .context("session disappeared during stop")?;
             current.source_profile = profile.clone();
+            anyhow::ensure!(
+                current.lifecycle_reservation_is_owned(LifecycleOperation::Stop, generation),
+                "Session changed during stop; resources retained"
+            );
             let flushed = current.flush_published_conversation(&storage);
-            // A pinned-foreign sid and a sid another row durably owns are both
-            // deliberate refusals rather than doubtful writes, so the teardown
-            // keeps no evidence to preserve. A real failure still keeps it, and
-            // the sandbox container always stops: the store is a host bind, not
-            // container state.
+            if current.prime_runtime().is_some()
+                && matches!(flushed, Some(SidWrite::Failed | SidWrite::Skipped))
+            {
+                anyhow::bail!(
+                    "could not persist final conversation publication; native evidence retained"
+                );
+            }
+            current.kill_locked()?;
+            current.release_scope()?;
             let container_result = crate::session::worktree_edit::stop_sandbox_container(
                 &current.id,
                 current.is_sandboxed(),
@@ -471,7 +503,7 @@ impl Instance {
                     )
                 }
             }
-        });
+        })();
         match teardown {
             Ok(()) => {
                 lifecycle.commit_lifecycle_status(
@@ -527,7 +559,7 @@ mod tests {
             std::env::var("PATH").unwrap_or_default()
         );
         let _path = crate::session::test_support::EnvGuard::set(&[("PATH", path.as_str())]);
-        for coordinated_all in [false, true] {
+        for operation in ["kill", "stop", "kill_all"] {
             let profile = "fresh-terminal-stop";
             let storage = crate::session::Storage::new_unwatched(profile).unwrap();
             let mut cached = Instance::new("cached scope", temp.path().to_str().unwrap());
@@ -562,12 +594,19 @@ mod tests {
                 String::from_utf8_lossy(&created.stderr)
             );
             crate::tmux::refresh_session_cache();
-            if coordinated_all {
-                cached.kill_all_tmux_sessions();
-            } else {
-                cached
-                    .kill()
-                    .expect_err("the current scope lacks empty-cgroup proof");
+            match operation {
+                "kill_all" => cached.kill_all_tmux_sessions(),
+                "stop" => {
+                    cached
+                        .stop()
+                        .expect_err("the current scope lacks empty-cgroup proof");
+                }
+                "kill" => {
+                    cached
+                        .kill()
+                        .expect_err("the current scope lacks empty-cgroup proof");
+                }
+                _ => unreachable!(),
             }
             assert!(
                 !crate::tmux::session_exists(&name),
@@ -590,6 +629,91 @@ mod tests {
                 vec![crate::process::worker_registry::ScopeOwnership::Owned { unit }]
             );
             std::fs::remove_file(&marker).unwrap();
+        }
+    }
+    #[test]
+    #[serial_test::serial]
+    fn prime_cleanup_failure_still_tears_down_the_pane_and_retains_ownership() {
+        if crate::tmux::tmux_command().arg("-V").output().is_err() {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(root.path());
+        let profile = "prime-pane-cleanup-failure";
+        let storage = crate::session::storage::Storage::new_unwatched(profile).unwrap();
+        for clean in [false, true] {
+            let mut inst = Instance::new("Prime cleanup failure", root.path().to_str().unwrap());
+            inst.source_profile = profile.into();
+            let runtime = crate::process::prime::PrimeRuntime::new(
+                "/bin/false".into(),
+                root.path().into(),
+                None,
+            )
+            .unwrap();
+            runtime.prepare().unwrap();
+            inst.active_execution = Some(super::super::execution::ActiveExecution {
+                launch_id: "failed-cleanup".into(),
+                binding: super::super::execution::ExecutionBinding {
+                    agent: "prime-agent".into(),
+                    stores: vec![],
+                    configuration: vec![],
+                    cwd: root.path().into(),
+                    cwd_filesystem: "host".into(),
+                    filesystem: "host".into(),
+                    exported_default_store: None,
+                },
+                capture: Some(CaptureContext::PrimeStatus(runtime.clone())),
+                container: None,
+            });
+            storage
+                .update(|instances, _| {
+                    instances.push(inst.clone());
+                    Ok(())
+                })
+                .unwrap();
+            let name = crate::tmux::Session::generate_name(&inst.id, &inst.title);
+            struct Pane(String);
+            impl Drop for Pane {
+                fn drop(&mut self) {
+                    let _ = crate::tmux::tmux_command()
+                        .args(["kill-session", "-t", &self.0])
+                        .output();
+                }
+            }
+            let _pane = Pane(name.clone());
+            assert!(crate::tmux::tmux_command()
+                .args(["new-session", "-d", "-s", &name, "sleep 60"])
+                .status()
+                .unwrap()
+                .success());
+            crate::tmux::refresh_session_cache();
+            let result = if clean {
+                inst.kill_clean_in(&storage).map(|_| ())
+            } else {
+                inst.kill()
+            };
+            crate::tmux::refresh_session_cache();
+            assert!(result.is_err());
+            assert!(
+                !crate::tmux::session_exists(&name),
+                "cleanup error left the pane running"
+            );
+            let persisted = storage
+                .load()
+                .unwrap()
+                .into_iter()
+                .find(|row| row.id == inst.id)
+                .unwrap();
+            assert_eq!(persisted.status, Status::Error);
+            assert_eq!(
+                persisted.prime_runtime().unwrap().directory,
+                runtime.directory
+            );
+            assert!(
+                runtime.directory.exists(),
+                "unproven native route must remain recoverable"
+            );
+            std::fs::remove_dir_all(&runtime.directory).unwrap();
         }
     }
 
@@ -664,6 +788,145 @@ mod tests {
             "teardown must stop the agent that is actually running"
         );
     }
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn prime_stop_flushes_the_owned_root_before_disposal_and_retains_failed_publication_evidence() {
+        use std::os::unix::fs::PermissionsExt;
+        for conflict in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
+            let project = temp.path().join("project");
+            let store = temp.path().join("prime-store");
+            let sessions = store.join("sessions");
+            std::fs::create_dir(&project).unwrap();
+            std::fs::create_dir_all(&sessions).unwrap();
+            let storage = crate::session::Storage::new_unwatched("prime-stop").unwrap();
+            let sid = uuid::Uuid::new_v4().to_string();
+            let transcript = sessions.join(format!("{sid}.jsonl"));
+            std::fs::write(
+                &transcript,
+                serde_json::json!({"type":"session","id":sid,"rlmDepth":0,"cwd":project})
+                    .to_string()
+                    + "\n",
+            )
+            .unwrap();
+            let observation = serde_json::json!({"sessions":[{
+                "sessionId":sid,"sessionFile":transcript,"cwd":project,
+                "activeSessionId":sid,"rlmDepth":0,"attachedClients":1,
+                "workerState":"ready","lifecycle":"running","activity":"idle",
+                "isStreaming":false,"isCompacting":false,"hasRunningSubagents":false,
+                "isBashRunning":false,"isSessionActive":false
+            }]});
+            let at_shutdown = temp.path().join("at-shutdown.json");
+            let program = temp.path().join("native-prime");
+            std::fs::write(&program, format!(
+                "#!/bin/sh\ncase \"$1\" in\nlist) printf '%s' {};;\nshutdown) cat {} > {}; printf '%s' '{{\"failed\":[]}}';;\n*) exit 2;;\nesac\n",
+                crate::session::environment::shell_escape(&observation.to_string()),
+                crate::session::environment::shell_escape(storage.sessions_path().to_str().unwrap()),
+                crate::session::environment::shell_escape(at_shutdown.to_str().unwrap()),
+            )).unwrap();
+            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let runtime =
+                crate::process::prime::PrimeRuntime::new(program, store.clone(), None).unwrap();
+            runtime.prepare().unwrap();
+            struct PrivateRuntimeRoot(std::path::PathBuf);
+            impl Drop for PrivateRuntimeRoot {
+                fn drop(&mut self) {
+                    let _ = std::fs::remove_dir_all(&self.0);
+                }
+            }
+            let _runtime_root = PrivateRuntimeRoot(runtime.directory.clone());
+            let binding = ExecutionBinding {
+                agent: "prime-agent".into(),
+                stores: vec![store.clone()],
+                configuration: Vec::new(),
+                cwd: project.clone(),
+                cwd_filesystem: "host".into(),
+                filesystem: "host".into(),
+                exported_default_store: None,
+            };
+            let mut instance = Instance::new("owned Prime root", project.to_str().unwrap());
+            instance.source_profile = "prime-stop".into();
+            instance.tool = "prime-agent".into();
+            instance.status = Status::Running;
+            instance.terminal_scopes = Some(Vec::new());
+            if conflict {
+                let mut pinned = binding.clone();
+                pinned.cwd = temp.path().join("other-project");
+                instance.resume_intent = ResumeIntent::Use(sid.clone());
+                instance.resume_binding = Some(ConversationBinding {
+                    session_id: sid.clone(),
+                    execution: Some(pinned),
+                    provenance: ConversationProvenance::Asserted,
+                    transcript_path: None,
+                });
+                instance.set_agent_conversation(
+                    Some(sid.clone()),
+                    Some(ConversationBinding {
+                        session_id: sid.clone(),
+                        execution: Some(binding.clone()),
+                        provenance: ConversationProvenance::Observed,
+                        transcript_path: None,
+                    }),
+                    None,
+                );
+            }
+            instance.active_execution = Some(ActiveExecution {
+                launch_id: uuid::Uuid::new_v4().to_string(),
+                binding,
+                capture: Some(CaptureContext::Prime {
+                    plan: crate::session::instance::PrimeAgentCapturePlan {
+                        store,
+                        session_dir: "sessions".into(),
+                        container_session_dir: sessions,
+                        container_cwd: project.to_str().unwrap().into(),
+                    },
+                    runtime: Some(runtime.clone()),
+                }),
+                container: None,
+            });
+            storage
+                .update(|rows, _| {
+                    rows.push(instance.clone());
+                    Ok(())
+                })
+                .unwrap();
+            let result = instance.stop();
+            if conflict {
+                assert!(result.is_err());
+                assert!(
+                    runtime.directory.exists(),
+                    "failed persistence retains its observation route"
+                );
+                assert!(
+                    !at_shutdown.exists(),
+                    "native cleanup cannot precede successful publication persistence"
+                );
+                assert_eq!(
+                    storage.load().unwrap()[0].resume_intent,
+                    ResumeIntent::Use(sid)
+                );
+                runtime.cleanup().unwrap();
+            } else {
+                result.unwrap();
+                assert!(
+                    !runtime.directory.exists(),
+                    "the native route is actually disposed"
+                );
+                let before_cleanup: Vec<Instance> =
+                    serde_json::from_slice(&std::fs::read(at_shutdown).unwrap()).unwrap();
+                assert_eq!(
+                    before_cleanup[0].agent_session_id.as_deref(),
+                    Some(sid.as_str())
+                );
+                let stored = storage.load().unwrap();
+                assert_eq!(stored[0].agent_session_id.as_deref(), Some(sid.as_str()));
+                assert_eq!(stored[0].status, Status::Stopped);
+            }
+        }
+    }
+
     #[test]
     #[serial_test::serial]
     fn stop_flushes_six_hour_old_pi_publication_for_builtin_and_direct_command_alias() {
@@ -994,16 +1257,6 @@ mod tests {
             })
             .unwrap();
 
-        let snapshot = temp.path().join("sessions-at-kill.json");
-        let ready = temp.path().join("trap-installed");
-        let script = format!(
-            "trap 'find {root} -name sessions.json -exec cat {{}} + > {out}.tmp; \
-             mv {out}.tmp {out}; exit 0' TERM HUP; \
-             touch {ready}; while :; do sleep 0.05; done",
-            root = temp.path().display(),
-            out = snapshot.display(),
-            ready = ready.display(),
-        );
         let name = crate::tmux::Session::generate_name(&inst.id, &inst.title);
         let _ = crate::tmux::tmux_command()
             .args(["kill-session", "-t", &name])
@@ -1018,31 +1271,54 @@ mod tests {
                 "80",
                 "-y",
                 "24",
-                "sh",
-                "-c",
+                "sleep 600",
             ])
-            .arg(&script)
             .output()
             .expect("tmux");
         assert!(created.status.success(), "the test needs a real pane");
         let _pane = crate::tmux::test_helpers::TmuxTestSession::from_name(name);
         crate::tmux::refresh_session_cache();
-        let wait_for = |path: &std::path::Path, what: &str| {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-            while !path.exists() {
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "timed out waiting for {what}"
-                );
-                std::thread::sleep(std::time::Duration::from_millis(10));
+
+        // Read the stored rows synchronously as the first kill signal is about
+        // to be sent; a pane-side trap would race the SIGKILL escalation.
+        struct SnapshotAtFirstSignal {
+            sessions: std::path::PathBuf,
+            snapshot: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+        }
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for SnapshotAtFirstSignal {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                if event.metadata().target() != "process.signal" {
+                    return;
+                }
+                let mut snapshot = self.snapshot.lock().unwrap();
+                if snapshot.is_none() {
+                    *snapshot = Some(std::fs::read_to_string(&self.sessions).unwrap());
+                }
             }
+        }
+        let snapshot = std::sync::Arc::default();
+        let layer = SnapshotAtFirstSignal {
+            sessions: storage.sessions_path().to_path_buf(),
+            snapshot: std::sync::Arc::clone(&snapshot),
         };
-        wait_for(&ready, "the pane to install its trap");
+        {
+            use tracing_subscriber::layer::SubscriberExt;
+            let _guard = tracing::subscriber::set_default(
+                tracing_subscriber::Registry::default().with(layer),
+            );
+            tracing::callsite::rebuild_interest_cache();
+            inst.stop().expect("stop");
+        }
 
-        inst.stop().expect("stop");
-
-        wait_for(&snapshot, "the pane to record its kill signal");
-        let at_kill = std::fs::read_to_string(&snapshot).unwrap();
+        let at_kill = snapshot
+            .lock()
+            .unwrap()
+            .take()
+            .expect("stop signals the pane's process tree");
         let rows: Vec<serde_json::Value> = serde_json::from_str(&at_kill).unwrap();
         let row = rows
             .iter()

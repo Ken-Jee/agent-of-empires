@@ -51,14 +51,15 @@ mod v034_trash_retention_minutes;
 mod v035_custom_sort_order;
 mod v036_session_creation_count;
 mod v037_trash_lifecycle_id;
-mod v038_canonical_sidebar;
-mod v039_serve_passphrase_policy;
-mod v040_reconcile_serve_passphrase_policy;
+mod v038_prime_native_runtime;
+mod v039_prime_control_path;
+mod v040_worker_ownership;
 mod v041_pending_purge_owners;
 mod v042_reconcile_session_creation_count;
 mod v043_reconcile_trash_lifecycle_id;
 mod v044_reconcile_serve_passphrase_policy;
 mod v045_runner_scope_ownership;
+mod v046_reconcile_runtime_lineages;
 
 /// Fixtures shared by migrations that rewrite agent hook files.
 #[cfg(test)]
@@ -99,7 +100,7 @@ use anyhow::Result;
 use std::fs;
 use tracing::{debug, info};
 
-const CURRENT_VERSION: u32 = 45;
+const CURRENT_VERSION: u32 = 46;
 const VERSION_FILE: &str = ".schema_version";
 
 struct Migration {
@@ -296,18 +297,18 @@ const MIGRATIONS: &[Migration] = &[
     },
     Migration {
         version: 38,
-        name: "canonical_sidebar",
-        run: v038_canonical_sidebar::run,
+        name: "prime_native_runtime",
+        run: v038_prime_native_runtime::run,
     },
     Migration {
         version: 39,
-        name: "serve_passphrase_policy",
-        run: v039_serve_passphrase_policy::run,
+        name: "prime_control_path",
+        run: v039_prime_control_path::run,
     },
     Migration {
         version: 40,
-        name: "reconcile_serve_passphrase_policy",
-        run: v040_reconcile_serve_passphrase_policy::run,
+        name: "worker_ownership",
+        run: v040_worker_ownership::run,
     },
     Migration {
         version: 41,
@@ -333,6 +334,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 45,
         name: "runner_scope_ownership",
         run: v045_runner_scope_ownership::run,
+    },
+    Migration {
+        version: 46,
+        name: "reconcile_runtime_lineages",
+        run: v046_reconcile_runtime_lineages::run,
     },
 ];
 
@@ -413,16 +419,28 @@ pub fn run_migrations() -> Result<()> {
 /// [`run_migrations_announced`] for `aoe migrate`. This path only advances the
 /// schema version and reports the migrations it actually runs.
 pub fn run_migrations_with(reporter: Option<progress::Reporter>) -> Result<()> {
-    run_migrations_inner(reporter, false)
+    run_migrations_inner(reporter, false, None)
 }
 
 /// [`run_migrations_with`] for an explicit `aoe migrate`: a pending sandbox
 /// store move also narrates what is still pending and why.
 pub fn run_migrations_announced(reporter: Option<progress::Reporter>) -> Result<()> {
-    run_migrations_inner(reporter, true)
+    run_migrations_inner(reporter, true, None)
 }
 
-fn run_migrations_inner(reporter: Option<progress::Reporter>, announce: bool) -> Result<()> {
+pub(crate) fn run_migrations_under_transaction(
+    reporter: Option<progress::Reporter>,
+    announce: bool,
+    transaction: &crate::daemon::lifecycle::Transaction,
+) -> Result<()> {
+    run_migrations_inner(reporter, announce, Some(transaction))
+}
+
+fn run_migrations_inner(
+    reporter: Option<progress::Reporter>,
+    announce: bool,
+    transaction: Option<&crate::daemon::lifecycle::Transaction>,
+) -> Result<()> {
     let _installed = progress::install(reporter);
     let _announced = progress::install_announced(announce);
     // `announce` is the explicit `aoe migrate`, and the two reconciliations
@@ -445,6 +463,9 @@ fn run_migrations_inner(reporter: Option<progress::Reporter>, announce: bool) ->
     if current == CURRENT_VERSION {
         v027_isolate_sandbox_stores::reconcile_pending(explicit_migrate)?;
         v033_isolate_sandbox_content::reconcile_pending(move_stores)?;
+        if announce {
+            v046_reconcile_runtime_lineages::run()?;
+        }
         return Ok(());
     }
 
@@ -466,7 +487,12 @@ fn run_migrations_inner(reporter: Option<progress::Reporter>, announce: bool) ->
             position: index + 1,
             total: pending.len(),
         });
-        (migration.run)()?;
+        match (migration.version, transaction) {
+            (44, Some(transaction)) => {
+                v044_reconcile_serve_passphrase_policy::run_with_transaction(transaction)?
+            }
+            _ => (migration.run)()?,
+        }
         set_version(migration.version)?;
         progress::report(progress::Event::Finished {
             version: migration.version,
@@ -628,7 +654,7 @@ mod tests {
         fs::write(app.join(VERSION_FILE), "31").unwrap();
         fs::write(
             app.join("sessions.json"),
-            r#"[{"agent_session_id":"old","resume_intent":{"kind":"Use","value":"target"},"retroactive_capture_excludes":["old"]}]"#,
+            r#"[{"id":"3131313131313131","agent_session_id":"old","resume_intent":{"kind":"Use","value":"target"},"retroactive_capture_excludes":["old"]}]"#,
         )
         .unwrap();
 
@@ -663,7 +689,7 @@ mod tests {
             &fs::read(app.join(crate::session::purge_owners::FILE_NAME)).unwrap(),
         )
         .unwrap();
-        assert_eq!(journal["version"], 2);
+        assert_eq!(journal["version"], 3);
         assert_eq!(journal["owners"], serde_json::json!([]));
     }
 
@@ -701,7 +727,7 @@ mod tests {
         fs::write(app.join(VERSION_FILE), "28").unwrap();
         fs::write(
             app.join("sessions.json"),
-            r#"[{"retroactive_capture_excludes":["legacy-sid"],"pending_initial_turn":"go"}]"#,
+            r#"[{"id":"2828282828282828","retroactive_capture_excludes":["legacy-sid"],"pending_initial_turn":"go"}]"#,
         )
         .unwrap();
 

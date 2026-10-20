@@ -25,12 +25,14 @@ import { useWorkspaces } from "./hooks/useWorkspaces";
 import { useLastSessionRestore } from "./hooks/useLastSessionRestore";
 import { SCRATCH_GROUP_ID, useRepoGroups } from "./hooks/useRepoGroups";
 import { useSessionGroups } from "./hooks/useSessionGroups";
+import { useAttentionJump } from "./hooks/useAttentionJump";
 import { useNestedSidebarGroups } from "./hooks/useNestedSidebarGroups";
 import { useOrgGroups } from "./hooks/useOrgGroups";
-import { PluginUiProvider, usePluginUiEntries } from "./lib/pluginUiContext";
+import { PluginUiProvider, usePluginAttention, usePluginPages, usePluginUiEntries } from "./lib/pluginUiContext";
+import { buildPluginPageActions } from "./lib/pluginPages";
 import { buildSortValueMap, pluginSortSpecs } from "./lib/pluginUi";
 import type { PluginSortContext, SidebarSortMode } from "./lib/sidebarSort";
-import { nextAttentionSessionId, sessionNeedsAttention, workspaceIsTrashed } from "./lib/sidebarSort";
+import { nextAttentionSessionId, workspaceIsTrashed } from "./lib/sidebarSort";
 import { useSidebarAxis, useSidebarSortMode } from "./hooks/useSidebarPrefs";
 import { repoGroupToSidebarGroup, type SidebarGroup } from "./lib/sidebarGroups";
 import { useProjects } from "./hooks/useProjects";
@@ -54,6 +56,8 @@ import type { RightPanelView } from "./lib/rightPanelView";
 import { usePaneLayout, dockTabs, dockGroups, dockOf, isActiveTab, isDockCollapsed } from "./lib/paneLayout";
 import { isPluginPaneId, resolvePaneIcon, usePluginPanes, type PluginPane } from "./lib/pluginPanes";
 import { PluginPaneBody } from "./components/plugin/PluginPane";
+import { PluginPageView } from "./components/plugin/PluginPageView";
+import { PluginSessionMenu } from "./components/plugin/PluginSessionMenu";
 import { TOUR_ANCHORS, tourAnchor } from "./lib/tourSteps";
 import {
   deleteWorkspaceSessions,
@@ -92,7 +96,7 @@ import {
   restoreSession,
   fetchPlugins,
 } from "./lib/api";
-import type { DeleteSessionOptions, ServerAbout } from "./lib/api";
+import type { DeleteSessionOptions, ServerAbout, SettingsResponse } from "./lib/api";
 import { getClientCapabilities } from "./lib/clientCapabilities";
 import { normalizeProjectPathKey } from "./lib/registeredProjects";
 import { IdleDecayWindowContext, parseIdleDecayWindowMs } from "./lib/idleDecay";
@@ -194,7 +198,7 @@ export default function App() {
   const [sessionColorsEnabled, setSessionColorsEnabled] = useState(true);
   const [systemHealthEnabled, setSystemHealthEnabled] = useState(false);
 
-  const applyAppSettings = useCallback((settings: Record<string, unknown> | null | undefined) => {
+  const applyAppSettings = useCallback((settings: SettingsResponse | null | undefined) => {
     setIdleDecayWindowMs(parseIdleDecayWindowMs(settings));
     setUnreadIndicatorEnabled(parseUnreadIndicatorEnabled(settings));
     setSessionRowTagMode(parseSessionRowTagMode(settings));
@@ -354,8 +358,31 @@ function AppContent({
   const settingsRootMatch = useMatch("/settings");
   const settingsTabMatch = useMatch("/settings/:tab");
   const profilesMatch = useMatch("/profiles");
-  const activeSessionId = sessionMatch?.params.sessionId ?? null;
+  const pluginPageMatch = useMatch("/plugins/:pluginId/:pageId");
+  // A plugin page's split pane shows `?session=` as the routed session, docks and all.
+  const activeSessionId = sessionMatch?.params.sessionId ?? (pluginPageMatch ? searchParams.get("session") : null);
+  const selectPluginPageSession = useCallback(
+    (id: string | null) =>
+      setSearchParams(
+        (prev) => {
+          const next = new URLSearchParams(prev);
+          if (id) next.set("session", id);
+          else next.delete("session");
+          return next;
+        },
+        { replace: true },
+      ),
+    [setSearchParams],
+  );
+  // Off a removed session: back to the dashboard, or on a plugin page just out of its split pane.
+  const onPluginPage = pluginPageMatch !== null;
+  const leaveActiveSession = useCallback(
+    () => (onPluginPage ? selectPluginPageSession(null) : navigate("/")),
+    [onPluginPage, selectPluginPageSession, navigate],
+  );
   const showSettings = settingsRootMatch !== null || settingsTabMatch !== null;
+  // Settings and plugin pages take the full width, sidebar and session panels hidden.
+  const fullPageView = showSettings || pluginPageMatch !== null;
   const settingsTab = settingsTabMatch?.params.tab ?? null;
 
   const {
@@ -440,6 +467,9 @@ function AppContent({
   // built-in sort; if the entry reappears on a later poll the selection
   // resumes. Selecting a built-in mode clears it via `selectSidebarSortMode`.
   const pluginUiEntries = usePluginUiEntries();
+  const pluginPages = usePluginPages();
+  const pluginPageActions = useMemo(() => buildPluginPageActions(pluginPages ?? []), [pluginPages]);
+  const pluginAttention = usePluginAttention();
   const [pluginSortRef, setPluginSortRef] = useState<{ pluginId: string; entryId: string } | null>(null);
   const activePluginSort = useMemo(() => {
     if (!pluginSortRef) return null;
@@ -479,8 +509,13 @@ function AppContent({
     toggleRepoCollapsed,
     updateRepoAppearance,
     reorderRepoGroups,
-  } = useRepoGroups(workspaces, workspaceOrdering, sidebarSortMode, projects, pluginSort);
-  const { groups: sessionGroups, toggleGroupCollapsed } = useSessionGroups(workspaces, sidebarSortMode, pluginSort);
+  } = useRepoGroups(workspaces, workspaceOrdering, sidebarSortMode, projects, pluginSort, pluginAttention);
+  const { groups: sessionGroups, toggleGroupCollapsed } = useSessionGroups(
+    workspaces,
+    sidebarSortMode,
+    pluginSort,
+    pluginAttention,
+  );
   // The nested `repo+group` axis reuses the already-built repo groups for
   // its top level (so repo collapse, appearance, and ordering are shared
   // with the repo axis) and splits each repo by `group_path` underneath.
@@ -489,6 +524,7 @@ function AppContent({
     repoGroups,
     sidebarSortMode,
     pluginSort,
+    pluginAttention,
   );
   // The org axis (#3283) partitions the same repo groups by remote owner;
   // it needs no sort/plugin-sort input of its own since it reuses each
@@ -554,6 +590,9 @@ function AppContent({
   // of tabs (diff, one-or-more terminals, plugin panes) with one active body.
   // The tab membership + active tab + terminal count are persisted per session;
   // dock sizes stay global (Dock/BottomDock own those localStorage keys).
+  // Null until the active Session's row loads, so nothing is seeded from a guess.
+  const activeRow = sessions.find((s) => s.id === activeSessionId);
+  const activeOutsideRepository = activeRow ? Boolean(activeRow.outside_repository) : null;
   const {
     layout: paneLayout,
     openTab,
@@ -566,7 +605,7 @@ function AppContent({
     togglePlugin,
     syncPlugins,
     setDockCollapsed,
-  } = usePaneLayout(activeSessionId);
+  } = usePaneLayout(activeSessionId, activeOutsideRepository);
   const pluginPanes = usePluginPanes(activeSessionId);
   const pluginPaneById = useMemo(() => {
     const m = new Map<string, PluginPane>();
@@ -575,16 +614,15 @@ function AppContent({
   }, [pluginPanes]);
 
   // Auto-add newly available plugin panes as tabs in their default dock; the
-  // layout suppresses any the user explicitly closed. When the user disabled
-  // plugin auto-open (#3035) pass an empty list rather than skipping the
-  // effect: syncPlugins still materializes the session's seeded layout on
-  // mount (pinning the diff/terminal defaults), it just adds no plugin panes.
-  // Manual activity-bar opens and already-open panes are unaffected.
+  // layout suppresses any the user explicitly closed. With plugin auto-open
+  // off (#3035) an empty list still pins the seeded diff/terminal defaults,
+  // which waits for the Session row so a non-git seed never keeps Diff (#4574).
   useEffect(() => {
+    if (activeOutsideRepository === null) return;
     syncPlugins(
       webSettings.autoOpenPluginPanes ? pluginPanes.map((p) => ({ id: p.id, defaultDock: p.defaultDock })) : [],
     );
-  }, [pluginPanes, syncPlugins, webSettings.autoOpenPluginPanes]);
+  }, [pluginPanes, syncPlugins, webSettings.autoOpenPluginPanes, activeOutsideRepository]);
 
   // One-shot lookup from plugin id to its manifest identity (icon name +
   // icon_asset URL), so a pane gets a real identity glyph, up to the plugin's
@@ -1186,7 +1224,7 @@ function AppContent({
         clearDraft(id);
         clearStoredComments(id);
       },
-      navigateHome: () => navigate("/"),
+      navigateHome: leaveActiveSession,
       notify: toastBus.handler,
     });
   };
@@ -1233,7 +1271,7 @@ function AppContent({
               clearDraft(id);
               clearStoredComments(id);
             },
-            navigateHome: () => navigate("/"),
+            navigateHome: leaveActiveSession,
             notify,
           },
         );
@@ -1244,7 +1282,7 @@ function AppContent({
     toastBus.handler?.[anyFailed ? "error" : "info"](
       anyFailed ? "Some trashed sessions could not be deleted" : "Emptied trash",
     );
-  }, [trashedWorkspaces, activeSessionId, setSessionStatus, navigate]);
+  }, [trashedWorkspaces, activeSessionId, setSessionStatus, leaveActiveSession]);
 
   // Move-to-trash path (#2489): the safe default. Unlike permanent delete it
   // deliberately KEEPS the per-session acp cache, draft, and stored comments
@@ -1258,7 +1296,7 @@ function AppContent({
     setDeletingSessionIds(null);
     for (const id of ids) setSessionStatus(id, "Stopped");
     if (wasActive) {
-      navigate("/");
+      leaveActiveSession();
     }
 
     // The returned snapshot re-buckets each row into Trash immediately
@@ -1586,6 +1624,12 @@ function AppContent({
     }
   }, [navigate, activeSessionId]);
 
+  const handleClosePluginPage = useCallback(() => {
+    // A deep link has no in-app history to pop.
+    if (location.key !== "default") navigate(-1);
+    else navigate("/");
+  }, [navigate, location.key]);
+
   const handleOpenHelp = useCallback(() => {
     setShowHelp(true);
   }, []);
@@ -1706,19 +1750,7 @@ function AppContent({
   // Flattened, display-ordered session ids plus the subset needing attention,
   // sourced from the same sidebar model the user sees so jump-to-next follows
   // the visible order under any sort or axis.
-  const attentionJump = useMemo(() => {
-    const orderedIds: string[] = [];
-    const attention = new Set<string>();
-    for (const g of sidebarGroups) {
-      for (const v of g.workspaces) {
-        for (const s of v.workspace.sessions) {
-          orderedIds.push(s.id);
-          if (sessionNeedsAttention(s)) attention.add(s.id);
-        }
-      }
-    }
-    return { orderedIds, attention };
-  }, [sidebarGroups]);
+  const attentionJump = useAttentionJump(sidebarGroups);
 
   const handleJumpToAttention = useCallback(() => {
     const next = nextAttentionSessionId(attentionJump.orderedIds, attentionJump.attention, activeSessionId);
@@ -1765,7 +1797,8 @@ function AppContent({
           }
           setShowSessionWizard(false);
           setShowHelp(false);
-          if (showSettings) handleCloseSettings();
+          // Settings dialogs handle Escape after this capture-phase shortcut.
+          if (showSettings && !document.querySelector('[aria-modal="true"]')) handleCloseSettings();
           setShowAbout(false);
           setSelectedFile(null);
         },
@@ -1869,111 +1902,8 @@ function AppContent({
     [conversationHits, sessions, activeSessionId, handleSelectSession],
   );
 
-  const renderContent = () => {
-    if (showSettings) {
-      return (
-        <SettingsView
-          tab={settingsTab}
-          onClose={handleCloseSettings}
-          onSelectTab={(t) => {
-            const p = searchParams.get("profile");
-            // Marks a tab opened from the mobile section list, so its Back pops to it.
-            navigate(`/settings/${t}${p ? `?profile=${encodeURIComponent(p)}` : ""}`, {
-              state: { fromSettingsList: settingsTab === null },
-            });
-          }}
-          onShowList={() => {
-            if ((location.state as { fromSettingsList?: boolean } | null)?.fromSettingsList) {
-              navigate(-1);
-              return;
-            }
-            const p = searchParams.get("profile");
-            navigate(`/settings${p ? `?profile=${encodeURIComponent(p)}` : ""}`, { replace: true });
-          }}
-          onServerAboutRefresh={refreshServerAbout}
-          profile={searchParams.get("profile")}
-          onSelectProfile={(p) => {
-            const next = new URLSearchParams(searchParams);
-            next.set("profile", p);
-            setSearchParams(next, { replace: true });
-          }}
-          readOnly={serverAbout?.read_only}
-          cityhall={caps.cityhall}
-        />
-      );
-    }
-
-    // Refresh on `/session/<id>` paints once with `sessions === []` before
-    // the first poll resolves. Without this guard the lookup misses, the
-    // dashboard fallback renders, and the acp/terminal view only
-    // reappears once the fetch lands. Hold the minimal pre-auth shell
-    // until the first fetch settles, then let the real fallback decide.
-    // See #1351.
-    if (activeSessionId && !sessionsLoaded) {
-      // The shell (TopBar + sidebar) already renders around this; fill the main
-      // pane with a skeleton rather than blanking it until the first fetch lands.
-      return <MainPaneSkeleton />;
-    }
-
-    if (!activeWorkspace || !activeSession) {
-      return (
-        <Dashboard
-          sessions={sessions}
-          onSelectSession={handleSelectSession}
-          onNewSession={handleNewSession}
-          onCloneFromUrl={handleCloneFromUrl}
-          onToggleSidebar={handleToggleSidebar}
-          readOnly={serverAbout?.read_only}
-          canManageProjects={caps.canManageProjects}
-        />
-      );
-    }
-
-    // Below the md breakpoint there is no room for the side-by-side split.
-    // Render one full-viewport pane and let the picker choose which view
-    // occupies it (#1452). The agent terminal (and the paired shell, once
-    // first opened) stay mounted but hidden so their PTY, scrollback, and
-    // focus survive view switches; the diff view has no xterm so it mounts
-    // on demand. Inactive layers use visibility, never display:none, which
-    // would collapse xterm's measured geometry to zero. The desktop branch
-    // below is left exactly as it was; only this mobile branch is new.
-    if (singlePane) {
-      return (
-        <MobileMainPane
-          view={rightPanelView}
-          pluginPanes={pluginPanes}
-          onBackToAgent={() => handlePickView("agent")}
-          onOpenAgentsPane={() => handlePickView("agents")}
-          pairedMounted={pairedMounted}
-          activeSession={activeSession ?? null}
-          activeSessionId={activeSessionId}
-          sessions={sessions}
-          webSettings={webSettings}
-          selectedFilePath={selectedFilePath}
-          selectedRepoName={selectedRepoName}
-          selectedFileLine={selectedFileLine}
-          revision={revision}
-          diffFiles={diffFiles}
-          perRepoBases={perRepoBases}
-          warning={warning}
-          diffFilesLoading={diffFilesLoading}
-          onSelectFile={handleSelectFile}
-          onOpenFileRef={handleOpenFileRef}
-          onCloseFile={handleCloseFile}
-          onDiffRefresh={refreshDiffFiles}
-          commentsEnabled={commentsEnabled}
-          commentSendEnabled={commentSendEnabled}
-          commentSendDisabledReason={commentSendDisabledReason}
-          diffComments={diffComments}
-          commentsIsMultiRepo={commentsIsMultiRepo}
-          sendDialogOpen={sendDialogOpen}
-          onOpenSendDialog={() => setSendDialogOpen(true)}
-          onCloseSendDialog={() => setSendDialogOpen(false)}
-          onClearSelectedFile={() => setSelectedFile(null)}
-        />
-      );
-    }
-
+  /** The routed session with its docks: the session route, or a plugin page's split pane. */
+  const renderSessionLayout = () => {
     // Render a pane body by id. Passed to the docks as a callback (rather than
     // building an array of {icon, body} objects here) so the per-session JSX is
     // constructed inside the dock, not threaded through a prop object.
@@ -2145,6 +2075,150 @@ function AppContent({
     );
   };
 
+  const renderContent = () => {
+    if (pluginPageMatch) {
+      return (
+        <PluginPageView
+          key={pluginPageMatch.pathname}
+          pluginId={pluginPageMatch.params.pluginId ?? ""}
+          pageId={pluginPageMatch.params.pageId ?? ""}
+          onBack={handleClosePluginPage}
+          readOnly={serverAbout?.read_only ?? false}
+          cityhall={caps.cityhall}
+          theme={resolvedTheme}
+          selectedSessionId={activeSessionId}
+          onSelectSession={selectPluginPageSession}
+          renderSession={() => {
+            if (!sessionsLoaded) return { title: "", view: <MainPaneSkeleton /> };
+            return activeSession ? { title: activeSession.title, view: renderSessionLayout() } : null;
+          }}
+          renderSessionMenu={(request) => (
+            <PluginSessionMenu
+              request={request}
+              workspaces={workspaces}
+              readOnly={serverAbout?.read_only ?? false}
+              observedById={observedById}
+              runtimeEpoch={runtimeEpoch}
+              handlers={{
+                onSessionMutation: applySessionMutation,
+                onDelete: handleDeleteSession,
+                onStop: handleStopSession,
+                onStart: handleStartSession,
+                onSwitchView: handleSwitchView,
+                onCreateSession: handleCreateSession,
+              }}
+            />
+          )}
+        />
+      );
+    }
+    if (showSettings) {
+      return (
+        <SettingsView
+          tab={settingsTab}
+          onClose={handleCloseSettings}
+          onSelectTab={(t) => {
+            const p = searchParams.get("profile");
+            // Marks a tab opened from the mobile section list, so its Back pops to it.
+            navigate(`/settings/${t}${p ? `?profile=${encodeURIComponent(p)}` : ""}`, {
+              state: { fromSettingsList: settingsTab === null },
+            });
+          }}
+          onShowList={() => {
+            if ((location.state as { fromSettingsList?: boolean } | null)?.fromSettingsList) {
+              navigate(-1);
+              return;
+            }
+            const p = searchParams.get("profile");
+            navigate(`/settings${p ? `?profile=${encodeURIComponent(p)}` : ""}`, { replace: true });
+          }}
+          onServerAboutRefresh={refreshServerAbout}
+          profile={searchParams.get("profile")}
+          onSelectProfile={(p) => {
+            const next = new URLSearchParams(searchParams);
+            next.set("profile", p);
+            setSearchParams(next, { replace: true });
+          }}
+          readOnly={serverAbout?.read_only}
+          cityhall={caps.cityhall}
+        />
+      );
+    }
+
+    // Refresh on `/session/<id>` paints once with `sessions === []` before
+    // the first poll resolves. Without this guard the lookup misses, the
+    // dashboard fallback renders, and the acp/terminal view only
+    // reappears once the fetch lands. Hold the minimal pre-auth shell
+    // until the first fetch settles, then let the real fallback decide.
+    // See #1351.
+    if (activeSessionId && !sessionsLoaded) {
+      // The shell (TopBar + sidebar) already renders around this; fill the main
+      // pane with a skeleton rather than blanking it until the first fetch lands.
+      return <MainPaneSkeleton />;
+    }
+
+    if (!activeWorkspace || !activeSession) {
+      return (
+        <Dashboard
+          sessions={sessions}
+          onSelectSession={handleSelectSession}
+          onNewSession={handleNewSession}
+          onCloneFromUrl={handleCloneFromUrl}
+          onToggleSidebar={handleToggleSidebar}
+          readOnly={serverAbout?.read_only}
+          canManageProjects={caps.canManageProjects}
+        />
+      );
+    }
+
+    // Below the md breakpoint there is no room for the side-by-side split.
+    // Render one full-viewport pane and let the picker choose which view
+    // occupies it (#1452). The agent terminal (and the paired shell, once
+    // first opened) stay mounted but hidden so their PTY, scrollback, and
+    // focus survive view switches; the diff view has no xterm so it mounts
+    // on demand. Inactive layers use visibility, never display:none, which
+    // would collapse xterm's measured geometry to zero. The desktop branch
+    // below is left exactly as it was; only this mobile branch is new.
+    if (singlePane) {
+      return (
+        <MobileMainPane
+          view={rightPanelView}
+          pluginPanes={pluginPanes}
+          onBackToAgent={() => handlePickView("agent")}
+          onOpenAgentsPane={() => handlePickView("agents")}
+          pairedMounted={pairedMounted}
+          activeSession={activeSession ?? null}
+          activeSessionId={activeSessionId}
+          sessions={sessions}
+          webSettings={webSettings}
+          selectedFilePath={selectedFilePath}
+          selectedRepoName={selectedRepoName}
+          selectedFileLine={selectedFileLine}
+          revision={revision}
+          diffFiles={diffFiles}
+          perRepoBases={perRepoBases}
+          warning={warning}
+          diffFilesLoading={diffFilesLoading}
+          onSelectFile={handleSelectFile}
+          onOpenFileRef={handleOpenFileRef}
+          onCloseFile={handleCloseFile}
+          onDiffRefresh={refreshDiffFiles}
+          commentsEnabled={commentsEnabled}
+          commentSendEnabled={commentSendEnabled}
+          commentSendDisabledReason={commentSendDisabledReason}
+          diffComments={diffComments}
+          commentsIsMultiRepo={commentsIsMultiRepo}
+          sendDialogOpen={sendDialogOpen}
+          onOpenSendDialog={() => setSendDialogOpen(true)}
+          onCloseSendDialog={() => setSendDialogOpen(false)}
+          onClearSelectedFile={() => setSelectedFile(null)}
+        />
+      );
+    }
+
+    return renderSessionLayout();
+  };
+
   // No root-height pin remains: every mobile terminal surface (agent,
   // paired host, paired container) is the capture-snapshot live view
   // now, with no PTY to protect from keyboard-driven layout shrink. The
@@ -2158,6 +2232,8 @@ function AppContent({
       replayEvents: serverAbout?.acp_replay_events ?? 0,
       compactionReminder: serverAbout?.acp_compaction_reminder ?? false,
       compactionReminderPercent: serverAbout?.acp_compaction_reminder_percent ?? 75,
+      noticeDisplay: serverAbout?.acp_notice_display ?? "persistent",
+      noticeTimeoutSecs: serverAbout?.acp_notice_timeout_secs ?? 10,
     }),
     [
       serverAbout?.acp_show_tool_durations,
@@ -2165,6 +2241,8 @@ function AppContent({
       serverAbout?.acp_replay_events,
       serverAbout?.acp_compaction_reminder,
       serverAbout?.acp_compaction_reminder_percent,
+      serverAbout?.acp_notice_display,
+      serverAbout?.acp_notice_timeout_secs,
     ],
   );
 
@@ -2221,7 +2299,7 @@ function AppContent({
     serverAboutLoaded &&
     sessionsLoaded &&
     !activeSessionId &&
-    !showSettings &&
+    !fullPageView &&
     !showSessionWizard &&
     !showHelp &&
     !showAbout &&
@@ -2316,7 +2394,7 @@ function AppContent({
   // dashboard / settings / diff panes the bar is the only navigation there is.
   const headerCollapsible =
     singlePane &&
-    !showSettings &&
+    !fullPageView &&
     !!activeWorkspace &&
     activeSession?.view === "structured" &&
     rightPanelView === "agent";
@@ -2353,8 +2431,8 @@ function AppContent({
             isDevBuild={isDebugBuild(serverAbout)}
             onOpenTips={tips.open}
             onGoDashboard={handleGoDashboard}
-            sidebarColumnVisible={!showSettings && sidebarOpen}
-            rightColumnVisible={isMdUp && !showSettings && !!activeWorkspace && !!activeSession && !rightDockCollapsed}
+            sidebarColumnVisible={!fullPageView && sidebarOpen}
+            rightColumnVisible={isMdUp && !fullPageView && !!activeWorkspace && !!activeSession && !rightDockCollapsed}
           />
         </CollapsibleRegion>
 
@@ -2380,7 +2458,7 @@ function AppContent({
         )}
 
         <div className="flex flex-1 min-h-0">
-          {!showSettings && (
+          {!fullPageView && (
             <WorkspaceSidebar
               observedById={observedById}
               runtimeEpoch={runtimeEpoch}
@@ -2538,7 +2616,13 @@ function AppContent({
             setShowPalette(false);
             setPaletteQuery("");
           }}
-          actions={[...commandActions, ...conversationActions, ...settingsCommands, ...pluginCommandActions]}
+          actions={[
+            ...commandActions,
+            ...conversationActions,
+            ...pluginPageActions,
+            ...settingsCommands,
+            ...pluginCommandActions,
+          ]}
           onSearchChange={setPaletteQuery}
           searching={conversationSearching}
         />
@@ -2576,7 +2660,7 @@ function AppContent({
           ref={setKeyboardProxyRef}
           data-keyboard-proxy
           data-session-input={
-            activeSession && !showSettings && (!singlePane || rightPanelView === "agent" || rightPanelView === "paired")
+            activeSession && !fullPageView && (!singlePane || rightPanelView === "agent" || rightPanelView === "paired")
               ? ""
               : undefined
           }

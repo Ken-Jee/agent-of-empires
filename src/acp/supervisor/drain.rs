@@ -115,7 +115,11 @@ impl<S: BroadcastSink> Drain<S> {
                 "drain channel closed (agent connection task ended); evaluating respawn"
             );
             if end.agent_unresponsive {
-                kill_wedged_runner(&*self.process_control, &self.session_id).await;
+                let identity = lock_recover(&self.lifecycle)
+                    .running(&self.session_id)
+                    .filter(|(current, _)| current == &lease)
+                    .and_then(|(_, identity)| identity);
+                kill_wedged_runner(&*self.process_control, &self.session_id, identity).await;
             }
             if end.rate_limited {
                 info!(
@@ -271,21 +275,50 @@ impl<S: BroadcastSink> Drain<S> {
         lock_recover(&self.pending_context_resets).remove(&self.session_id)
     }
 
-    /// Remove this epoch's handle; a no-op once a newer epoch replaced it.
-    /// Every caller is a terminal arm with no respawn behind it, so this
-    /// worker's background-agent tailers die here and nothing will report
-    /// their outcome: detach them, or a park leaves the panel showing them
-    /// running and holds the sidebar dot lit for its length (#4001). Gated on
-    /// the release so a newer epoch's sub-agents, which that epoch's own sweep
-    /// owns, are left alone; the detach runs off the workers guard because
-    /// it reads the store.
+    /// Keep ownership until a native, requested, or unprovable teardown settles.
     async fn drop_handle(&self, lease: &Lease) {
-        let dropped = {
-            let mut guard = self.workers.lock().await;
+        let unproven_record = match worker_registry::load_strict(&self.session_id) {
+            Ok(Some(record)) => record.agent_key == "prime-agent" || record.prime_runtime.is_some(),
+            Ok(None) => false,
+            Err(_) => true,
+        };
+        let mut guard = self.workers.lock().await;
+        let requires_settlement = unproven_record || worker_registry::stop_requested(&self.session_id)
+            || guard.get(&self.session_id).is_some_and(|handle| matches!(&handle.kind, WorkerKind::Runner { spawn_config } if spawn_config.uses_native_prime()));
+        let dropped = if requires_settlement {
+            let decision = {
+                let mut lifecycle = lock_recover(&self.lifecycle);
+                if !lifecycle
+                    .running(&self.session_id)
+                    .is_some_and(|(current, _)| &current == lease)
+                {
+                    return;
+                }
+                lifecycle.begin_stop(&self.session_id, "worker_connection_closed", false)
+            };
+            let crate::acp::runner_lifecycle::StopDecision::TearDown { lease, identity } = decision
+            else {
+                return;
+            };
+            guard.remove(&self.session_id);
+            drop(guard);
+            let settlement =
+                tear_down_runner(&*self.process_control, &self.session_id, identity).await;
+            settle_sweeping_if_owed(
+                &self.process_control,
+                &self.lifecycle,
+                &self.notify,
+                &lease,
+                settlement,
+            )
+            .await;
+            true
+        } else {
             let dropped = lock_recover(&self.lifecycle).release_running(lease);
             if dropped {
                 guard.remove(&self.session_id);
             }
+            drop(guard);
             dropped
         };
         if dropped {
@@ -346,8 +379,7 @@ impl<S: BroadcastSink> Drain<S> {
                 info!(
                     target: "acp.supervisor",
                     session = %session_id,
-                    "worker registry deleted by user (`aoe acp stop|kill`); \
-                     dropping WorkerHandle without respawn"
+                    "worker stop requested; settling its handle without respawn"
                 );
                 self.publish(Event::Stopped {
                     reason: "user_stopped".into(),
@@ -366,8 +398,9 @@ impl<S: BroadcastSink> Drain<S> {
         mut config: SpawnConfig,
     ) -> Option<(Lease, mpsc::Receiver<Event>)> {
         let session_id = &self.session_id;
+        let original_prime = lease.prime();
         let begun = lock_recover(&self.lifecycle).begin_respawn(lease);
-        let Ok((respawn_lease, previous)) = begun else {
+        let Ok((respawn_lease, mut previous)) = begun else {
             debug!(
                 target: "acp.supervisor",
                 session = %session_id,
@@ -385,6 +418,9 @@ impl<S: BroadcastSink> Drain<S> {
         config.launch_lease = Some(respawn_lease.clone());
 
         tokio::time::sleep(RESPAWN_BACKOFF).await;
+        if worker_registry::stop_requested(session_id) {
+            lock_recover(&self.lifecycle).begin_stop(session_id, "user_stopped", false);
+        }
         let cancelled = lock_recover(&self.lifecycle).cancel_requested(&respawn_lease);
         if let Some(reason) = cancelled {
             if lock_recover(&self.lifecycle).convert_to_stopping(&respawn_lease) {
@@ -394,6 +430,39 @@ impl<S: BroadcastSink> Drain<S> {
             return None;
         }
 
+        if original_prime != crate::acp::runner_lifecycle::PrimeOwnership::NotPrime {
+            let mut settlement =
+                tear_down_runner(&*self.process_control, session_id, previous).await;
+            if settlement == crate::acp::runner_lifecycle::Settlement::Proven
+                && !matches!(
+                    tokio::task::spawn_blocking(move || original_prime.retire()).await,
+                    Ok(Ok(()))
+                )
+            {
+                settlement = crate::acp::runner_lifecycle::Settlement::Unproven(previous);
+            }
+            if !matches!(settlement, crate::acp::runner_lifecycle::Settlement::Proven) {
+                if lock_recover(&self.lifecycle).convert_to_stopping(&respawn_lease) {
+                    self.workers.lock().await.remove(session_id);
+                    settle_sweeping_if_owed(
+                        &self.process_control,
+                        &self.lifecycle,
+                        &self.notify,
+                        &respawn_lease,
+                        settlement,
+                    )
+                    .await;
+                    self.publish(Event::AgentStartupError {
+                        message:
+                            "Prime native termination is unproven; replacement remains blocked"
+                                .into(),
+                    });
+                }
+                return None;
+            }
+            previous = None;
+        }
+        respawn_lease.record_prime(crate::acp::runner_lifecycle::PrimeOwnership::NotPrime);
         Self::refresh_launch_env(&self.session_id, &mut config).await;
         if let Some((wrapper, base)) = &config.wrapper_substitution {
             log_wrapper_substitution(session_id, &config.tool, wrapper, base);
@@ -418,15 +487,30 @@ impl<S: BroadcastSink> Drain<S> {
             self.workers.lock().await.remove(session_id);
             return None;
         };
-        let identity = client.runner_pid().map(|pid| RunnerIdentity {
-            pid,
-            generation: respawn_lease.epoch(),
+        let identity = client.runner_pid().map(|pid| {
+            worker_registry::load(session_id)
+                .ok()
+                .flatten()
+                .filter(|record| record.pid == pid && record.generation == respawn_lease.epoch())
+                .map(|record| RunnerIdentity::from_record(&record))
+                .or_else(|| respawn_lease.spawned_runner())
+                .unwrap_or_else(|| RunnerIdentity::unattested(pid, respawn_lease.epoch()))
         });
         let client = Arc::new(client);
 
         let refused = {
             let mut guard = self.workers.lock().await;
-            match lock_recover(&self.lifecycle).install(&respawn_lease, identity) {
+            if worker_registry::stop_requested(session_id) {
+                lock_recover(&self.lifecycle).begin_stop(session_id, "user_stopped", false);
+            }
+            let mut install = lock_recover(&self.lifecycle).install(&respawn_lease, identity);
+            if install.is_ok() && worker_registry::stop_requested(session_id) {
+                lock_recover(&self.lifecycle).begin_stop(session_id, "user_stopped", false);
+                install = Err(InstallError::Cancelled {
+                    reason: "user_stopped".into(),
+                });
+            }
+            match install {
                 Ok(()) => match guard.get_mut(session_id) {
                     Some(handle) => {
                         handle.client = Arc::clone(&client);
@@ -454,9 +538,20 @@ impl<S: BroadcastSink> Drain<S> {
                     session = %session_id,
                     "respawn completed under a stale lease; tearing the runner down"
                 );
-                let _ = client.shutdown().await;
-                tear_down_runner(&*self.process_control, session_id, identity).await;
-                lock_recover(&self.lifecycle).release_running(&respawn_lease);
+                super::teardown::retire_client(&self.lifecycle, &respawn_lease, &client, identity)
+                    .await;
+                let settlement =
+                    tear_down_runner(&*self.process_control, session_id, identity).await;
+                lock_recover(&self.lifecycle).convert_to_stopping(&respawn_lease);
+                lock_recover(&self.lifecycle).owe_sweep(&respawn_lease);
+                settle_sweeping_if_owed(
+                    &self.process_control,
+                    &self.lifecycle,
+                    &self.notify,
+                    &respawn_lease,
+                    settlement,
+                )
+                .await;
                 return None;
             }
         }
@@ -569,10 +664,7 @@ impl<S: BroadcastSink> Drain<S> {
                 .ok()
                 .flatten()
                 .filter(|record| record.generation == respawn_lease.epoch())
-                .map(|record| RunnerIdentity {
-                    pid: record.pid,
-                    generation: record.generation,
-                })
+                .map(|r| RunnerIdentity::from_record(&r))
         });
         // One lock, after the await: a stop recorded while this waited for
         // `workers` must not be lost to a conversion that drops it.
@@ -669,7 +761,10 @@ async fn restart_decision(workers: &Workers, session_id: &str) -> RestartDecisio
         handle.kind,
         WorkerKind::Runner { .. } | WorkerKind::Attached
     );
-    if runner_managed && matches!(worker_registry::load(session_id), Ok(None)) {
+    if runner_managed
+        && (worker_registry::stop_requested(session_id)
+            || matches!(worker_registry::load(session_id), Ok(None)))
+    {
         debug!(
             target: "acp.supervisor",
             session = %session_id,
@@ -707,39 +802,34 @@ async fn restart_decision(workers: &Workers, session_id: &str) -> RestartDecisio
     }
 }
 
-/// Kill a runner a watchdog declared wedged, so the respawn cannot load against it.
-async fn kill_wedged_runner(control: &dyn ProcessControl, session_id: &str) {
-    let old_pid = worker_registry::load(session_id)
+/// Fence only the runner belonging to the ended connection.
+async fn kill_wedged_runner(
+    control: &dyn ProcessControl,
+    session_id: &str,
+    identity: Option<RunnerIdentity>,
+) {
+    let Some(identity) = identity else {
+        return;
+    };
+    control.terminate_group(identity);
+    wait_for_exit(control, identity, Duration::from_secs(3)).await;
+    if control.is_alive(identity) {
+        control.kill_group(identity);
+        wait_for_exit(control, identity, Duration::from_millis(200)).await;
+    }
+    if control.is_alive(identity) {
+        return;
+    }
+    if worker_registry::load(session_id)
         .ok()
         .flatten()
-        .map(|r| r.pid);
-    if let Some(pid) = old_pid {
-        if control.is_alive(pid) {
-            info!(
-                target: "acp.supervisor",
-                session = %session_id,
-                pid,
-                "SIGTERM wedged runner process group before respawn (agent_unresponsive)"
-            );
-            control.terminate_group(pid);
-            wait_for_exit(control, pid, Duration::from_secs(3)).await;
-        }
-        if control.is_alive(pid) {
-            warn!(
-                target: "acp.supervisor",
-                session = %session_id,
-                pid,
-                "wedged runner survived SIGTERM grace; escalating to SIGKILL"
-            );
-            control.kill_group(pid);
-            wait_for_exit(control, pid, Duration::from_millis(200)).await;
+        .is_some_and(|record| identity.owns_record(&record))
+    {
+        if let Ok(socket_path) = worker_registry::socket_path_for(session_id) {
+            let _ = std::fs::remove_file(socket_path);
         }
     }
-    if let Ok(socket_path) = worker_registry::socket_path_for(session_id) {
-        if socket_path.exists() {
-            let _ = std::fs::remove_file(&socket_path);
-        }
-    }
+    control.forget(identity);
 }
 
 #[cfg(test)]
@@ -747,6 +837,192 @@ mod tests {
     use super::super::test_support::*;
     use super::*;
     use crate::daemon::AcpWorkerState;
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_durable_cli_stop_before_disconnect_prevents_automatic_respawn() {
+        let (_home, _tmp) = isolate_home();
+        let control =
+            Arc::new(crate::acp::runner_lifecycle::test_support::FakeProcessControl::default());
+        control.alive(4242);
+        let sup = Supervisor::new(VecSink::new())
+            .with_process_control(control.clone())
+            .with_launcher(Arc::new(|_, _| {
+                Box::pin(async { panic!("a stopped worker must not respawn") })
+            }));
+        let id = "cli-stop-disconnect";
+        save_record(id, 4242, 0);
+        let record = worker_registry::load(id).unwrap().unwrap();
+        let lease = sup
+            .test_install_runner(
+                id,
+                runner_config(worker_registry::socket_path_for(id).unwrap()),
+                Some(RunnerIdentity::from_record(&record)),
+            )
+            .await;
+        let intent = worker_registry::request_stop(&record).unwrap();
+        let (tx, rx) = mpsc::channel(4);
+        let drain = sup.start_drain_task(id.into(), lease, rx, None);
+        drop(tx);
+        tokio::time::timeout(Duration::from_secs(5), drain)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(sup.worker_state(id).await, AcpWorkerState::Absent);
+        assert!(worker_registry::load(id).unwrap().is_none());
+        assert_eq!(worker_registry::stop_intent(id).unwrap(), Some(intent));
+        assert!(sup
+            .begin_resume(
+                id,
+                crate::acp::runner_lifecycle::ResumeKind::Attach,
+                worker_registry::ResumeAuthority::Automatic
+            )
+            .await
+            .is_err());
+        assert!(control.signals().contains(&(4242, "TERM")));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn native_ownership_without_a_cleanup_route_blocks_replacement_and_release() {
+        for attached in [false, true] {
+            let (_home, _tmp) = isolate_home();
+            let control =
+                Arc::new(crate::acp::runner_lifecycle::test_support::FakeProcessControl::default());
+            control.alive(4242);
+            let sup = Supervisor::new(VecSink::new())
+                .with_process_control(control)
+                .with_launcher(Arc::new(|_, _| {
+                    Box::pin(async {
+                        panic!("replacement launched before native ownership was settled")
+                    })
+                }));
+            let id = "prime-unproven";
+            save_record(id, 4242, 0);
+            let mut record = worker_registry::load(id).unwrap().unwrap();
+            record.agent_key = "prime-agent".into();
+            worker_registry::save(&record).unwrap();
+            let identity = Some(RunnerIdentity::unattested(4242, 0));
+            let lease = if attached {
+                let (client, _tx) =
+                    crate::acp::acp_client::AcpClient::fake_for_test(AcpSessionId(id.into()));
+                sup.test_install_handle(id, client, WorkerKind::Attached, identity)
+                    .await
+            } else {
+                let mut config = runner_config(worker_registry::socket_path_for(id).unwrap());
+                config.agent_key = "prime-agent".into();
+                sup.test_install_runner(id, config, identity).await
+            };
+            let (tx, rx) = mpsc::channel(4);
+            let drain = sup.start_drain_task(id.into(), lease, rx, None);
+            tx.send(Event::AcpSessionAssigned {
+                acp_session_id: "native-context".into(),
+            })
+            .await
+            .unwrap();
+            drop(tx);
+            tokio::time::timeout(Duration::from_secs(10), drain)
+                .await
+                .unwrap()
+                .unwrap();
+            let retained = worker_registry::load(id).unwrap().unwrap();
+            assert_eq!((retained.pid, retained.generation), (4242, 0));
+            let mut lifecycle = lock_recover(&sup.lifecycle);
+            assert!(matches!(
+                lifecycle.admit(id, crate::acp::runner_lifecycle::ResumeKind::Spawn),
+                Err(crate::acp::runner_lifecycle::AdmitError::TeardownPending)
+            ));
+            assert_eq!(lifecycle.occupied_slots(), 1);
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn unattested_native_drain_retains_replacement_fencing() {
+        use crate::acp::runner_lifecycle::WorkerPhase;
+
+        for key in ["prime-agent", "audit-prime"] {
+            let _home = isolate_home();
+            let control =
+                Arc::new(crate::acp::runner_lifecycle::test_support::FakeProcessControl::default());
+            let sup = Supervisor::new(VecSink::new()).with_process_control(control.clone());
+            let lifecycle = Arc::clone(&sup.lifecycle);
+            control.probe_phase(move |id| lock_recover(&lifecycle).phase(id));
+            let id = "native-drop-sweep";
+            let mut config = runner_config(worker_registry::socket_path_for(id).unwrap());
+            config.agent_key = key.into();
+            if key != "prime-agent" {
+                config.wrapper_substitution = Some((key.into(), "prime-agent".into()));
+            }
+            let lease = sup.test_install_runner(id, config, None).await;
+            let (tx, rx) = mpsc::channel(4);
+            let drain = sup.start_drain_task(id.into(), lease, rx, None);
+            tx.send(Event::Stopped {
+                reason: "rate_limited".into(),
+            })
+            .await
+            .unwrap();
+            drop(tx);
+            tokio::time::timeout(Duration::from_secs(5), drain)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                control.releases(),
+                [(id.into(), Some(WorkerPhase::Stopping))]
+            );
+            let mut lifecycle = lock_recover(&sup.lifecycle);
+            assert!(matches!(
+                lifecycle.admit(id, crate::acp::runner_lifecycle::ResumeKind::Spawn),
+                Err(crate::acp::runner_lifecycle::AdmitError::TeardownPending)
+            ));
+            assert_eq!(lifecycle.occupied_slots(), 1);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial_test::serial]
+    async fn native_respawn_retains_unresolved_ownership_when_its_record_disappears() {
+        let _home = isolate_home();
+        let id = "native-respawn-missing-route";
+        let socket = worker_registry::socket_path_for(id).unwrap();
+        let mut record = worker_record(id, 4242, socket.clone());
+        record.agent_key = "prime-agent".into();
+        worker_registry::save(&record).unwrap();
+        let (launcher, _launches) = crate::server::test_support::counting_failing_launcher();
+        let sup = Supervisor::new(VecSink::new())
+            .with_process_control(Arc::new(
+                crate::acp::runner_lifecycle::test_support::FakeProcessControl::default(),
+            ))
+            .with_launcher(launcher);
+        let mut config = runner_config(socket);
+        config.agent_key = "prime-agent".into();
+        let lease = sup.test_install_runner(id, config, None).await;
+        assert_eq!(sup.worker_state(id).await, AcpWorkerState::Running);
+        let (sender, inbound) = mpsc::channel(4);
+        let drain = sup.start_drain_task(id.into(), lease, inbound, None);
+        drop(sender);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while sup.worker_state(id).await != AcpWorkerState::Resuming {
+            assert!(
+                !drain.is_finished() && std::time::Instant::now() < deadline,
+                "the live record must admit a respawn before its backoff"
+            );
+            tokio::task::yield_now().await;
+        }
+        // Paused time keeps the approved respawn in backoff until the route disappears.
+        std::fs::remove_file(worker_registry::record_path(id).unwrap()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), drain)
+            .await
+            .expect("respawn drain must reach its terminal ownership decision")
+            .unwrap();
+        assert!(sup.is_owned(id).await);
+        assert!(matches!(
+            sup.reserve_spawn(id, worker_registry::ResumeAuthority::Explicit)
+                .await,
+            Err(super::super::SupervisorError::TeardownPending(_))
+        ));
+    }
 
     #[tokio::test]
     #[serial_test::serial]
@@ -1063,10 +1339,7 @@ mod tests {
             .test_install_runner(
                 "s-resp",
                 runner_config(socket),
-                Some(RunnerIdentity {
-                    pid: 4242,
-                    generation: 0,
-                }),
+                Some(RunnerIdentity::unattested(4242, 0)),
             )
             .await;
         let (inbound_tx, inbound_rx) = mpsc::channel::<Event>(4);
@@ -1154,10 +1427,7 @@ mod tests {
             .test_install_runner(
                 "s-respfail",
                 runner_config(socket),
-                Some(RunnerIdentity {
-                    pid: 4242,
-                    generation: 0,
-                }),
+                Some(RunnerIdentity::unattested(4242, 0)),
             )
             .await;
         let (inbound_tx, inbound_rx) = mpsc::channel::<Event>(4);
@@ -1229,10 +1499,7 @@ mod tests {
             .test_install_runner(
                 "s-late-respawn",
                 runner_config(socket),
-                Some(RunnerIdentity {
-                    pid: 4242,
-                    generation: 0,
-                }),
+                Some(RunnerIdentity::unattested(4242, 0)),
             )
             .await;
         let (inbound_tx, inbound_rx) = mpsc::channel::<Event>(4);
@@ -1293,10 +1560,7 @@ mod tests {
             .test_install_runner(
                 "s-respawn-kept",
                 runner_config(socket),
-                Some(RunnerIdentity {
-                    pid: 4242,
-                    generation: 0,
-                }),
+                Some(RunnerIdentity::unattested(4242, 0)),
             )
             .await;
         let (inbound_tx, inbound_rx) = mpsc::channel::<Event>(4);
@@ -1308,7 +1572,10 @@ mod tests {
             .expect("drain task must finish")
             .unwrap();
         assert_eq!(control.signals(), [(4343, "TERM")]);
-        assert!(control.is_alive(4242), "the previous runner is retained");
+        assert!(
+            control.is_alive(RunnerIdentity::unattested(4242, 0)),
+            "the previous runner is retained"
+        );
         assert!(control.releases().is_empty(), "{:?}", control.releases());
         assert_eq!(
             sup.worker_state("s-respawn-kept").await,
@@ -1336,10 +1603,7 @@ mod tests {
             .test_install_runner(
                 "s-crash",
                 runner_config(socket),
-                Some(RunnerIdentity {
-                    pid: 4242,
-                    generation: 0,
-                }),
+                Some(RunnerIdentity::unattested(4242, 0)),
             )
             .await;
         let (inbound_tx, inbound_rx) = mpsc::channel::<Event>(4);
@@ -1489,14 +1753,7 @@ mod tests {
         config.host_environment = vec![("CLAUDE_CONFIG_DIR".into(), "stale".into())];
         config.base_host_environment = vec![("HOME".into(), temp.path().display().to_string())];
         let lease = sup
-            .test_install_runner(
-                "s-store",
-                config,
-                Some(RunnerIdentity {
-                    pid: 4242,
-                    generation: 0,
-                }),
-            )
+            .test_install_runner("s-store", config, Some(RunnerIdentity::unattested(4242, 0)))
             .await;
         let (inbound_tx, inbound_rx) = mpsc::channel::<Event>(4);
         let drain = sup.start_drain_task("s-store".into(), lease, inbound_rx, None);

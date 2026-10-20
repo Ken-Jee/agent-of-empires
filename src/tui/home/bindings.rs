@@ -99,6 +99,7 @@ pub enum ActionId {
     AutoName,
     /// Permanently purge every trashed session after a confirm (palette only; no chord).
     EmptyTrash,
+    ToggleSplitTerminal,
 }
 
 impl ActionId {
@@ -852,11 +853,30 @@ pub static BINDINGS: &[Binding] = &[
         context: Context::Always,
         help: Some(HelpMeta {
             section: HelpSection::Other,
-            desc: "Serve (LAN / Tunnel)",
+            desc: if cfg!(feature = "web") {
+                "Web dashboard (browser / phone)"
+            } else {
+                "Remote API access (LAN / Tunnel)"
+            },
         }),
         palette: Some(PaletteMeta {
-            title: "Open serve (LAN / Tunnel)",
-            keywords: &["web", "remote", "phone", "tunnel"],
+            title: if cfg!(feature = "web") {
+                "Open web dashboard (browser / phone)"
+            } else {
+                "Open remote API access (LAN / Tunnel)"
+            },
+            keywords: &[
+                "serve",
+                "web",
+                "dashboard",
+                "browser",
+                "remote",
+                "phone",
+                "mobile",
+                "qr",
+                "tunnel",
+                "lan",
+            ],
             group: PaletteGroup::Settings,
         }),
     },
@@ -993,6 +1013,21 @@ pub static BINDINGS: &[Binding] = &[
         palette: Some(PaletteMeta {
             title: "Toggle preview info header",
             keywords: &["hide", "show", "info", "header", "preview"],
+            group: PaletteGroup::Views,
+        }),
+    },
+    Binding {
+        id: ActionId::ToggleSplitTerminal,
+        non_strict: &[k('|')],
+        strict: &[k('|')],
+        context: Context::Always,
+        help: Some(HelpMeta {
+            section: HelpSection::Views,
+            desc: "Split preview: agent above terminal",
+        }),
+        palette: Some(PaletteMeta {
+            title: "Toggle split terminal preview",
+            keywords: &["split", "terminal", "shell", "pane", "preview"],
             group: PaletteGroup::Views,
         }),
     },
@@ -1190,6 +1225,7 @@ pub fn palette_id(id: ActionId) -> &'static str {
         ActionId::ToggleSnooze => "snooze",
         ActionId::ToggleUnread => "toggle-unread",
         ActionId::TogglePreviewInfo => "toggle-preview-info",
+        ActionId::ToggleSplitTerminal => "toggle-split-terminal",
         ActionId::ToggleHideStopped => "toggle-hide-stopped",
         ActionId::ToggleDiagnostics => "toggle-diagnostics",
         ActionId::OpenSystemHealth => "open-system-health",

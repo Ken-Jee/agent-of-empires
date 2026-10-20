@@ -166,9 +166,7 @@ pub fn detect_hermes_status(raw_content: &str) -> Status {
     detect_via_manifest("hermes", raw_content, "", None)
 }
 
-/// Agents whose status comes from hooks alone: Kiro, settl, Kimi Code and
-/// Prime Agent render no pane shape worth parsing, so the pane fallback
-/// reports Idle and the hook file speaks for them.
+/// Kiro, settl and Kimi Code report through hooks; their pane fallback is Idle.
 pub fn detect_hook_only_status(_content: &str) -> Status {
     Status::Idle
 }
@@ -187,6 +185,11 @@ pub fn detect_qwen_status(raw_content: &str) -> Status {
 
 pub fn detect_antigravity_status(raw_content: &str) -> Status {
     detect_via_manifest("antigravity", raw_content, "", None)
+}
+
+/// Native-only agents have no authoritative pane status.
+pub fn detect_native_only_status(_content: &str) -> Status {
+    Status::Unknown
 }
 
 #[cfg(test)]
@@ -3293,12 +3296,10 @@ run this command? (y/n)
 
     #[test]
     fn test_hook_only_agents_report_idle_from_the_pane() {
-        // Kiro, settl, Kimi and Prime Agent are hook-detected; their pane
-        // fallback is a constant, so what is worth pinning is the registry
-        // wiring: each must route to it rather than to a real detector.
+        // Hook-only agents ignore pane output.
         assert_eq!(detect_hook_only_status("anything"), Status::Idle);
         assert_eq!(detect_hook_only_status(""), Status::Idle);
-        for agent in ["kiro", "settl", "kimi", "prime-agent"] {
+        for agent in ["kiro", "settl", "kimi"] {
             let Some(def) = crate::agents::get_agent(agent) else {
                 continue;
             };

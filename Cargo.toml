@@ -3,9 +3,9 @@ members = [".", "xtask", "aoe-settings-derive", "aoe-plugin-api"]
 
 [package]
 name = "agent-of-empires"
-version = "1.19.0"
+version = "1.20.0"
 edition = "2021"
-rust-version = "1.85"
+rust-version = "1.89"
 authors = ["Agent of Empires Contributors"]
 description = "Terminal session manager for AI coding agents"
 # MIT throughout, except the OSC 8 emission state machine in
@@ -50,7 +50,9 @@ aoe-plugin-api = { path = "aoe-plugin-api" }
 serde = { version = "1.0", features = ["derive"] }
 serde_ignored = "0.1"
 serde_json = { version = "1.0", features = ["preserve_order"] }
+ts-rs = { version = "12", optional = true }
 yaml_serde = "0.10.7"
+granit-parser = { version = "1.3", features = ["std"] }
 toml = "1.1"
 toml_edit = "0.25"
 dotenv-ng-core = "1.0"
@@ -78,7 +80,7 @@ anyhow = "1.0"
 chrono = { version = "0.4", features = ["serde"] }
 
 # UUID generation
-uuid = { version = "1.23", features = ["v4"] }
+uuid = { version = "1.23", features = ["v4", "serde"] }
 zstd = "0.14"
 
 # Random
@@ -118,7 +120,7 @@ rattles = "0.3"
 regex = "1.10"
 
 # Git operations
-git2 = { version = "0.21", features = ["vendored-openssl"] }
+git2 = "0.21"
 
 # Diff computation
 similar = "3.1"
@@ -126,8 +128,9 @@ similar = "3.1"
 # Hashing
 sha2 = "0.11"
 
-# File locking
+# Locking
 fs2 = "0.4"
+parking_lot = "0.12"
 
 # Stream utilities (for crossterm EventStream)
 futures-util = "0.3"
@@ -138,11 +141,8 @@ tempfile = "3.14"
 # PATH lookup for external viewers (lnav, bat, less) used by `aoe logs`.
 which = "8.0"
 
-# Local SQLite reader for opencode's session store. Bundled to avoid a
-# system libsqlite3 dependency. Used to read session state without spawning
-# `opencode session list`, which leaks a 4.5MB /tmp/.<hash>.so per invocation
-# via opencode's bun:ffi OpenTUI extract path (see anomalyco/opencode#6523).
-rusqlite = { version = "0.40", features = ["bundled"] }
+# SQLite
+rusqlite = "0.40"
 
 # Daemon HTTP/WS server. Core: the daemon is the product, the dashboard is one
 # surface on it (see the `web` feature).
@@ -186,9 +186,7 @@ tar = "0.4"
 flate2 = "1"
 xz2 = "0.1"
 
-# WebSocket client for the structured view-in-TUI view: subscribes to the daemon's
-# `/sessions/{id}/acp/ws` stream and pumps frames into the local reducer. The
-# daemon itself uses axum's built-in WS support and never pulls this in.
+# WebSockets for daemon clients and the daemon's local UDS transport.
 tokio-tungstenite = { version = "0.30", default-features = false, features = ["rustls-tls-webpki-roots", "connect"] }
 
 # Capability-safe file opens for the session file-read endpoint (#3088): open
@@ -196,20 +194,19 @@ tokio-tungstenite = { version = "0.30", default-features = false, features = ["r
 # escape the intended root.
 cap-std = "4.0.2"
 
-# Unix-only: O_NOFOLLOW for race-free plugin-tree reads/copies (no std constant);
-# sd-notify reports readiness to systemd (no-op without NOTIFY_SOCKET).
+# Unix-only: O_NOFOLLOW for capability-safe filesystem operations.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
-sd-notify = "0.5"
 
 [features]
 # The daemon (REST/WS API, auth, Web Push, ACP, structured view) is core: a
 # plain `cargo build` ships it and needs no Node. `web` adds the embedded
 # dashboard bundle, which is what invokes npm; released binaries are built
 # `--features web`, so every distributed binary ships the dashboard.
-default = ["default-plugins"]
-# Compile in the bundled first-party plugins. Build the bare core (acceptance
-# criterion 1 of #268) by opting out with `--no-default-features`.
+default = ["default-plugins", "vendored"]
+# OpenSSL and SQLite vendoring for portable builds.
+vendored = ["git2/vendored-openssl", "rusqlite/bundled"]
+# Compatibility flag for default plugin selection.
 default-plugins = []
 # Gates the `e2e` test target (tests/e2e/main.rs). Off by default so CI can run
 # the suite as two parallel shards without enumerating every non-e2e test
@@ -228,9 +225,13 @@ web = ["rust-embed", "qrcode"]
 # set, and a CI guard rejects any `cfg(feature = "serve")` so the alias
 # cannot diverge from `web`.
 serve = ["web"]
+# Derives `ts_rs::TS` on the live wire types so `cargo xtask gen-live-wire` can
+# emit the dashboard's copy. Not needed by any shipped binary.
+typescript = ["dep:ts-rs"]
 
 [dev-dependencies]
 serial_test = "4.0"
+jsonschema = { version = "0.59.0", default-features = false }
 # Test-only tokio clock control (`start_paused`), so the token-rotation
 # loop's grace deadline can be asserted without sleeping through it.
 # `cargo build` and released binaries never enable `test-util`.

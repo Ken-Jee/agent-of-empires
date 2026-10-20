@@ -32,6 +32,8 @@ aoe serve --open                # Open the URL in the default browser when ready
 aoe serve --remote --read-only  # Monitor without terminal input
 ```
 
+From the TUI, press `R` (`Ctrl+R` with strict hotkeys), shown as `R Web` in the shortcut bar, to start a background server on your network or over a tunnel. While it runs, the entry reads `R ● Web` in green.
+
 The server prints a URL with an auth token:
 
 ```
@@ -210,7 +212,7 @@ With `--auth=passphrase --behind-proxy`, the passphrase wall applies to TCP loop
 
 ### Running under systemd
 
-A foreground `aoe serve` reports readiness over `sd_notify` when systemd sets `NOTIFY_SOCKET`, so a unit can use `Type=notify`. `READY=1` is sent once the TCP and owner-verified Unix listeners are bound, the first healthy canonical snapshot is published, plugin workers are launched and background tasks are running; `STOPPING=1` is sent when shutdown starts. If aoe runs as a child of a wrapper (for example `cargo run`), add `NotifyAccess=all`, since systemd otherwise accepts messages only from the main process.
+`aoe serve` supports `Type=notify` when `NOTIFY_SOCKET` is set, using pathname or Linux abstract (`@name`) sockets. It sends `READY=1` after binding the required TCP and owner-verified Unix listeners, publishing the first canonical snapshot, and starting workers/tasks; it sends `STOPPING=1` when shutdown starts. A quarantined component does not stop healthy CLI reads, but native health and mutation admission remain fail-closed. Supported local runtime-read publication waits for retained readers before readiness; CityHall and unsupported namespaces keep their no-publication behavior. Writes run outside async workers and each has a one-second timeout; a receiver that remains full can still cause `READY=1` to be lost. Wrappers such as `cargo run` require `NotifyAccess=all`.
 
 ## Security
 
@@ -228,6 +230,10 @@ A foreground `aoe serve` reports readiness over `sd_notify` when systemd sets `N
 - **Local-only fields**: the agent-command surface and status-hook shell commands map names to arbitrary host commands, so the server rejects any PATCH touching them; they are editable only in the TUI on the host.
 
 The server also sets `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`, and `Referrer-Policy: no-referrer` (the last prevents token leaks via Referer).
+
+### Plugin pages
+
+A plugin page is framed with `sandbox="allow-scripts allow-downloads"` and served under its own policy (see [Pages](../plugin-api.md#pages)), so its script runs in an opaque origin: it cannot read the dashboard's token, binding secret, storage or cookies, call the API, or navigate the dashboard; it can save files to the downloads folder, subject to the browser's download protections. Because a frame load cannot send the device-binding header, the dashboard first mints a page ticket through a bound request. The ticket rides an `HttpOnly` cookie scoped to that page's URL, lasts 60 seconds, and authenticates only that page for the still-signed-in session that minted it; it never appears in the frame URL or document. That route is the only one framable, and only by the dashboard.
 
 ### DNS rebinding
 

@@ -285,7 +285,11 @@ fn spawn_enabled_worker(
                 return;
             }
         };
-        if let Err(e) = supervisor.spawn_inner(request, reservation).await {
+        if let Err(e) = supervisor
+            .spawn_inner(
+                request, reservation)
+            .await
+        {
             let message = structured_spawn_error_message(&e, &agent_name);
             tracing::warn!(target: "acp.switch", session = %session_id, "spawn after enable: {message}");
             supervisor.publish_startup_error(&session_id, message);
@@ -357,7 +361,14 @@ async fn deferred_enable_request(
             return Some(Err(format!("container start failed: {e}")));
         }
     };
-    let reservation = match state.acp_supervisor.reserve_spawn(session_id).await {
+    let reservation = match state
+        .acp_supervisor
+        .reserve_spawn(
+            session_id,
+            crate::process::worker_registry::ResumeAuthority::Explicit,
+        )
+        .await
+    {
         Ok(reservation) => reservation,
         Err(error) => return Some(Err(error.to_string())),
     };
@@ -650,6 +661,7 @@ mod tests {
         row: &Instance,
         pid: u32,
         control: Arc<crate::acp::runner_lifecycle::test_support::FakeProcessControl>,
+        original_birth: Option<crate::process::ProcessBirthIdentity>,
     ) -> (
         Arc<AppState>,
         crate::acp::supervisor::test_support::Gate,
@@ -664,7 +676,7 @@ mod tests {
         );
         let gate = Gate::default();
         let (launcher, deleted) =
-            recording_gated_launcher(&gate, pid, &row.id, "gated-native-session");
+            recording_gated_launcher(&gate, pid, &row.id, "gated-native-session", original_birth);
         let state = crate::server::test_support::build_test_app_state_impl(
             vec![row.clone()],
             Vec::new(),
@@ -679,7 +691,14 @@ mod tests {
             },
         );
         crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
-        let reservation = state.acp_supervisor.reserve_spawn(&row.id).await.unwrap();
+        let reservation = state
+            .acp_supervisor
+            .reserve_spawn(
+                &row.id,
+                crate::process::worker_registry::ResumeAuthority::Explicit,
+            )
+            .await
+            .unwrap();
         let lease = reservation.lease().clone();
         let mut request = spawn_request(&row.id);
         request.source_profile = Some(row.source_profile.clone());
@@ -688,6 +707,103 @@ mod tests {
             tokio::spawn(async move { supervisor.spawn_inner(request, reservation).await });
         gate.entered.notified().await;
         (state, gate, spawner, lease, deleted)
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn disable_without_context_retires_an_unborn_producer_without_journal_debt(
+    ) -> anyhow::Result<()> {
+        let _home = crate::session::test_support::isolate_app_dir();
+        crate::session::config::update_app_state(|state| {
+            state.has_acknowledged_agent_hooks = true
+        })?;
+        let project = tempfile::tempdir()?;
+        let mut row = Instance::new("unborn terminal handoff", project.path().to_str().unwrap());
+        row.view = View::Structured;
+        row.source_profile = "default".into();
+        row.command = "sleep 60".into();
+        assert!(
+            row.acp_session_id.is_none(),
+            "this transition has no context to keep"
+        );
+        let _pane = crate::tmux::test_helpers::TmuxTestSession::from_name(
+            crate::tmux::Session::generate_name(&row.id, &row.title),
+        );
+        crate::server::test_support::seed_instances_on_disk_for_test("default", vec![row.clone()]);
+        let state = crate::server::test_support::build_test_app_state(vec![row.clone()]);
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+        let producer = state
+            .acp_supervisor
+            .reserve_spawn(
+                &row.id,
+                crate::process::worker_registry::ResumeAuthority::Explicit,
+            )
+            .await?;
+        let cancellation = producer.lease().cancellation().clone();
+        let disabling = acp_disable(State(state.clone()), Path(row.id.clone()));
+        tokio::pin!(disabling);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::select! {
+                response = &mut disabling => anyhow::bail!("terminal handoff answered before producer settlement: {}", response.into_response().status()),
+                _ = cancellation.cancelled() => Ok::<_, anyhow::Error>(()),
+            }
+        }).await??;
+        assert!(futures_util::poll!(&mut disabling).is_pending());
+        drop(producer);
+        let response = disabling.await.into_response();
+        if response.status() != StatusCode::OK {
+            let status = response.status();
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+            anyhow::bail!(
+                "no-context terminal handoff failed with {status}: {}",
+                String::from_utf8_lossy(&body)
+            );
+        }
+        assert!(response
+            .headers()
+            .contains_key(crate::daemon::RUNTIME_REVISION_HEADER));
+        let storage = crate::session::Storage::open_unwatched("default")?;
+        let stored = storage.load()?;
+        let terminal = stored
+            .iter()
+            .find(|candidate| candidate.id == row.id)
+            .unwrap();
+        assert_eq!(terminal.view, View::Terminal);
+        assert!(terminal.lifecycle_generation > row.lifecycle_generation);
+        assert!(terminal.lifecycle_reservation.is_none());
+        let snapshot = state.runtime.snapshot(&state).await?;
+        let terminal = snapshot
+            .value
+            .contents
+            .sessions
+            .iter()
+            .find(|candidate| candidate.id == row.id)
+            .unwrap();
+        assert_eq!(terminal.view, View::Terminal);
+        assert_eq!(
+            terminal.agent_pane.state,
+            crate::session::PanePresence::Alive
+        );
+        state.acp_supervisor.forget_session(&row.id)?;
+        assert!(state
+            .acp_supervisor
+            .capture_retirement(&row.id)?
+            .lease
+            .is_none());
+        let next = state
+            .acp_supervisor
+            .reserve_spawn(
+                &row.id,
+                crate::process::worker_registry::ResumeAuthority::Explicit,
+            )
+            .await?;
+        drop(next);
+        assert!(state
+            .acp_supervisor
+            .capture_retirement(&row.id)?
+            .lease
+            .is_none());
+        Ok(())
     }
 
     #[tokio::test]
@@ -707,6 +823,8 @@ mod tests {
             .kill_on_drop(true)
             .spawn()?;
         let pid = child.id().unwrap();
+        let original_birth = crate::process::process_birth_identity(pid)?
+            .expect("owned child has a live process birth identity");
         let control = Arc::new(FakeProcessControl::default());
         control.alive(pid);
         let project = tempfile::tempdir()?;
@@ -718,7 +836,7 @@ mod tests {
             crate::tmux::Session::generate_name(&row.id, &row.title),
         );
         let (state, gate, spawner, lease, deleted) =
-            pending_handoff(&row, pid, control.clone()).await;
+            pending_handoff(&row, pid, control.clone(), Some(original_birth)).await;
         let enabled = acp_enable(State(state.clone()), Path(row.id.clone()))
             .await
             .into_response();
@@ -761,11 +879,11 @@ mod tests {
         let during_metadata = state.canonical_metadata.read().await.clone();
         crate::server::reload::reload_state_instances_from_disk(
             &state,
-            storage.load()?,
+            (storage.load()?).into(),
             vec![(sampled.clone(), "gated-native-session".into())],
             crate::server::state::StatusSource::DiskOnly,
             during_epoch,
-            during_metadata,
+            Ok(during_metadata),
             Default::default(),
         )
         .await;
@@ -814,7 +932,11 @@ mod tests {
             "permanent cancellation deletes the late native transcript"
         );
         assert!(control.signals().contains(&(pid, "TERM")));
-        assert!(!control.is_alive(pid));
+        assert!(
+            !control.is_alive(crate::acp::runner_lifecycle::RunnerIdentity::from_record(
+                &sampled,
+            ))
+        );
         assert!(worker_registry::load(&row.id)?.is_none());
         assert!(!state.acp_supervisor.is_owned(&row.id).await);
         let snapshot = state.runtime.snapshot(&state).await?;
@@ -869,11 +991,11 @@ mod tests {
         let metadata = state.canonical_metadata.read().await.clone();
         crate::server::reload::reload_state_instances_from_disk(
             &state,
-            persisted,
+            (persisted).into(),
             vec![(sampled, "gated-native-session".into())],
             crate::server::state::StatusSource::DiskOnly,
             epoch_before_reload,
-            metadata,
+            Ok(metadata),
             Default::default(),
         )
         .await;
@@ -926,7 +1048,8 @@ mod tests {
         row.source_profile = "default".into();
         let control = Arc::new(FakeProcessControl::default());
         control.immortal(4747);
-        let (state, gate, spawner, lease, _) = pending_handoff(&row, 4747, control.clone()).await;
+        let (state, gate, spawner, lease, _) =
+            pending_handoff(&row, 4747, control.clone(), None).await;
         let disabling = acp_disable(State(state.clone()), Path(row.id.clone()));
         tokio::pin!(disabling);
         tokio::time::timeout(Duration::from_secs(5), async {

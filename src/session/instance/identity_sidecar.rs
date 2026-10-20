@@ -1,22 +1,9 @@
-//! Identity extension launches and the Pi/Prime sidecars and transcripts they publish.
+//! Pi identity publication and transcript validation.
 
 use super::*;
 use crate::agents::SessionCaptureBackend;
-use crate::session::config::container_config::PRIME_AGENT_DIR_IN_CONTAINER;
 
 pub(super) const SESSION_SIDECAR_MAX_BYTES: usize = 4096;
-
-pub(super) fn read_sandbox_sidecar_file(
-    store: &Path,
-    instance_id: &str,
-    leaf: &str,
-    max_bytes: usize,
-) -> Option<Vec<u8>> {
-    crate::session::validate_instance_id(instance_id).ok()?;
-    let root = crate::session::AnchoredDir::open(store).ok()?;
-    let relative = Path::new("aoe-session").join(instance_id).join(leaf);
-    root.read_regular(&relative, max_bytes).ok()?
-}
 
 /// `Unreadable` is a statement about our view of the store, never about the
 /// conversation; only `Absent` may justify dropping a resume.
@@ -112,20 +99,7 @@ impl Instance {
                     container_config::PI_SIDECAR_DIR_IN_CONTAINER.to_string(),
                 )
             }
-            SessionCaptureBackend::PrimeAgent => {
-                self.prime_agent_capture_plan_with(&config, bind_dir.clone())?;
-                container_config::install_prime_sandbox_extension_at(&bind_dir).ok()?;
-                (
-                    PRIME_AGENT_DIR_IN_CONTAINER,
-                    format!(
-                        " -e {}",
-                        shell_escape(&format!(
-                            "{PRIME_AGENT_DIR_IN_CONTAINER}/extensions/aoe-session-id.js"
-                        ))
-                    ),
-                    format!("{PRIME_AGENT_DIR_IN_CONTAINER}/aoe-session"),
-                )
-            }
+
             _ => return None,
         };
         if !config.uses_default_container_home()
@@ -170,7 +144,7 @@ impl Instance {
         if let Some(active) = &self.active_execution {
             return match &active.capture {
                 Some(CaptureContext::Pi { source, .. }) => Some(source.clone()),
-                Some(CaptureContext::Prime { sidecar, .. }) => sidecar.clone(),
+
                 _ => None,
             };
         }
@@ -813,7 +787,19 @@ pi = "~/.pi-personal"
 
         let mut cmd = String::from("pi");
         declared
-            .apply_session_flags(&mut cmd, "test", crate::agents::get_agent("pi"), None)
+            .apply_session_flags(
+                &mut cmd,
+                crate::agents::get_agent("pi"),
+                None,
+                &super::execution::AgentLaunchContext::host(
+                    crate::agents::get_agent("pi"),
+                    declared
+                        .default_selector_agent()
+                        .and_then(|agent| declared.host_agent_command(agent, None))
+                        .as_ref(),
+                ),
+                &mut declared.conversation_state(),
+            )
             .unwrap();
         assert!(
             !cmd.contains(STALE_ID) && !cmd.contains("--session"),
@@ -962,7 +948,18 @@ pi = "~/.pi-personal"
 
         let mut cmd = "pi".to_string();
         let resumed = inst
-            .apply_session_flags(&mut cmd, "test", crate::agents::get_agent("pi"), None)
+            .apply_session_flags(
+                &mut cmd,
+                crate::agents::get_agent("pi"),
+                None,
+                &super::execution::AgentLaunchContext::host(
+                    crate::agents::get_agent("pi"),
+                    inst.default_selector_agent()
+                        .and_then(|agent| inst.host_agent_command(agent, None))
+                        .as_ref(),
+                ),
+                &mut inst.conversation_state(),
+            )
             .unwrap();
         assert_eq!(cmd, "pi", "no selector may be handed to a doomed resume");
         assert!(!resumed, "nothing was resumed");
@@ -975,7 +972,18 @@ pi = "~/.pi-personal"
         std::fs::write(&transcript, "{}\n").unwrap();
         let mut cmd = "pi".to_string();
         assert!(inst
-            .apply_session_flags(&mut cmd, "test", crate::agents::get_agent("pi"), None)
+            .apply_session_flags(
+                &mut cmd,
+                crate::agents::get_agent("pi"),
+                None,
+                &super::execution::AgentLaunchContext::host(
+                    inst.default_selector_agent(),
+                    inst.default_selector_agent()
+                        .and_then(|agent| inst.host_agent_command(agent, None))
+                        .as_ref()
+                ),
+                &mut inst.conversation_state()
+            )
             .unwrap());
         assert_eq!(cmd, format!("pi --session '{}'", transcript.display()));
     }
@@ -992,7 +1000,7 @@ pi = "~/.pi-personal"
         inst.tool = "pi".to_string();
         inst.sandbox_info = Some(test_sandbox("aoe-pi-path-retry", None));
         inst.agent_session_id = Some(sid.to_string());
-        let mut storage = crate::session::storage::Storage::new_unwatched(profile).unwrap();
+        let storage = crate::session::storage::Storage::new_unwatched(profile).unwrap();
         let seed = inst.clone();
         storage
             .update(|instances, _| {
