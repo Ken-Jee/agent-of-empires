@@ -46,9 +46,16 @@ test.describe("ensure_session restart flow", () => {
     const [session] = await listSessions(serve.baseUrl);
     const sessionId = session!.id;
     const tmuxName = `${serve.tmuxPrefix}${title}_${sessionId.slice(0, 8)}`;
-    const ensure = async () =>
-      (await fetch(`${serve.baseUrl}/api/sessions/${sessionId}/ensure`, { method: "POST" }).then((r) => r.json()))
-        .status;
+    const ensure = async () => {
+      const response = await fetch(`${serve.baseUrl}/api/sessions/${sessionId}/ensure`, { method: "POST" });
+      const body = await response.text();
+      expect(response.status, `POST /ensure returned ${response.status}: ${body}`).toBe(200);
+      const result: unknown = JSON.parse(body);
+      if (typeof result !== "object" || result === null || !("status" in result) || typeof result.status !== "string") {
+        throw new Error(`POST /ensure returned an invalid status: ${body}`);
+      }
+      return result.status;
+    };
 
     // The status poller flips the seeded session to Error once it sees no tmux session.
     await expect.poll(async () => (await listSessions(serve.baseUrl))[0]?.status, { timeout: 10_000 }).toBe("Error");

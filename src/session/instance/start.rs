@@ -183,12 +183,9 @@ impl Instance {
         // durable recheck after the pre-launch hooks (which run without this
         // lock) lives in `reacquire_launch_locks_after_hooks`.
         self.ensure_startable()?;
-        // A `remain-on-exit` corpse still owns the tmux name, so plain
-        // `exists()` reads a crashed agent as a running session and start
-        // becomes a silent no-op the caller reports as success. Recreate the
-        // pane instead, the way restart already does. See #3399.
+        // A remain-on-exit corpse still owns its physical name and must be recreated.
         let session = self.tmux_session()?;
-        let corpse_pane = if session.exists() {
+        let corpse_pane = if session.exists_live() {
             if !session.is_pane_dead() {
                 return Ok(LaunchSidOutcome::Skipped);
             }
@@ -306,7 +303,7 @@ impl Instance {
     ) -> Result<LaunchSidOutcome> {
         let profile = storage.storage().profile();
         let session = self.tmux_session()?;
-        if session.exists() {
+        if session.exists_live() {
             anyhow::bail!(
                 "session {} gained a tmux pane before its reserved launch",
                 self.id

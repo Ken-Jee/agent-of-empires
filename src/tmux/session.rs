@@ -368,6 +368,10 @@ impl Session {
     pub fn exists(&self) -> bool {
         crate::tmux::session_exists(&self.name)
     }
+
+    pub(crate) fn exists_live(&self) -> bool {
+        crate::tmux::session_exists_live(&self.name)
+    }
     pub(crate) fn exists_with_deadline(&self, deadline: &crate::tmux::TmuxCommandDeadline) -> bool {
         let mut command = crate::tmux::tmux_command();
         command
@@ -464,7 +468,7 @@ impl Session {
         container_env: &[(String, String)],
         scope: Option<&crate::process::systemd::ScopePrefix>,
     ) -> Result<()> {
-        if self.exists() {
+        if self.exists_live() {
             return Ok(());
         }
 

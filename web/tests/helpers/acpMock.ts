@@ -1,5 +1,5 @@
 // Mocked structured view session: REST stubs plus a WebSocket replaying `{ session_id, seq, event }` frames.
-// The frame log is resent on reconnect like the daemon's drain; the reducer dedupes by seq.
+// Reconnect replays only frames and rows newer than the acknowledged sequence.
 
 import { expect, type Page, type WebSocketRoute } from "@playwright/test";
 
@@ -286,8 +286,18 @@ export async function mockAcpSession(page: Page, opts: AcpSessionMockOptions = {
   });
   await page.routeWebSocket(/\/sessions\/[^/]+\/acp\/ws/, (route) => {
     ws = route;
-    for (const frame of frameLog) route.send(frame);
-    route.send(JSON.stringify({ kind: "transcript_snapshot", rows: rowLog.map((e) => e.row) }));
+    const since = Number(new URL(route.url()).searchParams.get("since") ?? "0");
+    for (const frame of frameLog) {
+      // pushEvents owns these serialized sequence envelopes.
+      const envelope = JSON.parse(frame) as { seq: number };
+      if (envelope.seq > since) route.send(frame);
+    }
+    route.send(
+      JSON.stringify({
+        kind: "transcript_snapshot",
+        rows: rowLog.filter((entry) => entry.seq > since).map((entry) => entry.row),
+      }),
+    );
   });
 
   pushEvents(opts.initialEvents ?? []);

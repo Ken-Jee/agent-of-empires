@@ -2112,19 +2112,17 @@ pub fn probe_session_existence(name: &str) -> SessionExistence {
     session_existence_from_cache(name).unwrap_or(SessionExistence::Unknown)
 }
 
-/// Authoritative session existence, with a cache fast-path for the positive
-/// case only. The session cache is a snapshot refreshed on a ~2s cadence, so
-/// its answers are asymmetric: a HIT proves the session existed as of the last
-/// scan (trust it), but a MISS is unreliable, a session created since the scan
-/// reads as absent. Trusting a cached miss is what made teardown and drift
-/// decisions racy; here a miss (or a stale/absent cache) falls through to a
-/// live `has-session`, keeping existence checks free of false negatives while
-/// preserving the fast path for sessions that do exist.
+/// Cached-positive existence hint; misses probe tmux live.
+/// Claiming or creating a physical name requires `session_exists_live`.
 pub fn session_exists(name: &str) -> bool {
     if session_exists_from_cache(name) == Some(true) {
         return true;
     }
+    session_exists_live(name)
+}
 
+/// Probe current exact-name existence without consulting the snapshot cache.
+pub(crate) fn session_exists_live(name: &str) -> bool {
     let mut command = tmux_command();
     command.args(["has-session", "-t"]).arg(format!("={name}"));
     run_tmux_command_with_timeout(&mut command)

@@ -4,6 +4,9 @@ Explicit resume and fork against a qualified conversation require the native age
 
 Runtime conversation changes such as `/clear`, `/new`, fork, continue, or a fresh pane generation rotate the recorded identity when the native agent publishes the change. The old identity and any artifact predating the launch boundary cannot be recaptured after an AoE process restart.
 
+Physical launch and pane adoption decisions probe the exact tmux name live.
+A cached tmux session snapshot cannot suppress recreation of a missing pane.
+
 ## Automatic capture matrix
 
 | Agent | Host terminal | Sandboxed terminal | Authoritative source |

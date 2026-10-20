@@ -293,11 +293,16 @@ impl Instance {
         let (_title, _lifecycle) = self.acquire_auxiliary_locks_in(store)?;
         crate::tmux::refresh_session_cache();
         let session = self.terminal_tmux_session_indexed(index)?;
-        if session.exists() && session.is_pane_dead() {
-            session.kill()?;
-        }
-
-        let is_new = !session.exists();
+        let is_new = if session.exists_live() {
+            if session.is_pane_dead() {
+                session.kill()?;
+                true
+            } else {
+                false
+            }
+        } else {
+            true
+        };
         if is_new {
             session.create_with_size(&self.project_path, None, size, &self.effective_profile())?;
             self.apply_terminal_tmux_options(index);
@@ -391,7 +396,7 @@ impl Instance {
         );
         tmux::refresh_session_cache();
         let session = self.container_terminal_tmux_session_indexed(index)?;
-        if session.exists() && !session.is_pane_dead() {
+        if session.exists_live() && !session.is_pane_dead() {
             return Ok((session, false));
         }
         let generation =
@@ -459,10 +464,16 @@ impl Instance {
             // Values ride the protected env-file, never the host shell or runtime
             // process env. See [`crate::session::environment::DockerExecEnv`].
             let session = self.container_terminal_tmux_session_indexed(index)?;
-            if session.exists() && session.is_pane_dead() {
-                session.kill()?;
-            }
-            let is_new = !session.exists();
+            let is_new = if session.exists_live() {
+                if session.is_pane_dead() {
+                    session.kill()?;
+                    true
+                } else {
+                    false
+                }
+            } else {
+                true
+            };
             if is_new {
                 let session = tmux::Session::from_name(session.name());
                 session.create_with_size_env_and_container_env(

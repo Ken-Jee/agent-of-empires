@@ -209,6 +209,10 @@ impl PairedTerminal {
         crate::tmux::session_exists(&self.name)
     }
 
+    fn exists_live(&self) -> bool {
+        crate::tmux::session_exists_live(&self.name)
+    }
+
     fn is_pane_dead(&self) -> bool {
         is_pane_dead(&self.name)
     }
@@ -220,7 +224,7 @@ impl PairedTerminal {
         size: Option<(u16, u16)>,
         profile: &str,
     ) -> Result<()> {
-        if self.exists() {
+        if self.exists_live() {
             return Ok(());
         }
         let config = crate::tmux::tmux_option_config(profile);
@@ -390,6 +394,10 @@ impl TerminalSession {
         self.inner.exists()
     }
 
+    pub(crate) fn exists_live(&self) -> bool {
+        self.inner.exists_live()
+    }
+
     pub fn is_pane_dead(&self) -> bool {
         self.inner.is_pane_dead()
     }
@@ -498,6 +506,10 @@ impl ContainerTerminalSession {
 
     pub fn exists(&self) -> bool {
         self.inner.exists()
+    }
+
+    pub(crate) fn exists_live(&self) -> bool {
+        self.inner.exists_live()
     }
 
     pub fn is_pane_dead(&self) -> bool {
@@ -668,6 +680,44 @@ mod tests {
             TerminalSession::generate_name(ID, "Refactor billing"),
             "a live container terminal is not the host terminal"
         );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn physical_creators_ignore_stale_positive_session_cache() {
+        crate::tmux::test_helpers::require_tmux!();
+        let _home = crate::session::test_support::isolate_app_dir();
+        let _shell = crate::session::test_support::EnvGuard::set(&[("SHELL", "/bin/sh")]);
+        let cache = crate::tmux::SessionCacheGuard::capture();
+        for kind in [
+            None,
+            Some(TerminalKind::Host),
+            Some(TerminalKind::Container),
+        ] {
+            let guard = TmuxTestSession::new("aoe_stale_positive_claim");
+            cache.force_present(&[guard.name()]);
+            match kind {
+                None => Session::from_name(guard.name()).create_with_size(
+                    "/tmp",
+                    Some("exec cat"),
+                    Some((80, 24)),
+                    "default",
+                ),
+                Some(kind) => PairedTerminal {
+                    name: guard.name().to_string(),
+                    kind,
+                }
+                .create_with_size(
+                    "/tmp",
+                    Some("exec cat"),
+                    Some((80, 24)),
+                    "default",
+                ),
+            }
+            .expect("a stale cached positive must not suppress physical creation");
+            let pane = crate::tmux::test_helpers::only_pane_id(guard.name());
+            crate::tmux::test_helpers::wait_for_pane_command(&pane, "cat");
+        }
     }
 
     #[test]
