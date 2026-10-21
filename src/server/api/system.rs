@@ -1825,6 +1825,9 @@ pub async fn get_update_status(State(state): State<Arc<AppState>>) -> Json<Updat
 
     match crate::update::check_for_update(&current, false).await {
         Ok(info) => {
+            // Same rule as the TUI: hide an update `aoe update` can't install yet.
+            let update_available = info.available
+                && crate::update::install::update_actionable(&info.latest_version).await;
             let release_url = if info.latest_version.is_empty() {
                 None
             } else {
@@ -1838,7 +1841,7 @@ pub async fn get_update_status(State(state): State<Arc<AppState>>) -> Json<Updat
                 } else {
                     Some(info.latest_version)
                 },
-                update_available: info.available,
+                update_available,
                 release_url,
                 error: None,
                 dismissed_version: cfg.app_state.dismissed_update_version.clone(),
