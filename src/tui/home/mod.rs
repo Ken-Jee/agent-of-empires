@@ -529,16 +529,7 @@ pub struct HomeView {
     /// Session whose persisted view flips (structured ↔ terminal) after the
     /// switch-view confirm dialog is accepted.
     pub(super) pending_switch_view_session: Option<String>,
-    /// Session whose structured-view open is waiting on the "start a
-    /// local daemon?" confirm (see `prompt_start_daemon_for_structured`).
-    pub(super) pending_daemon_start_session: Option<String>,
-    /// The structured-view session mounted in the preview pane, if any:
-    /// a streaming transcript that `render_preview` paints as the
-    /// preview content for a selected structured row (read-only until
-    /// entered; see `EmbeddedView::is_active`). Owned here so the
-    /// preview renderer, info header, and drag-select all compose with
-    /// it; the `App` loop drives its async sides (connect, WS pump,
-    /// active-mode key routing).
+
     pub(in crate::tui) structured_preview:
         Option<crate::tui::structured_view::embedded::EmbeddedView>,
     /// True while the App's preview-on-select reconcile has picked a

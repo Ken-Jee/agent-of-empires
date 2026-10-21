@@ -197,12 +197,7 @@ pub struct App {
     /// Set by `Action::SwitchSessionView` so the async main loop can run
     /// the daemon switch POST (awaited; the sync handler can't).
     pending_view_switch: Option<String>,
-    /// Set by `Action::StartDaemonThenOpenStructured` (the Yes on the
-    /// "start a local daemon?" confirm) so the async loop can spawn the
-    /// daemon, wait for health, and then open the structured view.
-    pending_daemon_start_open: Option<String>,
-    /// Set by `Action::SmartRenameNow` so the async loop can run the daemon
-    /// canonical `/smart-rename` request for either session backend.
+
     pending_smart_rename: Option<String>,
     /// Debounce for structured preview-on-select, so fast navigation doesn't
     /// connect a WebSocket per keystroke.
@@ -481,7 +476,6 @@ impl App {
             host_title: super::host_title::HostTitleTracker::default(),
             mosh_active,
             pending_structured_view_open: None,
-            pending_daemon_start_open: None,
             preview_mount_pending: None,
             pending_view_switch: None,
             pending_smart_rename: None,
@@ -1568,11 +1562,7 @@ impl App {
                                 if let Some(session_id) = self.pending_view_switch.take() {
                                     self.perform_view_switch(&session_id, terminal).await;
                                 }
-                                // Same for a [Yes] click on the start-daemon
-                                // confirm from a structured-view open.
-                                if let Some(session_id) = self.pending_daemon_start_open.take() {
-                                    self.start_daemon_then_open(&session_id, terminal).await;
-                                }
+
                                 // Same for an "Auto-name now" palette/menu click.
                                 if let Some(session_id) = self.pending_smart_rename.take() {
                                     self.perform_smart_rename(&session_id);
@@ -2861,10 +2851,6 @@ impl App {
             self.perform_view_switch(&session_id, terminal).await;
         }
 
-        if let Some(session_id) = self.pending_daemon_start_open.take() {
-            self.start_daemon_then_open(&session_id, terminal).await;
-        }
-
         if let Some(session_id) = self.pending_structured_view_open.take() {
             self.open_structured_view(&session_id).await?;
         }
@@ -2891,20 +2877,9 @@ impl App {
         }
     }
 
-    /// Run a stashed view switch: resolve the daemon, POST the matching
-    /// switch endpoint, and surface the outcome as a transient status.
-    /// The daemon persists the flipped view and (re)spawns the worker /
-    /// tears down the pane; the file watcher refreshes the row, so the
-    /// TUI mutates no session state itself. Errors surface as status
-    /// text rather than failing the app loop.
-    ///
-    /// When no daemon is running, a localhost one is started first: the
-    /// user just confirmed a dialog that says the agent restarts under
-    /// `aoe serve`, so the spawn is part of the consented action rather
-    /// than a hidden side effect. `terminal` is borrowed to paint the
-    /// "Starting…" status before the (up to several seconds) wait.
+    /// Switch views against the located runtime without changing daemon exposure.
     async fn perform_view_switch(&mut self, session_id: &str, terminal: &mut Terminal<TuiBackend>) {
-        use crate::acp::client::{require_daemon, HttpClient, ManagerError};
+        use crate::acp::client::{locate_daemon, HttpClient};
 
         let Some(inst) = self.home.get_instance(session_id) else {
             return;
@@ -2912,23 +2887,19 @@ impl App {
         let to_structured = !inst.is_structured();
         let title = inst.title.clone();
 
-        let endpoint = match require_daemon().await {
-            Ok(e) => e,
-            Err(ManagerError::NoDaemonRunning(_)) => {
-                self.set_status("Starting local daemon for the view switch…");
-                let _ = self.draw(terminal);
-                match crate::tui::dialogs::start_local_daemon_and_wait().await {
-                    Ok(e) => e,
-                    Err(e) => {
-                        // The log-tail hint is multi-line; a status is one row.
-                        let first = e.lines().next().unwrap_or("unknown error");
-                        self.set_status(format!("view switch failed: {first}"));
-                        return;
-                    }
-                }
-            }
+        self.set_status("Connecting to the daemon…");
+        let _ = self.draw(terminal);
+        let endpoint = match locate_daemon().await {
+            Ok(endpoint) => endpoint,
             Err(e) => {
-                self.set_status(format!("daemon unreachable: {e}"));
+                // The failure hint is multi-line; a status is one row.
+                let first = e
+                    .to_string()
+                    .lines()
+                    .next()
+                    .unwrap_or("unknown error")
+                    .to_string();
+                self.set_status(format!("view switch failed: {first}"));
                 return;
             }
         };
@@ -2951,15 +2922,9 @@ impl App {
         });
     }
 
-    /// Enter (activate) the structured view for `session_id`: it takes
-    /// the keyboard so the composer works. Usually the view is already
-    /// mounted as a preview (selecting the row mounts it), so this just
-    /// flips it active. If it isn't mounted (e.g. the daemon was down
-    /// when selected), connect now; and with no daemon at all, offer to
-    /// start a localhost one (the Yes path resumes through
-    /// `start_daemon_then_open`).
+    /// Enter the structured view against the located runtime.
     async fn open_structured_view(&mut self, session_id: &str) -> Result<()> {
-        use crate::acp::client::{require_daemon, ManagerError};
+        use crate::acp::client::locate_daemon;
 
         // Archived rows render a placeholder; an active view would capture keys invisibly.
         if self
@@ -2983,18 +2948,21 @@ impl App {
                 .await;
             return Ok(());
         }
-        match require_daemon().await {
+        match locate_daemon().await {
             Ok(endpoint) => {
                 self.connect_embedded_structured(endpoint, session_id).await;
                 self.activate_embedded();
                 self.drain_pending_paste_for_structured_view(session_id)
                     .await;
             }
-            Err(ManagerError::NoDaemonRunning(_)) => {
-                self.home.prompt_start_daemon_for_structured(session_id);
-            }
             Err(e) => {
-                self.set_status(format!("structured view: {e}"));
+                let first = e
+                    .to_string()
+                    .lines()
+                    .next()
+                    .unwrap_or("unknown error")
+                    .to_string();
+                self.set_status(format!("structured view: {first}"));
             }
         }
         Ok(())
@@ -3060,32 +3028,6 @@ impl App {
     /// covers it cleanly, the same way exiting live-send does.
     fn close_embedded_structured(&mut self) {
         self.home.structured_preview = None;
-    }
-
-    /// The Yes path of the "start a local daemon?" confirm: spawn a
-    /// localhost daemon with visible feedback, wait for it to become
-    /// healthy, then mount + enter the embedded structured view.
-    async fn start_daemon_then_open(
-        &mut self,
-        session_id: &str,
-        terminal: &mut Terminal<TuiBackend>,
-    ) {
-        self.set_status("Starting local daemon…");
-        let _ = self.draw(terminal);
-        match crate::tui::dialogs::start_local_daemon_and_wait().await {
-            Ok(endpoint) => {
-                self.update_status = None;
-                self.connect_embedded_structured(endpoint, session_id).await;
-                self.activate_embedded();
-                // Preserve the captured draft until its requested view mounts.
-                self.drain_pending_paste_for_structured_view(session_id)
-                    .await;
-            }
-            Err(e) => {
-                let first = e.lines().next().unwrap_or("unknown error");
-                self.set_status(format!("daemon start failed: {first}"));
-            }
-        }
     }
 
     fn clear_preview_mount_pending(&mut self) {
@@ -3278,7 +3220,6 @@ impl App {
             // These need the async loop, which drains them after this returns.
             Action::OpenStructuredView(id) => self.pending_structured_view_open = Some(id),
             Action::SwitchSessionView(id) => self.pending_view_switch = Some(id),
-            Action::StartDaemonThenOpenStructured(id) => self.pending_daemon_start_open = Some(id),
             Action::SmartRenameNow(id) => self.pending_smart_rename = Some(id),
         }
         Ok(())
@@ -3761,14 +3702,7 @@ pub enum Action {
     /// `pending_structured_view_open`; the daemon persists the change and
     /// the file watcher refreshes the row.
     SwitchSessionView(String),
-    /// The Yes on the "no daemon running, start a local one?" confirm
-    /// shown when opening a structured view. Stashed in
-    /// `pending_daemon_start_open` (spawn + health wait must be
-    /// awaited) and drained alongside the other structured stashes.
-    StartDaemonThenOpenStructured(String),
-    /// On-demand "Auto-name now" for a structured session. Stashed in
-    /// `pending_smart_rename` (the daemon POST needs the async loop) and
-    /// drained alongside the other structured stashes (#3039).
+
     SmartRenameNow(String),
 }
 

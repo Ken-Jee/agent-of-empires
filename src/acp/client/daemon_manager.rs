@@ -1,7 +1,10 @@
-//! Discovery never spawns; only initial TUI bootstrap and explicit reconnect may ensure a local core.
+//! Discovery never spawns. CLI autostart may launch loopback; native TUI bootstrap launches Core only.
+
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use thiserror::Error;
 
+use super::autostart;
 use super::discovery::{discover, discover_env, DaemonEndpoint, DiscoveryError};
 use super::http::HttpError;
 
@@ -17,10 +20,25 @@ pub enum ManagerError {
     EnvOverrideUnauthorized,
     #[error("local daemon unavailable: {0}")]
     NoDaemonRunning(#[from] DiscoveryError),
+    #[error(
+        "could not start a local aoe daemon: {0}\n\nStart one by hand with `aoe serve --daemon`, or attach to an existing remote daemon with:\n  AOE_DAEMON_URL=<url> AOE_DAEMON_TOKEN=<token> aoe …"
+    )]
+    AutostartFailed(String),
+}
+
+static AUTOSTART_DISABLED: AtomicBool = AtomicBool::new(false);
+
+/// Set once at startup from `--no-autostart` / `AOE_NO_AUTOSTART`.
+pub fn set_autostart_disabled(disabled: bool) {
+    AUTOSTART_DISABLED.store(disabled, Ordering::Relaxed);
+}
+
+pub(crate) fn autostart_disabled() -> bool {
+    AUTOSTART_DISABLED.load(Ordering::Relaxed)
 }
 
 /// Check the selected endpoint without spawning or changing exposure.
-pub async fn require_daemon() -> Result<DaemonEndpoint, ManagerError> {
+pub async fn locate_daemon() -> Result<DaemonEndpoint, ManagerError> {
     if discover_env().is_some() {
         let endpoint = discover().map_err(|_| ManagerError::EnvOverrideUnreachable)?;
         let client = super::HttpClient::new(endpoint.clone())
@@ -41,10 +59,32 @@ pub async fn require_daemon() -> Result<DaemonEndpoint, ManagerError> {
     Ok(endpoint)
 }
 
-/// Called once at local TUI bootstrap, never by a reconnect timer.
-pub async fn ensure_daemon(profile: &str) -> anyhow::Result<DaemonEndpoint> {
-    if discover_env().is_some() {
-        return require_daemon().await.map_err(Into::into);
+/// Start a local daemon if needed; only its spawning caller receives the PID.
+pub async fn ensure_daemon() -> Result<(DaemonEndpoint, Option<u32>), ManagerError> {
+    if discover_env().is_some() || autostart_disabled() {
+        return locate_daemon().await.map(|endpoint| (endpoint, None));
     }
-    crate::cli::serve::ensure_core_daemon(profile).await
+    if let Some(endpoint) = autostart::healthy_local().await {
+        return Ok((endpoint, None));
+    }
+    autostart::start_local()
+        .await
+        .map_err(ManagerError::AutostartFailed)
+}
+
+/// Announce CLI autostart on stderr, also under `--json`.
+pub async fn require_daemon() -> Result<DaemonEndpoint, ManagerError> {
+    let (endpoint, started) = ensure_daemon().await?;
+    if let Some(pid) = started {
+        eprintln!("Started aoe daemon (pid {pid})");
+    }
+    Ok(endpoint)
+}
+
+/// Only initial native bootstrap and explicit reconnect may start a local Core.
+pub async fn ensure_native_daemon(profile: &str) -> anyhow::Result<DaemonEndpoint> {
+    if discover_env().is_some() {
+        return locate_daemon().await.map_err(Into::into);
+    }
+    crate::cli::serve::ensure_core_daemon(profile, !autostart_disabled()).await
 }

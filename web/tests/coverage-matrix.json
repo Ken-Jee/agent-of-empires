@@ -2582,6 +2582,24 @@
       ]
     },
     {
+      "id": "settings.persistent-structured-views",
+      "kind": "vitest",
+      "risk": "low",
+      "specs": [
+        "src/components/__tests__/StructuredSessionStack.test.tsx",
+        "src/lib/__tests__/persistentStructuredViews.test.ts",
+        "src/components/settings/__tests__/StructuredViewDisplaySettings.test.tsx",
+        "src/components/acp/__tests__/StructuredViewRoot.test.tsx"
+      ],
+      "components": [
+        "web/src/components/StructuredSessionStack.tsx",
+        "web/src/components/TerminalSessionStack.tsx",
+        "web/src/hooks/usePersistentSessionIds.ts",
+        "web/src/lib/persistentStructuredViews.ts",
+        "web/src/components/MobileMainPane.tsx"
+      ]
+    },
+    {
       "id": "settings.panels-section",
       "kind": "vitest",
       "risk": "low",

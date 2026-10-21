@@ -867,6 +867,7 @@ last_seen_version = "{}"
             .env("PATH", self.env_path())
             .env("TERM", "xterm-256color")
             .env_remove("NO_COLOR")
+            .env_remove("AOE_NO_AUTOSTART")
             .envs(self.extra_env.iter().map(|(key, value)| (key, value)))
             .output()
             .expect("failed to run tmux new-session");
@@ -1320,6 +1321,7 @@ last_seen_version = "{}"
             .env("PATH", self.env_path())
             .env_remove("AGENT_OF_EMPIRES_DEBUG")
             .env_remove("AOE_LOG_LEVEL")
+            .env_remove("AOE_NO_AUTOSTART")
             .envs(self.extra_env.iter().map(|(key, value)| (key, value)));
         for key in &self.extra_env_remove {
             command.env_remove(key);

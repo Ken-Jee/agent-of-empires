@@ -919,7 +919,9 @@ fn command_is_aoe_serve(command: &[u8]) -> bool {
                     return false;
                 }
             }
+            b"--no-autostart" => index += 1,
             arg if arg.starts_with(b"--profile=")
+                || arg.starts_with(b"--no-autostart=")
                 || arg.starts_with(b"--daemon-url=")
                 || (arg.starts_with(b"-p") && arg.len() > 2) =>
             {
@@ -1414,10 +1416,15 @@ async fn fetch_cityhall_bundle(url: &str, token: &str) -> Result<String> {
 
 pub(crate) async fn ensure_core_daemon(
     profile: &str,
+    allow_start: bool,
 ) -> Result<crate::acp::client::DaemonEndpoint> {
     use clap::Parser;
     let transaction = crate::daemon::lifecycle::Transaction::acquire().await?;
     if daemon_pid().is_none() {
+        anyhow::ensure!(
+            allow_start,
+            "Local daemon autostart is disabled; start one with `aoe serve --core-only --daemon`"
+        );
         let resolved_profile = crate::session::config::effective_profile(profile);
         let profile = resolved_profile.as_str();
         crate::session::require_known_profile(profile)?;
@@ -1986,6 +1993,7 @@ mod tests {
             (b"agent-of-empires serve --daemon", true),
             (b"aoe --profile work serve --daemon", true),
             (b"aoe --profile=work serve --daemon", true),
+            (b"aoe --no-autostart serve --daemon", true),
             (b"aoe update", false),
             (b"aoe --profile serve update", false),
             (b"aoe --some-option serve update", false),
@@ -2309,6 +2317,7 @@ mod tests {
             globals,
             vec![
                 ("daemon-url".to_string(), None),
+                ("no-autostart".to_string(), None),
                 ("profile".to_string(), Some('p')),
             ],
             "a top-level global changed; teach command_is_aoe_serve about it before \

@@ -243,7 +243,6 @@ impl HomeView {
             pending_image_pull: None,
             confirm_checked: Vec::new(),
             pending_switch_view_session: None,
-            pending_daemon_start_session: None,
             structured_preview: None,
             structured_preview_pending: false,
             pending_force_remove_session: None,

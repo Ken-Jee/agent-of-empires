@@ -660,7 +660,8 @@ impl SessionFeed {
         let quit_control = self.quit_control.clone();
         self.task = Some(tokio::spawn(async move {
             let result: anyhow::Result<()> = async {
-                let endpoint = crate::acp::client::daemon_manager::ensure_daemon(&profile).await?;
+                let endpoint =
+                    crate::acp::client::daemon_manager::ensure_native_daemon(&profile).await?;
                 let mut connection = RuntimeConnection::connect(
                     &endpoint,
                     (!profile.is_empty()).then_some(profile.as_str()),

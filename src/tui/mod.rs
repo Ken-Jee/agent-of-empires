@@ -322,7 +322,7 @@ pub async fn run(profile: &str, startup_warning: Option<String>) -> Result<()> {
 
     // Preserve first-run local UI without minting a profile in the observer.
     if crate::session::list_profiles()?.is_empty() {
-        crate::acp::client::daemon_manager::ensure_daemon(profile).await?;
+        crate::acp::client::daemon_manager::ensure_native_daemon(profile).await?;
     }
     // Mosh mangles mouse-tracking escapes, so capture stays off under it.
     // `App` re-resolves the config so a mid-session toggle still applies.
