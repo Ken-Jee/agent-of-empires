@@ -1938,26 +1938,27 @@ mod tests {
     #[serial_test::serial]
     async fn session_enumeration_failure_does_not_block_recovered_inventory() {
         use crate::server::{
-            reload::reload_state_instances_from_disk, state::StatusSource, test_support,
+            reload::{load_profiles_for_reload, reload_state_instances_from_disk},
+            state::StatusSource,
+            test_support,
         };
         let home = TempHome::new();
         let profiles = home.app_dir().join("profiles");
         std::fs::create_dir_all(home.app_dir()).unwrap();
         std::fs::write(&profiles, "not a directory").unwrap();
         let state = test_support::build_test_app_state(Vec::new());
-        let (failed, failed_metadata) =
-            crate::server::reload::load_profiles_for_reload(&state.file_watch);
-        let failed_health = failed.cache.health.clone();
-        reload_state_instances_from_disk(
-            &state,
-            failed,
-            vec![],
-            StatusSource::DiskOnly,
-            0,
-            failed_metadata,
-            Default::default(),
-        )
-        .await;
+        let reload = |(loaded, metadata)| {
+            reload_state_instances_from_disk(
+                &state,
+                loaded,
+                vec![],
+                StatusSource::DiskOnly,
+                0,
+                metadata,
+                Default::default(),
+            )
+        };
+        reload(load_profiles_for_reload(&state.file_watch)).await;
         let snapshot = cached_snapshot(&state).await;
         assert!(!crate::cli::runtime_read::dto::component_healthy(
             &snapshot.health.global_enumeration
@@ -1975,48 +1976,124 @@ mod tests {
         assert!(crate::cli::runtime_read::dto::profile_component_healthy(
             &snapshot.profiles[0].health.metadata
         ));
-        async {
-            let (loaded, metadata) =
-                crate::server::reload::load_profiles_for_reload(&state.file_watch);
-            reload_state_instances_from_disk(
-                &state,
-                loaded,
-                vec![],
-                StatusSource::DiskOnly,
-                0,
-                metadata,
-                Default::default(),
-            )
-            .await
-        }
-        .await;
+        reload(load_profiles_for_reload(&state.file_watch)).await;
         assert!(cached_data_healthy(&cached_snapshot(&state).await, "main"));
-        std::fs::remove_dir_all(profiles.join("main")).unwrap();
-        let failed_metadata = crate::server::reload::load_all_profiles(&state.file_watch)
-            .map(|loaded| loaded.metadata);
-        let failed = crate::server::reload::LoadedInstances {
-            instances: vec![],
-            cache: super::super::reload::RuntimeReadCache {
-                health: failed_health,
-                ..Default::default()
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn failed_enumeration_keeps_rows_until_a_successful_empty_inventory() {
+        use crate::daemon::{ReloadFailureCode, RuntimeHealth};
+        use crate::server::{
+            reload::{
+                load_all_profiles, load_profiles_for_reload, load_read_projection,
+                reload_state_instances_from_disk,
             },
+            state::StatusSource,
+            test_support,
         };
-        reload_state_instances_from_disk(
-            &state,
-            failed,
-            vec![],
-            StatusSource::DiskOnly,
-            0,
-            failed_metadata,
-            Default::default(),
-        )
-        .await;
-        let snapshot = cached_snapshot(&state).await;
-        assert!(crate::cli::runtime_read::dto::component_healthy(
-            &snapshot.health.global_enumeration
-        ));
-        assert!(snapshot.profiles.is_empty());
-        assert!(snapshot.sessions.is_empty());
+        use std::sync::atomic::Ordering;
+
+        for mode in [StatusSource::DiskOnly, StatusSource::TmuxApplied] {
+            let home = TempHome::new();
+            Storage::new_unwatched("main")
+                .unwrap()
+                .update(|rows, _| {
+                    *rows = vec![named("kept", "main")];
+                    Ok(())
+                })
+                .unwrap();
+            let state = test_support::build_test_app_state(Vec::new());
+            let reload = |(loaded, metadata), read_epoch| {
+                reload_state_instances_from_disk(
+                    &state,
+                    loaded,
+                    vec![],
+                    mode,
+                    read_epoch,
+                    metadata,
+                    Default::default(),
+                )
+            };
+            reload(load_profiles_for_reload(&state.file_watch), 0).await;
+            state.instances.write().await[0].last_error = Some("daemon-only".into());
+            let accepted_metadata = state.canonical_metadata.read().await.clone();
+
+            let profiles = home.app_dir().join("profiles");
+            let stash = home.app_dir().join("profiles-stash");
+            std::fs::rename(&profiles, &stash).unwrap();
+            std::fs::write(&profiles, "not a directory").unwrap();
+            let failed = load_profiles_for_reload(&state.file_watch);
+            assert!(failed.0.cache.health.enumeration_failed);
+            state.mutation_epoch.store(1, Ordering::SeqCst);
+            reload(failed, 0).await;
+            assert!(
+                !state
+                    .runtime_read_cache
+                    .read()
+                    .unwrap()
+                    .health
+                    .enumeration_failed
+            );
+            assert_eq!(*state.canonical_health.read().await, RuntimeHealth::Healthy);
+
+            reload(load_profiles_for_reload(&state.file_watch), 1).await;
+            assert!(
+                state
+                    .runtime_read_cache
+                    .read()
+                    .unwrap()
+                    .health
+                    .enumeration_failed
+            );
+            let degraded = RuntimeHealth::Degraded {
+                code: ReloadFailureCode::ProfileEnumeration,
+                profiles: Vec::new(),
+            };
+            assert_eq!(*state.canonical_health.read().await, degraded);
+            assert_eq!(*state.canonical_metadata.read().await, accepted_metadata);
+            let snapshot = cached_snapshot(&state).await;
+            assert!(!crate::cli::runtime_read::dto::component_healthy(
+                &snapshot.health.global_enumeration
+            ));
+            assert!(snapshot.sessions.iter().any(|row| row.id == "kept"));
+            assert_eq!(
+                state.instances.read().await[0].last_error.as_deref(),
+                Some("daemon-only")
+            );
+
+            std::fs::remove_file(&profiles).unwrap();
+            std::fs::rename(&stash, &profiles).unwrap();
+            let canonical = load_all_profiles(&state.file_watch);
+            assert!(canonical.is_ok());
+            std::fs::rename(&profiles, &stash).unwrap();
+            std::fs::write(&profiles, "not a directory").unwrap();
+            let partial = load_read_projection(&state.file_watch, canonical);
+            assert!(partial.0.cache.health.enumeration_failed);
+            assert!(partial.1.is_ok());
+            reload(partial, 1).await;
+            assert_eq!(*state.canonical_health.read().await, degraded);
+            assert_eq!(state.instances.read().await.len(), 1);
+
+            std::fs::remove_file(&profiles).unwrap();
+            std::fs::rename(&stash, &profiles).unwrap();
+            reload(load_profiles_for_reload(&state.file_watch), 1).await;
+            assert!(
+                !state
+                    .runtime_read_cache
+                    .read()
+                    .unwrap()
+                    .health
+                    .enumeration_failed
+            );
+            assert_eq!(*state.canonical_health.read().await, RuntimeHealth::Healthy);
+            assert_eq!(state.instances.read().await.len(), 1);
+
+            std::fs::remove_dir_all(&profiles).unwrap();
+            reload(load_profiles_for_reload(&state.file_watch), 1).await;
+            assert!(state.instances.read().await.is_empty());
+            assert!(cached_snapshot(&state).await.sessions.is_empty());
+        }
     }
 
     /// Project and group registry errors degrade only their own components.

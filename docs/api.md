@@ -234,6 +234,11 @@ Scoped session reads refuse whole-profile registry decode failures, such as malf
 
 All-profile listing preserves healthy profiles' rows and warns on stderr for each unavailable profile. Human output exits successfully; JSON remains valid but exits nonzero when the listing is incomplete. Invalid stored groups degrade only that profile's group enumeration; invalid global projects degrade only global metadata. These components remain independent.
 
+A failed profile enumeration retains accepted rows and runtime-only overlays.
+Repaired files alone do not restore accepted profile-data health; a reload must
+adopt the recovery. Native health clears only after complete canonical adoption,
+not a partially successful load.
+
 The CLI projection is not native mutation authority. Complete canonical profile loading can still degrade native health and refuse native mutations with HTTP 503 while healthy CLI reads continue. Snapshot sampling never rewrites the stores.
 
 Newly listed profile stores are read on a cache miss without replacing existing live session rows. A newly listed store reusing a cached profile name or alias is not admitted as a cache miss; the daemon must accept a reload first. This includes deleting and recreating a profile with the same name, preventing retained live rows from being mixed with replacement-store data.

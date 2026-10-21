@@ -1172,6 +1172,25 @@ pub(super) async fn reload_state_instances_from_disk(
         );
         return Vec::new();
     }
+    // Failed enumeration is unknown, not empty.
+    if cache.health.enumeration_failed {
+        state
+            .runtime_read_cache
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .health
+            .enumeration_failed = true;
+        drop(current);
+        if matches!(
+            &native_health,
+            crate::daemon::RuntimeHealth::Degraded { .. }
+        ) {
+            *state.canonical_health.write().await = native_health;
+        }
+        state.runtime.request_publish();
+        return Vec::new();
+    }
+
     if let Some(transition) = transition.as_ref() {
         let repairs = repair_structured_rows_from_live_workers(&mut fresh, repair_records);
         if let Err(error) = persist_structured_row_repairs(
