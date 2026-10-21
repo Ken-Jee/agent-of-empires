@@ -111,6 +111,11 @@ This document contains the help content for the `aoe` command-line program.
 * [`aoe hooks status`↴](#aoe-hooks-status)
 * [`aoe hooks approve`↴](#aoe-hooks-approve)
 * [`aoe serve`↴](#aoe-serve)
+* [`aoe daemon`↴](#aoe-daemon)
+* [`aoe daemon start`↴](#aoe-daemon-start)
+* [`aoe daemon stop`↴](#aoe-daemon-stop)
+* [`aoe daemon status`↴](#aoe-daemon-status)
+* [`aoe daemon restart`↴](#aoe-daemon-restart)
 * [`aoe url`↴](#aoe-url)
 * [`aoe acp`↴](#aoe-acp)
 * [`aoe acp doctor`↴](#aoe-acp-doctor)
@@ -173,6 +178,7 @@ Run without arguments to launch the TUI dashboard.
 * `skill` — Query and manage agent skills
 * `hooks` — Let AoE write agent hooks into each agent's own config, for every agent and every profile
 * `serve` — Start the aoe daemon: REST/WebSocket API, plus the web dashboard in builds that embed it
+* `daemon` — Control the background aoe daemon; each verb is the matching `aoe serve` flag (`--daemon`, `--stop`, `--status`, `--restart`)
 * `url` — Print the URL of a running `aoe serve` daemon
 * `acp` — Manage the ACP structured-view workers (doctor, ps, logs, prompt, approve, ...)
 * `uninstall` — Uninstall Agent of Empires
@@ -1732,6 +1738,53 @@ Start the aoe daemon: REST/WebSocket API, plus the web dashboard in builds that 
 * `--passphrase <PASSPHRASE>` — Require a passphrase for login (second-factor auth). Can also be set via AOE_SERVE_PASSPHRASE environment variable
 * `--open` — Open the dashboard URL in the default browser once the server is ready. Ignored in a build with no dashboard bundle, under --daemon or --remote, and whenever no browser the user could see is reachable (see `tui::open_url`): over SSH without a forwarded display, or on Linux/BSD with no display server. `BROWSER` overrides the check on platforms whose launcher reads it, which excludes macOS
 * `--restart` — Restart a running `aoe serve` daemon, replaying the host, port, mode, and auth it was launched with (read from `serve.launch`). The passphrase is recalled from `serve.passphrase` or `AOE_SERVE_PASSPHRASE` before the old daemon is stopped, so a passphrase-protected daemon is never left down. Incompatible with the flags that would change the daemon's bind config: that config comes from the persisted launch state
+
+
+
+## `aoe daemon`
+
+Control the background aoe daemon; each verb is the matching `aoe serve` flag (`--daemon`, `--stop`, `--status`, `--restart`)
+
+**Usage:** `aoe daemon <COMMAND>`
+
+###### **Subcommands:**
+
+* `start` — Start the daemon in the background (`aoe serve --daemon`)
+* `stop` — Stop the running daemon (`aoe serve --stop`)
+* `status` — Print the daemon's PID, mode, URLs and log path (`aoe serve --status`)
+* `restart` — Restart the daemon with its persisted launch config (`aoe serve --restart`)
+
+
+
+## `aoe daemon start`
+
+Start the daemon in the background (`aoe serve --daemon`)
+
+**Usage:** `aoe daemon start`
+
+
+
+## `aoe daemon stop`
+
+Stop the running daemon (`aoe serve --stop`)
+
+**Usage:** `aoe daemon stop`
+
+
+
+## `aoe daemon status`
+
+Print the daemon's PID, mode, URLs and log path (`aoe serve --status`)
+
+**Usage:** `aoe daemon status`
+
+
+
+## `aoe daemon restart`
+
+Restart the daemon with its persisted launch config (`aoe serve --restart`)
+
+**Usage:** `aoe daemon restart`
 
 
 
