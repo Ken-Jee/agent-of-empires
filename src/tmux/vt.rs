@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 use base64::Engine;
 
 use crate::tmux::osc8::{Osc8Scanner, PaneLink};
+use crate::tmux::session::OwnerClaim;
 use crate::tmux::PaneCursor;
 
 /// Bounds the OSC 52 payload accumulator against a malformed stream.
@@ -855,6 +856,13 @@ fn lf_to_crlf(raw: &[u8]) -> Vec<u8> {
         prev = b;
     }
     out
+}
+
+/// Why no VT channel is available. `PipeOwned` is a confirmed live competing owner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VtUnavailable {
+    PipeOwned,
+    Other,
 }
 
 /// Channel lifecycle.
@@ -1946,22 +1954,23 @@ pub(crate) struct VtRowsSample {
 }
 
 impl VtChannel {
-    /// The shared channel for `session`, arming one if none is live. `None` when
-    /// tmux is too old or any step fails; callers then use capture/send-keys.
+    /// The shared channel for `session`, arming one if none is live. `Err` when
+    /// tmux is too old, another process owns the pipe, or any step fails; callers
+    /// then use capture/send-keys.
     #[cfg(test)]
     pub(crate) fn acquire(session: &str) -> Option<Arc<VtChannel>> {
         let deadline = crate::tmux::TmuxCommandDeadline::new();
-        Self::acquire_with_deadline(session, &deadline)
+        Self::acquire_with_deadline(session, &deadline).ok()
     }
 
     pub(crate) fn acquire_with_deadline(
         session: &str,
         deadline: &crate::tmux::TmuxCommandDeadline,
-    ) -> Option<Arc<VtChannel>> {
+    ) -> Result<Arc<VtChannel>, VtUnavailable> {
         // A dead entry (the session was recreated) must not be reused.
         if let Some(ch) = lookup(session) {
             if ch.lifecycle() == VtLifecycle::Live {
-                return Some(ch);
+                return Ok(ch);
             }
         }
         // Serialize arming per session so the loser adopts the winner's channel.
@@ -1975,7 +1984,7 @@ impl VtChannel {
             let _armed = arm_lock.lock().unwrap();
             if let Some(ch) = lookup(session) {
                 if ch.lifecycle() == VtLifecycle::Live {
-                    Some(ch)
+                    Ok(ch)
                 } else {
                     Self::arm_and_register(session, deadline)
                 }
@@ -1995,7 +2004,7 @@ impl VtChannel {
     fn arm_and_register(
         session: &str,
         deadline: &crate::tmux::TmuxCommandDeadline,
-    ) -> Option<Arc<VtChannel>> {
+    ) -> Result<Arc<VtChannel>, VtUnavailable> {
         Self::arm(session, deadline).map(|channel| {
             let channel = Arc::new(channel);
             REGISTRY
@@ -2006,26 +2015,30 @@ impl VtChannel {
         })
     }
 
-    fn arm(name: &str, deadline: &crate::tmux::TmuxCommandDeadline) -> Option<Self> {
+    fn arm(name: &str, deadline: &crate::tmux::TmuxCommandDeadline) -> Result<Self, VtUnavailable> {
         if !tmux_supports_pipe_pane_io(deadline) {
-            return None;
+            return Err(VtUnavailable::Other);
         }
         let target = format!("{name}:^.0");
-        let (cols, rows, _, _) = pane_size_cursor(&target, deadline)?;
+        let (cols, rows, _, _) = pane_size_cursor(&target, deadline).ok_or(VtUnavailable::Other)?;
         // `pipe-pane` is exclusive per pane, so defer to another live VT owner.
         let session = crate::tmux::Session::from_name(name);
         let owner = new_pipe_owner_id();
-        if !session.claim_vt_owner_with_deadline(
+        match session.claim_vt_owner_with_deadline(
             &owner,
             crate::tmux::session::VT_OWNER_TTL,
             deadline,
         ) {
-            tracing::info!(
-                %target,
-                pid = std::process::id(),
-                "vt: pipe owned by another process; using capture fallback"
-            );
-            return None;
+            OwnerClaim::Claimed => {}
+            OwnerClaim::Held => {
+                tracing::info!(
+                    %target,
+                    pid = std::process::id(),
+                    "vt: pipe owned by another process; using capture fallback"
+                );
+                return Err(VtUnavailable::PipeOwned);
+            }
+            OwnerClaim::Error => return Err(VtUnavailable::Other),
         }
         let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, SCROLLBACK_LINES)));
         let stop = Arc::new(AtomicBool::new(false));
@@ -2060,12 +2073,12 @@ impl VtChannel {
         let Some((sock_path, listener, control_path, control_listener)) = setup() else {
             let _ = std::fs::remove_dir_all(&sock_dir);
             session.release_vt_owner_with_deadline(&owner, deadline);
-            return None;
+            return Err(VtUnavailable::Other);
         };
         let Some(exe) = std::env::current_exe().ok() else {
             let _ = std::fs::remove_dir_all(&sock_dir);
             session.release_vt_owner_with_deadline(&owner, deadline);
-            return None;
+            return Err(VtUnavailable::Other);
         };
         let wakeup: Arc<Mutex<Option<ChangeWakeup>>> = Arc::new(Mutex::new(None));
         let chunk_seq = Arc::new(AtomicU64::new(0));
@@ -2112,7 +2125,7 @@ impl VtChannel {
             session.release_vt_pipe_owner_with_deadline(&owner, deadline);
             let _ = reader.join();
             let _ = std::fs::remove_dir_all(&sock_dir);
-            return None;
+            return Err(VtUnavailable::Other);
         }
         let control_stop = stop.clone();
         let control_drain = drain.clone();
@@ -2133,7 +2146,7 @@ impl VtChannel {
                 session.release_vt_pipe_owner_with_deadline(&owner, deadline);
                 let _ = reader.join();
                 let _ = std::fs::remove_dir_all(&sock_dir);
-                return None;
+                return Err(VtUnavailable::Other);
             }
             std::thread::sleep(Duration::from_millis(2));
         }
@@ -2179,7 +2192,7 @@ impl VtChannel {
             session.release_vt_pipe_owner_with_deadline(&owner, deadline);
             let _ = reader.join();
             let _ = std::fs::remove_dir_all(&sock_dir);
-            return None;
+            return Err(VtUnavailable::Other);
         }
         tracing::info!(
             %target,
@@ -2190,7 +2203,7 @@ impl VtChannel {
             "vt channel armed (pipe-pane <-> vt100 grid)"
         );
 
-        Some(Self {
+        Ok(Self {
             name: name.to_string(),
             input,
             owner_id: owner,
@@ -2743,11 +2756,12 @@ impl Osc52Channel {
         }
         let session = crate::tmux::Session::from_name(name);
         let owner = new_pipe_owner_id();
-        if !session.claim_vt_owner_with_deadline(
+        if session.claim_vt_owner_with_deadline(
             &owner,
             crate::tmux::session::VT_OWNER_TTL,
             deadline,
-        ) {
+        ) != OwnerClaim::Claimed
+        {
             return None;
         }
 
