@@ -2576,6 +2576,13 @@ mod tests {
         };
 
         let literal = temp.path().join(".claude");
+        let transcripts =
+            work.join("projects")
+                .join(crate::session::capture::encode_claude_project_path(
+                    &crate::session::capture::canonicalize_or_raw("/tmp").to_string_lossy(),
+                ));
+        std::fs::create_dir_all(&transcripts).unwrap();
+        std::fs::write(transcripts.join(format!("{sid}.jsonl")), "{}\n").unwrap();
         for (profile, store, expected) in [
             ("undeclared", None, None),
             ("literal", None, None),
@@ -2619,6 +2626,50 @@ mod tests {
                 "legacy profile={profile} store={store:?}"
             );
         }
+
+        let source = temp.path().join("source");
+        std::fs::create_dir_all(&source).unwrap();
+        declare("source", source.to_str().unwrap());
+        let mut parent = Instance::new("parent", "/tmp");
+        parent.tool = "claude".into();
+        parent.source_profile = "source".into();
+        let (_, parent_execution) = routed(&parent);
+        assert_eq!(parent_execution.exported_default_store, Some(false));
+        let parent_sid = "22222222-2222-4222-8222-222222222222";
+        let relative = transcripts
+            .strip_prefix(&work)
+            .unwrap()
+            .join(format!("{parent_sid}.jsonl"));
+        std::fs::create_dir_all(source.join(relative.parent().unwrap())).unwrap();
+        std::fs::write(source.join(&relative), "{}\n").unwrap();
+        let mut child = Instance::new("fork", "/tmp");
+        child.tool = "claude".into();
+        child.source_profile = "alias".into();
+        child.agent_session_id = Some("33333333-3333-4333-8333-333333333333".into());
+        child.resume_intent = ResumeIntent::Fork {
+            from: parent_sid.into(),
+        };
+        child.resume_binding = Some(crate::session::ConversationBinding {
+            session_id: parent_sid.into(),
+            execution: Some(parent_execution),
+            provenance: crate::session::ConversationProvenance::Observed,
+            transcript_path: None,
+        });
+        crate::session::conversation_carry::carry_fork_parent(&mut child).unwrap();
+        assert_eq!(routed(&child).0, Some(work.clone()));
+        assert_eq!(
+            std::fs::read_to_string(work.join(&relative)).unwrap(),
+            "{}\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(source.join(&relative)).unwrap(),
+            "{}\n"
+        );
+        assert_eq!(
+            child.agent_session_id.as_deref(),
+            Some("33333333-3333-4333-8333-333333333333")
+        );
+        assert!(matches!(&child.resume_intent, ResumeIntent::Fork { from } if from == parent_sid));
     }
 
     #[test]
