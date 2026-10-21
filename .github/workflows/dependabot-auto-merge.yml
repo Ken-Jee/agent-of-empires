@@ -84,9 +84,21 @@ jobs:
           # A PAT, not GITHUB_TOKEN: a merge queued with GITHUB_TOKEN lands
           # without firing the push workflows on main (macOS suite, nix hash).
           GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
           PR_URL: ${{ github.event.pull_request.html_url }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        run: gh pr merge --auto --squash --match-head-commit "$HEAD_SHA" "$PR_URL"
+          QUEUE_QUERY: 'query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){isMergeQueueEnabled}}}'
+        run: |
+          set -euo pipefail
+          # A merge queue owns the merge method, and gh forwards --squash to
+          # the API even then; without a queue, gh needs one non-interactively.
+          queue=$(gh api graphql -F owner="${REPO%/*}" -F name="${REPO#*/}" -F number="$PR_NUMBER" \
+            -f query="$QUEUE_QUERY" \
+            --jq .data.repository.pullRequest.isMergeQueueEnabled)
+          method=(--squash)
+          if [ "$queue" = true ]; then method=(); fi
+          gh pr merge --auto "${method[@]}" --match-head-commit "$HEAD_SHA" "$PR_URL"
 
       - name: Withdraw auto-merge after rejection or failed checks
         if: ${{ !cancelled() && (failure() || steps.eligible.outputs.ok != 'true') }}
