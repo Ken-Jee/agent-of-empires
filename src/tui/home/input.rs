@@ -478,18 +478,72 @@ impl HomeView {
         }
     }
 
+    pub(super) fn has_tool_targets(&self) -> bool {
+        !self.tool_configs.is_empty()
+            || self
+                .selected_session
+                .as_ref()
+                .and_then(|id| self.get_instance(id))
+                .is_some_and(|row| {
+                    row.auxiliary.iter().any(|observation| {
+                        matches!(
+                            observation.target,
+                            crate::session::AuxiliaryTarget::Tool { .. }
+                        )
+                    })
+                })
+    }
+
     fn open_tool_picker(&mut self) {
+        let observed = self
+            .selected_session
+            .as_ref()
+            .and_then(|id| self.get_instance(id))
+            .into_iter()
+            .flat_map(|row| row.auxiliary.iter())
+            .filter_map(|observation| match &observation.target {
+                crate::session::AuxiliaryTarget::Tool { tool_name } => Some(tool_name.as_str()),
+                _ => None,
+            });
         self.tool_picker_dialog = Some(crate::tui::dialogs::ToolPickerDialog::new(
             &self.tool_configs,
+            observed,
         ));
     }
 
     fn activate_tool(&mut self, tool_name: String, toggle_current: bool) -> Option<Action> {
+        let observed = self.selected_session.as_ref()
+            .and_then(|id| self.get_instance(id))
+            .is_some_and(|row| row.auxiliary.iter().any(|observation| {
+                matches!(&observation.target, crate::session::AuxiliaryTarget::Tool { tool_name: name } if name == &tool_name)
+            }));
+        let recovery_only = observed
+            && self
+                .tool_configs
+                .get(&tool_name)
+                .is_none_or(|config| config.background || config.command.trim().is_empty());
+        if recovery_only {
+            self.cancel_native_attachment();
+            self.exit_live_send_if_active();
+            self.view_mode = if toggle_current
+                && matches!(&self.view_mode, ViewMode::Tool(current) if current == &tool_name)
+            {
+                ViewMode::Structured
+            } else {
+                ViewMode::Tool(tool_name)
+            };
+            self.preview_scroll_offset = 0;
+            self.tool_preview_cache = super::PreviewCache::default();
+            return None;
+        }
+        if !self.tool_configs.contains_key(&tool_name) {
+            return None;
+        }
         let (background, command_is_empty) = self
             .tool_configs
             .get(&tool_name)
             .map(|config| (config.background, config.command.trim().is_empty()))
-            .unwrap_or((false, false));
+            .expect("configured tool");
 
         if !background {
             if toggle_current
@@ -2871,7 +2925,7 @@ impl HomeView {
                 if matches!(self.view_mode, ViewMode::Tool(_)) {
                     self.cancel_native_attachment();
                     self.view_mode = ViewMode::Structured;
-                } else if !self.tool_configs.is_empty() {
+                } else if self.has_tool_targets() {
                     self.open_tool_picker();
                 }
             }
@@ -3537,10 +3591,13 @@ impl HomeView {
             ));
             return;
         };
-        if pane.state == crate::session::PanePresence::Absent {
-            return;
-        }
-        let adoption =
+        let recovery_only = self
+            .tool_configs
+            .get(tool_name)
+            .is_none_or(|config| config.background || config.command.trim().is_empty());
+        let adoption = if recovery_only {
+            None
+        } else {
             pane.legacy_tool
                 .as_ref()
                 .map(|identity| crate::session::LegacyToolAdoption {
@@ -3548,16 +3605,18 @@ impl HomeView {
                     identity: identity.clone(),
                     profile: inst.source_profile.clone(),
                     lifecycle_generation: inst.lifecycle_generation,
-                });
-        if pane.state == crate::session::PanePresence::Unknown && adoption.is_none() {
-            self.info_dialog = Some(InfoDialog::new("Kill Tool", "Tool ownership is unavailable, invalid, or ambiguous. No tool or agent was stopped."));
-            return;
-        }
+                })
+        };
         let message = if let Some(adoption) = &adoption {
             format!("Adopt and kill legacy tool '{}' for '{}'\nRow: {} / {} / generation {}\nTmux: {} ({} / {}, PID {})\nThis confirmation assigns this exact unmarked pane to this tool before stopping it.",
                 tool_name, inst.title, inst.source_profile, inst.id, inst.lifecycle_generation,
                 adoption.tmux_session, adoption.identity.session_id, adoption.identity.pane_id,
                 adoption.identity.pane_pid)
+        } else if recovery_only {
+            format!(
+                "Finish original cleanup for '{}' on '{}'?\nCurrent replacement panes will not be adopted.",
+                tool_name, inst.title
+            )
         } else {
             format!(
                 "Are you sure you want to kill {} for '{}'?",

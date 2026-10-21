@@ -616,6 +616,16 @@ impl LockedDataFile {
         self.target.read()
     }
 
+    pub(crate) fn require_writable_existing(&self) -> Result<()> {
+        self.target.require_writable_existing()
+    }
+
+    /// Publish through the locked, anchored slot and durably sync its actual parent.
+    pub(crate) fn replace_and_sync(&self, content: &[u8]) -> Result<()> {
+        self.target.replace(content)?;
+        self.target.sync_parent()
+    }
+
     pub(crate) fn into_target(self) -> super::anchored_fs::ResolvedDataFile {
         self.target
     }

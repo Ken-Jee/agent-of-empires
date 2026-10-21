@@ -42,6 +42,13 @@ Malformed ownership proofs or purge journals remain fatal without advancing the
 schema marker. Rewrites require backups and repeated reconciliation preserves
 already-migrated bytes.
 
+Schema 47 initializes the private `tool-retirements.json` journal. Runtime
+tool stop, launch, and whole-row cleanup require the migrated journal and
+never recreate a missing one. Records preserve the authorized original process
+births and exact tmux server incarnation before live target removal. Older
+tmux-only pending receipts are not silently converted or discarded: without a
+provable original live incarnation they remain unresolved evidence.
+
 Managed restart, rollback and Core promotion reconcile historical launch policy
 under their existing daemon lifecycle transaction before decoding the launch.
 Launch-only reconciliation accepts only supported historical schemas or a valid

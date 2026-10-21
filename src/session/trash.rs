@@ -1553,6 +1553,7 @@ mod tests {
     #[test]
     fn purge_removes_relocated_worktree() {
         let _app_guard = crate::session::test_support::isolate_app_dir();
+        crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
         // Acceptance criterion: purging a trashed session deletes the worktree
         // at its relocated holding path, leaving nothing behind.
         if !git_available() {
@@ -1619,6 +1620,7 @@ mod tests {
     #[test]
     fn purge_recovers_when_project_path_diverged_and_locked_entry_survives() {
         let _app_guard = crate::session::test_support::isolate_app_dir();
+        crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
         if !git_available() {
             return;
         }

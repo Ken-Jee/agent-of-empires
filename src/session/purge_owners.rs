@@ -944,6 +944,7 @@ mod tests {
                 let _home = crate::session::test_support::isolate_app_dir();
                 let root = crate::session::get_app_dir()?;
                 initialize(&root)?;
+                crate::tmux::tool_retirement::initialize(&root)?;
                 for name in ["source", "keep", "distinct"] {
                     crate::session::create_profile(name)?;
                 }

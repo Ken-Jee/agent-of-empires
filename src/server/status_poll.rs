@@ -467,12 +467,28 @@ pub(super) async fn status_poll_loop(
         let file_watch_for_poll = state.file_watch.clone();
         let sandbox_health = health.borrow().clone();
         let updated = tokio::task::spawn_blocking(move || {
-            let (mut loaded, metadata) =
+            let (mut loaded, mut metadata) =
                 super::reload::load_profiles_for_reload(&file_watch_for_poll);
             drop(snapshot_guard);
             seed_tick_tracking(&mut loaded.instances, &prev_tracking);
             crate::tmux::refresh_session_cache();
             let pane_metadata = crate::tmux::batch_pane_metadata();
+            let pending = match crate::tmux::ToolSession::pending_retirement_targets() {
+                Ok(pending) => pending,
+                Err(source) => {
+                    tracing::warn!(target: "server.status", %source, "tool retirement inventory is unavailable");
+                    if metadata.is_ok() {
+                        metadata = Err(super::reload::ReloadFailure {
+                            health: crate::daemon::RuntimeHealth::Degraded {
+                                code: crate::daemon::ReloadFailureCode::Metadata,
+                                profiles: Vec::new(),
+                            },
+                            source,
+                        });
+                    }
+                    Vec::new()
+                }
+            };
             if let Err(error) = &pane_metadata {
                 tracing::warn!(
                     target: "server.status",
@@ -489,6 +505,7 @@ pub(super) async fn status_poll_loop(
                 &sandbox_health,
             );
             if let Ok(metadata) = &metadata {
+                super::pane::seed_pending_tool_targets(&mut loaded.instances, &pending);
                 let legacy_scope = super::pane::legacy_tool_scope_for_panes(
                     &loaded.instances,
                     &metadata.raw_tool_names,
@@ -505,6 +522,7 @@ pub(super) async fn status_poll_loop(
                         tools,
                         pane_metadata.as_ref().ok(),
                         legacy_scope.as_ref(),
+                        Some(&pending),
                     );
                 }
             }
@@ -606,6 +624,7 @@ mod tests {
             return;
         }
         let _home = crate::session::test_support::isolate_app_dir();
+        crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
         let project = tempfile::tempdir().unwrap();
         let mut row = Instance::new("tick auxiliary", project.path().to_str().unwrap());
         row.source_profile = "work".into();

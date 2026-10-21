@@ -926,6 +926,7 @@ mod tests {
         let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
         let app = crate::session::get_app_dir().unwrap();
         crate::session::purge_owners::initialize(&app).unwrap();
+        crate::tmux::tool_retirement::initialize(&app).unwrap();
         let profile = "hook-rollback";
         crate::session::config::profile_config::save_profile_config(profile, &Default::default())
             .unwrap();
@@ -1083,6 +1084,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
         crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
+        crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
         crate::session::config::update_app_state(|state| {
             state.has_acknowledged_agent_hooks = true;
         })

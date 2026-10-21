@@ -3658,6 +3658,7 @@ mod tests {
         use crate::session::PendingInitialTurn;
         let _app_dir = crate::session::test_support::isolate_app_dir();
         crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
+        crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
         let pending = || PendingInitialTurn {
             text: "resume".into(),
             attachments: vec![],
@@ -3750,6 +3751,7 @@ mod tests {
     async fn prompt_touch_refuses_persisted_blocks_without_a_replica_wake() {
         let _app_dir = crate::session::test_support::isolate_app_dir();
         crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
+        crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
         for reason in [
             "archived",
             "trashed",
@@ -3818,6 +3820,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let _app_dir = crate::session::test_support::isolate_app_dir();
         crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
+        crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
         let mut instance = Instance::new("failed-prompt-wake", "/tmp/aoe-failed-prompt-wake");
         instance.source_profile = "default".into();
         instance.view = crate::session::View::Structured;

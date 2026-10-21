@@ -140,11 +140,35 @@ fn observe_agent(
     )
 }
 
+pub(super) fn seed_pending_tool_targets(
+    rows: &mut [crate::session::Instance],
+    pending: &[(String, String)],
+) {
+    for row in rows {
+        for (_, tool_name) in pending.iter().filter(|(id, _)| id == &row.id) {
+            let target = crate::session::AuxiliaryTarget::Tool {
+                tool_name: tool_name.clone(),
+            };
+            if !row
+                .auxiliary
+                .iter()
+                .any(|observation| observation.target == target)
+            {
+                row.auxiliary.push(crate::session::AuxiliaryObservation {
+                    target,
+                    pane: Default::default(),
+                });
+            }
+        }
+    }
+}
+
 pub(super) fn sample_panes(
     instance: &mut crate::session::Instance,
     tools: &[String],
     panes: Option<&std::collections::HashMap<String, crate::tmux::PaneMetadata>>,
     legacy_scope: Option<&crate::tmux::LegacyToolScope>,
+    pending: Option<&[(String, String)]>,
 ) {
     use crate::session::{AuxiliaryObservation, AuxiliaryTarget, PanePresence};
     instance.agent_pane = observe_agent(instance, panes);
@@ -167,7 +191,13 @@ pub(super) fn sample_panes(
             });
         }
     }
-    for name in tools {
+    for name in tools.iter().chain(
+        pending
+            .into_iter()
+            .flatten()
+            .filter(|(id, _)| id == &instance.id)
+            .map(|(_, tool)| tool),
+    ) {
         if !instance.auxiliary.iter().any(|observation| matches!(&observation.target, AuxiliaryTarget::Tool { tool_name } if tool_name == name)) {
             instance.auxiliary.push(AuxiliaryObservation {
                 target: AuxiliaryTarget::Tool { tool_name: name.clone() },
@@ -190,18 +220,33 @@ pub(super) fn sample_panes(
             || match &observation.target {
                 AuxiliaryTarget::Host { index: 0 } => true,
                 AuxiliaryTarget::Container { index: 0 } => sandboxed,
-                AuxiliaryTarget::Tool { tool_name } => tools.contains(tool_name),
+                AuxiliaryTarget::Tool { tool_name } => {
+                    tools.contains(tool_name)
+                        || pending.is_none_or(|owners| {
+                            owners
+                                .iter()
+                                .any(|(id, tool)| id == &instance.id && tool == tool_name)
+                        })
+                }
                 _ => false,
             }
     });
 }
 pub(super) async fn seed_initial_observations(state: &Arc<AppState>) -> anyhow::Result<()> {
-    let panes = tokio::task::spawn_blocking(crate::tmux::batch_pane_metadata).await?;
+    let (panes, pending) = tokio::task::spawn_blocking(|| {
+        (
+            crate::tmux::batch_pane_metadata(),
+            crate::tmux::ToolSession::pending_retirement_targets(),
+        )
+    })
+    .await?;
+    let pending = pending?;
     if let Err(error) = &panes {
         tracing::warn!(target: "server.status", %error, "initial pane observations are unavailable");
     }
     let metadata = state.canonical_metadata.read().await;
     let mut rows = state.instances.write().await;
+    seed_pending_tool_targets(&mut rows, &pending);
     let legacy_scope =
         legacy_tool_scope_for_panes(&rows, &metadata.raw_tool_names, panes.as_ref().ok());
     for row in &mut *rows {
@@ -210,7 +255,13 @@ pub(super) async fn seed_initial_observations(state: &Arc<AppState>) -> anyhow::
             .get(&row.source_profile)
             .map(Vec::as_slice)
             .unwrap_or_default();
-        sample_panes(row, tools, panes.as_ref().ok(), legacy_scope.as_ref());
+        sample_panes(
+            row,
+            tools,
+            panes.as_ref().ok(),
+            legacy_scope.as_ref(),
+            Some(&pending),
+        );
     }
     Ok(())
 }
@@ -328,6 +379,10 @@ pub(super) async fn stop_native_auxiliary(
             )
         }
     };
+    let tool_only = targets
+        .iter()
+        .flatten()
+        .any(|target| matches!(target, AuxiliaryTarget::Tool { .. }));
     for target in targets.iter().flatten() {
         anyhow::ensure!(
             !matches!(target, AuxiliaryTarget::Host { index } | AuxiliaryTarget::Container { index } if *index > MAX_TERMINAL_INDEX),
@@ -357,10 +412,7 @@ pub(super) async fn stop_native_auxiliary(
             !worker_state.shutdown.is_cancelled(),
             crate::session::NativeStoreUnavailable
         );
-        let config = targets
-            .iter()
-            .flatten()
-            .any(|target| matches!(target, AuxiliaryTarget::Tool { .. }))
+        let config = tool_only
             .then(|| native.configuration(Some(native.storage().profile())))
             .transpose()?;
         for target in targets.iter().flatten() {
@@ -379,6 +431,10 @@ pub(super) async fn stop_native_auxiliary(
                     let config = config.as_ref().expect("tool request configuration");
                     anyhow::ensure!(
                         known
+                            || crate::tmux::ToolSession::has_pending_retirement(
+                                &instance.id,
+                                tool_name
+                            )?
                             || config
                                 .tools
                                 .get(tool_name)
@@ -404,10 +460,25 @@ pub(super) async fn stop_native_auxiliary(
         } else {
             None
         };
-        instance.acquire_lifecycle_reservation(&native, LifecycleOperation::Stop, None)?;
+        if tool_only {
+            instance.advance_auxiliary_generation_in(&native)?;
+        } else {
+            instance.acquire_lifecycle_reservation(&native, LifecycleOperation::Stop, None)?;
+        }
         let effect = (|| -> anyhow::Result<()> {
-            let panes = crate::tmux::batch_pane_metadata()?;
             native.check_available()?;
+            for target in targets.iter().flatten() {
+                if let AuxiliaryTarget::Tool { tool_name } = target {
+                    if crate::tmux::ToolSession::settle_pending_retirement(
+                        &instance.id,
+                        tool_name,
+                        adoption.as_ref(),
+                    )? {
+                        return Ok(());
+                    }
+                }
+            }
+            let panes = crate::tmux::batch_pane_metadata()?;
             for target in targets.iter().flatten() {
                 match target {
                     AuxiliaryTarget::Host { index } => crate::tmux::TerminalSession::from_snapshot(
@@ -459,7 +530,9 @@ pub(super) async fn stop_native_auxiliary(
             Ok(())
         })();
         let panes = crate::tmux::batch_pane_metadata();
-        instance.release_lifecycle_reservation(&native, LifecycleOperation::Stop)?;
+        if !tool_only {
+            instance.release_lifecycle_reservation(&native, LifecycleOperation::Stop)?;
+        }
         let mut all_absent = true;
         native.adopt_auxiliary_observations(
             &instance,
@@ -827,6 +900,602 @@ async fn probe_tmux_readiness(tmux_name: &str) -> PaneReadiness {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn prepare_tool_retirement(
+        row: &crate::session::Instance,
+    ) -> anyhow::Result<(
+        crate::tmux::ToolSession,
+        crate::tmux::test_helpers::TmuxTestSession,
+        crate::process::CapturedProcessTree,
+    )> {
+        let name = crate::tmux::ToolSession::generate_name(&row.id, &row.title, "probe");
+        let guard = crate::tmux::test_helpers::TmuxTestSession::from_name(&name);
+        let tool = crate::tmux::ToolSession::new(&row.id, &row.title, "probe");
+        tool.create_with_size("/tmp", "sleep 600", None, "default", &row.id, "probe")?;
+        let panes = crate::tmux::batch_pane_metadata()?;
+        let identity = crate::tmux::ToolSession::legacy_identity(panes.get(&name).unwrap())?;
+        let proof = crate::process::CapturedProcessTree::capture(identity.pane_pid)?;
+        let _interruption =
+            crate::tmux::ToolSession::interrupt_retirement_after_prepare_for_test(&row.id);
+        assert!(tool
+            .kill_verified(&row.id, "probe", &identity)
+            .unwrap_err()
+            .to_string()
+            .contains("after durable"));
+        Ok((tool, guard, proof))
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn tool_stop_advances_generation_without_coarse_reservation_before_journal_lock(
+    ) -> anyhow::Result<()> {
+        if !crate::tmux::is_tmux_available() {
+            return Ok(());
+        }
+        let _home = crate::session::test_support::isolate_app_dir();
+        let root = crate::session::get_app_dir()?;
+        crate::tmux::tool_retirement::initialize(&root)?;
+        crate::session::config::update_config(|config| {
+            config.tools.remove("probe");
+        })?;
+        let mut row = crate::session::Instance::new("initial stop boundary", "/tmp");
+        row.source_profile = "default".into();
+        row.auxiliary.push(crate::session::AuxiliaryObservation {
+            target: crate::session::AuxiliaryTarget::Tool {
+                tool_name: "probe".into(),
+            },
+            pane: Default::default(),
+        });
+        crate::server::test_support::seed_instances_on_disk_for_test("default", vec![row.clone()]);
+        let tool = crate::tmux::ToolSession::new(&row.id, &row.title, "probe");
+        let _target = crate::tmux::test_helpers::TmuxTestSession::from_name(tool.session_name());
+        tool.create_with_size("/tmp", "sleep 600", None, "default", &row.id, "probe")?;
+        let state = crate::server::test_support::build_test_app_state(vec![row.clone()]);
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+        let storage = crate::session::Storage::open_unwatched("default")?;
+        // A remembered target avoids the admission journal read. Holding the real
+        // sidecar therefore pauses the actual handler after its generation commit,
+        // before publication/effects and before any normal-return cleanup can run.
+        let journal = crate::session::LockedDataFile::open(
+            &root.join(crate::tmux::tool_retirement::FILE_NAME),
+        )?;
+        let worker_state = state.clone();
+        let id = row.id.clone();
+        let worker = tokio::spawn(async move {
+            stop_native_auxiliary(
+                &worker_state,
+                &id,
+                AuxiliaryStopRequest::Target(crate::daemon::StopAuxiliaryBody {
+                    target: crate::session::AuxiliaryTarget::Tool {
+                        tool_name: "probe".into(),
+                    },
+                    adoption: None,
+                }),
+            )
+            .await
+        });
+        let committed = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let current = storage.load()?.remove(0);
+                if current.lifecycle_generation > row.lifecycle_generation {
+                    break anyhow::Ok(current);
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await??;
+        assert_eq!(committed.lifecycle_generation, row.lifecycle_generation + 1);
+        assert!(
+            committed.lifecycle_reservation.is_none(),
+            "a crash here must not leave fresh coarse Stop ownership ahead of journal recovery"
+        );
+        assert!(!worker.is_finished());
+        assert!(storage.instance_lifecycle_lock_is_held_for_test(&row.id));
+        assert!(state.instance_lock(&row.id).await.try_lock().is_err());
+        assert!(state.profile_namespace.try_write().is_err());
+        let recorded: serde_json::Value = serde_json::from_str(&journal.read()?.unwrap())?;
+        assert_eq!(recorded["owners"], serde_json::json!([]));
+        drop(journal);
+        worker.await??;
+        let committed = storage.load()?.remove(0);
+        assert_eq!(committed.lifecycle_generation, row.lifecycle_generation + 1);
+        assert!(committed.lifecycle_reservation.is_none());
+        assert!(!crate::tmux::ToolSession::has_pending_retirement(
+            &row.id, "probe"
+        )?);
+        let stale = publish_auxiliary_after_ensure(
+            &state,
+            row,
+            crate::session::AuxiliaryTarget::Tool {
+                tool_name: "probe".into(),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            stale.downcast_ref::<crate::session::LifecycleReservationError>(),
+            Some(&crate::session::LifecycleReservationError::Superseded)
+        );
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn native_tool_stop_recovers_prepared_and_proven_debt_without_coarse_owner_or_replacement_effect(
+    ) -> anyhow::Result<()> {
+        use crate::tmux::test_helpers::{pane_field, TmuxTestSession};
+        struct CohortCleanup {
+            root: Option<crate::process::CapturedProcessTree>,
+            descendant: Option<crate::process::CapturedProcessTree>,
+            pid: u32,
+            birth: crate::process::ProcessBirthIdentity,
+        }
+        impl Drop for CohortCleanup {
+            fn drop(&mut self) {
+                if crate::process::process_birth_identity(self.pid)
+                    .ok()
+                    .flatten()
+                    .as_ref()
+                    == Some(&self.birth)
+                {
+                    if let Ok(tree) = crate::process::CapturedProcessTree::capture(self.pid) {
+                        let _ = tree.settle(std::time::Duration::ZERO);
+                    }
+                }
+                for tree in [self.root.take(), self.descendant.take()]
+                    .into_iter()
+                    .flatten()
+                {
+                    let _ = tree.settle(std::time::Duration::ZERO);
+                }
+            }
+        }
+        fn live_session_ids(sentinel: &str) -> anyhow::Result<std::collections::HashSet<String>> {
+            let mut command = crate::tmux::tmux_query_command();
+            command.args(["list-sessions", "-F", "#{session_id}"]);
+            let output = crate::tmux::TmuxCommandDeadline::new().run(&mut command)?;
+            anyhow::ensure!(
+                output.status.success(),
+                "independent session census failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let text = String::from_utf8(output.stdout)?;
+            let mut ids = std::collections::HashSet::new();
+            for id in text.lines() {
+                anyhow::ensure!(
+                    id.strip_prefix('$').is_some_and(|digits| !digits.is_empty()
+                        && digits.bytes().all(|byte| byte.is_ascii_digit())),
+                    "malformed session ID"
+                );
+                anyhow::ensure!(ids.insert(id.to_owned()), "duplicate session ID");
+            }
+            anyhow::ensure!(ids.contains(sentinel), "private sentinel is missing");
+            Ok(ids)
+        }
+        if !crate::tmux::is_tmux_available() {
+            return Ok(());
+        }
+        let _home = crate::session::test_support::isolate_app_dir();
+        let root = crate::session::get_app_dir()?;
+        crate::tmux::tool_retirement::initialize(&root)?;
+        crate::session::config::update_config(|config| {
+            config.tools.remove("probe");
+        })?;
+        let sentinel = TmuxTestSession::new("native_retirement_census");
+        assert!(crate::tmux::tmux_command()
+            .args(["new-session", "-d", "-s", sentinel.name(), "sleep 600"])
+            .status()?
+            .success());
+        let sentinel_id = pane_field(sentinel.name(), "#{session_id}");
+        for after_proof in [false, true] {
+            let mut row = crate::session::Instance::new("native interrupted stop", "/tmp");
+            row.source_profile = "default".into();
+            row.auxiliary.push(crate::session::AuxiliaryObservation {
+                target: crate::session::AuxiliaryTarget::Tool {
+                    tool_name: "probe".into(),
+                },
+                pane: Default::default(),
+            });
+            crate::server::test_support::seed_instances_on_disk_for_test(
+                "default",
+                vec![row.clone()],
+            );
+            let fixture = tempfile::tempdir()?;
+            let start = fixture.path().join("start.fifo");
+            let wait = fixture.path().join("wait.fifo");
+            let pid_file = fixture.path().join("child.pid");
+            for fifo in [&start, &wait] {
+                nix::unistd::mkfifo(
+                    fifo,
+                    nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+                )?;
+            }
+            let script = fixture.path().join("tool.sh");
+            std::fs::write(&script, format!(
+                "read -r line < '{}'\ntrap '' HUP TERM\nsetsid sh -c 'trap \"\" HUP TERM; echo $$ > \"$1\"; read -r line < \"$2\"' sh '{}' '{}' &\nwait\n",
+                start.display(), pid_file.display(), wait.display(),
+            ))?;
+            let tool = crate::tmux::ToolSession::new(&row.id, &row.title, "probe");
+            let _target = TmuxTestSession::from_name(tool.session_name());
+            tool.create_with_size(
+                fixture.path().to_str().unwrap(),
+                &format!("sh '{}'", script.display()),
+                None,
+                "default",
+                &row.id,
+                "probe",
+            )?;
+            let original_id = pane_field(tool.session_name(), "#{session_id}");
+            let root_pid = pane_field(tool.session_name(), "#{pane_pid}").parse()?;
+            let mut cleanup = CohortCleanup {
+                root: Some(crate::process::CapturedProcessTree::capture(root_pid)?),
+                descendant: None,
+                pid: root_pid,
+                birth: crate::process::process_birth_identity(root_pid)?
+                    .ok_or_else(|| anyhow::anyhow!("original root vanished before its barrier"))?,
+            };
+            // Freeze a root-only proof before allowing the resistant child to
+            // exist. Removing the original root later must not settle that child.
+            std::fs::write(&start, "start\n")?;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let descendant = loop {
+                if let Ok(pid) = std::fs::read_to_string(&pid_file)
+                    .and_then(|text| text.trim().parse::<u32>().map_err(std::io::Error::other))
+                {
+                    break pid;
+                }
+                anyhow::ensure!(
+                    std::time::Instant::now() < deadline,
+                    "child never reached its barrier"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            };
+            cleanup.descendant = Some(crate::process::CapturedProcessTree::capture(descendant)?);
+            let state = crate::server::test_support::build_test_app_state(vec![row.clone()]);
+            crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+            let prepared_interruption = (!after_proof).then(|| {
+                crate::tmux::ToolSession::interrupt_retirement_after_prepare_for_test(&row.id)
+            });
+            let proven_interruption = after_proof.then(|| {
+                crate::tmux::ToolSession::interrupt_retirement_before_ack_for_test(&row.id)
+            });
+            let error = stop_native_auxiliary(
+                &state,
+                &row.id,
+                AuxiliaryStopRequest::Target(crate::daemon::StopAuxiliaryBody {
+                    target: crate::session::AuxiliaryTarget::Tool {
+                        tool_name: "probe".into(),
+                    },
+                    adoption: None,
+                }),
+            )
+            .await
+            .unwrap_err();
+            assert!(format!("{error:#}").contains(if after_proof {
+                "after original retirement proof before acknowledgement"
+            } else {
+                "after durable tool retirement preparation"
+            }));
+            drop((prepared_interruption, proven_interruption));
+            let storage = crate::session::Storage::open_unwatched("default")?;
+            let persisted = storage.load()?.remove(0);
+            assert_eq!(persisted.lifecycle_generation, row.lifecycle_generation + 1);
+            assert!(persisted.lifecycle_reservation.is_none());
+            assert!(crate::tmux::ToolSession::has_pending_retirement(
+                &row.id, "probe"
+            )?);
+            let child = cleanup.descendant.as_ref().unwrap();
+            assert_eq!(child.all_exited()?, after_proof);
+            if !after_proof {
+                assert!(crate::tmux::tmux_command()
+                    .args(["kill-session", "-t", tool.session_name()])
+                    .status()?
+                    .success());
+                cleanup
+                    .root
+                    .take()
+                    .unwrap()
+                    .settle(std::time::Duration::ZERO)?;
+                assert!(
+                    !child.all_exited()?,
+                    "original debt must retain the resistant child"
+                );
+            }
+            assert!(!live_session_ids(&sentinel_id)?.contains(&original_id));
+            assert!(crate::tmux::tmux_command()
+                .args(["new-session", "-d", "-s", tool.session_name(), "sleep 600"])
+                .status()?
+                .success());
+            let replacement_id = pane_field(tool.session_name(), "#{session_id}");
+            let replacement = crate::process::CapturedProcessTree::capture(
+                pane_field(tool.session_name(), "#{pane_pid}").parse()?,
+            )?;
+            drop(state);
+            // Reconstruct the real native admission state from persisted rows,
+            // with no remembered target or usable tool configuration.
+            let restarted = crate::server::test_support::build_test_app_state(storage.load()?);
+            crate::server::test_support::refresh_canonical_metadata_for_test(&restarted).await;
+            assert!(restarted.instances.read().await[0].auxiliary.is_empty());
+            let error = stop_native_auxiliary(
+                &restarted,
+                &row.id,
+                AuxiliaryStopRequest::Target(crate::daemon::StopAuxiliaryBody {
+                    target: crate::session::AuxiliaryTarget::Tool {
+                        tool_name: "probe".into(),
+                    },
+                    adoption: None,
+                }),
+            )
+            .await
+            .unwrap_err();
+            assert!(format!("{error:#}").contains("Auxiliary target remains present after stop"));
+            assert!(child.all_exited()?);
+            assert!(!replacement.all_exited()?);
+            let ids = live_session_ids(&sentinel_id)?;
+            assert!(!ids.contains(&original_id));
+            assert!(ids.contains(&replacement_id));
+            assert_eq!(pane_field(tool.session_name(), "#{@aoe_tool_owner}"), "");
+            assert!(!crate::tmux::ToolSession::has_pending_retirement(
+                &row.id, "probe"
+            )?);
+            let persisted = storage.load()?.remove(0);
+            assert_eq!(persisted.lifecycle_generation, row.lifecycle_generation + 2);
+            assert!(persisted.lifecycle_reservation.is_none());
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn stop_recovers_absent_unconfigured_debt_without_stopping_replacement(
+    ) -> anyhow::Result<()> {
+        if !crate::tmux::is_tmux_available() {
+            return Ok(());
+        }
+        let _home = crate::session::test_support::isolate_app_dir();
+        crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir()?)?;
+        crate::session::config::update_config(|config| {
+            config.tools.remove("probe");
+        })?;
+        for (replacement, legacy_replacement) in [(false, false), (true, false), (true, true)] {
+            let mut row = crate::session::Instance::new("restart debt", "/tmp");
+            row.source_profile = "default".into();
+            crate::server::test_support::seed_instances_on_disk_for_test(
+                "default",
+                vec![row.clone()],
+            );
+            let (tool, _guard, original) = prepare_tool_retirement(&row)?;
+            assert!(crate::tmux::tmux_command()
+                .args(["kill-session", "-t", tool.session_name()])
+                .status()?
+                .success());
+            let replacement_proof = if replacement {
+                if legacy_replacement {
+                    assert!(crate::tmux::tmux_command()
+                        .args(["new-session", "-d", "-s", tool.session_name(), "sleep 600",])
+                        .status()?
+                        .success());
+                } else {
+                    tool.create_with_size("/tmp", "sleep 600", None, "default", &row.id, "probe")?;
+                }
+                let panes = crate::tmux::batch_pane_metadata()?;
+                Some(crate::process::CapturedProcessTree::capture(
+                    panes.get(tool.session_name()).unwrap().pane_pid.unwrap(),
+                )?)
+            } else {
+                None
+            };
+            let state = crate::server::test_support::build_test_app_state(vec![row.clone()]);
+            crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+            seed_initial_observations(&state).await?;
+            assert!(state.instances.read().await[0].auxiliary.iter().any(|observation| {
+                matches!(&observation.target, crate::session::AuxiliaryTarget::Tool { tool_name } if tool_name == "probe")
+                    && (replacement || observation.pane.state == crate::session::PanePresence::Absent)
+            }));
+            // Neither remembered observations nor current configuration admits this
+            // request. Only the validated original debt makes explicit Stop reachable.
+            state.instances.write().await[0].auxiliary.clear();
+            let result = stop_native_auxiliary(
+                &state,
+                &row.id,
+                AuxiliaryStopRequest::Target(crate::daemon::StopAuxiliaryBody {
+                    target: crate::session::AuxiliaryTarget::Tool {
+                        tool_name: "probe".into(),
+                    },
+                    adoption: None,
+                }),
+            )
+            .await;
+            assert_eq!(result.is_err(), replacement);
+            assert!(original.all_exited()?);
+            assert!(!crate::tmux::ToolSession::has_pending_retirement(
+                &row.id, "probe"
+            )?);
+            if let Some(proof) = replacement_proof {
+                assert!(
+                    !proof.all_exited()?,
+                    "original acknowledgement must not authorize replacement cleanup"
+                );
+                if legacy_replacement {
+                    assert_eq!(
+                        crate::tmux::test_helpers::pane_field(
+                            tool.session_name(),
+                            "#{@aoe_tool_owner}"
+                        ),
+                        ""
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn whole_row_cleanup_drains_original_debt_before_tmux_absence() -> anyhow::Result<()> {
+        if !crate::tmux::is_tmux_available() {
+            return Ok(());
+        }
+        let _home = crate::session::test_support::isolate_app_dir();
+        crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir()?)?;
+        let row = crate::session::Instance::new("parent cleanup debt", "/tmp");
+        let (tool, _guard, original) = prepare_tool_retirement(&row)?;
+        assert!(crate::tmux::tmux_command()
+            .args(["kill-session", "-t", tool.session_name()])
+            .status()?
+            .success());
+        crate::tmux::utils::kill_ancillary_sessions_for_id(&row.id)?;
+        assert!(original.all_exited()?);
+        assert!(!crate::tmux::ToolSession::has_pending_retirement(
+            &row.id, "probe"
+        )?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn obsolete_boot_recovery_consumes_original_without_adopting_legacy_replacement(
+    ) -> anyhow::Result<()> {
+        if !crate::tmux::is_tmux_available() {
+            return Ok(());
+        }
+        let _home = crate::session::test_support::isolate_app_dir();
+        let root = crate::session::get_app_dir()?;
+        crate::tmux::tool_retirement::initialize(&root)?;
+        crate::session::config::update_config(|config| {
+            config.tools.remove("probe");
+        })?;
+        let mut row = crate::session::Instance::new("obsolete debt replacement", "/tmp");
+        row.source_profile = "default".into();
+        crate::server::test_support::seed_instances_on_disk_for_test("default", vec![row.clone()]);
+        let name = crate::tmux::ToolSession::generate_name(&row.id, &row.title, "probe");
+        let _guard = crate::tmux::test_helpers::TmuxTestSession::from_name(&name);
+        assert!(crate::tmux::tmux_command()
+            .args(["new-session", "-d", "-s", &name, "sleep 600",])
+            .status()?
+            .success());
+        let panes = crate::tmux::batch_pane_metadata()?;
+        let replacement = crate::process::CapturedProcessTree::capture(
+            panes.get(&name).unwrap().pane_pid.unwrap(),
+        )?;
+        let boot = format!("obsolete-{}", crate::process::boot_id().unwrap());
+        let pid = i32::MAX as u32;
+        // Handcraft authorized old-boot state whose recorded server cannot be
+        // inspected. Today's unmarked replacement is not part of this cohort.
+        std::fs::write(
+            root.join(crate::tmux::tool_retirement::FILE_NAME),
+            serde_json::to_vec(&serde_json::json!({
+                "version": 1,
+                "owners": [{
+                    "token": uuid::Uuid::new_v4(),
+                    "instance_id": row.id, "tool_name": "probe",
+                    "socket": "/unreachable/original-tmux.sock", "server_pid": pid,
+                    "server_birth": {"boot_id":boot, "start_id":"uninspectable-server"},
+                    "receipt": {
+                        "name": name,
+                        "identity": {"session_id":"$999999", "pane_id":"%999999", "pane_pid":pid},
+                        "owner": serde_json::to_string(&(&row.id, "probe"))?,
+                        "tree": {"boot_id":boot, "processes":[{"pid":pid, "start_id":"uninspectable-original"}]},
+                    },
+                }],
+            }))?,
+        )?;
+        let state = crate::server::test_support::build_test_app_state(vec![row.clone()]);
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+        seed_initial_observations(&state).await?;
+        let adoption = {
+            let rows = state.instances.read().await;
+            let pane = &rows[0].auxiliary.iter().find(|observation| {
+                matches!(&observation.target, crate::session::AuxiliaryTarget::Tool { tool_name } if tool_name == "probe")
+            }).unwrap().pane;
+            crate::session::LegacyToolAdoption {
+                tmux_session: pane.tmux_session.clone().unwrap(),
+                identity: pane
+                    .legacy_tool
+                    .clone()
+                    .expect("replacement remains confirmable, never adopted"),
+                profile: row.source_profile.clone(),
+                lifecycle_generation: row.lifecycle_generation,
+            }
+        };
+        let result = stop_native_auxiliary(
+            &state,
+            &row.id,
+            AuxiliaryStopRequest::Target(crate::daemon::StopAuxiliaryBody {
+                target: crate::session::AuxiliaryTarget::Tool {
+                    tool_name: "probe".into(),
+                },
+                adoption: Some(adoption),
+            }),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "physical replacement still prevents a successful Stop acknowledgement"
+        );
+        assert!(!crate::tmux::ToolSession::has_pending_retirement(
+            &row.id, "probe"
+        )?);
+        assert!(!replacement.all_exited()?);
+        assert_eq!(
+            crate::tmux::test_helpers::pane_field(&name, "#{@aoe_tool_owner}"),
+            ""
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn ensure_refuses_changed_original_then_drains_debt_before_new_launch() -> anyhow::Result<()> {
+        if !crate::tmux::is_tmux_available() {
+            return Ok(());
+        }
+        let _home = crate::session::test_support::isolate_app_dir();
+        crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir()?)?;
+        crate::session::config::update_config(|config| {
+            config.tools.insert(
+                "probe".into(),
+                crate::session::config::ToolSessionConfig {
+                    command: "sleep 600".into(),
+                    ..Default::default()
+                },
+            );
+        })?;
+        let mut row = crate::session::Instance::new("launch debt", "/tmp");
+        row.source_profile = "default".into();
+        crate::server::test_support::seed_instances_on_disk_for_test("default", vec![row.clone()]);
+        let store = crate::session::Storage::open_unwatched("default")?;
+        let (tool, _guard, original) = prepare_tool_retirement(&row)?;
+        let foreign = serde_json::to_string(&("foreign", "probe"))?;
+        assert!(crate::tmux::tmux_command()
+            .args([
+                "set-option",
+                "-t",
+                tool.session_name(),
+                "@aoe_tool_owner",
+                &foreign,
+            ])
+            .status()?
+            .success());
+        assert!(row
+            .start_tool_with_size_in("probe", None, &store, None, None)
+            .is_err());
+        assert!(!original.all_exited()?);
+        assert!(crate::tmux::ToolSession::has_pending_retirement(
+            &row.id, "probe"
+        )?);
+        assert!(crate::tmux::tmux_command()
+            .args(["kill-session", "-t", tool.session_name()])
+            .status()?
+            .success());
+        let (_, created) = row.start_tool_with_size_in("probe", None, &store, None, None)?;
+        assert!(created);
+        assert!(original.all_exited()?);
+        assert!(!crate::tmux::ToolSession::has_pending_retirement(
+            &row.id, "probe"
+        )?);
+        Ok(())
+    }
 
     #[test]
     fn legacy_observation_is_confirmable_but_never_ready_until_owned() {

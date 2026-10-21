@@ -2300,6 +2300,7 @@ mod tests {
             let _home = crate::session::test_support::isolate_app_dir();
             let root = crate::session::get_app_dir().unwrap();
             super::super::purge_owners::initialize(&root).unwrap();
+            crate::tmux::tool_retirement::initialize(&root).unwrap();
             let (_temp, repo, worktree, mut row) = test_worktree_fixture("alias-owner");
             row.source_profile = "source".into();
             row.terminal_scopes = Some(vec![]);
@@ -2360,6 +2361,7 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let _home = crate::session::test_support::isolate_app_dir_at(home.path());
         super::super::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
+        crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
         let bin = home.path().join("bin");
         std::fs::create_dir(&bin).unwrap();
         let manager = bin.join("systemctl");
@@ -2442,6 +2444,7 @@ mod tests {
     #[test]
     fn test_deletion_result_success_when_no_worktree_or_sandbox() {
         let _app_guard = crate::session::test_support::isolate_app_dir();
+        crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
         let instance = create_test_instance();
         let request = DeletionRequest {
             session_id: instance.id.clone(),
@@ -2472,6 +2475,8 @@ mod tests {
             (true, true, true),
         ] {
             let _home = crate::session::test_support::isolate_app_dir();
+            crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir().unwrap())
+                .unwrap();
             super::super::purge_owners::initialize(&crate::session::get_app_dir().unwrap())
                 .unwrap();
             let profile = "purge-post-hook-path";
@@ -2621,6 +2626,8 @@ mod tests {
         }
         for irreversible in [true, false] {
             let _home = crate::session::test_support::isolate_app_dir();
+            crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir().unwrap())
+                .unwrap();
             super::super::purge_owners::initialize(&crate::session::get_app_dir().unwrap())
                 .unwrap();
             let storage = Storage::new_unwatched("purge-runner").unwrap();
@@ -2715,6 +2722,7 @@ mod tests {
     fn unresolved_runner_capture_preserves_row_before_irreversible_commit() {
         let _home = crate::session::test_support::isolate_app_dir();
         super::super::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
+        crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
         let storage = Storage::new_unwatched("unresolved-capture").unwrap();
         let mut instance = create_test_instance();
         instance.source_profile = "unresolved-capture".into();
@@ -2781,6 +2789,7 @@ mod tests {
         let _home = crate::session::test_support::isolate_app_dir();
         let root = crate::session::get_app_dir().unwrap();
         super::super::purge_owners::initialize(&root).unwrap();
+        crate::tmux::tool_retirement::initialize(&root).unwrap();
         let profile = "purge-unresolvable-owner";
         let storage = Storage::new_unwatched(profile).unwrap();
         let mut instance = create_test_instance();
@@ -2847,6 +2856,8 @@ mod tests {
             "unchanged",
         ] {
             let _home = crate::session::test_support::isolate_app_dir();
+            crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir().unwrap())
+                .unwrap();
             super::super::purge_owners::initialize(&crate::session::get_app_dir().unwrap())
                 .unwrap();
             let profile = "group-purge-selection";
@@ -2957,6 +2968,7 @@ mod tests {
     fn purge_rejects_execution_mode_changes_after_hooks() {
         let _home = crate::session::test_support::isolate_app_dir();
         super::super::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
+        crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
         let profile = "purge-mode-after-hooks";
         let storage = Storage::new_unwatched(profile).unwrap();
         let mut instance = create_test_instance();
@@ -3019,6 +3031,7 @@ mod tests {
         let _home = crate::session::test_support::isolate_app_dir();
         let root = crate::session::get_app_dir().unwrap();
         super::super::purge_owners::initialize(&root).unwrap();
+        crate::tmux::tool_retirement::initialize(&root).unwrap();
         let profile = "purge-failed-commit-owner";
         let storage = Storage::new_unwatched(profile).unwrap();
         let mut instance = create_test_instance();
@@ -3169,6 +3182,7 @@ mod tests {
         let _home = crate::session::test_support::isolate_app_dir();
         let root = crate::session::get_app_dir().unwrap();
         super::super::purge_owners::initialize(&root).unwrap();
+        crate::tmux::tool_retirement::initialize(&root).unwrap();
         let profile = "purge-lost-commit-owner";
         let storage = Storage::new_unwatched(profile).unwrap();
         let mut instance = create_test_instance();
@@ -3260,6 +3274,7 @@ mod tests {
         let _home = crate::session::test_support::isolate_app_dir();
         let root = crate::session::get_app_dir().unwrap();
         super::super::purge_owners::initialize(&root).unwrap();
+        crate::tmux::tool_retirement::initialize(&root).unwrap();
         let profile = "recovery-head-of-line";
         let storage = Storage::new_unwatched(profile).unwrap();
         storage
@@ -3326,6 +3341,7 @@ mod tests {
         let _home = crate::session::test_support::isolate_app_dir();
         let root = crate::session::get_app_dir().unwrap();
         super::super::purge_owners::initialize(&root).unwrap();
+        crate::tmux::tool_retirement::initialize(&root).unwrap();
         let profile = "recovery-single-attempt-per-pass";
         let storage = Storage::new_unwatched(profile).unwrap();
         storage
@@ -3406,6 +3422,7 @@ mod tests {
         let _home = crate::session::test_support::isolate_app_dir();
         let root = crate::session::get_app_dir().unwrap();
         super::super::purge_owners::initialize(&root).unwrap();
+        crate::tmux::tool_retirement::initialize(&root).unwrap();
         let real = root.join("real-repository");
         let alias = root.join("repository-alias");
         std::fs::create_dir(&real).unwrap();
@@ -3516,6 +3533,7 @@ mod tests {
         // the plan has nothing left to hold and must be released.
         let _home = crate::session::test_support::isolate_app_dir();
         super::super::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
+        crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
         let (_temp, main_repo, worktree, mut instance) = test_worktree_fixture("reaped-branch");
         let profile = "purge-reap-uncommitted";
         let storage = Storage::new_unwatched(profile).unwrap();
@@ -3663,6 +3681,7 @@ mod tests {
     fn creation_rollback_preserves_a_different_launch_owner() {
         let _guard = crate::session::test_support::isolate_app_dir();
         super::super::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
+        crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
         let profile = "creation-rollback";
         let storage = Storage::new_unwatched(profile).unwrap();
         let mut instance = create_test_instance();
@@ -3737,6 +3756,7 @@ mod tests {
     fn creation_rollback_survives_the_released_launch_reservation() {
         let _guard = crate::session::test_support::isolate_app_dir();
         super::super::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
+        crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
         let profile = "creation-rollback-post-launch";
         let storage = Storage::new_unwatched(profile).unwrap();
         let mut instance = create_test_instance();
@@ -3801,6 +3821,7 @@ mod tests {
     fn creation_rollback_refuses_a_row_a_later_owner_took() {
         let _guard = crate::session::test_support::isolate_app_dir();
         super::super::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
+        crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
         let profile = "creation-rollback-later-owner";
         let storage = Storage::new_unwatched(profile).unwrap();
         let mut instance = create_test_instance();
@@ -3866,6 +3887,7 @@ mod tests {
     fn purge_claim_drops_force_from_a_stale_trash_lifecycle() {
         let _guard = crate::session::test_support::isolate_app_dir();
         super::super::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
+        crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
         let earlier = Utc::now() - chrono::Duration::minutes(5);
         for (profile, same_lifecycle, same_timestamp) in [
             ("purge-stale-force", false, false),
@@ -3922,6 +3944,7 @@ mod tests {
     fn purge_transaction_generation_gate_and_durable_commit() {
         let _guard = crate::session::test_support::isolate_app_dir();
         super::super::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
+        crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
         let profile = "purge-generation-gate";
         let storage = Storage::new_unwatched(profile).unwrap();
         let mut instance = create_test_instance();
@@ -4009,6 +4032,7 @@ mod tests {
     fn same_timestamp_retrash_blocks_reserved_purge_before_irreversible_cleanup() {
         let _home = crate::session::test_support::isolate_app_dir();
         crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
+        crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
         let profile = "purge-same-clock-gate";
         let storage = Storage::new_unwatched(profile).unwrap();
         let mut selected = create_test_instance();
@@ -4057,6 +4081,7 @@ mod tests {
     fn on_destroy_hooks_run_without_the_instance_lifecycle_flock() {
         let temp = tempfile::tempdir().unwrap();
         let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
+        crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
         super::super::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
         let profile = "purge-unlocked-hooks";
         let ready = temp.path().join("ready");
@@ -4185,6 +4210,8 @@ mod tests {
         for adopt_after_scan in [false, true] {
             let (tmp, main_repo, worktree, mut owner) = test_worktree_fixture("feature/shared");
             let _home = crate::session::test_support::isolate_app_dir_at(&tmp.path().join("home"));
+            crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir().unwrap())
+                .unwrap();
             let storage = Storage::new_unwatched("owner").unwrap();
             owner.source_profile = "owner".to_string();
             crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap())
@@ -4282,6 +4309,7 @@ mod tests {
     #[test]
     fn test_deletion_result_success_even_with_delete_worktree_flag_when_no_worktree() {
         let _app_guard = crate::session::test_support::isolate_app_dir();
+        crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
         let instance = create_test_instance();
         let request = DeletionRequest {
             session_id: instance.id.clone(),
@@ -4394,7 +4422,11 @@ mod tests {
         }
 
         #[test]
+        #[serial_test::serial]
         fn call_site_surfaces_teardown_failure() {
+            let _home = crate::session::test_support::isolate_app_dir();
+            crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir().unwrap())
+                .unwrap();
             // A failed container teardown must surface as an error so the
             // caller keeps the session record, not silently succeed. Pins the
             // `perform_deletion` call site, not just the mapping helper.
@@ -4407,7 +4439,11 @@ mod tests {
         }
 
         #[test]
+        #[serial_test::serial]
         fn call_site_invokes_teardown_unconditionally() {
+            let _home = crate::session::test_support::isolate_app_dir();
+            crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir().unwrap())
+                .unwrap();
             // Guards against re-introducing an existence-probe gate around the
             // teardown: it must run whenever the session is sandboxed and
             // delete_sandbox is set.
@@ -4442,6 +4478,8 @@ mod tests {
             ] {
                 let temp = tempfile::TempDir::new().unwrap();
                 let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
+                crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir().unwrap())
+                    .unwrap();
                 let mut request = sandboxed_request();
                 if case == Case::PreTransition {
                     request.instance.sandbox_store_generation = 0;
@@ -4492,6 +4530,8 @@ mod tests {
         fn call_site_removes_the_session_agent_store() {
             let temp = tempfile::TempDir::new().unwrap();
             let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
+            crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir().unwrap())
+                .unwrap();
             let request = sandboxed_request();
             let store = temp
                 .path()
@@ -4521,6 +4561,8 @@ mod tests {
         fn a_pre_transition_session_leaves_its_store_to_the_migration() {
             let temp = tempfile::TempDir::new().unwrap();
             let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
+            crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir().unwrap())
+                .unwrap();
             let mut request = sandboxed_request();
             request.instance.sandbox_store_generation = 0;
             let store = temp
@@ -4543,6 +4585,8 @@ mod tests {
         fn a_failed_teardown_leaves_the_store_for_the_reclaim_pass() {
             let temp = tempfile::TempDir::new().unwrap();
             let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
+            crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir().unwrap())
+                .unwrap();
             let mut request = sandboxed_request();
             let scratch = crate::session::get_app_dir()
                 .unwrap()
@@ -4582,6 +4626,8 @@ mod tests {
         fn a_purge_that_fails_after_teardown_leaves_the_store() {
             let temp = tempfile::TempDir::new().unwrap();
             let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
+            crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir().unwrap())
+                .unwrap();
             let mut request = sandboxed_request();
             request.delete_worktree = true;
             request.instance.worktree_info = Some(crate::session::WorktreeInfo {
@@ -4729,6 +4775,8 @@ mod tests {
         #[serial_test::serial]
         fn sandboxed_with_worktree_kills_tmux_and_container_before_worktree() {
             let _app_guard = crate::session::test_support::isolate_app_dir();
+            crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir().unwrap())
+                .unwrap();
             // The preclean probes the container runtime before the stages
             // below run, and a host with no usable runtime answers that probe
             // with a failure rather than with absence. A failure reads as
@@ -4816,6 +4864,8 @@ mod tests {
         #[test]
         fn real_worktree_and_branch_are_removed_idempotently() {
             let _app_guard = crate::session::test_support::isolate_app_dir();
+            crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir().unwrap())
+                .unwrap();
             let (_tmp, main_repo, worktree_path, instance) =
                 test_worktree_fixture("feature/delete-me");
             let request = DeletionRequest {
@@ -4864,6 +4914,8 @@ mod tests {
         #[test]
         fn e2e_real_worktree_is_removed_on_disk() {
             let _app_guard = crate::session::test_support::isolate_app_dir();
+            crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir().unwrap())
+                .unwrap();
             let tmp = tempfile::TempDir::new().unwrap();
             let main_repo = tmp.path().join("main");
             let worktree_path = tmp.path().join("worktree");
@@ -4968,6 +5020,8 @@ mod tests {
         #[test]
         fn default_branch_worktree_survives_a_forced_delete() {
             let _app_guard = crate::session::test_support::isolate_app_dir();
+            crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir().unwrap())
+                .unwrap();
             let tmp = tempfile::TempDir::new().unwrap();
             let bare = tmp.path().join("project/.bare");
             let worktree_path = tmp.path().join("project/main");
@@ -5091,6 +5145,8 @@ mod tests {
         #[serial_test::serial]
         fn purge_preserves_workspace_repos_referenced_by_surviving_sessions() {
             let _home = crate::session::test_support::isolate_app_dir();
+            crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir().unwrap())
+                .unwrap();
             crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap())
                 .unwrap();
             for reference in ["checkout", "branch", "workspace root"] {
@@ -5235,6 +5291,8 @@ mod tests {
         #[test]
         fn e2e_workspace_dir_that_is_not_aoe_owned_is_refused() {
             let _app_guard = crate::session::test_support::isolate_app_dir();
+            crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir().unwrap())
+                .unwrap();
             let tmp = tempfile::TempDir::new().unwrap();
             let user_checkout = tmp.path().join("backend");
             init_repo(&user_checkout);
@@ -5302,6 +5360,8 @@ mod tests {
         #[test]
         fn e2e_workspace_ancestor_with_unrelated_content_is_not_recursively_removed() {
             let _app_guard = crate::session::test_support::isolate_app_dir();
+            crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir().unwrap())
+                .unwrap();
             let tmp = tempfile::TempDir::new().unwrap();
             let user_checkout = tmp.path().join("backend");
             init_repo(&user_checkout);
@@ -5370,6 +5430,8 @@ mod tests {
         #[test]
         fn e2e_workspace_repo_keeps_a_branch_aoe_did_not_create() {
             let _app_guard = crate::session::test_support::isolate_app_dir();
+            crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir().unwrap())
+                .unwrap();
             let tmp = tempfile::TempDir::new().unwrap();
             let workspace = tmp.path().join("ws");
             let main_repo = tmp.path().join("frontend");
@@ -5429,6 +5491,8 @@ mod tests {
         #[test]
         fn perform_deletion_is_idempotent_on_worktree() {
             let _app_guard = crate::session::test_support::isolate_app_dir();
+            crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir().unwrap())
+                .unwrap();
             let tmp = tempfile::TempDir::new().unwrap();
             let main_repo = tmp.path().join("main");
             let worktree_path = tmp.path().join("worktree");
@@ -5499,6 +5563,8 @@ mod tests {
         #[test]
         fn e2e_preserved_worktree_keeps_its_branch() {
             let _app_guard = crate::session::test_support::isolate_app_dir();
+            crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir().unwrap())
+                .unwrap();
             let tmp = tempfile::TempDir::new().unwrap();
             let main_repo = tmp.path().join("main");
             let worktree_path = tmp.path().join("worktree");
@@ -5600,6 +5666,8 @@ mod tests {
         #[test]
         fn e2e_real_worktree_with_untracked_files_force_removed() {
             let _app_guard = crate::session::test_support::isolate_app_dir();
+            crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir().unwrap())
+                .unwrap();
             let tmp = tempfile::TempDir::new().unwrap();
             let main_repo = tmp.path().join("main");
             let worktree_path = tmp.path().join("worktree");
@@ -5761,6 +5829,8 @@ mod tests {
         #[test]
         fn sandboxed_with_dirty_worktree_skips_preclean_and_preserves_changes() {
             let _app_guard = crate::session::test_support::isolate_app_dir();
+            crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir().unwrap())
+                .unwrap();
             let (_tmp, main_repo, worktree_path, instance) =
                 build_sandboxed_worktree("feature/dirty-no-force");
 
@@ -5833,6 +5903,8 @@ mod tests {
         #[test]
         fn sandboxed_with_dirty_worktree_force_runs_preclean_and_removes() {
             let _app_guard = crate::session::test_support::isolate_app_dir();
+            crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir().unwrap())
+                .unwrap();
             let (_tmp, main_repo, worktree_path, instance) =
                 build_sandboxed_worktree("feature/dirty-force");
 
@@ -5876,6 +5948,8 @@ mod tests {
         #[test]
         fn unsandboxed_kills_tmux_before_worktree() {
             let _app_guard = crate::session::test_support::isolate_app_dir();
+            crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir().unwrap())
+                .unwrap();
             let instance = Instance::new("Test", "/tmp/aoe-deletion-test-nonexistent");
             let request = DeletionRequest {
                 session_id: instance.id.clone(),
@@ -5912,6 +5986,8 @@ mod tests {
         #[test]
         fn e2e_workspace_dir_with_stray_file_is_kept_not_failed() {
             let _app_guard = crate::session::test_support::isolate_app_dir();
+            crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir().unwrap())
+                .unwrap();
             let tmp = tempfile::TempDir::new().unwrap();
             let workspace = tmp.path().join("ws");
             let main_repo = tmp.path().join("frontend");
@@ -6000,6 +6076,8 @@ mod tests {
         #[serial]
         fn scratch_session_is_kept_on_request_then_removed_and_tolerates_missing_dir() {
             let _tmp = isolate_app_dir();
+            crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir().unwrap())
+                .unwrap();
             let (instance, dir) = scratch_instance();
             let result = perform_deletion(&DeletionRequest {
                 session_id: instance.id.clone(),
@@ -6051,6 +6129,8 @@ mod tests {
         #[serial]
         fn scratch_session_with_missing_dir_still_succeeds() {
             let _tmp = isolate_app_dir();
+            crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir().unwrap())
+                .unwrap();
             let (instance, dir) = scratch_instance();
             // Simulate the "directory already gone" race (user deleted
             // manually, FS hiccup, etc.). Deletion must not fail.
@@ -6080,6 +6160,8 @@ mod tests {
         #[serial]
         fn scratch_cleanup_leaves_paths_outside_its_root_alone() {
             let _tmp = isolate_app_dir();
+            crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir().unwrap())
+                .unwrap();
             let app_dir = crate::session::get_app_dir().unwrap();
             for (scratch, parent) in [(true, std::env::temp_dir()), (false, app_dir)] {
                 let dir = parent.join(format!("aoe-scratch-guard-{}", uuid::Uuid::new_v4()));

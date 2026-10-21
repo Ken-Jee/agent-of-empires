@@ -1054,11 +1054,48 @@ pub(crate) fn runner_birth_identity(pid: u32) -> anyhow::Result<Option<ProcessBi
     birth
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct CapturedProcessTreeReceipt {
     boot_id: String,
     processes: Vec<PrimeProcessIdentity>,
+}
+
+impl CapturedProcessTreeReceipt {
+    pub(crate) fn boot_identity(&self) -> &str {
+        &self.boot_id
+    }
+
+    pub(crate) fn root_is_current(&self) -> anyhow::Result<bool> {
+        let root = self
+            .processes
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("captured tool root is missing"))?;
+        Ok(process_birth_identity(root.pid)?
+            .is_some_and(|birth| birth.boot_id == self.boot_id && birth.start_id == root.start_id))
+    }
+
+    pub(crate) fn validate(&self, root_pid: u32) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self.boot_id.is_empty()
+                && self
+                    .processes
+                    .first()
+                    .is_some_and(|root| root.pid == root_pid)
+                && self.processes.iter().all(|identity| {
+                    identity.pid > 0
+                        && i32::try_from(identity.pid).is_ok()
+                        && !identity.start_id.is_empty()
+                })
+                && self.processes.iter().enumerate().all(|(index, identity)| {
+                    !self.processes[..index]
+                        .iter()
+                        .any(|known| known.pid == identity.pid)
+                }),
+            "captured tool retirement identity is unavailable"
+        );
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -1121,24 +1158,20 @@ impl CapturedProcessTree {
         receipt: CapturedProcessTreeReceipt,
         root_pid: u32,
     ) -> anyhow::Result<Self> {
-        anyhow::ensure!(
-            boot_id().as_deref() == Some(receipt.boot_id.as_str())
-                && receipt
-                    .processes
-                    .first()
-                    .is_some_and(|root| root.pid == root_pid)
-                && receipt
-                    .processes
-                    .iter()
-                    .all(|identity| identity.pid > 0 && !identity.start_id.is_empty()),
-            "captured tool retirement identity is unavailable"
-        );
+        receipt.validate(root_pid)?;
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        let current_boot = boot_id()
+            .filter(|identity| !identity.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("process boot identity unavailable"))?;
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
-            let mut handles = Vec::with_capacity(receipt.processes.len());
-            for identity in &receipt.processes {
-                if let Some(handle) = platform::ProcessHandle::capture(identity)? {
-                    handles.push(handle);
+            let mut handles = Vec::new();
+            if receipt.boot_id == current_boot {
+                handles.reserve(receipt.processes.len());
+                for identity in &receipt.processes {
+                    if let Some(handle) = platform::ProcessHandle::capture(identity)? {
+                        handles.push(handle);
+                    }
                 }
             }
             Ok(Self { receipt, handles })
@@ -1650,6 +1683,19 @@ mod tests {
                 .collect::<Vec<_>>(),
             [30, 31]
         );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn captured_tree_changed_boot_is_obsolete_but_malformed_identity_is_not() {
+        let current = CapturedProcessTree::capture(std::process::id()).unwrap();
+        let mut receipt = current.receipt().clone();
+        receipt.boot_id = format!("different-{}", receipt.boot_id);
+        let obsolete = CapturedProcessTree::resume(receipt.clone(), std::process::id()).unwrap();
+        assert!(obsolete.all_exited().unwrap());
+        obsolete.settle(Duration::ZERO).unwrap();
+        receipt.processes.push(receipt.processes[0].clone());
+        assert!(CapturedProcessTree::resume(receipt, std::process::id()).is_err());
     }
 
     #[cfg(target_os = "macos")]

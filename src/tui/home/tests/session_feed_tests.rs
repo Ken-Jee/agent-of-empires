@@ -297,6 +297,13 @@ fn tool_preview_enter_upgrades_one_canonical_preparation() {
         Some(PanePresence::Unknown),
     ] {
         let mut env = create_test_env_with_sessions(1);
+        env.view.tool_configs.insert(
+            "probe".into(),
+            crate::session::config::ToolSessionConfig {
+                command: "sleep 600".into(),
+                ..Default::default()
+            },
+        );
         let id = env.view.instance_at(0).id.clone();
         env.view.select_session_by_id(&id);
         let mut respond = env.view.session_feed.terminal_driver_for_test();
@@ -1743,6 +1750,13 @@ fn legacy_stop_confirmation_retains_the_original_exact_row_and_pane() {
         AuxiliaryObservation, AuxiliaryTarget, LegacyToolIdentity, PaneObservation, PanePresence,
     };
     let mut env = create_test_env_empty();
+    env.view.tool_configs.insert(
+        "probe".into(),
+        crate::session::config::ToolSessionConfig {
+            command: "sleep 600".into(),
+            ..Default::default()
+        },
+    );
     let instance = local_row(&mut env, "Row", "/tmp/repo");
     let id = instance.id.clone();
     seed_profile("test", &env.view.cloned_instances());
@@ -1975,5 +1989,145 @@ fn cancelled_attach_live_send_and_send_settle_without_a_continuation_in_either_r
             assert!(env.view.session_feed.can_submit(&id));
             assert!(env.view.pending_indeterminate_queue.is_empty());
         }
+    }
+}
+
+#[test]
+#[serial]
+fn absent_unconfigured_tool_remains_recoverable_without_native_preparation() {
+    use crate::session::{AuxiliaryObservation, AuxiliaryTarget, PaneObservation, PanePresence};
+    let mut env = create_test_env_empty();
+    let instance = local_row(&mut env, "Row", "/tmp/repo");
+    let id = instance.id.clone();
+    seed_profile("test", &env.view.cloned_instances());
+    env.view.tool_configs.clear();
+    let target = AuxiliaryTarget::Tool {
+        tool_name: "removed-raw-tool".into(),
+    };
+    let row = canonical_row(
+        &instance,
+        serde_json::json!({
+            "auxiliary": [AuxiliaryObservation {
+                target: target.clone(),
+                pane: PaneObservation { state: PanePresence::Absent, tmux_session: None, legacy_tool: None },
+            }],
+        }),
+    );
+    let mut respond = env.view.session_feed.command_driver_for_test();
+    publish_canonical_snapshot(&mut env, vec![row], vec![], 1);
+    env.view.select_session_by_id(&id);
+    env.view
+        .handle_key(KeyEvent::new(KeyCode::Char(';'), KeyModifiers::NONE), None);
+    assert!(
+        env.view.tool_picker_dialog.is_some(),
+        "pending raw name must remain discoverable after restart without config"
+    );
+    env.view
+        .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), None);
+    assert_eq!(
+        env.view.view_mode,
+        ViewMode::Tool("removed-raw-tool".into())
+    );
+    assert!(env.view.pending_native_attachment.is_none());
+    assert!(env.view.live_send.is_none());
+    assert!(
+        env.view.session_feed.can_submit(&id),
+        "recovery selection must not submit Ensure or Send"
+    );
+    env.view.stop_selected();
+    assert!(env.view.confirm_dialog.is_some());
+    assert_eq!(
+        env.view.pending_stop_auxiliary.as_ref().unwrap().1.target,
+        target
+    );
+    env.view.dispatch_confirm_submit("stop_auxiliary");
+    let (sent_id, mutation) = respond(Err("retained original debt".into())).unwrap();
+    assert_eq!(sent_id, id);
+    let crate::daemon::SessionMutation::StopAuxiliary(sent) = mutation else {
+        panic!("wrong mutation")
+    };
+    assert_eq!(sent.target, target);
+    assert!(sent.adoption.is_none());
+}
+
+#[test]
+#[serial]
+fn recovery_only_stop_never_adopts_current_legacy_replacement() {
+    use crate::session::{
+        AuxiliaryObservation, AuxiliaryTarget, LegacyToolIdentity, PaneObservation, PanePresence,
+    };
+    for configuration in ["missing", "background", "blank"] {
+        let mut env = create_test_env_empty();
+        let instance = local_row(&mut env, "Row", "/tmp/repo");
+        let id = instance.id.clone();
+        seed_profile("test", &env.view.cloned_instances());
+        env.view.tool_configs.clear();
+        if configuration != "missing" {
+            env.view.tool_configs.insert(
+                "probe".into(),
+                crate::session::config::ToolSessionConfig {
+                    command: if configuration == "blank" {
+                        " \t".into()
+                    } else {
+                        "sleep 600".into()
+                    },
+                    background: configuration == "background",
+                    ..Default::default()
+                },
+            );
+        }
+        let target = AuxiliaryTarget::Tool {
+            tool_name: "probe".into(),
+        };
+        let row = canonical_row(
+            &instance,
+            serde_json::json!({
+                "auxiliary": [AuxiliaryObservation {
+                    target: target.clone(),
+                    pane: PaneObservation {
+                        state: PanePresence::Unknown,
+                        tmux_session: Some("current-legacy-replacement".into()),
+                        legacy_tool: Some(LegacyToolIdentity {
+                            session_id: "$42".into(), pane_id: "%42".into(), pane_pid: 4242,
+                        }),
+                    },
+                }],
+            }),
+        );
+        let mut respond = env.view.session_feed.command_driver_for_test();
+        publish_canonical_snapshot(&mut env, vec![row], vec![], 1);
+        env.view.select_session_by_id(&id);
+        env.view
+            .handle_key(KeyEvent::new(KeyCode::Char(';'), KeyModifiers::NONE), None);
+        assert!(env.view.tool_picker_dialog.is_some());
+        env.view
+            .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), None);
+        assert_eq!(env.view.view_mode, ViewMode::Tool("probe".into()));
+        assert!(
+            env.view.confirm_dialog.is_none(),
+            "selection must not ask to adopt replacement B"
+        );
+        assert!(env.view.pending_legacy_tool_preparation.is_none());
+        assert!(env.view.pending_native_attachment.is_none());
+        assert!(env.view.live_send.is_none());
+        assert!(
+            env.view.session_feed.can_submit(&id),
+            "selection must not submit Ensure or Send"
+        );
+        env.view.stop_selected();
+        assert!(env.view.confirm_dialog.is_some());
+        let pending = &env.view.pending_stop_auxiliary.as_ref().unwrap().1;
+        assert_eq!(pending.target, target);
+        assert!(
+            pending.adoption.is_none(),
+            "{configuration}: original-debt Stop must not capture replacement B"
+        );
+        env.view.dispatch_confirm_submit("stop_auxiliary");
+        let (_, mutation) = respond(Err("original debt retained".into())).unwrap();
+        let crate::daemon::SessionMutation::StopAuxiliary(sent) = mutation else {
+            panic!("wrong mutation")
+        };
+        assert_eq!(sent.target, target);
+        assert!(sent.adoption.is_none());
     }
 }

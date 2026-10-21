@@ -316,6 +316,13 @@ fn view_switch_auto_starts_live_send_only_when_enabled() {
     ];
     for (mode, on_switch, key_event, expected_view, live) in cases {
         let mut env = create_test_env_empty();
+        env.view.tool_configs.insert(
+            "lazygit".into(),
+            crate::session::config::ToolSessionConfig {
+                command: "sleep 600".into(),
+                ..Default::default()
+            },
+        );
         write_live_send_on_view_switch(mode, on_switch);
         let id = add_session(&mut env.view, "session-one");
         env.view.flat_items = env.view.build_flat_items();

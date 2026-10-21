@@ -86,6 +86,7 @@ async fn committed_purge_preserves_a_reused_rows_structured_projection() -> anyh
     for recovered_with_replacement_worker in [false, true] {
         let _home = crate::session::test_support::isolate_app_dir();
         crate::session::purge_owners::initialize(&crate::session::get_app_dir()?)?;
+        crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir()?)?;
         let mut row = Instance::new("original projection", "");
         let scratch = crate::session::scratch::provision_scratch_dir(&row.id)?;
         row.project_path = scratch.to_string_lossy().into_owned();
@@ -325,6 +326,7 @@ async fn committed_purge_settles_only_its_live_preconfiguration_producer() -> an
         let recovered = window != 0;
         let _home = crate::session::test_support::isolate_app_dir();
         crate::session::purge_owners::initialize(&crate::session::get_app_dir()?)?;
+        crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir()?)?;
         let mut row = Instance::new("preconfiguration producer", "");
         let scratch = crate::session::scratch::provision_scratch_dir(&row.id)?;
         row.project_path = scratch.to_string_lossy().into_owned();
@@ -597,6 +599,7 @@ async fn committed_structured_purge_releases_admission_exclusion_before_retireme
     use crate::session::deletion::{DeletionRequest, PurgeTransaction};
     let _home = crate::session::test_support::isolate_app_dir();
     crate::session::purge_owners::initialize(&crate::session::get_app_dir()?)?;
+    crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir()?)?;
     for (recovered, running) in [(false, false), (true, false), (false, true), (true, true)] {
         let mut row = Instance::new("purge admission", "");
         let scratch = crate::session::scratch::provision_scratch_dir(&row.id)?;
@@ -1558,6 +1561,7 @@ async fn structured_stop_start_receipts_include_the_committed_peer_bundle() -> a
 #[serial_test::serial]
 async fn archive_receipts_publish_committed_status_and_peer_rows() -> anyhow::Result<()> {
     let _guard = crate::session::test_support::isolate_app_dir();
+    crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir()?)?;
     let mut row = Instance::new("archive receipt", "/tmp/archive-receipt");
     row.source_profile = "receipt".into();
     row.status = Status::Waiting;
@@ -1715,6 +1719,7 @@ async fn archive_and_trash_receipts_discard_killed_auxiliary_observations() -> a
     }
     for archive in [true, false] {
         let _home = crate::session::test_support::isolate_app_dir();
+        crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir()?)?;
         let project = tempfile::tempdir()?;
         let mut row = Instance::new("auxiliary receipt", project.path().to_str().unwrap());
         row.source_profile = "receipt".into();
@@ -1926,6 +1931,7 @@ async fn trash_restore_receipts_publish_complete_peer_bundles() -> anyhow::Resul
 async fn purge_receipt_publishes_removal_and_committed_peer_rows() -> anyhow::Result<()> {
     let _guard = crate::session::test_support::isolate_app_dir();
     crate::session::purge_owners::initialize(&crate::session::get_app_dir()?)?;
+    crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir()?)?;
     let mut row = Instance::new("purge receipt", "/tmp/purge-receipt");
     row.source_profile = "receipt".into();
     row.status = Status::Stopped;
@@ -1979,6 +1985,7 @@ async fn workspace_purge_retains_shared_files_when_structured_shutdown_is_unprov
 ) -> anyhow::Result<()> {
     let _home = crate::session::test_support::isolate_app_dir();
     crate::session::purge_owners::initialize(&crate::session::get_app_dir()?)?;
+    crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir()?)?;
     let mut owner = Instance::new("owner", "");
     let root = crate::session::scratch::provision_scratch_dir(&owner.id)?;
     owner.project_path = root.to_string_lossy().into_owned();
@@ -2090,6 +2097,7 @@ async fn workspace_purge_keeps_owner_when_a_sibling_was_restored() -> anyhow::Re
 async fn overlapping_workspace_purges_complete_without_lock_inversion() -> anyhow::Result<()> {
     let _guard = crate::session::test_support::isolate_app_dir();
     crate::session::purge_owners::initialize(&crate::session::get_app_dir()?)?;
+    crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir()?)?;
     let mut rows = vec![
         Instance::new("left", "/tmp/purge-overlap"),
         Instance::new("right", "/tmp/purge-overlap"),
@@ -5138,6 +5146,7 @@ struct PluginStatusFeed {
 impl PluginStatusFeed {
     async fn attach(state: &std::sync::Arc<crate::server::AppState>, profile: &str) -> Self {
         crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
+        crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
         let mut profiles: HashMap<String, Vec<Instance>> = HashMap::new();
         for row in state.instances.write().await.iter_mut() {
             row.source_profile = row.effective_profile();
@@ -7803,6 +7812,7 @@ async fn permanent_delete_keeps_a_worktree_a_surviving_session_uses() {
         let tmp = tempfile::tempdir().unwrap();
         let _home = crate::session::test_support::isolate_app_dir_at(&tmp.path().join("home"));
         crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
+        crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
         let main_repo = tmp.path().join("main");
         let checkout = tmp.path().join("shared");
         std::fs::create_dir_all(&main_repo).unwrap();
@@ -7920,6 +7930,7 @@ async fn purges_finish_when_request_is_cancelled() {
         let tmp = tempfile::tempdir().unwrap();
         let _home = crate::session::test_support::isolate_app_dir_at(&tmp.path().join("home"));
         crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
+        crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
         let profile = "workspace-disconnect";
         let mut instance = Instance::new("cancelled-request", tmp.path().to_str().unwrap());
         instance.source_profile = profile.to_string();
@@ -8046,6 +8057,7 @@ async fn scratch_create_resolves_profile_before_publication_and_purge() {
 
     let _home = crate::session::test_support::isolate_app_dir();
     crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
+    crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
     crate::session::config::update_config(|config| {
         config.default_profile = "chosen-default".to_string();
     })
@@ -8344,6 +8356,7 @@ async fn a_full_failure_map_replays_its_oldest_key_and_refuses_new_ones() {
     // half-created row survives and the retry would find it instead of the
     // recorded failure.
     crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
+    crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
     let marker = tempfile::tempdir().unwrap();
     let runs = marker.path().join("runs");
     let hook = format!("echo run >> '{}'; exit 1", runs.display());
@@ -8461,6 +8474,7 @@ async fn a_retry_across_a_restart_is_fenced_before_profile_validation() {
     use crate::server::test_support as support;
     let _home = crate::session::test_support::isolate_app_dir();
     crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
+    crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
     crate::session::config::update_app_state(|state| {
         state.has_acknowledged_agent_hooks = true;
     })
@@ -8592,6 +8606,7 @@ async fn a_cancelled_create_does_not_freeze_its_idempotency_key() {
     // which a fresh app dir has not initialized, and the retry would then find
     // that half-created row instead of running again.
     crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
+    crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
     support::seed_instances_on_disk_for_test("test", Vec::new());
     let (launcher, _launches) = support::counting_failing_launcher();
     let state = support::build_test_app_state_with_launcher(Vec::new(), launcher);
@@ -8766,6 +8781,7 @@ done
 async fn failed_forced_trash_drop_requires_selected_identity_and_returns_receipt() {
     let _home = crate::session::test_support::isolate_app_dir();
     crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
+    crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
     let profile = "failed-trash-drop";
     let mut row = Instance::new("failed forced purge", "");
     let root = crate::session::scratch::provision_scratch_dir(&row.id).unwrap();
@@ -8958,6 +8974,7 @@ async fn failed_forced_trash_drop_requires_selected_identity_and_returns_receipt
 async fn same_timestamp_retrash_rejects_stale_force_and_drop_consent() -> anyhow::Result<()> {
     let _home = crate::session::test_support::isolate_app_dir();
     crate::session::purge_owners::initialize(&crate::session::get_app_dir()?)?;
+    crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir()?)?;
     let profile = "same-clock-trash-consent";
     let mut selected = Instance::new("selected trash", "");
     let root = crate::session::scratch::provision_scratch_dir(&selected.id)?;

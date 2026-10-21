@@ -574,6 +574,7 @@ pub(crate) fn kill_session_if_present(name: &str) -> Result<()> {
 /// Kill indexed terminals and tool sessions, including names left behind by retitles.
 pub(crate) fn kill_ancillary_sessions_for_id(id: &str) -> Result<()> {
     use crate::tmux::{CONTAINER_TERMINAL_PREFIX, TERMINAL_PREFIX, TOOL_PREFIX};
+    crate::tmux::ToolSession::settle_pending_retirements_for(id)?;
     let output = crate::tmux::tmux_query_command()
         .args(["list-sessions", "-F", "#{session_name}"])
         .output()?;
@@ -1265,6 +1266,8 @@ esac
                 "a connection error must not claim the session was removed"
             );
             let _home = crate::session::test_support::isolate_app_dir();
+            crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir().unwrap())
+                .unwrap();
             let instance = crate::session::Instance::new("proof", "/tmp");
             let results = [
                 ("agent", instance.kill_locked()),
@@ -1389,6 +1392,8 @@ esac
             use crate::tmux::test_helpers::TmuxTestSession;
             use crate::tmux::{ContainerTerminalSession, Session, TerminalSession, ToolSession};
             let _home = crate::session::test_support::isolate_app_dir();
+            crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir().unwrap())
+                .unwrap();
             let id = "abc12345-owned";
             let owned = [
                 TerminalSession::generate_name(id, "old title"),

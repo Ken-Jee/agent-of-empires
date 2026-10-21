@@ -1133,6 +1133,7 @@ mod tests {
         let _env_read = crate::session::test_support::EnvGuard::read_lock();
         let temp = tempfile::tempdir().unwrap();
         let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
+        crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
         let inst = Instance::new("Ancillary teardown", temp.path().to_str().unwrap());
         let terminal = crate::tmux::TerminalSession::generate_name(&inst.id, "web terminal");
         let reaped = temp.path().join("ancillary-reaped");

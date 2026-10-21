@@ -1276,6 +1276,7 @@ fn tool_admission_rejects_reserved_rows_and_uses_fresh_configuration() {
         );
     })
     .unwrap();
+    crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
     let name = crate::tmux::ToolSession::generate_name(&id, &instance.title, "probe");
     let _tool = crate::tmux::test_helpers::TmuxTestSession::from_name(name.clone());
     // The daemon prepares panes through `start_tool_with_size_in`, so the

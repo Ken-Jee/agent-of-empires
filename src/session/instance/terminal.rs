@@ -193,13 +193,16 @@ impl Instance {
             .get(tool_name)
             .filter(|tool| !tool.command.is_empty() && !tool.background)
             .ok_or_else(|| ToolLaunchUnavailable(tool_name.to_owned()))?;
-        let panes = crate::tmux::batch_pane_metadata()?;
-        let session = if let Some(adoption) = adoption {
+        if let Some(adoption) = adoption {
             anyhow::ensure!(
                 adoption.profile == self.source_profile
                     && adoption.lifecycle_generation == self.lifecycle_generation,
                 LifecycleReservationError::Superseded
             );
+        }
+        let retired = tmux::ToolSession::settle_pending_retirement(&self.id, tool_name, adoption)?;
+        let panes = crate::tmux::batch_pane_metadata()?;
+        let session = if let Some(adoption) = adoption.filter(|_| !retired) {
             let scope = legacy_scope.ok_or(crate::tmux::LegacyToolUnavailable(
                 "complete catalogue unavailable",
             ))?;

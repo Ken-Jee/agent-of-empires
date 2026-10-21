@@ -137,6 +137,22 @@ impl ResolvedDataFile {
         Ok(Some(content))
     }
 
+    /// Refuse a missing or read-only evidence slot before a destructive operation.
+    pub(crate) fn require_writable_existing(&self) -> Result<()> {
+        let fd = openat(
+            &self.parent.fd,
+            self.leaf.as_os_str(),
+            OFlag::O_WRONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW | OFlag::O_NONBLOCK,
+            Mode::empty(),
+        )
+        .context("opening existing writable data file")?;
+        let stat = fstat(&fd)?;
+        if stat.st_mode & nix::libc::S_IFMT != nix::libc::S_IFREG || stat.st_mode & 0o222 == 0 {
+            bail!("resolved data file is not a writable regular file");
+        }
+        Ok(())
+    }
+
     pub(crate) fn replace(&self, content: &[u8]) -> Result<()> {
         super::storage::replace_anchored_file(
             &self.parent.fd,

@@ -12,6 +12,7 @@ pub(crate) mod status_rules;
 mod terminal_session;
 #[cfg(test)]
 pub(crate) mod test_helpers;
+pub(crate) mod tool_retirement;
 mod tool_session;
 pub(crate) mod utils;
 #[cfg(unix)]

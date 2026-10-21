@@ -10,11 +10,10 @@ Press a hotkey to preview the tool in the home view. `Enter` follows your
 default attach mode, including [live mode](live-mode.md); `Tab` opens a
 full tmux client. Leaving the preview does not stop the tool.
 
-A targeted stop captures the original pane's process tree and proves those
-processes exited before reporting success. Before signaling, it retains that
-pane and its captured process incarnations in tmux. An unproven stop retries
-only those incarnations, including after daemon restart or the pane leader's
-exit. Changed ownership refuses the stop without signaling a replacement.
+A targeted stop durably records the original process births before removing
+the verified live tmux target. Retries settle only that original cohort.
+See [Lifecycle and cleanup](#lifecycle-and-cleanup) for ownership fences,
+interrupted-stop recovery, and fail-closed cases.
 
 ## Configuring tools
 
@@ -141,8 +140,9 @@ view or profile, opening an overlay, or pressing Escape cancels the pending
 handoff. A cancelled attachment does not become active when preparation ends.
 
 The daemon reports each tool as alive, dead, absent, or unknown. Unknown
-means ownership or liveness could not be established; targeted launch,
-recovery, and stop requests are refused rather than guessing an owner.
+means ownership or liveness could not be established; requests never guess an
+owner. An explicit stop may still finish an already-authorized original
+retirement, even when the current pane is absent or ownership is unknown.
 
 While the TUI shows **Runtime applying**, a change to that session is still
 pending. Wait for **Runtime ready** before another change to the same session.
@@ -164,6 +164,45 @@ the confirmation is open makes the request fail visibly without affecting a
 replacement or agent pane. Invalid owners and ambiguous names across profiles
 or configured raw tool names are refused, not overwritten. Session retitles
 alone do not transfer ownership to another tool.
+
+Targeted tool Stop retains the title and lifecycle flocks and atomically advances
+the row's durable generation, invalidating older continuations without installing
+a whole-session Stop reservation. Fresh peer lifecycle reservations still refuse
+the request; they are never cleared to admit recovery. Other stop operations keep
+their existing lifecycle reservations.
+
+Verified stops first capture the original process births, then atomically
+recheck the live pane's full owner, name, immutable tmux IDs, and PID. Before
+removing that exact tmux session, the daemon durably records its original
+process cohort in `tool-retirements.json` in the application data directory.
+The record also binds the original tmux socket and server process birth.
+The daemon removes the live tmux target before settling its captured cohort;
+this does not depend on tmux retaining a dead pane's PID.
+
+An interrupted stop retains the original record until physical retirement is
+proven and that exact record is acknowledged. While that original record remains,
+retrying never captures a replacement's descendants or uses the record alone to
+delete a current pane. If the original target is still present but no longer
+matches, the request refuses without signals. If the original target or server is
+provably gone, only the recorded original process births are settled. Once its
+internal acknowledgement has cleared the record, a subsequent named Stop is a
+new intent; a lost HTTP response does not provide exactly-once retry semantics.
+After a positively proven reboot, obsolete original debt can be acknowledged
+without inspecting recycled PIDs or adopting a current replacement pane.
+
+Tool launch and parent-session cleanup must settle outstanding original debt
+before treating a missing pane as complete. Pending tools remain discoverable
+in the selected row's tool picker after restart, including tools removed from
+configuration. Those entries are recovery-only: selecting one does not launch
+or attach; use Stop to finish its recorded cleanup without adopting any current
+replacement. A missing, unreadable, unsupported, or malformed journal is an
+error, not an empty inventory.
+
+A dead tmux 3.8 pane without a prior authorized retirement may no longer expose
+its original PID. That case remains fail-closed. Older tmux-only pending stop
+receipts are retained and refused, never discarded or replaced by a newly
+captured cohort.
+
 
 Tool sessions are automatically killed when their parent agent session
 is removed (`aoe remove <id>`, "Remove session" in the TUI, or delete

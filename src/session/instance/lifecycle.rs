@@ -8,9 +8,11 @@ use super::*;
 /// A transition acquires the per-instance lifecycle flock, then records a
 /// fresh generation under `Storage::update`. Terminal launch is the ordered
 /// exception: it first takes the app-global per-session title flock so title
-/// writers and launch cannot derive different tmux names. The durable
+/// writers and launch cannot derive different tmux names. A whole-session
 /// reservation stays held through hooks, external side effects, and the
 /// exact-generation commit; callers may release outer flocks for reentrant hooks.
+/// Targeted tool Stop retains both flocks and advances the durable generation
+/// without a whole-session reservation; its original cohort journal owns recovery.
 /// `status` is presentation state and never proves ownership.
 ///
 /// A crashed owner loses both the flock and, after the TTL, its reservation.
@@ -69,6 +71,21 @@ impl Instance {
     /// harmless because every commit is generation-checked.
     pub const LIFECYCLE_RESERVATION_TTL: chrono::Duration = chrono::Duration::minutes(10);
 
+    fn next_available_lifecycle_generation(
+        &self,
+        ttl: chrono::Duration,
+        now: DateTime<Utc>,
+    ) -> Result<u64, LifecycleReservationError> {
+        if let Some(reservation) = self.lifecycle_reservation.as_ref().filter(|reservation| {
+            reservation.generation == self.lifecycle_generation && (now - reservation.at) < ttl
+        }) {
+            return Err(LifecycleReservationError::Busy(reservation.op));
+        }
+        self.lifecycle_generation
+            .checked_add(1)
+            .ok_or(LifecycleReservationError::GenerationOverflow)
+    }
+
     /// Acquire exclusive durable ownership of the next lifecycle generation.
     ///
     /// Even a reservation for the same operation belongs to a peer: operation
@@ -81,16 +98,7 @@ impl Instance {
         ttl: chrono::Duration,
         now: DateTime<Utc>,
     ) -> Result<u64, LifecycleReservationError> {
-        if let Some(reservation) = self.lifecycle_reservation.as_ref().filter(|reservation| {
-            reservation.generation == self.lifecycle_generation && (now - reservation.at) < ttl
-        }) {
-            return Err(LifecycleReservationError::Busy(reservation.op));
-        }
-
-        let generation = self
-            .lifecycle_generation
-            .checked_add(1)
-            .ok_or(LifecycleReservationError::GenerationOverflow)?;
+        let generation = self.next_available_lifecycle_generation(ttl, now)?;
         self.lifecycle_generation = generation;
         self.failed_purge = None;
         self.lifecycle_reservation = Some(LifecycleReservation {
@@ -281,6 +289,44 @@ impl Instance {
             .iter()
             .find(|instance| instance.id == self.id)
             .is_some_and(|stored| stored.lifecycle_generation == generation))
+    }
+
+    /// Invalidate old auxiliary continuations without claiming whole-session ownership.
+    /// The caller retains title and lifecycle flocks through the resource effect.
+    pub(crate) fn advance_auxiliary_generation_in(
+        &mut self,
+        storage: &dyn crate::session::SessionStore,
+    ) -> Result<u64> {
+        storage.check_available()?;
+        let now = Utc::now();
+        let generation = storage.update(|instances, _groups| {
+            let stored = instances
+                .iter_mut()
+                .find(|instance| instance.id == self.id)
+                .ok_or(LifecycleReservationError::Superseded)?;
+            anyhow::ensure!(
+                stored.lifecycle_generation == self.lifecycle_generation
+                    && stored.title == self.title
+                    && stored.source_profile == self.source_profile
+                    && self.source_profile == storage.storage().profile(),
+                LifecycleReservationError::Superseded
+            );
+            stored.ensure_startable()?;
+            anyhow::ensure!(
+                !matches!(stored.status, Status::Creating | Status::Deleting),
+                LifecycleReservationError::Superseded
+            );
+            let generation =
+                stored.next_available_lifecycle_generation(Self::LIFECYCLE_RESERVATION_TTL, now)?;
+            stored.lifecycle_generation = generation;
+            // Availability above rejects every fresh current-generation owner.
+            // Only an expired or already-inert marker can be discarded here.
+            stored.lifecycle_reservation = None;
+            Ok(generation)
+        })?;
+        self.lifecycle_generation = generation;
+        self.lifecycle_reservation = None;
+        Ok(generation)
     }
 
     pub(crate) fn acquire_lifecycle_reservation(
@@ -601,6 +647,168 @@ impl Instance {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    #[serial_test::serial]
+    fn auxiliary_generation_preserves_state_and_rejects_stale_identity() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let storage = crate::session::Storage::new_unwatched("auxiliary-generation").unwrap();
+        for marker in [None, Some(false), Some(true)] {
+            let mut row = Instance::new("auxiliary", "/tmp/test");
+            row.source_profile = storage.profile().into();
+            row.lifecycle_generation = 7;
+            row.status = Status::Idle;
+            row.idle_entered_at = Some(Utc::now() - chrono::Duration::minutes(5));
+            row.lifecycle_reservation = marker.map(|inert| LifecycleReservation {
+                op: LifecycleOperation::Stop,
+                generation: if inert { 6 } else { 7 },
+                at: if inert {
+                    Utc::now()
+                } else {
+                    Utc::now() - Instance::LIFECYCLE_RESERVATION_TTL - chrono::Duration::seconds(1)
+                },
+            });
+            storage
+                .update(|rows, _| {
+                    *rows = vec![row.clone()];
+                    Ok(())
+                })
+                .unwrap();
+            let mut expected = serde_json::to_value(&row).unwrap();
+            expected["lifecycle_generation"] = 8.into();
+            expected
+                .as_object_mut()
+                .unwrap()
+                .remove("lifecycle_reservation");
+            let mut stale = row.clone();
+            assert_eq!(row.advance_auxiliary_generation_in(&storage).unwrap(), 8);
+            assert!(row.lifecycle_reservation.is_none());
+            assert_eq!(serde_json::to_value(&row).unwrap(), expected);
+            let committed = storage.load().unwrap().remove(0);
+            assert_eq!(serde_json::to_value(&committed).unwrap(), expected);
+            let bytes = std::fs::read(storage.sessions_path()).unwrap();
+            assert_eq!(
+                stale
+                    .advance_auxiliary_generation_in(&storage)
+                    .unwrap_err()
+                    .downcast_ref::<LifecycleReservationError>(),
+                Some(&LifecycleReservationError::Superseded)
+            );
+            for mismatch in ["title", "profile", "missing"] {
+                stale = committed.clone();
+                match mismatch {
+                    "title" => stale.title.push_str("-peer"),
+                    "profile" => stale.source_profile = "other".into(),
+                    _ => stale.id.push_str("-missing"),
+                }
+                assert_eq!(
+                    stale
+                        .advance_auxiliary_generation_in(&storage)
+                        .unwrap_err()
+                        .downcast_ref::<LifecycleReservationError>(),
+                    Some(&LifecycleReservationError::Superseded)
+                );
+                assert_eq!(std::fs::read(storage.sessions_path()).unwrap(), bytes);
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn auxiliary_generation_refuses_fresh_owners_overflow_and_valid_failed_purge() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let storage = crate::session::Storage::new_unwatched("auxiliary-refusals").unwrap();
+        for operation in [
+            LifecycleOperation::Launch,
+            LifecycleOperation::Capture,
+            LifecycleOperation::Stop,
+            LifecycleOperation::Purge,
+            LifecycleOperation::Restore,
+            LifecycleOperation::Trash,
+        ] {
+            let mut row = Instance::new("peer owner", "/tmp/test");
+            row.source_profile = storage.profile().into();
+            row.lifecycle_generation = 7;
+            row.lifecycle_reservation = Some(LifecycleReservation {
+                op: operation,
+                generation: 7,
+                at: Utc::now(),
+            });
+            storage
+                .update(|rows, _| {
+                    *rows = vec![row.clone()];
+                    Ok(())
+                })
+                .unwrap();
+            let bytes = std::fs::read(storage.sessions_path()).unwrap();
+            assert_eq!(
+                row.advance_auxiliary_generation_in(&storage)
+                    .unwrap_err()
+                    .downcast_ref::<LifecycleReservationError>(),
+                Some(&LifecycleReservationError::Busy(operation))
+            );
+            assert_eq!(row.lifecycle_generation, 7);
+            assert_eq!(std::fs::read(storage.sessions_path()).unwrap(), bytes);
+        }
+        let mut row = Instance::new("overflow", "/tmp/test");
+        row.source_profile = storage.profile().into();
+        row.lifecycle_generation = u64::MAX;
+        storage
+            .update(|rows, _| {
+                *rows = vec![row.clone()];
+                Ok(())
+            })
+            .unwrap();
+        let bytes = std::fs::read(storage.sessions_path()).unwrap();
+        assert_eq!(
+            row.advance_auxiliary_generation_in(&storage)
+                .unwrap_err()
+                .downcast_ref::<LifecycleReservationError>(),
+            Some(&LifecycleReservationError::GenerationOverflow)
+        );
+        assert_eq!(row.lifecycle_generation, u64::MAX);
+        assert_eq!(std::fs::read(storage.sessions_path()).unwrap(), bytes);
+        row.lifecycle_generation = 4;
+        row.trash();
+        row.record_failed_purge(true);
+        storage
+            .update(|rows, _| {
+                *rows = vec![row.clone()];
+                Ok(())
+            })
+            .unwrap();
+        let bytes = std::fs::read(storage.sessions_path()).unwrap();
+        assert_eq!(row.failed_purge_forced(), Some(true));
+        assert!(row.advance_auxiliary_generation_in(&storage).is_err());
+        assert_eq!(row.lifecycle_generation, 4);
+        assert_eq!(row.failed_purge_forced(), Some(true));
+        assert_eq!(storage.load().unwrap()[0].failed_purge_forced(), Some(true));
+        assert_eq!(std::fs::read(storage.sessions_path()).unwrap(), bytes);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn auxiliary_generation_failed_write_leaves_local_and_durable_generation_unchanged() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let storage = crate::session::Storage::new_unwatched("auxiliary-write-failure").unwrap();
+        let mut row = Instance::new("write failure", "/tmp/test");
+        row.source_profile = storage.profile().into();
+        storage
+            .update(|rows, _| {
+                rows.push(row.clone());
+                Ok(())
+            })
+            .unwrap();
+        let before = serde_json::to_value(&row).unwrap();
+        let bytes = std::fs::read(storage.sessions_path()).unwrap();
+        let _failure = storage.fail_writes_for_test();
+        assert!(row
+            .advance_auxiliary_generation_in(&storage)
+            .unwrap_err()
+            .to_string()
+            .contains("injected sessions write failure"));
+        assert_eq!(serde_json::to_value(&row).unwrap(), before);
+        assert_eq!(std::fs::read(storage.sessions_path()).unwrap(), bytes);
+    }
 
     #[test]
     #[serial_test::serial]

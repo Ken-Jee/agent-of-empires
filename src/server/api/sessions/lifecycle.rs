@@ -1210,7 +1210,7 @@ async fn stop_with_commit(
             .get(&row.source_profile)
             .map(Vec::as_slice)
             .unwrap_or_default();
-        crate::server::pane::sample_panes(row, tools, panes.as_ref(), legacy_scope.as_ref());
+        crate::server::pane::sample_panes(row, tools, panes.as_ref(), legacy_scope.as_ref(), None);
         // Direct stop bypasses the status-intent path that clears revival debt.
         row.plugin_revival_pending = false;
         state
@@ -2175,6 +2175,7 @@ async fn prepare_agent_session_inner(
                             tools,
                             panes.as_ref(),
                             legacy_scope.as_ref(),
+                            None,
                         );
                         state
                             .mutation_epoch

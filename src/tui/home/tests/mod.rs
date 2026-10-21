@@ -24,6 +24,7 @@ use tower::ServiceExt;
 
 pub(super) async fn native_state(profiles: &[&str]) -> Arc<AppState> {
     crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
+    crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
     let mut rows = Vec::new();
     for profile in profiles {
         let mut loaded = Storage::new_unwatched(profile).unwrap().load().unwrap();

@@ -186,7 +186,7 @@ impl NativeSessionStore {
                 .get(&row.source_profile)
                 .map(Vec::as_slice)
                 .unwrap_or_default();
-            super::pane::sample_panes(row, tools, panes.as_ref(), legacy_scope.as_ref());
+            super::pane::sample_panes(row, tools, panes.as_ref(), legacy_scope.as_ref(), None);
         })
     }
 
