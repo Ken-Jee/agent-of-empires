@@ -74,6 +74,33 @@ pub(super) fn extract_pi_uuid_from_filename(path: &Path) -> Option<String> {
     Some(uuid_part.to_string())
 }
 
+/// The transcript `<timestamp>_<sid>.jsonl` under a Pi sessions root: directly in it, or, for the
+/// default layout, in one per-cwd directory below it. Symlinks are never followed.
+pub(crate) fn find_pi_transcript(
+    root: &Path,
+    sid: &str,
+    nested: bool,
+) -> Option<std::path::PathBuf> {
+    let suffix = format!("_{sid}.jsonl");
+    let in_dir = |dir: &Path| {
+        std::fs::read_dir(dir).ok()?.flatten().find_map(|entry| {
+            let is_file = entry.file_type().ok()?.is_file();
+            let named = entry.file_name().to_str()?.ends_with(&suffix);
+            let path = entry.path();
+            (is_file && named && extract_pi_header_fields(&path)?.0.as_deref() == Some(sid))
+                .then_some(path)
+        })
+    };
+    in_dir(root).or_else(|| {
+        nested
+            .then(|| std::fs::read_dir(root).ok())
+            .flatten()?
+            .flatten()
+            .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+            .find_map(|entry| in_dir(&entry.path()))
+    })
+}
+
 pub(crate) fn read_pi_session_observation(
     instance_id: &str,
     source: &crate::session::instance::SessionSidecarSource,
@@ -233,6 +260,48 @@ mod tests {
             .as_deref(),
             Some("019342ab-1234-7def-8901-abcdef012345")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn find_pi_transcript_matches_id_in_either_layout_and_never_follows_symlinks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sid = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa";
+        let other = "bbbbbbbb-1111-4111-8111-bbbbbbbbbbbb";
+        let leaf = |id: &str| format!("2026-01-01T00-00-00-000Z_{id}.jsonl");
+        let write = |dir: &Path, name: String, header_id: &str| {
+            std::fs::create_dir_all(dir).unwrap();
+            let path = dir.join(name);
+            std::fs::write(
+                &path,
+                format!(
+                    "{}\n",
+                    serde_json::json!({"type": "session", "id": header_id})
+                ),
+            )
+            .unwrap();
+            path
+        };
+
+        let nested = tmp.path().join("nested");
+        write(&nested.join("--proj-a--"), leaf(other), other);
+        let wanted = write(&nested.join("--proj-b--"), leaf(sid), sid);
+        assert_eq!(find_pi_transcript(&nested, sid, true), Some(wanted));
+        assert_eq!(find_pi_transcript(&nested, sid, false), None);
+
+        let flat = tmp.path().join("flat");
+        let wanted = write(&flat, leaf(sid), sid);
+        assert_eq!(find_pi_transcript(&flat, sid, false), Some(wanted));
+
+        let mismatched = tmp.path().join("mismatched");
+        write(&mismatched.join("--p--"), leaf(sid), other);
+        assert_eq!(find_pi_transcript(&mismatched, sid, true), None);
+
+        let linked = tmp.path().join("linked");
+        let real = write(&tmp.path().join("elsewhere"), leaf(sid), sid);
+        std::fs::create_dir_all(linked.join("--p--")).unwrap();
+        std::os::unix::fs::symlink(&real, linked.join("--p--").join(leaf(sid))).unwrap();
+        assert_eq!(find_pi_transcript(&linked, sid, true), None);
     }
 
     #[test]
