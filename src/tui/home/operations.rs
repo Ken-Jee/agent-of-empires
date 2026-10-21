@@ -1346,6 +1346,9 @@ impl HomeView {
         self.rebuild_group_trees();
         self.save()?;
         self.reload()?;
+        if let Some(warning) = outcome.warning {
+            self.info_dialog = Some(InfoDialog::new("Workdir Renamed with Warning", &warning));
+        }
         Ok(())
     }
 
@@ -1505,6 +1508,7 @@ impl HomeView {
             // a stopped session; a running one warns and renames nothing.
             let mut new_path: Option<String> = None;
             let mut new_branch: Option<String> = None;
+            let mut move_warning: Option<String> = None;
             // Fire when the title changed (dir follows it) OR the user opted to
             let current_instance = self
                 .get_instance(&id)
@@ -1599,6 +1603,7 @@ impl HomeView {
                             let dir_moved = outcome.new_path != std::path::Path::new(&project_path);
                             new_path = Some(outcome.new_path.to_string_lossy().to_string());
                             new_branch = outcome.new_branch;
+                            move_warning = outcome.warning;
                             if dir_moved {
                                 crate::session::worktree_edit::discard_sandbox_container_after_move(
                                     &id,
@@ -1632,6 +1637,8 @@ impl HomeView {
                 let effect_instance = current_instance.clone();
                 let effect_id = id.clone();
                 let effect_title = effective_title.clone();
+                let move_warning = std::rc::Rc::new(std::cell::RefCell::new(None::<String>));
+                let effect_warning = std::rc::Rc::clone(&move_warning);
                 self.move_to_profile_with_effect(
                     &id,
                     target_profile,
@@ -1692,6 +1699,7 @@ impl HomeView {
                                                 candidate.is_sandboxed(),
                                             );
                                         }
+                                        *effect_warning.borrow_mut() = outcome.warning;
                                     }
                                     Err(crate::session::worktree_edit::WorktreeEditError::Unchanged) => {}
                                     Err(error) => return Err(error.into()),
@@ -1705,7 +1713,7 @@ impl HomeView {
                 drop(_identity_lock);
                 let tmux_warning = rekey_tmux_after_persist(&id, &current_title, &effective_title);
                 drop(_mutation_guards);
-                if let Some(warning) = tmux_warning {
+                if let Some(warning) = join_warnings([move_warning.take(), tmux_warning]) {
                     self.info_dialog = Some(InfoDialog::new("Rename Saved with Warning", &warning));
                 }
                 return Ok(());
@@ -1740,7 +1748,7 @@ impl HomeView {
             }
             self.save()?;
             self.reload()?;
-            if let Some(warning) = tmux_warning {
+            if let Some(warning) = join_warnings([move_warning, tmux_warning]) {
                 self.info_dialog = Some(InfoDialog::new("Rename Saved with Warning", &warning));
             }
         }
@@ -2329,6 +2337,16 @@ impl HomeView {
         self.update_selected();
         Ok(())
     }
+}
+
+/// Joins the non-empty warnings of one operation into a single dialog body.
+fn join_warnings(warnings: impl IntoIterator<Item = Option<String>>) -> Option<String> {
+    let joined = warnings
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    (!joined.is_empty()).then_some(joined)
 }
 
 /// Outcome of a TUI restore-from-trash driven directly against storage. See #2541.

@@ -325,6 +325,7 @@ pub async fn rename_session(
     // What to write to disk + memory once any git side effect has landed.
     let mut new_path: Option<String> = None;
     let mut new_branch: Option<String> = None;
+    let mut move_warning: Option<String> = None;
 
     if tied {
         // A directory move or branch rename is gated on a quiescent worktree,
@@ -379,12 +380,18 @@ pub async fn rename_session(
                     rename_branch,
                 },
             )
-            .map(|o| (o.new_path.to_string_lossy().to_string(), o.new_branch))
+            .map(|o| {
+                (
+                    o.new_path.to_string_lossy().to_string(),
+                    o.new_branch,
+                    o.warning,
+                )
+            })
         })
         .await;
 
         match edit {
-            Ok(Ok((path, branch))) => {
+            Ok(Ok((path, branch, warning))) => {
                 // A sandbox container created against the old path is stale
                 // once the dir moved, so drop it to force a fresh create.
                 // Awaited so an immediate restart cannot race the removal.
@@ -400,6 +407,7 @@ pub async fn rename_session(
                 }
                 new_path = Some(path);
                 new_branch = branch;
+                move_warning = warning;
             }
             // The title slug already maps to the current leaf and no branch
             // rename was asked for: fall through to a plain title rename.
@@ -530,6 +538,7 @@ pub async fn rename_session(
     } else {
         None
     };
+    response.warnings.extend(move_warning);
     if let Some(warning) = tmux_warning {
         response.warnings.push(warning);
     }
@@ -781,11 +790,17 @@ pub async fn set_worktree_name(
                 rename_branch,
             },
         )
-        .map(|o| (o.new_path.to_string_lossy().to_string(), o.new_branch))
+        .map(|o| {
+            (
+                o.new_path.to_string_lossy().to_string(),
+                o.new_branch,
+                o.warning,
+            )
+        })
     })
     .await;
 
-    let (new_path, new_branch) = match edit {
+    let (new_path, new_branch, move_warning) = match edit {
         Ok(Ok(v)) => v,
         Ok(Err(e)) => {
             tracing::warn!(target: "http.api.sessions", session = %id, "worktree edit failed: {e}");
@@ -861,7 +876,7 @@ pub async fn set_worktree_name(
         }
     }
 
-    let response = {
+    let mut response = {
         let mut instances = state.instances.write().await;
         let Some(inst) = instances.iter_mut().find(|i| i.id == id) else {
             return session_not_found();
@@ -869,6 +884,7 @@ pub async fn set_worktree_name(
         apply_worktree_name_edit(inst, &new_path, new_branch.as_deref());
         SessionResponse::from_instance(&*inst, crate::claude_settings::read_tui_fullscreen())
     };
+    response.warnings.extend(move_warning);
     drop(_identity_lock);
 
     (StatusCode::OK, Json(serde_json::json!(response))).into_response()
