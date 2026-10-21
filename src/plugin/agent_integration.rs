@@ -26,6 +26,11 @@ fn unique_candidates<'a, 'b, 'c>(
     for name in custom_names {
         candidate_counts.remove(name);
     }
+    for (_, tool, _) in &candidates {
+        if crate::agents::resolve_tool_name(tool).is_some() {
+            candidate_counts.remove(tool);
+        }
+    }
     candidates
         .into_iter()
         .filter_map(|(plugin, tool, command)| {
@@ -60,12 +65,15 @@ pub fn catalog<'a, 'b, 'c>(
 }
 
 /// Resolve a unique plugin-provided agent launch command.
-pub fn agent_command(tool: &str) -> Option<String> {
+pub fn agent_command<'a>(
+    tool: &str,
+    custom_names: impl IntoIterator<Item = &'a str>,
+) -> Option<String> {
     let registry = super::registry();
     catalog(
         &registry,
         crate::agents::AGENTS.iter().map(|agent| agent.name),
-        std::iter::empty(),
+        custom_names,
     )
     .into_iter()
     .find(|agent| agent.tool == tool)
@@ -91,7 +99,7 @@ mod tests {
                 ("plugin-b", "duplicate", "b"),
                 ("plugin-c", "builtin-agent", "c"),
                 ("plugin-d", "custom-agent", "d"),
-                ("plugin-e", "unique-agent", "e"),
+                ("plugin-e", "unique-helper", "e"),
             ],
             ["builtin-agent"],
             ["custom-agent"],
@@ -100,9 +108,23 @@ mod tests {
             entries,
             [PluginAgent {
                 plugin: "plugin-e",
-                tool: "unique-agent",
+                tool: "unique-helper",
                 command: "e",
             }]
         );
+    }
+
+    #[test]
+    fn aliases_resolved_by_builtins_are_reserved_from_plugins() {
+        assert!(unique_candidates(
+            [(
+                "plugin",
+                "claude-yolo",
+                "claude --dangerously-skip-permissions"
+            )],
+            [],
+            []
+        )
+        .is_empty());
     }
 }
