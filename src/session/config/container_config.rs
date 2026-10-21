@@ -4579,6 +4579,7 @@ mod tests {
             extra_env: None,
             custom_instruction: None,
             before_start_env: Vec::new(),
+            before_start_hook_env: Vec::new(),
             container_workdir: None,
         };
         let shared = host.join(SANDBOX_PRIVATE_SUBDIR).join(".credentials.json");
@@ -4734,6 +4735,7 @@ mount_ssh = true
             extra_env: None,
             custom_instruction: None,
             before_start_env: Vec::new(),
+            before_start_hook_env: Vec::new(),
             container_workdir: None,
         };
 
@@ -4857,6 +4859,7 @@ extra_run_args = ["--privileged"]
             extra_env: None,
             custom_instruction: None,
             before_start_env: Vec::new(),
+            before_start_hook_env: Vec::new(),
             container_workdir: None,
         };
 
@@ -4915,6 +4918,7 @@ extra_run_args = ["--privileged"]
                 extra_env: None,
                 custom_instruction: None,
                 before_start_env: Vec::new(),
+                before_start_hook_env: Vec::new(),
                 container_workdir: None,
             };
 
@@ -4978,6 +4982,7 @@ volume_ignores = ["**/bin", "**/obj", "target"]
             extra_env: None,
             custom_instruction: None,
             before_start_env: Vec::new(),
+            before_start_hook_env: Vec::new(),
             container_workdir: None,
         };
 
@@ -5069,6 +5074,7 @@ volume_ignores_strategy = "named"
                 extra_env: None,
                 custom_instruction: None,
                 before_start_env: Vec::new(),
+                before_start_hook_env: Vec::new(),
                 container_workdir: None,
             };
             build_container_config(
@@ -5201,6 +5207,7 @@ volume_ignores = ["node_modules"]
             extra_env: None,
             custom_instruction: None,
             before_start_env: Vec::new(),
+            before_start_hook_env: Vec::new(),
             container_workdir: None,
         };
 
@@ -5252,6 +5259,7 @@ volume_ignores = ["node_modules"]
             extra_env: None,
             custom_instruction: None,
             before_start_env: Vec::new(),
+            before_start_hook_env: Vec::new(),
             container_workdir: None,
         };
         let instance_id = "codex-sandbox-hooks-test";
@@ -5542,6 +5550,7 @@ volume_ignores = ["node_modules"]
                 extra_env: None,
                 custom_instruction: None,
                 before_start_env: Vec::new(),
+                before_start_hook_env: Vec::new(),
                 container_workdir: None,
             };
             let instance_id = format!("claude-trust-test-{is_yolo}");
@@ -5622,6 +5631,7 @@ claude-personal = "~/.claude-personal"
             extra_env: None,
             custom_instruction: None,
             before_start_env: Vec::new(),
+            before_start_hook_env: Vec::new(),
             container_workdir: None,
         };
         let instance_id = "declared-config-dir-test";
@@ -5715,6 +5725,7 @@ codex-work = "{}"
             extra_env: None,
             custom_instruction: None,
             before_start_env: Vec::new(),
+            before_start_hook_env: Vec::new(),
             container_workdir: None,
         };
         let instance_id = "declared-codex-dir-test";
@@ -5901,6 +5912,7 @@ codex-work = "{}"
             extra_env: None,
             custom_instruction: None,
             before_start_env: Vec::new(),
+            before_start_hook_env: Vec::new(),
             container_workdir: None,
         };
 
@@ -6003,6 +6015,7 @@ codex-work = "{}"
             extra_env: None,
             custom_instruction: None,
             before_start_env: Vec::new(),
+            before_start_hook_env: Vec::new(),
             container_workdir: None,
         };
         for agent in crate::agents::AGENTS
@@ -6093,6 +6106,7 @@ codex-work = "{}"
                 extra_env: None,
                 custom_instruction: None,
                 before_start_env: Vec::new(),
+                before_start_hook_env: Vec::new(),
                 container_workdir: None,
             };
             let instance_id = format!("{}-sidecar-sandbox-test", agent.name);
@@ -6186,6 +6200,7 @@ codex-work = "{}"
                 extra_env: None,
                 custom_instruction: None,
                 before_start_env: Vec::new(),
+                before_start_hook_env: Vec::new(),
                 container_workdir: None,
             },
             ContainerAgentSelection::new("cursor", None),
@@ -6255,6 +6270,7 @@ codex-work = "{}"
                 extra_env: None,
                 custom_instruction: None,
                 before_start_env: Vec::new(),
+                before_start_hook_env: Vec::new(),
                 container_workdir: None,
             },
             ContainerAgentSelection::new("kiro", None).with_selected_agent(Some("custom-agent")),
@@ -6441,6 +6457,7 @@ codex-work = "{}"
             extra_env: None,
             custom_instruction: None,
             before_start_env: Vec::new(),
+            before_start_hook_env: Vec::new(),
             container_workdir: None,
         };
         let instance_id = "codex-sandbox-refresh-hooks-test";
@@ -6544,6 +6561,7 @@ trusted_hash = "keep"
             extra_env: None,
             custom_instruction: None,
             before_start_env: Vec::new(),
+            before_start_hook_env: Vec::new(),
             container_workdir: None,
         };
         let build = |instance_id: &str| {
@@ -6636,6 +6654,7 @@ trusted_hash = "keep"
             extra_env: None,
             custom_instruction: None,
             before_start_env: Vec::new(),
+            before_start_hook_env: Vec::new(),
             container_workdir: None,
         };
         let instances = [
@@ -6919,6 +6938,7 @@ volume_ignores = ["target", "node_modules"]
             extra_env: None,
             custom_instruction: None,
             before_start_env: Vec::new(),
+            before_start_hook_env: Vec::new(),
             container_workdir: None,
         };
 
@@ -7012,6 +7032,7 @@ volume_ignores = ["target"]
             extra_env: None,
             custom_instruction: None,
             before_start_env: Vec::new(),
+            before_start_hook_env: Vec::new(),
             container_workdir: None,
         };
 
@@ -7100,6 +7121,7 @@ volume_ignores = ["target"]
             extra_env: None,
             custom_instruction: None,
             before_start_env: Vec::new(),
+            before_start_hook_env: Vec::new(),
             container_workdir: None,
         }
     }
@@ -7483,6 +7505,7 @@ volume_ignores = ["target"]
             extra_env: None,
             custom_instruction: None,
             before_start_env: Vec::new(),
+            before_start_hook_env: Vec::new(),
             container_workdir: None,
         };
         build_container_config(

@@ -257,7 +257,8 @@ pub(crate) fn native_context_notice_command(message: &str) -> String {
 
 /// Resolve a session's sandbox environment entries to concrete `(KEY, VALUE)` pairs on the host,
 /// for feeding into a host-side hook's process environment (so a `before_start` hook can read a
-/// per-session `$TEST_VAR`).
+/// per-session `$TEST_VAR`). `before_start_hook_env` entries are listed first so they win a key
+/// clash, and are never read by [`collect_environment`], so they stay out of the container.
 pub(crate) fn session_host_env_pairs(
     profile: &str,
     project_path: &std::path::Path,
@@ -279,6 +280,7 @@ pub(crate) fn session_host_env_pairs(
             host_hook_entries(extra, &trusted, &repo_aware)
         }
     };
+    let entries = [sandbox_info.before_start_hook_env.as_slice(), &entries].concat();
     resolve_hook_env_pairs(&entries)
 }
 
@@ -745,6 +747,7 @@ mod tests {
             extra_env: extra_env.map(strings),
             custom_instruction: None,
             before_start_env: Vec::new(),
+            before_start_hook_env: Vec::new(),
             container_workdir: None,
             provider: None,
         }
@@ -1134,6 +1137,28 @@ mod tests {
         assert_eq!(
             session_host_env_pairs("any-profile", tmp.path(), &info),
             owned(&[("TEST_VAR", "foo"), ("OTHER", "bar")])
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn hook_only_env_reaches_hook_but_not_container() {
+        let _app_guard = isolate_app_dir();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut info = sandbox(Some(&["SHARED=sandbox", "OTHER=bar"]));
+        info.before_start_hook_env = strings(&["MINT_REPO=a/b", "SHARED=hook", "BAD KEY=x"]);
+
+        let pairs = session_host_env_pairs("any-profile", tmp.path(), &info);
+        assert_eq!(
+            pairs,
+            owned(&[("MINT_REPO", "a/b"), ("SHARED", "hook"), ("OTHER", "bar")])
+        );
+
+        let container = collect_environment(&config(&[]), &info);
+        assert!(lookup(&container, "MINT_REPO").is_empty());
+        assert_eq!(
+            lookup(&container, "SHARED"),
+            [("sandbox".to_string(), false)]
         );
     }
 

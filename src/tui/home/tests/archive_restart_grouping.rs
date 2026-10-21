@@ -395,6 +395,7 @@ fn restart_selected_session_tool_swap_discards_sandbox_container() {
             extra_env: None,
             custom_instruction: None,
             before_start_env: Vec::new(),
+            before_start_hook_env: Vec::new(),
             container_workdir: None,
         });
     };

@@ -290,6 +290,7 @@ fn create_test_env_with_group_sessions() -> TestEnv {
         extra_env: None,
         custom_instruction: None,
         before_start_env: Vec::new(),
+        before_start_hook_env: Vec::new(),
         container_workdir: None,
     });
     let instances = [
