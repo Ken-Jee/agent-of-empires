@@ -19,6 +19,7 @@ aoe serve                       # Localhost only (default)
 aoe serve --remote              # Remote over HTTPS (Tailscale Funnel, else Cloudflare)
 aoe serve --host 0.0.0.0        # LAN/VPN access over HTTP (use a VPN)
 aoe serve --daemon              # Run in the background (--stop to stop it)
+aoe daemon start                # Same; also stop, status, restart
 aoe serve --open                # Open the URL in a browser when ready
 aoe serve --remote --read-only  # Monitor without sending keystrokes
 ```
@@ -76,9 +77,43 @@ aoe serve --host 127.0.0.1 --port 42041 \
 
 The upstream must set `X-Forwarded-For` (or `cf-connecting-ip`); aoe reads the last value as the client IP, and only when the socket peer is loopback, so a misconfigured upstream cannot spoof it. `--behind-proxy` also withdraws the same-host bypass, so a browser on the daemon's own host signs in with the passphrase like any other client, and the local TUI and `aoe acp` commands log in with the daemon's own `serve.passphrase`. Add `--allowed-origin https://aoe.example.com:8443` when the proxy listens on a nonstandard port. Both flags are replayed across `aoe serve --restart`.
 
-### Running under systemd
+### Running under systemd or launchd
 
-`aoe serve` supports `Type=notify` when `NOTIFY_SOCKET` is set, using pathname or Linux abstract (`@name`) sockets. It sends `READY=1` after binding the listener and starting workers/tasks, and `STOPPING=1` when shutdown starts. Writes run outside async workers and each has a one-second timeout; a receiver that remains full can still cause `READY=1` to be lost. Wrappers such as `cargo run` require `NotifyAccess=all`, since systemd otherwise accepts messages only from the main process.
+`aoe daemon start|stop|status|restart` are the `aoe serve --daemon|--stop|--status|--restart` controls. To let the OS own the daemon instead, run foreground `aoe serve` from a service unit, with no `--daemon` and no exposure flags. Substitute the absolute path from `command -v aoe`.
+
+`~/.config/systemd/user/aoe.service`, enabled with `systemctl --user enable --now aoe.service`:
+
+```ini
+[Unit]
+Description=Agent of Empires daemon
+
+[Service]
+Type=notify
+ExecStart=/path/to/aoe serve
+Restart=on-failure
+
+[Install]
+WantedBy=default.target
+```
+
+`~/Library/LaunchAgents/com.agentofempires.daemon.plist`, loaded with `launchctl bootstrap gui/$(id -u) <plist>`:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.agentofempires.daemon</string>
+  <key>ProgramArguments</key><array><string>/path/to/aoe</string><string>serve</string></array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
+</dict>
+</plist>
+```
+
+Control a manager-owned daemon with `systemctl --user` or `launchctl`, not `aoe daemon`: with `Restart=on-failure` and `SuccessfulExit=false` a stop through aoe leaves the unit inactive, and `aoe daemon start` would run a second, unmanaged daemon. The daemon inherits the service manager's `PATH`, so set it to include `tmux` and your agents. Give a debug build its own unit name or label so it does not replace the release one.
+
+`aoe serve` sends `READY=1` after binding and `STOPPING=1` at shutdown when `NOTIFY_SOCKET` is set. Wrappers such as `cargo run` require `NotifyAccess=all`.
 
 ## Security
 
