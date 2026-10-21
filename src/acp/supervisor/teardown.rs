@@ -1946,15 +1946,72 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn shutdown_and_wait_preserves_replacement_control_socket() {
+        let (_home, _tmp) = isolate_home();
+        let session_id = "sw-replacement-socket";
+        let old_pid = std::process::id() + 1;
+        let socket_path = worker_registry::socket_path_for(session_id).unwrap();
+        let control_path = crate::process::worker::control_socket_sibling(&socket_path);
+        let record = worker_record(session_id, old_pid, socket_path.clone());
+        worker_registry::save(&record).unwrap();
+        let _old_listener = std::os::unix::net::UnixListener::bind(&control_path).unwrap();
+        let original_identity = RunnerIdentity::from_record(&record);
+        let replacement = worker_record(session_id, std::process::id(), socket_path);
+        let expected_replacement = serde_json::to_value(&replacement).unwrap();
+        let replacement_listener = Arc::new(std::sync::Mutex::new(None));
+        let retained_listener = Arc::clone(&replacement_listener);
+        let replacement_control = control_path.clone();
+        let control = Arc::new(FakeProcessControl::default());
+        control.alive(old_pid);
+        control.probe_forget(move |retired| {
+            assert_eq!(retired, original_identity);
+            assert!(worker_registry::load_strict(session_id).unwrap().is_none());
+            assert!(!replacement_control.exists());
+            let listener = std::os::unix::net::UnixListener::bind(&replacement_control).unwrap();
+            worker_registry::save(&replacement).unwrap();
+            *retained_listener.lock().unwrap() = Some(listener);
+        });
+        let sup = Supervisor::new(VecSink::new()).with_process_control(control.clone());
+        let (client, _events) =
+            AcpClient::fake_for_test(crate::acp::state::AcpSessionId(session_id.into()));
+        sup.test_install_handle(
+            session_id,
+            client,
+            WorkerKind::Stdio,
+            Some(original_identity),
+        )
+        .await;
+
+        sup.shutdown_and_wait(session_id, Duration::from_millis(300))
+            .await
+            .unwrap();
+        assert!(!control.is_alive(original_identity));
+        assert_eq!(
+            serde_json::to_value(worker_registry::load_strict(session_id).unwrap().unwrap())
+                .unwrap(),
+            expected_replacement
+        );
+        let _peer = std::os::unix::net::UnixStream::connect(&control_path)
+            .expect("old cleanup must preserve the replacement control listener");
+        drop(replacement_listener);
+        worker_registry::delete_if_owned(session_id, std::process::id()).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn shutdown_and_wait_retires_a_term_ignoring_runner_before_reaping() {
+        use std::os::unix::process::ExitStatusExt;
+
         let (_home, tmp) = isolate_home();
         let ready = tmp.path().join("old-runner-ready");
         let mut old = tokio::process::Command::new("/bin/sh")
             .args([
                 "-c",
-                r#"trap '' TERM; printf ready > "$1"; exec sleep 60"#,
+                r#"trap '' TERM; printf ready > "$1"; IFS= read -r ignored"#,
                 "sh",
             ])
             .arg(&ready)
+            .stdin(std::process::Stdio::piped())
             .process_group(0)
             .kill_on_drop(true)
             .spawn()
@@ -1968,19 +2025,15 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-
-        let session_id = "sw-replacement-socket";
+        let session_id = "sw-physical-retirement";
         let socket_path = worker_registry::socket_path_for(session_id).unwrap();
-        let control_path = crate::process::worker::control_socket_sibling(&socket_path);
-        let mut record = worker_record(session_id, old_pid, socket_path.clone());
+        let mut record = worker_record(session_id, old_pid, socket_path);
         record.runner_identity = Some(
             crate::process::process_birth_identity(old_pid)
                 .unwrap()
                 .expect("ready runner has a live process birth identity"),
         );
         worker_registry::save(&record).unwrap();
-        let original_identity = RunnerIdentity::from_record(&record);
-
         let sup = Supervisor::new(VecSink::new());
         let (client, _events) =
             AcpClient::fake_for_test(crate::acp::state::AcpSessionId(session_id.into()));
@@ -1988,45 +2041,19 @@ mod tests {
             session_id,
             client,
             WorkerKind::Stdio,
-            Some(original_identity),
+            Some(RunnerIdentity::from_record(&record)),
         )
         .await;
-        let replacement_control = control_path.clone();
-        let replacement = tokio::spawn(async move {
-            let deadline = tokio::time::Instant::now()
-                + TEARDOWN_TERM_GRACE
-                + TEARDOWN_KILL_GRACE
-                + Duration::from_secs(1);
-            while worker_registry::load(session_id).unwrap().is_some() {
-                assert!(
-                    tokio::time::Instant::now() < deadline,
-                    "old registry record was not removed"
-                );
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-            let listener = tokio::net::UnixListener::bind(&replacement_control).unwrap();
-            worker_registry::save(&worker_record(session_id, std::process::id(), socket_path))
-                .unwrap();
-            listener
-        });
 
         sup.shutdown_and_wait(session_id, Duration::from_millis(300))
             .await
             .unwrap();
-        let _ = old
+        let status = old
             .wait()
             .await
             .expect("reap original runner after shutdown");
-        let listener = tokio::time::timeout(Duration::from_secs(1), replacement)
-            .await
-            .expect("replacement must publish during shutdown wait")
-            .unwrap();
-        assert!(
-            control_path.exists(),
-            "old runner cleanup removed the replacement control socket"
-        );
-        drop(listener);
-        worker_registry::delete_if_owned(session_id, std::process::id()).unwrap();
+        assert_eq!(status.signal(), Some(libc::SIGKILL));
+        assert!(worker_registry::load_strict(session_id).unwrap().is_none());
     }
 
     #[tokio::test]

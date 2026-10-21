@@ -1152,6 +1152,7 @@ pub(crate) mod test_support {
     use std::sync::Mutex;
 
     type PhaseProbe = Box<dyn Fn(&str) -> WorkerPhase + Send + Sync>;
+    type ForgetProbe = Box<dyn FnOnce(RunnerIdentity) + Send + Sync>;
 
     #[derive(Default)]
     pub(crate) struct FakeProcessControl {
@@ -1165,6 +1166,7 @@ pub(crate) mod test_support {
         failed_scopes: Mutex<HashSet<String>>,
         scope_units: Mutex<Vec<String>>,
         phase_probe: Mutex<Option<PhaseProbe>>,
+        forget_probe: Mutex<Option<ForgetProbe>>,
     }
 
     impl FakeProcessControl {
@@ -1199,6 +1201,13 @@ pub(crate) mod test_support {
             probe: impl Fn(&str) -> WorkerPhase + Send + Sync + 'static,
         ) {
             *self.phase_probe.lock().unwrap() = Some(Box::new(probe));
+        }
+
+        pub(crate) fn probe_forget(
+            &self,
+            probe: impl FnOnce(RunnerIdentity) + Send + Sync + 'static,
+        ) {
+            *self.forget_probe.lock().unwrap() = Some(Box::new(probe));
         }
 
         pub(crate) fn releases(&self) -> Vec<(String, Option<WorkerPhase>)> {
@@ -1238,7 +1247,12 @@ pub(crate) mod test_support {
             }
         }
 
-        fn forget(&self, _identity: RunnerIdentity) {}
+        fn forget(&self, identity: RunnerIdentity) {
+            let probe = self.forget_probe.lock().unwrap().take();
+            if let Some(probe) = probe {
+                probe(identity);
+            }
+        }
 
         fn release_scope(
             &self,
