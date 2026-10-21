@@ -482,10 +482,7 @@ impl ToolSession {
         if FAIL_SERVER_BIRTH_PROBE.replace(false) {
             bail!("injected uninspectable recorded server PID");
         }
-        Ok(
-            crate::process::process_birth_identity(pending.server_pid)?.as_ref()
-                == Some(&pending.server_birth),
-        )
+        crate::process::process_birth_is_live(pending.server_pid, &pending.server_birth)
     }
 
     /// An exact socket, server birth, and strict session census prove absence.

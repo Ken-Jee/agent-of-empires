@@ -1045,6 +1045,31 @@ pub(crate) fn process_birth_identity(pid: u32) -> anyhow::Result<Option<ProcessB
     }
 }
 
+pub(crate) fn process_birth_is_live(
+    pid: u32,
+    expected: &ProcessBirthIdentity,
+) -> anyhow::Result<bool> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        let Some(current) = process_birth_identity(pid)? else {
+            return Ok(false);
+        };
+        if &current != expected {
+            return Ok(false);
+        }
+        let identity = PrimeProcessIdentity {
+            pid,
+            start_id: current.start_id,
+        };
+        Ok(platform::ProcessHandle::capture(&identity)?.is_some())
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (pid, expected);
+        anyhow::bail!("process birth liveness unsupported on this platform")
+    }
+}
+
 pub(crate) fn runner_birth_identity(pid: u32) -> anyhow::Result<Option<ProcessBirthIdentity>> {
     let birth = process_birth_identity(pid);
     #[cfg(target_os = "macos")]

@@ -18,6 +18,7 @@ use super::access::{host_from_url, resolve_access_policy};
 use super::acp_events::{acp_event_listener, seed_acp_statuses};
 use super::disk_watch::{disk_watcher_consumer, init_disk_watch_subscriptions};
 use super::ip_discovery::{discover_tagged_ips, IpKind};
+use super::reload::load_all_instances;
 use super::router::build_router;
 use super::serve_snapshot::{
     spawn_serve_snapshot_loop, FormFactorCounters, StructuredTelemetryCounters,
@@ -830,6 +831,7 @@ pub(crate) async fn start_server(
         remote_owner_cache: RwLock::new(std::collections::HashMap::new()),
         changed_files_cache: std::sync::RwLock::new(std::collections::HashMap::new()),
         status_tx,
+        lifecycle: crate::server::lifecycle_feed::LifecycleFeed::new(),
         acp_events_tx: acp_events_tx.clone(),
         acp_event_store: acp_event_store.clone(),
         acp_control_cache: acp_control_cache.clone(),
@@ -1034,10 +1036,29 @@ pub(crate) async fn start_server(
     push::spawn_consumer(state.clone()).await;
     callback::spawn_consumer(state.clone()).await;
 
+    // Report this process's own session commits exactly; the disk consumer covers the rest.
+    // Held for the server's lifetime, and only worth running when a plugin host consumes it.
+    let _lifecycle_observer = state
+        .plugin_host
+        .as_ref()
+        .map(|_| state.lifecycle.install_commit_observer());
+
     // Launch plugin workers for every active plugin that declares a runtime.
     // Non-blocking: each worker runs in its own supervised task. A daemon with
     // no community plugin workers (the common case) does nothing here.
     if let Some(host) = state.plugin_host.clone() {
+        // Record the sessions on disk before a worker can list them, so a change made after
+        // its list is reported against that baseline instead of being absorbed into it.
+        let (feed, file_watch) = (state.lifecycle.clone(), state.file_watch.clone());
+        let baseline = feed
+            .establish_baseline(move || load_all_instances(&file_watch))
+            .await;
+        if !baseline {
+            tracing::warn!(
+                target: "server.lifecycle",
+                "no lifecycle baseline could be read; workers start anyway and session.lifecycle.changed may miss changes made before the next disk reload"
+            );
+        }
         // Subscribe before any worker can register, or a transition published meanwhile has no
         // forwarder to carry it.
         plugin_status::spawn_forwarder(state.clone(), host.clone());

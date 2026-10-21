@@ -1714,6 +1714,13 @@ mod runtime_identity_tests {
         );
         let pid = child.0.id();
         let identity = process_start_identity(pid).unwrap();
+        let birth = crate::process::process_birth_identity(pid)
+            .unwrap()
+            .unwrap();
+        assert!(crate::process::process_birth_is_live(pid, &birth).unwrap());
+        let mut stale = birth.clone();
+        stale.start_id.push_str("-reused");
+        assert!(!crate::process::process_birth_is_live(pid, &stale).unwrap());
         assert_eq!(
             process_identity_state(pid, &identity),
             ProcessIdentityState::Live
@@ -1724,6 +1731,7 @@ mod runtime_identity_tests {
             process_identity_state(pid, &identity),
             ProcessIdentityState::Live
         );
+        assert!(crate::process::process_birth_is_live(pid, &birth).unwrap());
 
         drop(child.0.stdin.take());
         assert_eq!(unsafe { libc::kill(pid as libc::pid_t, libc::SIGCONT) }, 0);
@@ -1732,6 +1740,11 @@ mod runtime_identity_tests {
             process_identity_state(pid, &identity),
             ProcessIdentityState::Dead
         );
+        assert_eq!(
+            crate::process::process_birth_identity(pid).unwrap(),
+            Some(birth.clone())
+        );
+        assert!(!crate::process::process_birth_is_live(pid, &birth).unwrap());
         child.0.wait().unwrap();
     }
 }

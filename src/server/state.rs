@@ -227,9 +227,9 @@ pub struct AppState {
     /// each tmux scrape when `old != new`. Keep the Sender around even
     /// when no receivers exist so callers can emit without checking.
     pub status_tx: broadcast::Sender<StatusChange>,
-    /// Web Push state: VAPID keypair, subscription store, VAPID subject.
-    /// None when `web.notifications_enabled` is false at startup (the
-    /// feature is fully off and endpoints return 404).
+    /// Publishes committed and disk-observed session lifecycle changes.
+    pub lifecycle: Arc<super::lifecycle_feed::LifecycleFeed>,
+    /// Web Push state; absent when web notifications are disabled.
     pub push: Option<Arc<PushState>>,
     /// Cached value of `web.notifications_enabled` at startup. Changes
     /// to the config flag require a server restart to take effect; this

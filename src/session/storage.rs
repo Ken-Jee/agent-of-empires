@@ -2272,6 +2272,11 @@ impl Storage {
     {
         let (mut instances, mut groups) = self.load_bundle(policy)?;
         let groups_before = groups.clone();
+        let observed = super::lifecycle::observing().then(|| {
+            let profile = super::config::effective_profile(&self.profile);
+            let before = super::lifecycle::rows_of(&instances, &profile);
+            (profile, before)
+        });
         let result = f(&mut instances, &mut groups)?;
 
         // Serialization failure must leave both files untouched.
@@ -2312,6 +2317,10 @@ impl Storage {
         self.file_watch.notify_local_change(&self.sessions_path);
         if let ReadPolicy::Complete(files) = policy {
             files.verify_current(&self.sessions_path)?;
+        }
+        if let Some((profile, before)) = observed {
+            let after = super::lifecycle::rows_of(&instances, &profile);
+            super::lifecycle::notify_commit(&profile, &before, &after);
         }
         Ok((result, instances, groups))
     }

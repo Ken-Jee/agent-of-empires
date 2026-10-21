@@ -269,10 +269,12 @@ pub(super) async fn disk_watcher_consumer(state: Arc<AppState>) {
         let started = std::time::Instant::now();
         let namespace = state.profile_namespace.read().await;
         let reload_lane = state.reload_lane.lock().await;
+        let lifecycle_turn = state.lifecycle.lock_reads().await;
         let snapshot_guard = state.session_service.disk_reload_guard().await;
         let read_epoch = state
             .mutation_epoch
             .load(std::sync::atomic::Ordering::SeqCst);
+        let lifecycle_since = state.lifecycle.commit_generation();
         let file_watch_for_load = state.file_watch.clone();
         let loaded = match tokio::task::spawn_blocking(move || {
             let fresh = super::reload::load_profiles_for_reload(&file_watch_for_load);
@@ -298,6 +300,18 @@ pub(super) async fn disk_watcher_consumer(state: Arc<AppState>) {
             }
         };
         let ((fresh, metadata), live_worker_records) = loaded;
+        // Diff before the reload consumes the rows. A session missing once is only a suspect,
+        // and a snapshot a commit overtook is dropped, so look again shortly rather than
+        // waiting for the next file event.
+        let observe_again = state.lifecycle.observe_disk(lifecycle_since, &fresh);
+        drop(lifecycle_turn);
+        if observe_again {
+            let again = state.disk_changed.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                again.notify_one();
+            });
+        }
         let count = fresh.instances.len();
         reload_state_instances_from_disk(
             &state,
@@ -488,6 +502,61 @@ mod tests {
             "live subscription count must match the empty handle map; mismatch \
              indicates a leaked subscriber from a resurrected entry."
         );
+    }
+
+    /// A write made by another process (no commit observer here) is only seen through the
+    /// file watch; the consumer must turn the reload into lifecycle changes.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn the_disk_consumer_publishes_lifecycle_changes_written_outside_the_daemon() {
+        use crate::session::lifecycle::LifecycleKind;
+        let temp = tempfile::tempdir().expect("tempdir");
+        let _app_dir = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let _ = crate::session::get_profile_dir("lifecycle-p1").expect("profile dir");
+        let live = FileWatchService::new().expect("live svc");
+        let state = test_support::build_test_app_state_configured(Vec::new(), |state| {
+            test_support::replace_file_watch(state, live);
+        });
+        let mut rx = state.lifecycle.subscribe();
+        state.lifecycle.observe_disk(
+            state.lifecycle.commit_generation(),
+            &crate::server::reload::LoadedInstances::from(Vec::new()),
+        );
+        init_disk_watch_subscriptions(state.clone()).await;
+        let consumer = tokio::spawn(disk_watcher_consumer(state.clone()));
+
+        let mut inst = Instance::new("outside", "/tmp/outside");
+        inst.source_profile = "lifecycle-p1".to_string();
+        let storage = crate::session::Storage::new_unwatched("lifecycle-p1").expect("storage");
+        let write = |archive: bool| {
+            let mut inst = inst.clone();
+            if archive {
+                inst.archive();
+            }
+            storage
+                .update(|rows, _| {
+                    *rows = vec![inst];
+                    Ok(())
+                })
+                .expect("write")
+        };
+        async fn next(
+            rx: &mut tokio::sync::broadcast::Receiver<crate::session::lifecycle::LifecycleChange>,
+        ) -> crate::session::lifecycle::LifecycleChange {
+            tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
+                .await
+                .expect("the consumer never published the change")
+                .expect("feed closed")
+        }
+
+        write(false);
+        let created = next(&mut rx).await;
+        assert_eq!(created.kind, LifecycleKind::Created);
+        assert_eq!(created.session_id, inst.id);
+        write(true);
+        assert_eq!(next(&mut rx).await.kind, LifecycleKind::Archived);
+
+        consumer.abort();
     }
 
     // Writes that land during init's per-profile iteration, before their profile has been

@@ -23,6 +23,7 @@ mod groups;
 pub mod idle_reap;
 pub mod import;
 mod instance;
+pub mod lifecycle;
 pub mod mcp;
 mod move_journal;
 pub(crate) mod path_identity;
