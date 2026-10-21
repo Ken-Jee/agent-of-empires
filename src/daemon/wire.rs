@@ -242,6 +242,10 @@ pub struct SessionResponse {
     pub acp_provider: Option<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub acp_can_fork: bool,
+    /// `acp.structured_view = off` for this session's profile and project: a
+    /// terminal session may not switch into the structured view.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub structured_view_off: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub keeps_context: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
