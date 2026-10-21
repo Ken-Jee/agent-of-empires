@@ -34,7 +34,7 @@ use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 use tracing::{debug, warn};
 
 use super::discovery::DaemonEndpoint;
-use super::http::HttpError;
+use super::http::{classify_error, HttpError, Scope};
 use super::passphrase_session::{self, PassphraseSessionCache};
 use crate::acp::protocol::AcpBroadcastFrame;
 use crate::acp::state::AcpState;
@@ -176,12 +176,24 @@ async fn connect_authed(
         Err(err) if is_unauthorized(&err) => match credential {
             Credential::Session { cached: true } => cache.invalidate(endpoint),
             Credential::Bearer if endpoint.resolved_passphrase().is_some() => {}
-            _ => return Err(err.into()),
+            _ => return Err(handshake_error(err)),
         },
-        result => return Ok(result?),
+        result => return result.map_err(handshake_error),
     }
     let (request, _) = build_authed_request(endpoint, url, cache, true).await?;
-    Ok(connect_pinned(request).await?)
+    connect_pinned(request).await.map_err(handshake_error)
+}
+
+/// A rejected upgrade the daemon named with a valid `AoE-Error-Code` keeps that refusal;
+/// anything else stays a transport error.
+fn handshake_error(error: tokio_tungstenite::tungstenite::Error) -> WsError {
+    if let tokio_tungstenite::tungstenite::Error::Http(response) = &error {
+        let refusal = classify_error(response.status(), response.headers(), Scope::Global);
+        if matches!(refusal, HttpError::Refused(_) | HttpError::ReadOnly) {
+            return WsError::Auth(refusal);
+        }
+    }
+    WsError::Transport(error)
 }
 
 /// A handshake rejection keeps its status and headers but not a body, which a server
@@ -759,5 +771,38 @@ mod tests {
             .unwrap();
         assert!(!is_unauthorized(&TError::Http(Box::new(forbidden))));
         assert!(!is_unauthorized(&TError::ConnectionClosed));
+    }
+
+    #[test]
+    fn rejected_handshakes_classify_only_a_valid_error_code() {
+        use crate::daemon::AoeErrorCode;
+        use tokio_tungstenite::tungstenite::http::Response;
+        use tokio_tungstenite::tungstenite::Error as TError;
+
+        // (status, header values, refusal expected)
+        let cases: [(u16, &[&str], Option<&str>); 7] = [
+            (403, &["access_policy_denied"], Some("access_policy_denied")),
+            (403, &["read_only"], Some("read_only")),
+            (426, &["tls_required"], Some("tls_required")),
+            (403, &[], None),
+            (403, &["not_a_code"], None),
+            (403, &["access_policy_denied", "read_only"], None),
+            (409, &["access_policy_denied"], None),
+        ];
+        for (status, values, expected) in cases {
+            let mut builder = Response::builder().status(status);
+            for value in values {
+                builder = builder.header(AoeErrorCode::HEADER, *value);
+            }
+            let error = TError::Http(Box::new(builder.body(None).unwrap()));
+            match (handshake_error(error), expected) {
+                (WsError::Auth(HttpError::Refused(code)), Some(token)) => {
+                    assert_eq!(code.as_str(), token)
+                }
+                (WsError::Auth(HttpError::ReadOnly), Some("read_only")) => {}
+                (WsError::Transport(_), None) => {}
+                (other, expected) => panic!("{status} {values:?}: {other:?} vs {expected:?}"),
+            }
+        }
     }
 }
