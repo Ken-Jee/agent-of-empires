@@ -485,6 +485,8 @@ mod tests {
     #[serial_test::serial]
     async fn login_and_elevate_errors_classify_from_the_safe_header_without_the_body() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        // Login writes a device binding under the app directory, so keep it in a tempdir.
+        let _app_dir = crate::session::test_support::isolate_app_dir();
         let _env = crate::session::test_support::EnvGuard::set(&[("AOE_DAEMON_PASSPHRASE", "pw")]);
         for (status, codes, expect) in [
             (
