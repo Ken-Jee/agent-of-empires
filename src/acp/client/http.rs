@@ -19,6 +19,8 @@ use crate::acp::transcript::TranscriptRow;
 use crate::plugin::ui_state::UiSnapshot;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(15);
+/// The daemon revives, waits for readiness and delivers before it answers a terminal send.
+const SEND_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Escapes bytes that could break out of one URL path segment while leaving a
 /// dotted plugin fqid intact.
@@ -335,8 +337,17 @@ impl HttpClient {
         no_revive: bool,
     ) -> Result<(), HttpError> {
         let body = serde_json::json!({ "message": message, "revive": !no_revive });
-        self.session_call(Method::POST, session_id, "/send", Some(body))
-            .await
+        let path = format!("/api/sessions/{session_id}/send");
+        self.send(
+            || {
+                self.request(Method::POST, &path)
+                    .json(&body)
+                    .timeout(SEND_TIMEOUT)
+            },
+            Scope::Session(session_id),
+        )
+        .await?;
+        Ok(())
     }
 
     /// The daemon-wide plugin UI snapshot (#2402).
