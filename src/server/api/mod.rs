@@ -7,6 +7,7 @@ mod acp;
 mod client_log;
 mod file_provenance;
 mod git;
+mod groups;
 mod log_level;
 mod logs;
 mod mcp;
@@ -33,6 +34,7 @@ pub use queue::{queue_clear, queue_edit, queue_enqueue, queue_list, queue_remove
 
 pub use client_log::post_client_log;
 pub use git::{clone_repo, is_git_repo, list_branches, list_worktrees};
+pub use groups::{create_group, delete_group};
 pub use log_level::{get_log_level, patch_log_level};
 pub use logs::get_logs;
 pub use mcp::{

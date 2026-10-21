@@ -161,7 +161,12 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/git/worktrees", get(api::list_worktrees))
         .route("/api/git/is-repo", get(api::is_git_repo))
         .route("/api/git/clone", post(api::clone_repo))
-        .route("/api/groups", get(api::list_groups))
+        .route(
+            "/api/groups",
+            get(api::list_groups)
+                .post(api::create_group)
+                .delete(api::delete_group),
+        )
         .route(
             "/api/projects",
             get(api::list_projects).post(api::create_project),
