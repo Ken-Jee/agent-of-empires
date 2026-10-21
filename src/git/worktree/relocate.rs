@@ -1045,18 +1045,54 @@ mod tests {
     }
 
     #[test]
-    fn convert_git_file_to_absolute_leaves_the_original_when_the_write_fails() {
+    #[cfg(unix)]
+    fn convert_git_file_to_absolute_never_writes_through_a_name_already_in_the_checkout() {
         let root = TempDir::new().unwrap();
-        let admin = root.path().join("admin");
-        std::fs::create_dir(&admin).unwrap();
+        std::fs::create_dir(root.path().join("admin")).unwrap();
+        let worktree = root.path().join("wt");
+        std::fs::create_dir(&worktree).unwrap();
+        std::fs::write(worktree.join(".git"), b"gitdir: ../admin\n").unwrap();
+        // The name an earlier version used for its temp file, redirecting elsewhere.
+        let bystander = root.path().join("bystander");
+        std::fs::write(&bystander, b"keep").unwrap();
+        std::os::unix::fs::symlink(&bystander, worktree.join(".git.aoe-pointer.tmp")).unwrap();
+
+        let returned = GitWorktree::convert_git_file_to_absolute(&worktree).unwrap();
+
+        assert!(returned.is_some());
+        assert_eq!(std::fs::read(&bystander).unwrap(), b"keep");
+        assert!(worktree
+            .join(".git.aoe-pointer.tmp")
+            .symlink_metadata()
+            .unwrap()
+            .is_symlink());
+        let written = std::fs::read(worktree.join(".git")).unwrap();
+        assert!(written.starts_with(b"gitdir: /"), "{written:?}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn convert_git_file_to_absolute_leaves_the_original_when_the_write_fails() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = TempDir::new().unwrap();
+        std::fs::create_dir(root.path().join("admin")).unwrap();
         let worktree = root.path().join("wt");
         std::fs::create_dir(&worktree).unwrap();
         let original = b"gitdir: ../admin\n".to_vec();
         std::fs::write(worktree.join(".git"), &original).unwrap();
-        // A directory at the temp path makes the write fail deterministically.
-        std::fs::create_dir(worktree.join(crate::git::worktree::GIT_POINTER_TMP)).unwrap();
+        // A read-only directory refuses the temp file. Root ignores the mode.
+        std::fs::set_permissions(&worktree, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let writable = std::fs::File::create(worktree.join("probe")).is_ok();
 
-        assert!(GitWorktree::convert_git_file_to_absolute(&worktree).is_err());
+        let result = GitWorktree::convert_git_file_to_absolute(&worktree);
+
+        std::fs::set_permissions(&worktree, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if writable {
+            eprintln!("skipping write-failure check: permissions are not enforced");
+            return;
+        }
+        assert!(result.is_err());
         assert_eq!(std::fs::read(worktree.join(".git")).unwrap(), original);
     }
 }
