@@ -2072,6 +2072,7 @@ impl HomeView {
             RestoreFromTrash::Restored {
                 project_path,
                 pre_trash_project_path,
+                warning,
             } => {
                 if let Some(inst) = self.instances.get_mut(&id) {
                     inst.project_path = project_path;
@@ -2081,6 +2082,12 @@ impl HomeView {
                 }
                 self.rebuild_flat_items();
                 self.select_session_by_id(&id);
+                if let Some(warning) = warning {
+                    self.info_dialog = Some(crate::tui::dialogs::InfoDialog::new(
+                        "Restored With Warning",
+                        &warning,
+                    ));
+                }
             }
             RestoreFromTrash::AlreadyGone => {
                 self.drop_peer_deleted_rows(std::slice::from_ref(&id));
@@ -2329,6 +2336,7 @@ enum RestoreFromTrash {
     Restored {
         project_path: String,
         pre_trash_project_path: Option<String>,
+        warning: Option<String>,
     },
     AlreadyGone,
     Busy(String),
@@ -2400,20 +2408,22 @@ fn restore_from_trash_with_storage(
         return RestoreFromTrash::AlreadyGone;
     };
 
-    if let crate::session::trash::RestoreOutcome::Failed { reason } =
-        crate::session::trash::restore_worktree_location(&mut instance)
-    {
-        let _ = storage.update(|instances, _groups| {
-            if let Some(stored) = instances.iter_mut().find(|candidate| candidate.id == id) {
-                stored.release_lifecycle_reservation_if_owned(
-                    LifecycleOperation::Restore,
-                    generation,
-                );
-            }
-            Ok(())
-        });
-        return RestoreFromTrash::WorktreeFailed { reason };
-    }
+    let warning = match crate::session::trash::restore_worktree_location(&mut instance) {
+        crate::session::trash::RestoreOutcome::Failed { reason } => {
+            let _ = storage.update(|instances, _groups| {
+                if let Some(stored) = instances.iter_mut().find(|candidate| candidate.id == id) {
+                    stored.release_lifecycle_reservation_if_owned(
+                        LifecycleOperation::Restore,
+                        generation,
+                    );
+                }
+                Ok(())
+            });
+            return RestoreFromTrash::WorktreeFailed { reason };
+        }
+        crate::session::trash::RestoreOutcome::Restored { warning, .. } => warning,
+        crate::session::trash::RestoreOutcome::NoChange => None,
+    };
     let restored_path = instance.project_path.clone();
     let restored_pre = instance.pre_trash_project_path.clone();
 
@@ -2429,6 +2439,7 @@ fn restore_from_trash_with_storage(
         Ok(crate::session::claim::RestoreCommit::Committed) => RestoreFromTrash::Restored {
             project_path: restored_path,
             pre_trash_project_path: restored_pre,
+            warning,
         },
         Ok(crate::session::claim::RestoreCommit::Superseded) => {
             RestoreFromTrash::Busy(crate::session::NEWER_GENERATION_BUSY_REASON.to_string())
