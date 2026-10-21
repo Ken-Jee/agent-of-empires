@@ -327,6 +327,8 @@ pub(super) const CITYHALL_MUTATION_DENY: &[(&str, &str)] = &[
     // Git / project / profile management.
     ("POST", "/api/git/clone"),
     ("POST", "/api/projects"),
+    ("POST", "/api/groups"),
+    ("DELETE", "/api/groups"),
     // Attaching a repo to a session takes an arbitrary host path, so it is denied for the
     // same reason `git/clone` and `POST /api/projects` are.
     ("POST", "/api/sessions/{id}/projects"),
