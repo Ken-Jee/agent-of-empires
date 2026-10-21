@@ -486,8 +486,11 @@ async fn upgrade_http(
 
 fn map_login_error(error: crate::acp::client::HttpError) -> ReadFailure {
     use crate::acp::client::HttpError;
+    use crate::daemon::AoeErrorCode;
     match error {
         HttpError::Unauthorized => map_http_status(401),
+        HttpError::ReadOnly => map_http_status(AoeErrorCode::ReadOnly.status().as_u16()),
+        HttpError::Refused(code) => map_http_status(code.status().as_u16()),
         HttpError::Server { status, .. } => map_http_status(status.as_u16()),
         _ => ReadFailure::post("unavailable"),
     }
@@ -740,6 +743,50 @@ mod tests {
     use super::*;
     use clap::Parser;
     use std::ffi::OsString;
+
+    // A coded login refusal keeps the category its bare status would have had.
+    #[test]
+    fn login_failures_keep_their_http_failure_category() {
+        use crate::acp::client::HttpError;
+        use crate::daemon::AoeErrorCode;
+        use reqwest::StatusCode;
+        let cases = [
+            (HttpError::Unauthorized, "unauthorized"),
+            (HttpError::ReadOnly, "unauthorized"),
+            (
+                HttpError::Refused(AoeErrorCode::AccessPolicyDenied),
+                "unauthorized",
+            ),
+            (
+                HttpError::Refused(AoeErrorCode::CityhallMode),
+                "unauthorized",
+            ),
+            (
+                HttpError::Refused(AoeErrorCode::TlsRequired),
+                "server_error",
+            ),
+            (
+                HttpError::Refused(AoeErrorCode::LifecycleLocked),
+                "server_error",
+            ),
+            (
+                HttpError::Server {
+                    status: StatusCode::FORBIDDEN,
+                },
+                "unauthorized",
+            ),
+            (
+                HttpError::Server {
+                    status: StatusCode::TOO_MANY_REQUESTS,
+                },
+                "server_error",
+            ),
+        ];
+        for (error, expected) in cases {
+            let label = error.to_string();
+            assert_eq!(map_login_error(error).code, expected, "{label}");
+        }
+    }
 
     // Localhost is pinned; other TLS names do not establish local provenance.
     #[test]
