@@ -36,31 +36,50 @@ fn newest_mtime(path: &std::path::Path) -> Option<SystemTime> {
     target.max(link)
 }
 
-/// Cached by `key`; `path` runs only on a miss.
+/// Cached by `key`; `path` runs only on a miss, outside the cache lock.
 fn cached_mtime(
     key: String,
     path: impl FnOnce() -> Option<std::path::PathBuf>,
 ) -> Option<SystemTime> {
-    let mut guard = MTIME_CACHE.lock().ok()?;
-    let cache = guard.get_or_insert_with(HashMap::new);
-    if let Some((at, mtime)) = cache.get(&key) {
-        if at.elapsed() < MTIME_TTL {
-            return *mtime;
+    {
+        let mut guard = MTIME_CACHE.lock().ok()?;
+        let cache = guard.get_or_insert_with(HashMap::new);
+        if let Some((at, mtime)) = cache.get(&key) {
+            if at.elapsed() < MTIME_TTL {
+                return *mtime;
+            }
         }
     }
     let mtime = path().and_then(|path| newest_mtime(&path));
-    cache.insert(key, (Instant::now(), mtime));
+    MTIME_CACHE
+        .lock()
+        .ok()?
+        .get_or_insert_with(HashMap::new)
+        .insert(key, (Instant::now(), mtime));
     mtime
 }
 
-/// Resolves the command as the daemon does when it spawns the adapter, so a pinned bundled copy
-/// is watched when it is the one in use.
+/// Which adapter copy a spawn runs. With both a PATH copy and a bundled one, spawn runs a version
+/// probe to choose, which a list poll must not do, so the offer is withheld instead.
+fn pick_adapter(
+    path_copy: Option<std::path::PathBuf>,
+    bundled: Option<std::path::PathBuf>,
+) -> Option<std::path::PathBuf> {
+    match (path_copy, bundled) {
+        (Some(path), None) | (None, Some(path)) => Some(path),
+        _ => None,
+    }
+}
+
 fn adapter_mtime(command: &str) -> Option<SystemTime> {
     cached_mtime(format!("acp:{command}"), || {
         let app_dir = crate::session::get_app_dir().ok();
-        crate::acp::acp_client::resolve_agent_command(command, app_dir.as_deref())
-            .ok()
-            .map(|r| r.path)
+        pick_adapter(
+            which::which(command).ok(),
+            app_dir
+                .as_deref()
+                .and_then(|dir| crate::acp::adapters::bundled_adapter_bin(dir, command)),
+        )
     })
 }
 
@@ -201,6 +220,16 @@ mod tests {
             container_workdir: None,
         });
         assert!(!binary_updated(&inst));
+    }
+
+    #[test]
+    fn an_adapter_on_both_path_and_bundle_is_not_guessed() {
+        let path = || Some(std::path::PathBuf::from("/usr/bin/adapter"));
+        let bundled = || Some(std::path::PathBuf::from("/data/adapters/adapter"));
+        assert_eq!(pick_adapter(path(), None), path());
+        assert_eq!(pick_adapter(None, bundled()), bundled());
+        assert_eq!(pick_adapter(path(), bundled()), None);
+        assert_eq!(pick_adapter(None, None), None);
     }
 
     #[test]
