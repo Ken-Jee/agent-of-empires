@@ -327,18 +327,18 @@ pub(super) async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> Re
 }
 
 async fn seed_in_flight_status(state: &AppState, id: &str) {
-    // Cold control-state fold at reattach time, same caveat as
-    // `seed_acp_statuses` (#4001).
+    let tasks_active = state.acp_event_store.has_unresolved_background_tasks(id);
+    let main_active = state.acp_event_store.has_in_flight_main_turn(id);
     let Some(intent) = state
         .acp_event_store
         .latest_seed_status_event(id)
-        .and_then(|event| crate::server::derive_acp_status(&event, false, false))
+        .and_then(|event| crate::server::derive_acp_status(&event, main_active, tasks_active))
     else {
         return;
     };
     let mut instances = state.instances.write().await;
     if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
-        crate::server::apply_status_intent(inst, Some(intent), &state.status_tx);
+        crate::server::acp_events::apply_status_seed(inst, intent, &state.status_tx);
     }
 }
 

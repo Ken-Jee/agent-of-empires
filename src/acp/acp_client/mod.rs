@@ -195,6 +195,7 @@ struct Launch {
     default_mode: Option<String>,
     default_model: Option<String>,
     mcp_servers: Vec<McpServer>,
+    claude_home: Option<PathBuf>,
     cancellation: tokio_util::sync::CancellationToken,
 }
 
@@ -237,6 +238,7 @@ impl Launch {
             default_mode: self.default_mode,
             default_model: self.default_model,
             mcp_servers: self.mcp_servers,
+            claude_home: self.claude_home,
             runner,
             cancellation: self.cancellation.clone(),
             shutdown: shutdown.clone(),
@@ -403,6 +405,7 @@ impl AcpClient {
                 ClientCmd::SetMode(_) => "set_mode",
                 ClientCmd::SetConfigOption { .. } => "set_config_option",
                 ClientCmd::ResumeBackgroundTailing(_) => "resume_background_tailing",
+                ClientCmd::ResumeTaskTailing(_) => "resume_task_tailing",
                 ClientCmd::DeleteSession { respond_to, .. } => {
                     let _ = respond_to.send(DeleteSessionOutcome::UnsupportedMethod);
                     "delete_session"
@@ -490,7 +493,7 @@ impl AcpClient {
         if cancellation.is_cancelled() {
             return Err(AcpError::Spawn("launch cancelled before spawning".into()));
         }
-        let launch = |sandbox| Launch {
+        let launch = |sandbox, native_store: &Option<crate::session::ExecutionBinding>| Launch {
             mode: ConnectMode::Fresh {
                 stored_acp_session_id: config.stored_acp_session_id.clone(),
                 seed_history_replay: config.seed_history_replay,
@@ -508,6 +511,11 @@ impl AcpClient {
             default_mode: config.default_mode.clone(),
             default_model: config.default_model.clone(),
             mcp_servers: config.mcp_servers.clone(),
+            claude_home: native_store
+                .as_ref()
+                .filter(|binding| binding.agent == "claude" && binding.filesystem == "host")
+                .and_then(|binding| binding.stores.first())
+                .cloned(),
             cancellation: cancellation.clone(),
         };
 
@@ -524,7 +532,8 @@ impl AcpClient {
             let (runner_pid, native_store) =
                 spawn_runner_detached(&config, &socket_path, session_id.0.clone(), runner_sandbox)
                     .await?;
-            let mut client = Self::connect_via_socket(socket_path, launch(sandbox), None).await?;
+            let mut client =
+                Self::connect_via_socket(socket_path, launch(sandbox, &native_store), None).await?;
             client.runner_pid = Some(runner_pid);
             client.native_store = native_store;
             return Ok(client);
@@ -540,7 +549,7 @@ impl AcpClient {
             .take()
             .ok_or_else(|| AcpError::Spawn("no stdout handle".into()))?;
         let child = Arc::new(Mutex::new(child));
-        let launch = launch(sandbox);
+        let launch = launch(sandbox, &native_store);
         let (label, install_binary) = (launch.session_id.0.clone(), launch.install_binary.clone());
         let transport = ByteStreams::new(stdin.compat_write(), stdout.compat());
         let events = mpsc::channel(64);
@@ -644,6 +653,7 @@ impl AcpClient {
         source_profile: Option<String>,
         deadline: Option<tokio::time::Instant>,
         launch_lease: Option<crate::acp::runner_lifecycle::Lease>,
+        claude_home: Option<PathBuf>,
     ) -> Result<Self, AcpError> {
         // The binary name keeps the compatibility gate active on reattach; an
         // unknown agent maps to `Other` anyway.
@@ -669,6 +679,7 @@ impl AcpClient {
             default_mode: None,
             default_model: None,
             mcp_servers: Vec::new(),
+            claude_home,
             cancellation: launch_lease
                 .as_ref()
                 .map_or_else(tokio_util::sync::CancellationToken::new, |lease| {
@@ -772,6 +783,19 @@ impl AcpClient {
                     .map(|l| (l.agent_id, l.output_file))
                     .collect(),
             ))
+            .await
+            .map_err(|_| AcpError::AgentExited)
+    }
+
+    /// Spawn transcript tailers for background tasks that survived a daemon
+    /// restart. Errors like [`Self::resume_background_tailing`].
+    pub async fn resume_task_tailing(
+        &self,
+        tasks: Vec<crate::acp::state::BackgroundTaskLaunch>,
+    ) -> Result<(), AcpError> {
+        let cmd_tx = self.cmd_tx.as_ref().ok_or(AcpError::NotRunning)?;
+        cmd_tx
+            .send(ClientCmd::ResumeTaskTailing(tasks))
             .await
             .map_err(|_| AcpError::AgentExited)
     }

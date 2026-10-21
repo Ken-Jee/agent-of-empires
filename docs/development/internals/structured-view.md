@@ -45,10 +45,12 @@ Trash is the reversible middle state: a delete moves the session there by defaul
 
 Purge captures the selected row's path, branch and runner references before destroy hooks. Before irreversible row removal, it adds fresh row references and persists ownership in `pending-purge-owners.json`. Failed cleanup retains ownership across requests and daemon restart; success releases only its own token. Missing, malformed or unsupported journals refuse cleanup. Both ordinary and irreversible purges require a captured process group to exit before host cleanup, even if its worker record disappeared. Ordinary purge retains the row and releases its reservation when that check fails. Uncaptured evidence is not proof of runtime absence. A refused irreversible commit settles its durable purge reservation before returning when the row remains on disk, so an immediate retry is not blocked b…
 
-An ambiguous tmux `no current target` failure is not absence proof. Teardown
-accepts it only after a bounded successful query on the same socket reports
-raw session names excluding the exact target. Failed or undecodable inventory
-keeps the teardown error and resources.
+An ambiguous tmux `no current target` failure is not absence proof. While
+the captured server is live, teardown requires a bounded inventory on the
+same socket that excludes the exact target. Failed or undecodable inventory
+retains the error and resources. Native process handles distinguish an
+unreaped exited server from a stopped server; matching birth alone proves
+identity, not liveness.
 
 After journal ownership and row removal are durable, a committed purge releases identity and instance lifecycle flocks before awaiting its captured lease and runner retirement. The durable journal and frozen retirement target preserve the original cleanup and process authority across that wait. Initial and recovered cleanup reacquire identity then lifecycle exclusion and revalidate store health, row absence, and the exact live journal owner before touching resources. A replacement lease or runner is never adopted as the old purge target; any unproven retirement, reused row, or changed owner keeps the journal and resources.
 
@@ -139,7 +141,13 @@ Three layers recover a turn that stops progressing:
 2. **Force end turn (client).** No streaming chunk for 30s with no tool in flight surfaces a button that publishes a synthetic `Stopped` plus a best-effort cancel. With a tool in flight, or during a latched compaction phase, it stays hidden so it cannot discard real progress.
 3. **Silent-orphan watchdog (daemon).** The adapter finished streaming but never sent the `PromptResponse` that closes `session/prompt`. It fires only when no tool call is in flight, at least one progress notification has arrived, and none has arrived for `silent_orphan_grace_secs` (120, dropping to a fixed 20s once a cost-populated `UsageUpdate` lands). A turn that already emitted its cost-populated usage with no off-protocol work pending ends cleanly; otherwise the daemon cancels, waits 10s, SIGTERMs, and respawns.
 
-**Off-protocol work** suppresses the watchdog, because some agent features go quiet with no ACP signal. An async `Agent` tool is tracked precisely (a tailer follows the sub-agent's transcript and an in-flight set keeps the watchdog from firing). `/compact` is detected from the ACP `compaction_update` the client advertises `session.compaction` for, or from text markers for agents without it, and its start latches a 30-minute grace floor so a large compaction is never cut short; the same signals publish `ConversationCompactionStarted` / `ConversationCompacted` so both clients know the phase, followed by `ConversationCompactionSummary` when the agent reports the summary it retained. A backgrounded `Bash` latches the floor until a cost-populated usage update arrives, and a `ScheduleWakeup` suppresses recovery until `wakeup_at` plus the floor, on a monotonic deadline that multiple wakeups extend. An agent-initiated turn that streamed output but reported no cost-bearing end and scheduled no wake is a stalled stream rather than a parked monitor, and recovers on its own 120s grace.
+**Off-protocol work** suppresses the watchdog, because some agent features go quiet with no ACP signal. An async `Agent` tool is tracked precisely (a tailer follows the sub-agent's transcript and an in-flight set keeps the watchdog from firing). `/compact` is detected from the ACP `compaction_update` the client advertises `session.compaction` for, or from text markers for agents without it, and its start latches a 30-minute grace floor so a large compaction is never cut short; the same signals publish `ConversationCompactionStarted` / `ConversationCompacted` so both clients know the phase, followed by `ConversationCompactionSummary` when the agent reports the summary it retained. A backgrounded `Bash` latches the floor until a cost-populated usage update arrives. Separately, a backgrounded `Bash` is tracked as a task: its start (`BackgroundTaskStarted`) comes from the tool result's `toolResponse.backgroundTaskId`, and its end (`BackgroundTaskFinished`) from the `<task-notification>` Claude Code writes to the session transcript (`task_transcript.rs`), which a tailer follows through the shared file watcher (a 30s re-read covers a dropped kernel event, and a 500ms poll takes over when no watcher is available). The adapter's own `async_task_*` updates are not used: declaring the AIR extension that unlocks them makes the adapter strip the output of every Read that names a path. Tasks are tracked for host sessions only; a sandboxed session's transcript is in the container. An open task keeps the session `Running` and the busy signal lit like a background sub-agent. A reattached worker's open tasks resume tailing from the start of the transcript, and teardown or a worker replacement finishes any left open. A `ScheduleWakeup` suppresses recovery until `wakeup_at` plus the floor, on a monotonic deadline that multiple wakeups extend. An agent-initiated turn that streamed output but reported no cost-bearing end and scheduled no wake is a stalled stream rather than a parked monitor, and recovers on its own 120s grace.
+
+Task monitoring uses the host Claude store captured for the launch or attachment.
+Transcript completion matches task ID and captured tool-use ID in the machine header, never quoted summary or result text.
+Reusing a task ID supersedes its prior monitor, which cannot retire the replacement.
+Pending tasks block conversation reset and idle shutdown, and restore canonical busy status after daemon restart or reattachment.
+Client busy indicators include tasks without changing the main-turn rules for sending prompts or Esc-to-cancel.
 
 ## Rate-limit handling
 
@@ -181,7 +189,7 @@ default_agent = "claude-code"
 approval_timeout_secs = 300
 destructive_require_double_confirm = true
 max_concurrent_workers = 100
-replay_events = 0                 # 0 = unlimited; caps per-session rows and the client buffer
+replay_events = 0                 # 0 = unlimited; caps per-session rows (rows of still-open background work are kept) and the client buffer
 node_path = ""
 show_tool_durations = true
 wrap_tool_output = false          # initial line wrap of tool output blocks; each block can toggle

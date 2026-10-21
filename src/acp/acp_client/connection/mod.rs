@@ -25,6 +25,7 @@ use agent_client_protocol::schema::v1::{
     WriteTextFileRequest, WriteTextFileResponse,
 };
 use agent_client_protocol::{Agent, ByteStreams, Client, ConnectionTo, Responder};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -81,6 +82,7 @@ pub(super) struct ConnectionParams {
     pub(super) default_mode: Option<String>,
     pub(super) default_model: Option<String>,
     pub(super) mcp_servers: Vec<McpServer>,
+    pub(super) claude_home: Option<PathBuf>,
     pub(super) runner: Option<RunnerLink>,
     pub(super) cancellation: tokio_util::sync::CancellationToken,
     pub(super) shutdown: tokio_util::sync::CancellationToken,
@@ -149,6 +151,7 @@ pub(super) async fn run_connection_task<W, R>(
         default_mode,
         default_model,
         mcp_servers,
+        claude_home,
         runner,
         cancellation,
         shutdown,
@@ -190,6 +193,7 @@ pub(super) async fn run_connection_task<W, R>(
         prompt_in_flight,
         resources.sandbox.as_ref(),
         ingress.clone(),
+        claude_home,
     ));
     let ready_tx = Arc::new(Mutex::new(Some(ready_tx)));
 
