@@ -97,7 +97,7 @@ impl ToolSession {
         Self::interrupt_retirement_for_test(id, RetirementCheckpoint::Prepared)
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn interrupt_retirement_before_ack_for_test(id: &str) -> impl Drop {
         Self::interrupt_retirement_for_test(id, RetirementCheckpoint::Proven)
     }

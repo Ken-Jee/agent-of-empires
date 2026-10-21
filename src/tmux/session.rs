@@ -2628,9 +2628,10 @@ pub(crate) fn build_create_args(
 mod tests {
     use crate::tmux::utils::{append_pane_base_index_args, append_remain_on_exit_args};
 
+    #[cfg(target_os = "linux")]
+    use super::super::test_helpers::require_tmux;
     use super::super::test_helpers::{
-        only_pane_id, pane_field, require_tmux, wait_for_pane_command, wait_for_pane_dead,
-        TmuxTestSession,
+        only_pane_id, pane_field, wait_for_pane_command, wait_for_pane_dead, TmuxTestSession,
     };
     use super::*;
     struct ReadyCaptureProbe {
