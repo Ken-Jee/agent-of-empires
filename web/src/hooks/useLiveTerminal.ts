@@ -167,6 +167,8 @@ export function useLiveTerminal(
           connected: true,
           reconnecting: false,
           paneDead: false,
+          transport: null,
+          transportReason: null,
         }));
         ws.send(encodeControl({ type: "claim_if_vacant" }));
         const desired = desiredRef.current;
