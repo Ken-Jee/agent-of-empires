@@ -327,6 +327,18 @@ impl HttpClient {
         Ok(res.json::<PromptDispatchWire>().await.unwrap_or_default())
     }
 
+    /// Types `message` into a terminal session's pane. `no_revive` fails loud on a dead pane.
+    pub async fn send_message(
+        &self,
+        session_id: &str,
+        message: &str,
+        no_revive: bool,
+    ) -> Result<(), HttpError> {
+        let body = serde_json::json!({ "message": message, "revive": !no_revive });
+        self.session_call(Method::POST, session_id, "/send", Some(body))
+            .await
+    }
+
     /// The daemon-wide plugin UI snapshot (#2402).
     pub async fn plugin_ui_state(&self) -> Result<UiSnapshot, HttpError> {
         self.get_json("/api/plugins/ui-state", Scope::Global).await
