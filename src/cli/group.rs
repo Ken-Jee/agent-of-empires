@@ -1,9 +1,10 @@
 //! `agent-of-empires group` subcommands implementation
 
-use anyhow::{bail, Result};
+use anyhow::Result;
 use clap::{Args, Subcommand};
 use serde::Serialize;
 
+use crate::acp::client::{require_daemon, HttpClient, HttpError};
 use crate::session::{GroupTree, Storage};
 
 #[derive(Subcommand)]
@@ -127,72 +128,47 @@ async fn list_groups(profile: &str, args: GroupListArgs) -> Result<()> {
 }
 
 async fn create_group(profile: &str, args: GroupCreateArgs) -> Result<()> {
-    let storage = Storage::open_unwatched(profile)?;
+    let name = args.name.trim();
+    let parent = args.parent.as_deref().map(str::trim);
+    let client = HttpClient::new(require_daemon().await?)?;
+    client
+        .create_group(name, parent, profile)
+        .await
+        .map_err(group_error)?;
 
-    let name = args.name.trim().to_string();
-    let group_path = if let Some(parent) = &args.parent {
-        format!("{}/{}", parent.trim(), name)
-    } else {
-        name.clone()
-    };
-
-    storage.update(|instances, groups| {
-        let mut group_tree = GroupTree::new_with_groups(instances, groups);
-        if group_tree.group_exists(&group_path) {
-            bail!("Group already exists: {}", group_path);
-        }
-        group_tree.create_group(&group_path);
-        *groups = group_tree.get_all_groups();
-        Ok(())
-    })?;
-
-    println!("✓ Created group: {}", group_path);
+    match parent {
+        Some(parent) => println!("✓ Created group: {parent}/{name}"),
+        None => println!("✓ Created group: {name}"),
+    }
     Ok(())
 }
 
 async fn delete_group(profile: &str, args: GroupDeleteArgs) -> Result<()> {
-    let storage = Storage::open_unwatched(profile)?;
-    let name = args.name.trim().to_string();
-    let force = args.force;
+    let name = args.name.trim();
+    let client = HttpClient::new(require_daemon().await?)?;
+    let moved = client
+        .delete_group(name, args.force, profile)
+        .await
+        .map_err(group_error)?;
 
-    let session_count = storage.update(|instances, groups| {
-        let mut group_tree = GroupTree::new_with_groups(instances, groups);
-        if !group_tree.group_exists(&name) {
-            bail!("Group not found: {}", name);
-        }
-
-        let session_count = instances
-            .iter()
-            .filter(|i| i.group_path == name || i.group_path.starts_with(&format!("{}/", name)))
-            .count();
-
-        if session_count > 0 {
-            if !force {
-                bail!(
-                    "Group '{}' contains {} sessions. Use --force to move them to default group.",
-                    name,
-                    session_count
-                );
-            }
-
-            for inst in instances.iter_mut() {
-                if inst.group_path == name || inst.group_path.starts_with(&format!("{}/", name)) {
-                    inst.group_path = String::new();
-                }
-            }
-        }
-
-        group_tree.delete_group(&name);
-        *groups = group_tree.get_all_groups();
-        Ok(session_count)
-    })?;
-
-    println!("✓ Deleted group: {}", name);
-    if force && session_count > 0 {
-        println!("  Moved {} sessions to default group", session_count);
+    println!("✓ Deleted group: {name}");
+    if moved > 0 {
+        println!("  Moved {moved} sessions to default group");
     }
-
     Ok(())
+}
+
+/// Surface the Daemon's `message` for a rejected group change.
+fn group_error(err: HttpError) -> anyhow::Error {
+    if let HttpError::Server { body, .. } = &err {
+        if let Some(message) = serde_json::from_str::<serde_json::Value>(body)
+            .ok()
+            .and_then(|v| v["message"].as_str().map(str::to_string))
+        {
+            return anyhow::anyhow!(message);
+        }
+    }
+    err.into()
 }
 
 async fn move_session(profile: &str, args: GroupMoveArgs) -> Result<()> {

@@ -374,6 +374,45 @@ impl HttpClient {
         Ok(())
     }
 
+    /// Register a group in `profile`, nested under `parent` when given.
+    pub async fn create_group(
+        &self,
+        name: &str,
+        parent: Option<&str>,
+        profile: &str,
+    ) -> Result<(), HttpError> {
+        let body = serde_json::json!({ "name": name, "parent": parent, "profile": profile });
+        self.send_elevated(
+            || self.request(Method::POST, "/api/groups").json(&body),
+            Scope::Global,
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Delete a group and its subtree; returns how many sessions were ungrouped.
+    pub async fn delete_group(
+        &self,
+        path: &str,
+        force: bool,
+        profile: &str,
+    ) -> Result<usize, HttpError> {
+        let force = force.to_string();
+        let query = [
+            ("path", path),
+            ("force", force.as_str()),
+            ("profile", profile),
+        ];
+        let res = self
+            .send_elevated(
+                || self.request(Method::DELETE, "/api/groups").query(&query),
+                Scope::Global,
+            )
+            .await?;
+        let body: serde_json::Value = res.json().await?;
+        Ok(body["moved_sessions"].as_u64().unwrap_or(0) as usize)
+    }
+
     /// Reload plugins from disk and replace this plugin's worker.
     pub async fn restart_plugin_worker(&self, plugin_id: &str) -> Result<(), HttpError> {
         let path = format!("/api/plugins/{plugin_id}/worker/restart");
