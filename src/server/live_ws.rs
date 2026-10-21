@@ -18,8 +18,9 @@
 //!   - `{"type":"size_owner","is_owner":bool}`: only the owner resizes the shared tmux
 //!     window and may type; the lock lives in tmux user options, so the web view and the
 //!     native TUI honor the same owner.
-//!   - `{"type":"transport","grid":bool}`: `false` is the capture fallback, which cannot
-//!     suppress a half-drawn repaint.
+//!   - `{"type":"transport","grid":bool,"reason"?:"pipe_owned"}`: `false` is the capture
+//!     fallback, which cannot suppress a half-drawn repaint. `reason` is present when another
+//!     process owns the pane's `pipe-pane`.
 //!   - `{"type":"clipboard","text":"..."}`: an OSC 52 write by the pane.
 //!
 //! Client to server: binary frames are raw pane input (dropped for a read-only or
@@ -51,7 +52,7 @@ use super::pane::{
 };
 use super::AppState;
 use crate::daemon::live::{
-    LiveClientMessage, LiveCursor, LivePane0, LivePaneMeta, LiveServerMessage,
+    LiveClientMessage, LiveCursor, LivePane0, LivePaneMeta, LiveServerMessage, LiveTransportReason,
 };
 use crate::tmux::{SIZE_OWNER_HEARTBEAT, SIZE_OWNER_TTL};
 
@@ -417,8 +418,21 @@ fn clipboard_json(text: &str) -> String {
 }
 
 /// Which transport is producing frames.
-fn transport_json(grid: bool) -> String {
-    live_json(&LiveServerMessage::Transport { grid })
+fn transport_json(grid: bool, reason: Option<LiveTransportReason>) -> String {
+    live_json(&LiveServerMessage::Transport { grid, reason })
+}
+
+/// Names pipe contention only when it is why the grid is not in use, not a split
+/// window or a history depth the grid cannot serve.
+#[cfg(unix)]
+fn transport_reason(
+    grid: bool,
+    pipe_owned: bool,
+    pane_count: Option<u16>,
+    window_lines: usize,
+) -> Option<LiveTransportReason> {
+    (!grid && pipe_owned && grid_transport_eligible(pane_count, window_lines))
+        .then_some(LiveTransportReason::PipeOwned)
 }
 
 /// Whether this connection may push the pane's OSC 52 copies into the viewer's browser
@@ -722,7 +736,7 @@ async fn handle_live_ws_inner(
     // The agent surface renders from the shared VT grid when one arms (the native TUI
     // preview shares it).
     #[cfg(unix)]
-    let vt = if transport == LiveTransport::Grid && config.tmux.vt_live {
+    let vt_acquired = if transport == LiveTransport::Grid && config.tmux.vt_live {
         let name = tmux_name.clone();
         tokio::task::spawn_blocking(move || {
             let deadline = crate::tmux::TmuxCommandDeadline::new();
@@ -730,10 +744,16 @@ async fn handle_live_ws_inner(
         })
         .await
         .ok()
-        .flatten()
     } else {
         None
     };
+    #[cfg(unix)]
+    let vt_pipe_owned = matches!(
+        vt_acquired,
+        Some(Err(crate::tmux::vt::VtUnavailable::PipeOwned))
+    );
+    #[cfg(unix)]
+    let vt = vt_acquired.and_then(Result::ok);
     #[cfg(not(unix))]
     let _ = transport;
     // Snapshot surfaces keep OSC 52 through a raw observer that builds no grid.
@@ -780,7 +800,7 @@ async fn handle_live_ws_inner(
         let mut last_published: Option<(String, Option<crate::tmux::PaneCursor>)> = None;
         // Announced on the first frame and whenever it flips, so a client can
         // report the transport rather than infer it.
-        let mut announced_grid: Option<bool> = None;
+        let mut announced_transport: Option<(bool, Option<LiveTransportReason>)> = None;
         // Patch baseline.
         let mut last_sent: Option<(Vec<String>, u32)> = None;
         let mut seq: u64 = 0;
@@ -832,7 +852,9 @@ async fn handle_live_ws_inner(
             let mut grid_incomplete = false;
             #[cfg(unix)]
             {
-                if live_grid.is_some() && pane_count.1.elapsed() >= PANE_COUNT_PROBE_INTERVAL {
+                if (live_grid.is_some() || vt_pipe_owned)
+                    && pane_count.1.elapsed() >= PANE_COUNT_PROBE_INTERVAL
+                {
                     let name = capture_tmux.clone();
                     // Advance the probe clock even on failure, or a tmux that cannot answer
                     // would be re-forked on every capture cycle instead of once a second.
@@ -1180,13 +1202,17 @@ async fn handle_live_ws_inner(
                         }
                     }
                     #[cfg(unix)]
-                    if announced_grid != Some(grid_frame) {
-                        announced_grid = Some(grid_frame);
+                    let announce = (
+                        grid_frame,
+                        transport_reason(grid_frame, vt_pipe_owned, pane_count.0, lines),
+                    );
+                    if announced_transport != Some(announce) {
+                        announced_transport = Some(announce);
                         // The two transports serialize the same screen from different
                         // sources, and carry their own scrollback depth with it.
                         last_sent = None;
                         if capture_tx
-                            .send(Message::Text(transport_json(grid_frame).into()))
+                            .send(Message::Text(transport_json(announce.0, announce.1).into()))
                             .await
                             .is_err()
                         {
@@ -2227,6 +2253,32 @@ mod tests {
         });
         drop(held);
         crate::tmux::vt::unregister_for_test(pane.name());
+    }
+
+    #[test]
+    fn pipe_contention_is_named_only_when_it_is_why_the_grid_is_unused() {
+        let within = crate::tmux::vt::SCROLLBACK_LINES;
+        let cases = [
+            (
+                false,
+                true,
+                Some(1),
+                within,
+                Some(LiveTransportReason::PipeOwned),
+            ),
+            (true, true, Some(1), within, None),
+            (false, false, Some(1), within, None),
+            (false, true, Some(2), within, None),
+            (false, true, None, within, None),
+            (false, true, Some(1), within + 1, None),
+        ];
+        for (grid, owned, panes, lines, want) in cases {
+            assert_eq!(
+                transport_reason(grid, owned, panes, lines),
+                want,
+                "grid={grid} owned={owned} panes={panes:?} lines={lines}"
+            );
+        }
     }
 
     #[test]
