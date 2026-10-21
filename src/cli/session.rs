@@ -2010,6 +2010,9 @@ async fn rename_session(profile: &str, args: RenameArgs) -> Result<()> {
                         is_sandboxed,
                     );
                 }
+                if let Some(warning) = &outcome.warning {
+                    eprintln!("Warning: {warning}");
+                }
                 new_path = Some(outcome.new_path.to_string_lossy().to_string());
                 new_branch = outcome.new_branch;
             }
@@ -2723,6 +2726,9 @@ async fn set_worktree_name(profile: &str, args: SetWorktreeNameArgs) -> Result<(
     }
     let new_path = outcome.new_path.to_string_lossy().to_string();
     let new_branch = outcome.new_branch.clone();
+    if let Some(warning) = &outcome.warning {
+        eprintln!("Warning: {warning}");
+    }
 
     storage
         .update(|instances, _groups| {

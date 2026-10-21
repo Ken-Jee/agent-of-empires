@@ -486,19 +486,23 @@ pub fn execute(instance: &super::Instance, plan: AttachPlan) -> Result<PreparedA
     let moved_to = (!matches!(conversion, Conversion::Append { .. }))
         .then(|| workspace_dir.to_string_lossy().to_string());
 
+    let mut move_warning = None;
     let primary = match &conversion {
         Conversion::Append { .. } => None,
         Conversion::MoveIn { primary, from, .. } => {
             let to = PathBuf::from(&primary.worktree_path);
             let primary_git = GitWorktree::new(PathBuf::from(&primary.main_repo_path))?;
-            if let Err(e) = primary_git.move_worktree(from, &to) {
-                undo.run();
-                return Err(e).with_context(|| {
-                    format!(
-                        "could not move this session's worktree into {}",
-                        workspace_dir.display()
-                    )
-                });
+            match primary_git.move_worktree(from, &to) {
+                Ok(moved) => move_warning = moved.into_warning(),
+                Err(e) => {
+                    undo.run();
+                    return Err(e).with_context(|| {
+                        format!(
+                            "could not move this session's worktree into {}",
+                            workspace_dir.display()
+                        )
+                    });
+                }
             }
             undo.moved_primary = Some((primary.main_repo_path.clone(), to, from.clone()));
             Some(primary.clone())
@@ -532,7 +536,7 @@ pub fn execute(instance: &super::Instance, plan: AttachPlan) -> Result<PreparedA
         }
     };
 
-    let warnings = match git_wt.create_worktree(
+    let mut warnings = match git_wt.create_worktree(
         &plan.branch,
         &worktree_path,
         plan.create,
@@ -550,6 +554,7 @@ pub fn execute(instance: &super::Instance, plan: AttachPlan) -> Result<PreparedA
         worktree_path.clone(),
         plan.create.then(|| plan.branch.clone()),
     ));
+    warnings.extend(move_warning);
 
     let repo = WorkspaceRepo {
         name: repo_name,
@@ -632,16 +637,23 @@ impl Undo {
         // it lands, `project_path` names a directory that does not exist.
         if let Some((main_repo, from, back_to)) = &self.moved_primary {
             match GitWorktree::new(PathBuf::from(main_repo)) {
-                Ok(git) => {
-                    if let Err(e) = git.move_worktree(from, back_to) {
-                        tracing::error!(
-                            target: "session.attach",
-                            from = %from.display(),
-                            to = %back_to.display(),
-                            "could not move the session's worktree back after a failed attach: {e:#}"
-                        );
+                Ok(git) => match git.move_worktree(from, back_to) {
+                    Ok(moved) => {
+                        if let Some(warning) = moved.into_warning() {
+                            tracing::warn!(
+                                target: "session.attach",
+                                to = %back_to.display(),
+                                "the session's worktree is degraded after moving back: {warning}"
+                            );
+                        }
                     }
-                }
+                    Err(e) => tracing::error!(
+                        target: "session.attach",
+                        from = %from.display(),
+                        to = %back_to.display(),
+                        "could not move the session's worktree back after a failed attach: {e:#}"
+                    ),
+                },
                 Err(e) => tracing::error!(
                     target: "session.attach",
                     "could not open {main_repo} to move the session's worktree back: {e:#}"
