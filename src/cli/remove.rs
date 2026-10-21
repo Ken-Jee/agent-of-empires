@@ -113,7 +113,10 @@ pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
         inst.trash();
         inst.source_profile = storage.profile().to_string();
         match crate::session::trash::prepare_trashed_worktree(&mut inst) {
-            crate::session::trash::RelocateOutcome::Relocated { .. } => {
+            crate::session::trash::RelocateOutcome::Relocated { warning, .. } => {
+                if let Some(warning) = warning {
+                    eprintln!("  Warning: {warning}");
+                }
                 let reloc = crate::session::trash::TrashRelocation {
                     new_project_path: inst.project_path.clone(),
                     pre_trash_project_path: inst.pre_trash_project_path.clone(),
