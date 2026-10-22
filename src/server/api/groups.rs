@@ -50,9 +50,14 @@ fn in_group(group_path: &str, group: &str) -> bool {
             .is_some_and(|rest| rest.starts_with('/'))
 }
 
-/// A profile the daemon manages: a valid name with an existing store.
+/// A profile the daemon manages: a valid name with an existing store. An
+/// empty name is the CLI's "no profile given" and means the configured default.
 fn resolve_profile(state: &AppState, requested: Option<String>) -> Result<String, Response> {
-    let profile = requested.unwrap_or_else(|| state.profile.clone());
+    let profile = match requested {
+        Some(p) if p.is_empty() => crate::session::config::resolve_default_profile(),
+        Some(p) => p,
+        None => state.profile.clone(),
+    };
     validate_profile_name(&profile)
         .map_err(|msg| api_error(StatusCode::BAD_REQUEST, "invalid_profile", msg))?;
     let known = crate::session::list_profiles().is_ok_and(|all| all.contains(&profile));
@@ -333,6 +338,38 @@ mod tests {
         .await
         .into_response();
         assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn empty_profile_targets_configured_default() {
+        let f = fixture(&[("one", "team")]);
+        crate::session::create_profile("configured").unwrap();
+        crate::session::config::update_config(|c| c.default_profile = "configured".into()).unwrap();
+        let body = |profile: &str| CreateGroupBody {
+            name: "g".into(),
+            parent: None,
+            profile: Some(profile.into()),
+        };
+
+        let resp = create_group(State(f.state.clone()), Ok(Json(body("")))).await;
+        assert_eq!(resp.into_response().status(), StatusCode::CREATED);
+        let groups = Storage::new_unwatched("configured")
+            .unwrap()
+            .load_groups_readonly()
+            .unwrap();
+        assert!(groups.iter().any(|g| g.path == "g"));
+
+        let resp = delete_group(
+            State(f.state.clone()),
+            Ok(Query(DeleteGroupQuery {
+                path: "g".into(),
+                force: false,
+                profile: Some(String::new()),
+            })),
+        )
+        .await;
+        assert_eq!(resp.into_response().status(), StatusCode::OK);
     }
 
     #[tokio::test]
