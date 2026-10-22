@@ -75,30 +75,44 @@ pub(super) fn extract_pi_uuid_from_filename(path: &Path) -> Option<String> {
 }
 
 /// The transcript `<timestamp>_<sid>.jsonl` under a Pi sessions root: directly in it, or, for the
-/// default layout, in one per-cwd directory below it. Symlinks are never followed.
+/// default layout, in one per-cwd directory below it. Symlinks are never followed. A copied store
+/// can hold the id twice; then nothing is returned rather than an arbitrary one.
 pub(crate) fn find_pi_transcript(
     root: &Path,
     sid: &str,
     nested: bool,
 ) -> Option<std::path::PathBuf> {
     let suffix = format!("_{sid}.jsonl");
-    let in_dir = |dir: &Path| {
-        std::fs::read_dir(dir).ok()?.flatten().find_map(|entry| {
-            let is_file = entry.file_type().ok()?.is_file();
-            let named = entry.file_name().to_str()?.ends_with(&suffix);
-            let path = entry.path();
-            (is_file && named && extract_pi_header_fields(&path)?.0.as_deref() == Some(sid))
-                .then_some(path)
-        })
-    };
-    in_dir(root).or_else(|| {
-        nested
-            .then(|| std::fs::read_dir(root).ok())
-            .flatten()?
+    let in_dir = |dir: &Path| -> Vec<std::path::PathBuf> {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return Vec::new();
+        };
+        entries
             .flatten()
-            .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
-            .find_map(|entry| in_dir(&entry.path()))
-    })
+            .filter(|entry| {
+                entry.file_type().is_ok_and(|kind| kind.is_file())
+                    && entry
+                        .file_name()
+                        .to_str()
+                        .is_some_and(|name| name.ends_with(&suffix))
+            })
+            .map(|entry| entry.path())
+            .filter(|path| {
+                extract_pi_header_fields(path).is_some_and(|(id, _)| id.as_deref() == Some(sid))
+            })
+            .collect()
+    };
+    let mut matches = in_dir(root);
+    if nested {
+        if let Ok(entries) = std::fs::read_dir(root) {
+            for entry in entries.flatten() {
+                if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                    matches.extend(in_dir(&entry.path()));
+                }
+            }
+        }
+    }
+    (matches.len() == 1).then(|| matches.remove(0))
 }
 
 pub(crate) fn read_pi_session_observation(
@@ -302,6 +316,11 @@ mod tests {
         std::fs::create_dir_all(linked.join("--p--")).unwrap();
         std::os::unix::fs::symlink(&real, linked.join("--p--").join(leaf(sid))).unwrap();
         assert_eq!(find_pi_transcript(&linked, sid, true), None);
+
+        let copied = tmp.path().join("copied");
+        write(&copied.join("--old--"), leaf(sid), sid);
+        write(&copied.join("--new--"), leaf(sid), sid);
+        assert_eq!(find_pi_transcript(&copied, sid, true), None, "ambiguous");
     }
 
     #[test]
