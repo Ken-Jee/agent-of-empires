@@ -2872,8 +2872,9 @@ async fn degraded_stream_revokes_grants_and_project_writes_while_owner_http_is_h
         !native_lease.is_valid(),
         "queued native dispatch observes the exact revoked grant"
     );
-    let groups = app.join("profiles/test/groups.json");
-    let profile_projects = app.join("profiles/test/projects.json");
+    let profile = crate::session::get_profile_dir("test").unwrap();
+    let groups = profile.join("groups.json");
+    let profile_projects = profile.join("projects.json");
     std::fs::write(&groups, "[]").unwrap();
     std::fs::write(&profile_projects, "[]").unwrap();
     std::fs::write(&groups, "{ SECRET_SOURCE_A").unwrap();
