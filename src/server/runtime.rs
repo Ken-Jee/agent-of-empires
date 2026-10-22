@@ -966,7 +966,7 @@ mod tests {
     async fn diagnostic_only_source_change_reaches_existing_owner_stream_without_new_cursor() {
         use crate::daemon::{RuntimeConnection, RuntimeEvent};
         let _home = crate::session::test_support::isolate_app_dir();
-        let app = crate::session::get_app_dir().unwrap();
+        let app = crate::session::get_app_dir().unwrap().canonicalize().unwrap();
         crate::session::get_profile_dir("test").unwrap();
         crate::session::config::update_config(|config| config.default_profile = "test".into())
             .unwrap();

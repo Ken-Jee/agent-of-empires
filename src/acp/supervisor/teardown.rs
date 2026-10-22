@@ -1322,7 +1322,7 @@ mod tests {
     use super::*;
     use crate::acp::acp_client::{AcpError, SpawnConfig};
     use crate::acp::runner_lifecycle::test_support::FakeProcessControl;
-    use crate::acp::runner_lifecycle::{InstallError, WorkerPhase};
+    use crate::acp::runner_lifecycle::WorkerPhase;
     use crate::acp::state::AcpSessionId;
     use std::sync::Arc;
 
@@ -1738,7 +1738,7 @@ mod tests {
         };
         assert_eq!(
             lock_recover(&sup.lifecycle).install(&lease, Some(identity)),
-            Err(InstallError::Stale)
+            Err(crate::acp::runner_lifecycle::InstallError::Stale)
         );
         {
             let request = lease.attest_runner();

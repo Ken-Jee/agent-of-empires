@@ -933,7 +933,7 @@ mod tests {
                     .unwrap();
                 request.extensions_mut().insert(ConnectInfo(
                     super::super::peer::ConnectionPeer::UnixOwner {
-                        uid: crate::process::effective_uid(),
+                        uid: nix::unistd::geteuid().as_raw(),
                     },
                 ));
                 assert_eq!(app.oneshot(request).await.unwrap().status(), StatusCode::OK);

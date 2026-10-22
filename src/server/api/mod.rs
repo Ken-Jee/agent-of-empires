@@ -435,7 +435,7 @@ mod tests {
                 .unwrap();
             request.extensions_mut().insert(axum::extract::ConnectInfo(
                 crate::server::peer::ConnectionPeer::UnixOwner {
-                    uid: crate::process::effective_uid(),
+                    uid: nix::unistd::geteuid().as_raw(),
                 },
             ));
             let response = app.clone().oneshot(request).await.unwrap();
