@@ -966,7 +966,10 @@ mod tests {
     async fn diagnostic_only_source_change_reaches_existing_owner_stream_without_new_cursor() {
         use crate::daemon::{RuntimeConnection, RuntimeEvent};
         let _home = crate::session::test_support::isolate_app_dir();
-        let app = crate::session::get_app_dir().unwrap();
+        let app = crate::session::get_app_dir()
+            .unwrap()
+            .canonicalize()
+            .unwrap();
         crate::session::get_profile_dir("test").unwrap();
         crate::session::config::update_config(|config| config.default_profile = "test".into())
             .unwrap();
@@ -985,7 +988,7 @@ mod tests {
         let work = owned.runtime.work.clone();
         owned.runtime = NativeRuntime::new(app.to_string_lossy().into_owned(), None, work);
         let state = Arc::new(owned);
-        let socket = app.canonicalize().unwrap().join("daemon/api.sock");
+        let socket = app.join("daemon/api.sock");
         let router = crate::server::test_support::build_router_for_test(state.clone());
         let server =
             crate::server::test_support::serve_owner_router_for_test(&socket, router).await;
@@ -993,8 +996,9 @@ mod tests {
         let mut connection = RuntimeConnection::connect(&endpoint, Some("test"))
             .await
             .unwrap();
-        let groups = app.join("profiles/test/groups.json");
-        let projects = app.join("profiles/test/projects.json");
+        let profile = crate::session::get_profile_dir("test").unwrap();
+        let groups = profile.join("groups.json");
+        let projects = profile.join("projects.json");
         std::fs::write(&groups, "[]").unwrap();
         let valid_groups = std::fs::read(&groups).unwrap();
         std::fs::write(&groups, "{ SECRET_GROUP_CONTENT").unwrap();

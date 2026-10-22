@@ -192,14 +192,15 @@ test("enabling structured view reaps owned panes and preserves an unverified too
         ";",
         "set-option",
         "-t",
-        `=${name}`,
+        `=${name}:`,
         "@aoe_kind",
         ["agent", "term", "tool", "tool"][index]!,
       ];
       if (name === names[2]) {
-        args.push(";", "set-option", "-t", `=${name}`, "@aoe_tool_owner", JSON.stringify([sessionId, "lazygit"]));
+        args.push(";", "set-option", "-t", `=${name}:`, "@aoe_tool_owner", JSON.stringify([sessionId, "lazygit"]));
       }
-      expect(tmux(serve.tmuxSocket, ...args).status).toBe(0);
+      const created = tmux(serve.tmuxSocket, ...args);
+      expect(created.status, created.stderr.toString()).toBe(0);
       expect(tmuxHasSession(serve.tmuxSocket, name)).toBe(true);
     }
 

@@ -272,6 +272,7 @@ fn test_cli_archive_kills_agent_and_terminal_tmux_sessions() {
         &tool_tmux_name,
     ];
     for name in names {
+        let target = format!("={name}:");
         let create = Command::new("tmux")
             .arg("-S")
             .arg(&sock)
@@ -286,6 +287,12 @@ fn test_cli_archive_kills_agent_and_terminal_tmux_sessions() {
                 "24",
                 "sleep",
                 "600",
+                ";",
+                "set-option",
+                "-t",
+                &target,
+                "pane-base-index",
+                "0",
             ])
             .output()
             .expect("tmux new-session");
@@ -376,6 +383,7 @@ fn test_cli_archive_no_kill_preserves_all_tmux_sessions() {
         &tool_tmux_name,
     ];
     for name in names {
+        let target = format!("={name}:");
         let create = Command::new("tmux")
             .arg("-S")
             .arg(&sock)
@@ -390,6 +398,12 @@ fn test_cli_archive_no_kill_preserves_all_tmux_sessions() {
                 "24",
                 "sleep",
                 "600",
+                ";",
+                "set-option",
+                "-t",
+                &target,
+                "pane-base-index",
+                "0",
             ])
             .output()
             .expect("tmux new-session");
