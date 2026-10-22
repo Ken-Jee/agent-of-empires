@@ -1274,6 +1274,10 @@ mod tests {
                     result.expect_err("unproven inventory must retain the original kill failure");
                 assert!(error.to_string().contains("no current target"));
             }
+            assert!(
+                crate::tmux::batch_pane_metadata().is_err(),
+                "pane absence needs a successful empty session inventory, case={case}"
+            );
             return;
         }
         for case in [
@@ -1305,6 +1309,7 @@ mod tests {
                     r#"#!/bin/sh
 case " $* " in
   *" kill-session "*) printf 'no current target\n' >&2; {remove}; exit 1;;
+  *" list-panes "*) printf 'no current target\n' >&2; exit 1;;
   *" list-sessions "*) {listing};;
   *) exit 42;;
 esac

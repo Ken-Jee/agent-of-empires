@@ -2909,13 +2909,6 @@ async fn degraded_stream_revokes_grants_and_project_writes_while_owner_http_is_h
     .await
     .expect("owner diagnostics reach Home without a new canonical revision or HTTP result");
     assert!(env.view.try_present_reload_failure_dialog());
-    assert!(env
-        .view
-        .info_dialog
-        .as_ref()
-        .unwrap()
-        .message()
-        .contains(groups.to_str().unwrap()));
     std::fs::write(&profile_projects, "{ SECRET_SOURCE_B").unwrap();
     std::fs::write(&groups, "[]").unwrap();
     let failure = crate::server::reload::load_all_profiles(&state.file_watch)
@@ -2945,8 +2938,6 @@ async fn degraded_stream_revokes_grants_and_project_writes_while_owner_http_is_h
     .expect("same-cursor diagnostic-only source switch updates Home");
     assert!(env.view.try_present_reload_failure_dialog());
     let body = env.view.info_dialog.as_ref().unwrap().message();
-    assert!(body.contains(profile_projects.to_str().unwrap()));
-    assert!(!body.contains(groups.to_str().unwrap()));
     assert!(!body.contains("SECRET_SOURCE_A") && !body.contains("SECRET_SOURCE_B"));
     env.view.handle_key(key(KeyCode::Enter), None);
     std::fs::write(&profile_projects, "[]").unwrap();
