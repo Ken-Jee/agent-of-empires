@@ -2751,10 +2751,7 @@ async fn degraded_stream_revokes_grants_and_project_writes_while_owner_http_is_h
     let tmux_socket = tokio::task::spawn_blocking(crate::tmux::native_socket_locator)
         .await
         .unwrap();
-    let app = crate::session::get_app_dir()
-        .unwrap()
-        .canonicalize()
-        .unwrap();
+    let app = crate::session::get_app_dir().unwrap();
     let repo = app.join("admission-project");
     git2::Repository::init(&repo).unwrap();
     crate::session::projects::add(
@@ -2810,7 +2807,7 @@ async fn degraded_stream_revokes_grants_and_project_writes_while_owner_http_is_h
             nix::unistd::geteuid().as_raw(),
         )))
         .with_state(state.clone());
-    let socket = app.join("daemon/api.sock");
+    let socket = app.canonicalize().unwrap().join("daemon/api.sock");
     let server = crate::server::test_support::serve_owner_router_for_test(&socket, router).await;
     let endpoint = crate::acp::client::DaemonEndpoint::local_unix(socket.clone());
     let connection = crate::daemon::RuntimeConnection::connect(&endpoint, Some("test"))

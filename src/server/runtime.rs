@@ -966,10 +966,7 @@ mod tests {
     async fn diagnostic_only_source_change_reaches_existing_owner_stream_without_new_cursor() {
         use crate::daemon::{RuntimeConnection, RuntimeEvent};
         let _home = crate::session::test_support::isolate_app_dir();
-        let app = crate::session::get_app_dir()
-            .unwrap()
-            .canonicalize()
-            .unwrap();
+        let app = crate::session::get_app_dir().unwrap();
         crate::session::get_profile_dir("test").unwrap();
         crate::session::config::update_config(|config| config.default_profile = "test".into())
             .unwrap();
@@ -988,7 +985,7 @@ mod tests {
         let work = owned.runtime.work.clone();
         owned.runtime = NativeRuntime::new(app.to_string_lossy().into_owned(), None, work);
         let state = Arc::new(owned);
-        let socket = app.join("daemon/api.sock");
+        let socket = app.canonicalize().unwrap().join("daemon/api.sock");
         let router = crate::server::test_support::build_router_for_test(state.clone());
         let server =
             crate::server::test_support::serve_owner_router_for_test(&socket, router).await;
