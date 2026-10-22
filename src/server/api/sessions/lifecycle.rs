@@ -517,18 +517,23 @@ pub async fn trash_session(
             return persist_failed_response();
         }
     };
-    if let crate::session::trash::RelocateOutcome::Failed { reason } = outcome {
-        tracing::warn!(
-            target: "http.api.sessions",
-            session = %id,
-            "trash worktree relocation skipped: {reason}",
-        );
-    }
+    let move_warning = match outcome {
+        crate::session::trash::RelocateOutcome::Failed { reason } => {
+            tracing::warn!(
+                target: "http.api.sessions",
+                session = %id,
+                "trash worktree relocation skipped: {reason}",
+            );
+            None
+        }
+        crate::session::trash::RelocateOutcome::Relocated { warning, .. } => warning,
+        crate::session::trash::RelocateOutcome::Skipped => None,
+    };
 
     let Some(durable) = durable else {
         return session_not_found();
     };
-    let response = {
+    let mut response = {
         let mut instances = state.instances.write().await;
         let Some(instance) = instances.iter_mut().find(|instance| instance.id == id) else {
             return crate::server::api::session_gone_after_persist();
@@ -539,6 +544,7 @@ pub async fn trash_session(
         instance.lifecycle_reservation = durable.lifecycle_reservation;
         SessionResponse::from_instance(instance, crate::claude_settings::read_tui_fullscreen())
     };
+    response.warnings.extend(move_warning);
     (StatusCode::OK, Json(serde_json::json!(response))).into_response()
 }
 
@@ -576,7 +582,7 @@ pub async fn restore_session(
     let restore_id = id.clone();
     let file_watch = state.file_watch.clone();
     let restored = tokio::task::spawn_blocking(move || {
-        let run = || -> Result<Instance, RestoreTransitionError> {
+        let run = || -> Result<(Instance, Option<String>), RestoreTransitionError> {
             let storage = Storage::new(&restore_profile, file_watch)
                 .map_err(|error| RestoreTransitionError::Persist(error.to_string()))?;
             let _lifecycle_lock = storage
@@ -609,23 +615,26 @@ pub async fn restore_session(
             else {
                 return Err(RestoreTransitionError::NotFound);
             };
-            if let crate::session::trash::RestoreOutcome::Failed { reason } =
-                crate::session::trash::restore_worktree_location(&mut instance)
+            let move_warning = match crate::session::trash::restore_worktree_location(&mut instance)
             {
-                let _ = storage.update(|instances, _groups| {
-                    if let Some(stored) = instances
-                        .iter_mut()
-                        .find(|candidate| candidate.id == restore_id)
-                    {
-                        stored.release_lifecycle_reservation_if_owned(
-                            LifecycleOperation::Restore,
-                            generation,
-                        );
-                    }
-                    Ok(())
-                });
-                return Err(RestoreTransitionError::Worktree(reason));
-            }
+                crate::session::trash::RestoreOutcome::Failed { reason } => {
+                    let _ = storage.update(|instances, _groups| {
+                        if let Some(stored) = instances
+                            .iter_mut()
+                            .find(|candidate| candidate.id == restore_id)
+                        {
+                            stored.release_lifecycle_reservation_if_owned(
+                                LifecycleOperation::Restore,
+                                generation,
+                            );
+                        }
+                        Ok(())
+                    });
+                    return Err(RestoreTransitionError::Worktree(reason));
+                }
+                crate::session::trash::RestoreOutcome::Restored { warning, .. } => warning,
+                crate::session::trash::RestoreOutcome::NoChange => None,
+            };
             let restored_path = instance.project_path.clone();
             let restored_pre = instance.pre_trash_project_path.clone();
             let commit = storage
@@ -643,7 +652,7 @@ pub async fn restore_session(
                 crate::session::claim::RestoreCommit::Committed => {
                     instance.untrash();
                     instance.lifecycle_reservation = None;
-                    Ok(instance)
+                    Ok((instance, move_warning))
                 }
                 crate::session::claim::RestoreCommit::Superseded => {
                     Err(RestoreTransitionError::Busy(
@@ -659,8 +668,8 @@ pub async fn restore_session(
     })
     .await;
 
-    let restored = match restored {
-        Ok(Ok(instance)) => instance,
+    let (restored, move_warning) = match restored {
+        Ok(Ok(result)) => result,
         Ok(Err(RestoreTransitionError::NotFound)) => return session_not_found(),
         Ok(Err(RestoreTransitionError::Busy(holder))) => {
             return api_error(
@@ -686,7 +695,7 @@ pub async fn restore_session(
         }
     };
 
-    let response = {
+    let mut response = {
         let mut instances = state.instances.write().await;
         let Some(instance) = instances.iter_mut().find(|instance| instance.id == id) else {
             return crate::server::api::session_gone_after_persist();
@@ -698,6 +707,7 @@ pub async fn restore_session(
         instance.untrash();
         SessionResponse::from_instance(instance, crate::claude_settings::read_tui_fullscreen())
     };
+    response.warnings.extend(move_warning);
     (StatusCode::OK, Json(serde_json::json!(response))).into_response()
 }
 

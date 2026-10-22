@@ -1777,16 +1777,24 @@ export async function logout(): Promise<void> {
   }
 }
 
-/** Rename a session. A tied worktree moves too, and a running session returns 409 with a message. */
-export async function renameSession(
-  id: string,
-  title: string,
+/** `{ ok }` plus the server's `warnings` on success and its `message` on failure. */
+async function okWithWarnings(
+  url: string,
+  init: RequestInit,
 ): Promise<{ ok: boolean; message?: string; warnings?: string[] }> {
-  const reply = await send(`/api/sessions/${id}`, jsonInit("PATCH", { title })).catch(() => null);
+  const reply = await send(url, init).catch(() => null);
   if (!reply) return { ok: false };
   if (!reply.ok) return { ok: false, message: stringField(reply.payload, "message") };
   const warnings = stringList(reply.payload?.warnings).filter((w): w is string => typeof w === "string");
   return warnings.length > 0 ? { ok: true, warnings } : { ok: true };
+}
+
+/** Rename a session. A tied worktree moves too, and a running session returns 409 with a message. */
+export function renameSession(
+  id: string,
+  title: string,
+): Promise<{ ok: boolean; message?: string; warnings?: string[] }> {
+  return okWithWarnings(`/api/sessions/${id}`, jsonInit("PATCH", { title }));
 }
 
 /** Re-trigger smart rename; a 202 means it started, not that the title changed. */
@@ -1804,8 +1812,8 @@ export function setWorktreeName(
   id: string,
   name: string,
   renameBranch: boolean,
-): Promise<{ ok: boolean; message?: string }> {
-  return okWithMessage(`/api/sessions/${id}/worktree-name`, jsonInit("PATCH", { name, rename_branch: renameBranch }));
+): Promise<{ ok: boolean; message?: string; warnings?: string[] }> {
+  return okWithWarnings(`/api/sessions/${id}/worktree-name`, jsonInit("PATCH", { name, rename_branch: renameBranch }));
 }
 
 export type AttachProjectWorker = "restarted" | "not_running" | "restart_failed";

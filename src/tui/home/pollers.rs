@@ -183,6 +183,8 @@ impl HomeView {
                         session = %result.session_id,
                         "trash transition incomplete: {reason}",
                     );
+                    self.info_dialog = Some(InfoDialog::new("Trashed With Warning", &reason));
+                    changed = true;
                 }
                 changed
             }

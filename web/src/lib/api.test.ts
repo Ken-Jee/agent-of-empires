@@ -1111,13 +1111,17 @@ describe("login", () => {
 });
 
 describe("session mutation messages", () => {
-  it("renameSession keeps only string warnings", async () => {
+  it.each([
+    ["renameSession", () => api.renameSession("s1", "T")],
+    ["setWorktreeName", () => api.setWorktreeName("s1", "feature", false)],
+  ])("%s keeps only string warnings", async (_name, call) => {
     fetchSpy.mockResolvedValueOnce(json({ warnings: ["kept", 3, null] }));
-    expect(await api.renameSession("s1", "T")).toEqual({ ok: true, warnings: ["kept"] });
+    expect(await call()).toEqual({ ok: true, warnings: ["kept"] });
   });
 
   it.each([
     ["renameSession", () => api.renameSession("s1", "x")],
+    ["setWorktreeName", () => api.setWorktreeName("s1", "x", false)],
     ["smartRenameSession", () => api.smartRenameSession("s1")],
     ["attachSessionProject", () => api.attachSessionProject("s1", "p")],
   ])("%s surfaces the server message", async (_name, call) => {

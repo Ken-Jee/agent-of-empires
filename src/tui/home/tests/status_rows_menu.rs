@@ -1088,6 +1088,33 @@ fn trash_reserves_durable_lifecycle_generation() {
     assert_eq!(row.lifecycle_generation, 1);
 }
 
+/// A trash whose worktree move landed degraded reaches the user as a dialog, not only a log line.
+#[test]
+#[serial]
+fn trash_result_warning_opens_info_dialog() {
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instance_at(0).id.clone();
+    env.view.trash_poller =
+        crate::tui::trash_poller::TrashPoller::with_handler_for_test(|request| {
+            crate::session::trash::TrashResult {
+                session_id: request.session_id,
+                relocation: None,
+                relocate_warning: Some("submodule x is not repointed".to_string()),
+            }
+        });
+    env.view.selected_session = Some(id.clone());
+    env.view.trash_session_by_id(&id);
+
+    for _ in 0..100 {
+        env.view.apply_trash_results();
+        if env.view.info_dialog.is_some() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    panic!("degraded trash warning never reached the info dialog");
+}
+
 /// A plain session's no-relocation teardown releases its durable Trash reservation
 /// before the worker publishes completion.
 #[test]
@@ -1409,6 +1436,8 @@ fn empty_trash_escalates_a_row_that_keeps_failing() {
             trashed.lifecycle_reservation, None,
             "trash reservation released"
         );
+        // The dead repo makes the relocation fail, which now opens a dialog.
+        env.view.info_dialog = None;
 
         // (checkbox labels offered, forced delete expected in flight); each offered box is ticked.
         let rounds: [(&[&str], bool); 3] = [

@@ -256,7 +256,10 @@ function RowModals({
         onCancel={close}
         onSubmit={async (name, renameBranch) => {
           const res = await setWorktreeName(sessionId, name, renameBranch);
-          if (res.ok) close();
+          if (res.ok) {
+            res.warnings?.forEach((warning) => reportInfo(warning));
+            close();
+          }
           return res;
         }}
       />,
