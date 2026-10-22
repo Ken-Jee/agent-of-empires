@@ -119,6 +119,10 @@ pub(crate) async fn send_terminal_message(
         if !tmux_session.exists() {
             return Err(Box::new((inst_owned, outcome, SendKeysError::NotRunning)));
         }
+        tmux_session.wait_until_ready(
+            std::time::Duration::from_secs(5),
+            crate::agents::ready_marker(&tool),
+        );
         let _input_lock = match inst_owned.lock_for_input() {
             Ok(lock) => lock,
             Err(e) => {
