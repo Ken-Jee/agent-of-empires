@@ -41,7 +41,33 @@ pub enum PanePresence {
 pub struct LegacyToolIdentity {
     pub session_id: String,
     pub pane_id: String,
-    pub pane_pid: u32,
+    #[serde(deserialize_with = "Option::deserialize")]
+    pub pane_pid: Option<u32>,
+}
+
+impl std::fmt::Display for LegacyToolIdentity {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{} / {}, ", self.session_id, self.pane_id)?;
+        match self.pane_pid {
+            Some(pid) => write!(formatter, "PID {pid}"),
+            None => formatter.write_str("leader exited"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TmuxServerIdentity {
+    pub socket: String,
+    pub pid: u32,
+    pub birth: crate::process::ProcessBirthIdentity,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct LegacyToolObservation {
+    pub identity: LegacyToolIdentity,
+    pub server: std::sync::Arc<TmuxServerIdentity>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -49,6 +75,7 @@ pub struct LegacyToolIdentity {
 pub struct LegacyToolAdoption {
     pub tmux_session: String,
     pub identity: LegacyToolIdentity,
+    pub server: std::sync::Arc<TmuxServerIdentity>,
     pub profile: String,
     pub lifecycle_generation: u64,
 }
@@ -61,7 +88,7 @@ pub struct PaneObservation {
     #[serde(default)]
     pub tmux_session: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub legacy_tool: Option<LegacyToolIdentity>,
+    pub legacy_tool: Option<LegacyToolObservation>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]

@@ -111,6 +111,29 @@ export function useSessions() {
     setState((prev) => ({ ...prev, sessions: prev.sessions.map((s) => (s.id === id ? { ...s, status } : s)) }));
   }, []);
 
+  const clearDeletingStatus = useCallback((selected: SessionResponse[]) => {
+    const originals = new Map(selected.map((session) => [session.id, session]));
+    setState((previous) => {
+      let sessions: SessionResponse[] | undefined;
+      for (const [index, row] of previous.sessions.entries()) {
+        const original = originals.get(row.id);
+        if (
+          row.status === "Deleting" &&
+          original &&
+          row.profile === original.profile &&
+          row.created_at === original.created_at &&
+          row.lifecycle_generation === original.lifecycle_generation &&
+          row.trashed_at === original.trashed_at &&
+          row.trash_lifecycle_id === original.trash_lifecycle_id
+        ) {
+          sessions ??= previous.sessions.slice();
+          sessions[index] = { ...row, status: original.status };
+        }
+      }
+      return sessions ? { ...previous, sessions } : previous;
+    });
+  }, []);
+
   const applySession = useCallback((session: SessionResponse) => {
     setState((prev) => {
       const observedById = { ...prev.observedById };
@@ -151,6 +174,7 @@ export function useSessions() {
     loaded,
     injectSession,
     setSessionStatus,
+    clearDeletingStatus,
     applySession,
     applySessionMutation,
   };

@@ -436,6 +436,52 @@ pub struct ServeLock {
 pub fn try_lock_serve() -> Result<Option<ServeLock>> {
     try_lock_serve_at(&crate::session::get_app_dir()?.join("serve.lock"))
 }
+pub(crate) fn with_inactive_serve_state<T>(
+    transaction: &crate::daemon::lifecycle::Transaction,
+    serve: Option<&ServeLock>,
+    operation: impl FnOnce(&ServeLock) -> Result<T>,
+) -> Result<T> {
+    let owned;
+    let serve = match serve {
+        Some(serve) => serve,
+        None => {
+            owned = try_lock_serve()?
+                .context("A daemon or migration owns serve.lock; recovery refused")?;
+            &owned
+        }
+    };
+    let _lifetime = transaction
+        .try_lifetime()?
+        .context("A daemon still owns its lifetime; recovery refused")?;
+    let _state = lock_serve_state_for_recovery()?;
+    anyhow::ensure!(
+        daemon_status() == DaemonStatus::Absent,
+        "Existing daemon identity is live or ambiguous; recovery refused"
+    );
+    operation(serve)
+}
+
+fn lock_serve_state_for_recovery() -> Result<std::fs::File> {
+    use fs2::FileExt as _;
+    let root = crate::session::AnchoredDir::open(&crate::session::get_app_dir()?)?;
+    let (file, path) = root.open_lock("serve.state.lock".as_ref())?;
+    crate::process::validate_recovery_file(&file)?;
+    match file.try_lock_exclusive() {
+        Ok(()) => Ok(file),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+            anyhow::bail!(
+                "Serve-state publisher owns {}; recovery refused without changing authority",
+                path.display()
+            )
+        }
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "Acquiring recovery serve-state exclusion {}",
+                path.display()
+            )
+        }),
+    }
+}
 
 pub struct ServeStartup {
     lock: ServeLock,
@@ -447,7 +493,12 @@ impl ServeStartup {
         &self,
         reporter: Option<crate::migrations::progress::Reporter>,
     ) -> Result<()> {
-        crate::migrations::run_migrations_under_transaction(reporter, false, &self.transaction)
+        crate::migrations::run_migrations_under_exclusion(
+            reporter,
+            false,
+            &self.transaction,
+            &self.lock,
+        )
     }
 }
 
@@ -499,16 +550,14 @@ fn daemon_running_error(pid: u32) -> anyhow::Error {
 
 fn try_lock_serve_at(path: &std::path::Path) -> Result<Option<ServeLock>> {
     use fs2::FileExt as _;
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(path)?;
+    let directory =
+        crate::session::AnchoredDir::open(path.parent().context("Serve lock has no parent")?)?;
+    let (file, _) = directory.open_lock(path.file_name().context("Serve lock has no name")?)?;
+    crate::process::validate_recovery_file(&file)?;
     match file.try_lock_exclusive() {
         Ok(()) => Ok(Some(ServeLock { _file: file })),
-        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
-        Err(e) => Err(e.into()),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+        Err(error) => Err(error.into()),
     }
 }
 
@@ -1012,16 +1061,11 @@ const SERVE_STATE_FILES: [&str; 4] = [
 /// Separate from the lifetime lock a running server holds, which this state is
 /// published and cleared under. Publishers hold it from before spawning until the pid
 /// and launch files are written; cleanup holds it across its ownership check and deletion.
-fn lock_serve_state() -> Result<std::fs::File> {
+pub(crate) fn lock_serve_state() -> Result<std::fs::File> {
     use fs2::FileExt as _;
-    let path = crate::session::get_app_dir()?.join("serve.state.lock");
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&path)
-        .with_context(|| format!("opening {}", path.display()))?;
+    let root = crate::session::AnchoredDir::open(&crate::session::get_app_dir()?)?;
+    let (file, path) = root.open_lock("serve.state.lock".as_ref())?;
+    crate::process::validate_recovery_file(&file)?;
     file.lock_exclusive()
         .with_context(|| format!("locking {}", path.display()))?;
     Ok(file)
@@ -1414,13 +1458,13 @@ async fn fetch_cityhall_bundle(url: &str, token: &str) -> Result<String> {
     Ok(daemon::decode_text(response).await?)
 }
 
-pub(crate) async fn ensure_core_daemon(
+pub(crate) async fn ensure_local_daemon(
     profile: &str,
     allow_start: bool,
-) -> Result<crate::acp::client::DaemonEndpoint> {
+) -> Result<(crate::acp::client::DaemonEndpoint, Option<u32>)> {
     use clap::Parser;
     let transaction = crate::daemon::lifecycle::Transaction::acquire().await?;
-    if daemon_pid().is_none() {
+    let started = if daemon_pid().is_none() {
         anyhow::ensure!(
             allow_start,
             "Local daemon autostart is disabled; start one with `aoe serve --core-only --daemon`"
@@ -1433,18 +1477,67 @@ pub(crate) async fn ensure_core_daemon(
             unreachable!()
         };
         start_daemon(profile, &args, &transaction, false).await?;
-    }
+        daemon_pid()
+    } else {
+        None
+    };
     let endpoint = crate::acp::client::DaemonEndpoint::local_unix(
         crate::daemon::transport::local_socket_path()?,
     );
-    anyhow::ensure!(
-        endpoint
-            .daemon_client()?
-            .local_runtime_ready((!profile.is_empty()).then_some(profile))
-            .await?,
-        "Local daemon runtime identity or profile readiness does not match"
+    endpoint
+        .daemon_client()?
+        .local_runtime_ready((!profile.is_empty()).then_some(profile))
+        .await?;
+    Ok((endpoint, started))
+}
+pub(crate) async fn start_dashboard_for_tui(
+    profile: &str,
+    mut args: ServeArgs,
+    predecessor_epoch: Option<&str>,
+    restart: bool,
+) -> Result<(
+    crate::daemon::RuntimeConnection,
+    crate::daemon::DaemonClient,
+)> {
+    let launch = if restart {
+        restart_daemon_with_receipt(Some(args), false).await?
+    } else {
+        let startup = lock_for_startup(profile, &mut args)
+            .await?
+            .context("Dashboard startup guard is unavailable")?;
+        let startup = tokio::task::spawn_blocking(move || {
+            startup.run_migrations(None)?;
+            Ok::<_, anyhow::Error>(startup)
+        })
+        .await??;
+        let ServeStartup { lock, transaction } = startup;
+        validate_launch_args(profile, &args).await?;
+        drop(lock);
+        start_daemon(profile, &args, &transaction, false).await?;
+        managed_launch(daemon_pid().context("Dashboard successor is unavailable")?)?
+    };
+    anyhow::ensure!(!launch.core_only, "Successor did not enable the dashboard");
+    let instance = launch
+        .instance_id
+        .context("Successor instance proof is missing")?;
+    let endpoint = crate::acp::client::DaemonEndpoint::local_unix(
+        crate::daemon::transport::local_socket_path()?,
     );
-    Ok(endpoint)
+    let connection = crate::daemon::RuntimeConnection::connect(
+        &endpoint,
+        (!profile.is_empty()).then_some(profile),
+    )
+    .await?;
+    anyhow::ensure!(
+        connection.info().owner_instance_id.as_deref() == Some(instance.as_str()),
+        "Dashboard successor identity changed before reconnect"
+    );
+    anyhow::ensure!(
+        predecessor_epoch.is_none_or(|epoch| epoch != connection.info().epoch),
+        "Dashboard successor reused the predecessor epoch"
+    );
+    let client = endpoint.daemon_client()?;
+    Ok((connection, client))
 }
 
 async fn start_daemon(
@@ -1691,12 +1784,14 @@ async fn migrate_managed_launch(
     full: bool,
 ) -> Result<crate::daemon::lifecycle::Transaction> {
     tokio::task::spawn_blocking(move || {
+        crate::migrations::ensure_schema_supported()?;
         if full {
-            let _serve = try_lock_serve()?.context("serve or migration is still running")?;
-            crate::migrations::run_migrations_under_transaction(
+            let serve = try_lock_serve()?.context("serve or migration is still running")?;
+            crate::migrations::run_migrations_under_exclusion(
                 Some(crate::cli::migrate::stderr_reporter()),
                 false,
                 &transaction,
+                &serve,
             )?;
         } else {
             crate::migrations::reconcile_serve_launch_under_transaction(&transaction)?;
@@ -1709,6 +1804,13 @@ async fn migrate_managed_launch(
 /// Replay the managed launch with the current executable, retaining it before stop.
 #[tracing::instrument(target = "serve.lifecycle", skip_all)]
 pub async fn restart_daemon() -> Result<()> {
+    restart_daemon_with_receipt(None, true).await.map(|_| ())
+}
+
+pub(crate) async fn restart_daemon_with_receipt(
+    override_args: Option<ServeArgs>,
+    announce: bool,
+) -> Result<ServeLaunch> {
     let transaction = crate::daemon::lifecycle::Transaction::acquire().await?;
     let Some(pid) = daemon_pid() else {
         bail!(
@@ -1719,15 +1821,19 @@ pub async fn restart_daemon() -> Result<()> {
     let transaction = migrate_managed_launch(transaction, false).await?;
 
     let launch = managed_launch(pid)?;
-    let passphrase = recall_serve_passphrase(&launch)?;
-    let args = launch.to_serve_args(passphrase);
+    let predecessor_passphrase = recall_serve_passphrase(&launch)?;
+    let args =
+        override_args.unwrap_or_else(|| launch.to_serve_args(predecessor_passphrase.clone()));
     validate_launch_args(&launch.profile, &args).await?;
-    retain_rollback_launch(&transaction, &launch, args.passphrase.as_deref())?;
+    retain_rollback_launch(&transaction, &launch, predecessor_passphrase.as_deref())?;
 
-    println!("Restarting aoe serve daemon (PID {pid})…");
+    if announce {
+        println!("Restarting aoe serve daemon (PID {pid})…");
+    }
     stop_daemon_locked(&transaction).await?;
     let transaction = migrate_managed_launch(transaction, true).await?;
-    complete_rollback_after(start_daemon(&launch.profile, &args, &transaction, true).await)
+    complete_rollback_after(start_daemon(&launch.profile, &args, &transaction, announce).await)?;
+    managed_launch(daemon_pid().context("Restart successor is unavailable")?)
 }
 
 fn report_stale_cleanup(pid: i32) {
@@ -2740,5 +2846,41 @@ mod tests {
                 "a known profile must reach the next validation, got: {msg}"
             );
         }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn newer_data_schema_preserves_managed_launch_and_credentials() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let _home = crate::session::test_support::isolate_app_dir_at(home.path());
+        let app = crate::session::get_app_dir()?;
+        let version = (crate::migrations::current_schema_version() + 1).to_string();
+        std::fs::write(app.join(".schema_version"), &version)?;
+        let original = serde_json::to_string(&serde_json::json!({
+            "schema": 1,
+            "pid": std::process::id(),
+            "instance_id": "retained-launch",
+            "auth_mode": "passphrase"
+        }))?;
+        for name in ["serve.launch", "serve.rollback.launch"] {
+            launch_file(name)?.replace(original.as_bytes())?;
+        }
+        let credential = "retained-credential";
+        launch_file("serve.passphrase")?.replace(credential.as_bytes())?;
+        let transaction = crate::daemon::lifecycle::Transaction::acquire().await?;
+
+        assert!(migrate_managed_launch(transaction, false).await.is_err());
+        for name in ["serve.launch", "serve.rollback.launch"] {
+            assert_eq!(launch_file(name)?.read()?.unwrap(), original);
+        }
+        assert_eq!(
+            launch_file("serve.passphrase")?.read()?.unwrap(),
+            credential
+        );
+        assert_eq!(
+            std::fs::read_to_string(app.join(".schema_version"))?,
+            version
+        );
+        Ok(())
     }
 }

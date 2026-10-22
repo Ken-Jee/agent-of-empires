@@ -615,6 +615,30 @@ impl LockedDataFile {
     pub(crate) fn read(&self) -> Result<Option<String>> {
         self.target.read()
     }
+    pub(crate) fn read_recovery_bytes(&self) -> Result<Option<Vec<u8>>> {
+        self.target.read_recovery_bytes()
+    }
+
+    pub(crate) fn quarantine_recovery_bytes(&self, bytes: &[u8]) -> Result<PathBuf> {
+        self.target.quarantine_recovery_bytes(bytes)
+    }
+
+    pub(crate) fn lock_recovery(target: super::anchored_fs::ResolvedDataFile) -> Result<Self> {
+        let (file, path) = target.open_sidecar()?;
+        crate::process::validate_recovery_file(&file)?;
+        match file.try_lock_exclusive() {
+            Ok(()) => Ok(Self {
+                target,
+                _flock: StorageFlock { file },
+            }),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                anyhow::bail!("Recovery journal exclusion {} is busy; no authority was changed; retry after its owner finishes", path.display())
+            }
+            Err(error) => Err(error).with_context(|| {
+                format!("Acquiring recovery journal exclusion {}", path.display())
+            }),
+        }
+    }
 
     pub(crate) fn require_writable_existing(&self) -> Result<()> {
         self.target.require_writable_existing()
@@ -987,6 +1011,35 @@ fn acquire_open_storage_shared_flock(file: fs::File, path: &Path) -> Result<Stor
 pub(crate) fn acquire_session_identity_lock() -> Result<StorageFlock> {
     acquire_storage_flock(&get_app_dir()?, SESSION_IDENTITY_LOCK_FILENAME)
 }
+pub(crate) fn acquire_migration_lifecycle_lock(
+    profile_dir: &Path,
+    instance_id: &str,
+) -> Result<StorageFlock> {
+    super::validate_instance_id(instance_id)?;
+    acquire_recovery_storage_flock(
+        profile_dir,
+        &format!("{INSTANCE_LIFECYCLE_LOCK_PREFIX}{instance_id}.lock"),
+    )
+}
+
+pub(crate) fn acquire_recovery_storage_flock(dir: &Path, name: &str) -> Result<StorageFlock> {
+    let directory = super::AnchoredDir::open(dir)?;
+    let (file, path) = directory.open_lock(name.as_ref())?;
+    crate::process::validate_recovery_file(&file)?;
+    match file.try_lock_exclusive() {
+        Ok(()) => Ok(StorageFlock { file }),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+            anyhow::bail!("Recovery exclusion {} is busy; no authority was changed; retry after its owner finishes", path.display())
+        }
+        Err(error) => {
+            Err(error).with_context(|| format!("Acquiring recovery exclusion {}", path.display()))
+        }
+    }
+}
+
+pub(crate) fn acquire_recovery_identity_lock() -> Result<StorageFlock> {
+    acquire_recovery_storage_flock(&get_app_dir()?, SESSION_IDENTITY_LOCK_FILENAME)
+}
 
 /// Serialize one session's title commit and post-commit tmux rekey across
 /// profiles and processes.
@@ -1001,6 +1054,31 @@ pub(crate) fn acquire_session_title_lock(instance_id: &str) -> Result<StorageFlo
         &get_app_dir()?,
         &format!("{SESSION_TITLE_LOCK_PREFIX}{instance_id}.lock"),
     )
+}
+pub(crate) struct TerminalHandoffDriver {
+    session_id: String,
+    _flock: StorageFlock,
+}
+
+impl TerminalHandoffDriver {
+    pub(crate) fn session_id(&self) -> &str {
+        &self.session_id
+    }
+}
+
+pub(crate) fn try_acquire_terminal_handoff_driver(
+    instance_id: &str,
+) -> Result<Option<TerminalHandoffDriver>> {
+    super::validate_instance_id(instance_id)
+        .context("refusing handoff driver lock for invalid instance id")?;
+    Ok(try_acquire_storage_flock(
+        &get_app_dir()?,
+        &format!(".terminal-handoff-{instance_id}.lock"),
+    )?
+    .map(|flock| TerminalHandoffDriver {
+        session_id: instance_id.to_owned(),
+        _flock: flock,
+    }))
 }
 
 // Thread-local crash injection isolates concurrent transaction tests.
@@ -1970,41 +2048,46 @@ impl Storage {
         kind: &str,
         source: Option<&super::anchored_fs::ResolvedDataFile>,
     ) -> Result<Vec<T>> {
-        let content = match source {
-            Some(source) => source.read()?,
-            None => read_nonempty(path)?,
-        };
-        let Some(content) = content else {
-            return Ok(Vec::new());
-        };
-        if matches!(policy, ReadPolicy::Complete(_)) {
-            return Ok(serde_json::from_str(&content)?);
-        }
-        if content.trim().is_empty() {
-            return Ok(Vec::new());
-        }
-        let rows: Vec<serde_json::Value> = serde_json::from_str(&content)?;
-        let mut valid = Vec::with_capacity(rows.len());
-        let mut corrupt = Vec::new();
-        for (index, row) in rows.into_iter().enumerate() {
-            match T::deserialize(&row) {
-                Ok(row) => valid.push(row),
-                Err(error) => {
-                    tracing::warn!(target: "session.store", profile = %self.profile, row = index, %error, %kind, path = %path.display(), "skipping corrupt stored row");
-                    corrupt.push(row);
+        let result = (|| {
+            let content = match source {
+                Some(source) => source.read()?,
+                None => read_nonempty(path)?,
+            };
+            let Some(content) = content else {
+                return Ok(Vec::new());
+            };
+            if matches!(policy, ReadPolicy::Complete(_)) {
+                return Ok(serde_json::from_str(&content)?);
+            }
+            if content.trim().is_empty() {
+                return Ok(Vec::new());
+            }
+            let rows: Vec<serde_json::Value> = serde_json::from_str(&content)?;
+            let mut valid = Vec::with_capacity(rows.len());
+            let mut corrupt = Vec::new();
+            for (index, row) in rows.into_iter().enumerate() {
+                match T::deserialize(&row) {
+                    Ok(row) => valid.push(row),
+                    Err(error) => {
+                        tracing::warn!(target: "session.store", profile = %self.profile, row = index, %error, %kind, path = %path.display(), "skipping corrupt stored row");
+                        corrupt.push(row);
+                    }
                 }
             }
-        }
-        if !corrupt.is_empty() && matches!(policy, ReadPolicy::Recover) {
-            let quarantine = path.with_file_name(format!("{kind}s.corrupt.jsonl"));
-            Self::write_corrupt_rows_quarantine(
-                &quarantine,
-                &corrupt,
-                kind,
-                self.profile_files(policy).map(|files| &files.directory),
-            );
-        }
-        Ok(valid)
+            if !corrupt.is_empty() && matches!(policy, ReadPolicy::Recover) {
+                let quarantine = path.with_file_name(format!("{kind}s.corrupt.jsonl"));
+                Self::write_corrupt_rows_quarantine(
+                    &quarantine,
+                    &corrupt,
+                    kind,
+                    self.profile_files(policy).map(|files| &files.directory),
+                );
+            }
+            Ok(valid)
+        })();
+        result.map_err(|error: anyhow::Error| {
+            error.context(crate::session::LoadSource(path.to_path_buf()))
+        })
     }
 
     /// Preserve the current corrupt set without growing it on every recovery read.
@@ -2090,7 +2173,10 @@ impl Storage {
         files.verify_current(&self.sessions_path)
     }
 
-    #[allow(clippy::unnecessary_cast)]
+    #[allow(
+        clippy::unnecessary_cast,
+        reason = "Darwin device IDs are signed; the bound identity is portable u64"
+    )]
     pub(crate) fn bound_profile_identity(&self) -> Result<(u64, u64)> {
         let (device, inode) = self
             .files
@@ -2494,6 +2580,9 @@ impl Storage {
             {
                 return Err(ProfileMoveRejected("Session already exists in target profile").into());
             }
+            if source.terminal_handoff.is_some() {
+                return Err(ProfileMoveRejected("terminal handoff is pending").into());
+            }
             let mut candidate = source.clone();
             if plan.profile.merge_complete_post {
                 candidate.merge_profile_move_diff(before, after, plan.profile.account_swap);
@@ -2811,14 +2900,17 @@ fn workspace_ordering_path() -> Result<PathBuf> {
 
 pub fn load_workspace_ordering() -> Result<WorkspaceOrdering> {
     let path = workspace_ordering_path()?;
-    if !path.exists() {
-        return Ok(WorkspaceOrdering::default());
-    }
-    let content = fs::read_to_string(&path)?;
-    if content.trim().is_empty() {
-        return Ok(WorkspaceOrdering::default());
-    }
-    Ok(serde_json::from_str(&content)?)
+    let result = (|| {
+        if !path.exists() {
+            return Ok(WorkspaceOrdering::default());
+        }
+        let content = fs::read_to_string(&path)?;
+        if content.trim().is_empty() {
+            return Ok(WorkspaceOrdering::default());
+        }
+        Ok(serde_json::from_str(&content)?)
+    })();
+    result.map_err(|error: anyhow::Error| error.context(crate::session::LoadSource(path)))
 }
 
 /// Mutate under the global workspace lock and return the exact committed ordering.

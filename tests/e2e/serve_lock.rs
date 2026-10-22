@@ -303,3 +303,71 @@ fn managed_core_promotion_migrates_historical_launch_before_replay() {
     ));
     h.run_cli_ok(&["serve", "--stop"]);
 }
+
+#[test]
+#[parallel]
+fn tui_restart_failure_retains_predecessor_credential_for_rotation_and_removal() {
+    use crate::harness::{app_dir_in, require_tmux, TuiTestHarness};
+    use std::net::TcpListener;
+    use std::time::Duration;
+    for rotate in [false, true] {
+        require_tmux!();
+        let mut h = TuiTestHarness::new(&format!("tui_rollback_credential_{rotate}"));
+        h.stop_daemon_on_drop();
+        let port = crate::harness::pick_free_port();
+        let port_text = port.to_string();
+        let predecessor_secret = "predecessor-secret-only-for-this-fixture";
+        h.run_cli_ok(&[
+            "serve",
+            "--daemon",
+            "--port",
+            &port_text,
+            "--passphrase",
+            predecessor_secret,
+        ]);
+        let app = app_dir_in(h.home_path());
+        let predecessor: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(app.join("serve.launch")).unwrap()).unwrap();
+        let blocker = (49152..65535)
+            .find_map(|candidate| TcpListener::bind(("0.0.0.0", candidate)).ok())
+            .expect("fixture high port");
+        let blocked_port = blocker.local_addr().unwrap().port();
+        std::fs::write(app.join("serve.last_port"), blocked_port.to_string()).unwrap();
+        if rotate {
+            let tailscale = h.install_path_command("tailscale");
+            std::fs::write(tailscale.join("tailscale"), "#!/bin/sh\nexit 1\n").unwrap();
+            let cloudflared = h.install_path_command("cloudflared");
+            std::fs::write(cloudflared.join("cloudflared"), "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'cloudflared version fixture'; exit 0; fi\nexit 7\n").unwrap();
+            // Drive the actual G rotation path without exposing a public fixture tunnel.
+            std::fs::write(app.join("serve.mode"), "tunnel").unwrap();
+        }
+        h.spawn_tui();
+        h.wait_for("Runtime ready");
+        h.send_keys("R");
+        h.wait_for(if rotate { "tunnel" } else { "local" });
+        let key = if rotate { "g" } else { "r" };
+        h.send_keys(key);
+        h.send_keys(key);
+        h.wait_for_timeout("Dashboard start failed", Duration::from_secs(75));
+        let retained: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(app.join("serve.rollback.launch")).unwrap())
+                .unwrap();
+        let credential: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(app.join("serve.rollback.passphrase")).unwrap())
+                .unwrap();
+        assert_eq!(retained["instance_id"], predecessor["instance_id"]);
+        assert_eq!(credential["passphrase"], predecessor_secret);
+        assert_eq!(credential["instance_id"], predecessor["instance_id"]);
+        drop(blocker);
+        h.run_cli_ok(&["serve", "--rollback"]);
+        let restored: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(app.join("serve.launch")).unwrap()).unwrap();
+        assert_eq!(restored["port"], predecessor["port"]);
+        assert_eq!(restored["has_passphrase"], true);
+        assert_eq!(restored["remote"], false);
+        assert_eq!(
+            std::fs::read_to_string(app.join("serve.passphrase")).unwrap(),
+            predecessor_secret
+        );
+    }
+}

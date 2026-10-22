@@ -1665,7 +1665,7 @@ fn cli_migration_34_37_43_persists_policy_and_second_run_bytes() {
         std::fs::write(app.join("serve.passphrase"), "secondary login").unwrap();
         let journal = "{\"version\":2,\"owners\":[]}\n";
         std::fs::write(app.join("pending-purge-owners.json"), journal).unwrap();
-        let first = h.run_cli(&["migrate"]);
+        let first = h.run_cli(&["settings", "explain", "acp.default_agent"]);
         assert!(
             first.status.success(),
             "schema={version}: {}",
@@ -1706,7 +1706,7 @@ fn cli_migration_34_37_43_persists_policy_and_second_run_bytes() {
             .iter()
             .map(|path| std::fs::read(path).unwrap())
             .collect();
-        let second = h.run_cli(&["migrate"]);
+        let second = h.run_cli(&["settings", "explain", "acp.default_agent"]);
         assert!(
             second.status.success(),
             "{}",

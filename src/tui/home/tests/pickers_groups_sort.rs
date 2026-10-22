@@ -4000,3 +4000,194 @@ fn same_named_groups_across_profiles_are_tagged_and_listed_once() {
         "{labels:?}"
     );
 }
+
+#[tokio::test]
+#[serial]
+async fn reveal_expands_only_target_profile_and_keeps_creation_attach_until_all_receipts_apply() {
+    use crate::daemon::{MutationReceipt, NamespaceMutation, NamespaceOutcome};
+    let mut env = create_test_env_empty();
+    env.view.active_profile = None;
+    env.view.group_by = crate::session::config::GroupByMode::Manual;
+    let mut target = Instance::new("created-exact", "/tmp/target");
+    target.source_profile = "test".into();
+    target.group_path = "parent/child".into();
+    let mut peer = Instance::new("peer", "/tmp/peer");
+    peer.source_profile = "peer".into();
+    peer.group_path = "parent/child".into();
+    for row in [&target, &peer] {
+        Storage::new_unwatched(&row.source_profile)
+            .unwrap()
+            .update(|rows, groups| {
+                *rows = vec![row.clone()];
+                *groups = ["parent", "parent/child"]
+                    .into_iter()
+                    .map(|path| {
+                        let mut group = Group::new(path, path);
+                        group.collapsed = true;
+                        group
+                    })
+                    .collect();
+                Ok(())
+            })
+            .unwrap();
+    }
+    let state = native_state(&["test", "peer"]).await;
+    apply_published(&mut env.view, &state).await;
+    let mut respond = env.view.session_feed.namespace_driver_for_test();
+    assert!(!env.view.reveal_session(&target.id, true).unwrap());
+    assert!(env.view.take_created_attach().is_none());
+    for path in ["parent", "parent/child"] {
+        let (status, headers, body) = request_with_headers(
+            &state,
+            "PATCH",
+            "/api/groups/collapse",
+            serde_json::json!({"group":{"profile":"test","path":path},"collapsed":false}),
+        )
+        .await;
+        assert!(status.is_success(), "{status}: {body}");
+        let captured = respond(Ok(MutationReceipt {
+            cursor: receipt_cursor(&headers),
+            outcome: NamespaceOutcome::Committed,
+        }))
+        .unwrap();
+        assert!(
+            matches!(captured, NamespaceMutation::CollapseGroup(command) if command.group.profile == "test" && command.group.path == path && !command.collapsed)
+        );
+        env.view.apply_session_feed();
+        assert!(
+            env.view.take_created_attach().is_none(),
+            "receipt alone does not reveal or attach"
+        );
+        apply_published(&mut env.view, &state).await;
+    }
+    assert_eq!(
+        env.view.take_created_attach().as_deref(),
+        Some(target.id.as_str())
+    );
+    assert!(env.view.take_created_attach().is_none());
+    assert_eq!(
+        env.view.selected_session.as_deref(),
+        Some(target.id.as_str())
+    );
+    assert!(Storage::new_unwatched("test")
+        .unwrap()
+        .load_complete_with_groups()
+        .unwrap()
+        .1
+        .iter()
+        .all(|group| !group.collapsed));
+    assert!(Storage::new_unwatched("peer")
+        .unwrap()
+        .load_complete_with_groups()
+        .unwrap()
+        .1
+        .iter()
+        .all(|group| group.collapsed));
+    let (status, _) = request(
+        &state,
+        "PATCH",
+        &format!("/api/sessions/{}", peer.id),
+        serde_json::json!({"title":"unrelated-peer-change"}),
+    )
+    .await;
+    assert!(status.is_success());
+    apply_published(&mut env.view, &state).await;
+    assert!(env
+        .view
+        .flat_items
+        .iter()
+        .any(|item| matches!(item, Item::Session { id, .. } if id == &target.id)));
+    assert_eq!(
+        env.view.selected_session.as_deref(),
+        Some(target.id.as_str())
+    );
+    assert!(respond(Err("must not replay expansion".into())).is_none());
+}
+
+#[tokio::test]
+#[serial]
+async fn creation_reveal_keeps_owed_attach_while_newer_metadata_frame_is_unapplied() {
+    use crate::daemon::{MutationReceipt, NamespaceOutcome};
+    let mut env = create_test_env_empty();
+    env.view.group_by = crate::session::config::GroupByMode::Manual;
+    let mut target = Instance::new("created-exact", "/tmp/target");
+    target.source_profile = "test".into();
+    target.group_path = "work".into();
+    let mut peer = Instance::new("metadata-peer", "/tmp/peer");
+    peer.source_profile = "test".into();
+    let storage = Storage::new_unwatched("test").unwrap();
+    storage
+        .update(|rows, groups| {
+            *rows = vec![target.clone(), peer.clone()];
+            let mut group = Group::new("work", "work");
+            group.collapsed = true;
+            *groups = vec![group];
+            Ok(())
+        })
+        .unwrap();
+    let state = native_state(&["test"]).await;
+    apply_published(&mut env.view, &state).await;
+    let mut respond = env.view.session_feed.namespace_driver_for_test();
+    assert!(!env.view.reveal_session(&target.id, true).unwrap());
+    let (status, headers, body) = request_with_headers(
+        &state,
+        "PATCH",
+        "/api/groups/collapse",
+        serde_json::json!({"group":{"profile":"test","path":"work"},"collapsed":false}),
+    )
+    .await;
+    assert!(status.is_success(), "{status}: {body}");
+    let receipt = receipt_cursor(&headers);
+    apply_published(&mut env.view, &state).await;
+    assert!(
+        env.view.pending_namespace_intent.is_some(),
+        "frame N alone cannot settle the expansion request"
+    );
+    let mut newer = published_snapshot(&state).await;
+    newer.cursor.revision += 1;
+    let newer_cursor = newer.cursor.clone();
+    storage
+        .update(|rows, _| {
+            rows.retain(|row| row.id != peer.id);
+            Ok(())
+        })
+        .unwrap();
+    crate::session::update_workspace_ordering(|ordering| {
+        ordering.order = vec!["/tmp/peer::lag".into()];
+        Ok(())
+    })
+    .unwrap();
+    env.view
+        .session_feed
+        .publish_for_test(crate::tui::session_feed::SessionFeedResult::Snapshot(
+            Arc::new(newer),
+        ));
+    env.view.apply_session_feed();
+    assert!(!env.view.session_feed.receipt_applied(&newer_cursor));
+    assert!(respond(Ok(MutationReceipt {
+        cursor: receipt,
+        outcome: NamespaceOutcome::Committed
+    }))
+    .is_some());
+    env.view.apply_session_feed();
+    assert!(env.view.take_created_attach().is_none());
+    assert!(
+        env.view.pending_created_attach.is_some(),
+        "newer unapplied metadata is not cancellation proof"
+    );
+    storage
+        .update(|rows, _| {
+            rows.push(peer.clone());
+            Ok(())
+        })
+        .unwrap();
+    env.view.session_feed_reload_retry_at = Some(std::time::Instant::now());
+    env.view.apply_session_feed();
+    assert!(env.view.session_feed.receipt_applied(&newer_cursor));
+    assert_eq!(
+        env.view.take_created_attach().as_deref(),
+        Some(target.id.as_str())
+    );
+    assert!(env.view.take_created_attach().is_none());
+    assert!(respond(Err("must not replay expansion".into())).is_none());
+}

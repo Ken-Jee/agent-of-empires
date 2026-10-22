@@ -1,10 +1,9 @@
-//! Discovery never spawns. CLI autostart may launch loopback; native TUI bootstrap launches Core only.
+//! Local clients share one private daemon startup path; discovery never spawns.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use thiserror::Error;
 
-use super::autostart;
 use super::discovery::{discover, discover_env, DaemonEndpoint, DiscoveryError};
 use super::http::HttpError;
 
@@ -21,7 +20,7 @@ pub enum ManagerError {
     #[error("local daemon unavailable: {0}")]
     NoDaemonRunning(#[from] DiscoveryError),
     #[error(
-        "could not start a local aoe daemon: {0}\n\nStart one by hand with `aoe serve --daemon`, or attach to an existing remote daemon with:\n  AOE_DAEMON_URL=<url> AOE_DAEMON_TOKEN=<token> aoe …"
+        "could not start a local aoe daemon: {0}\n\nStart one by hand with `aoe serve --core-only --daemon`, or attach to an existing remote daemon with:\n  AOE_DAEMON_URL=<url> AOE_DAEMON_TOKEN=<token> aoe …"
     )]
     AutostartFailed(String),
 }
@@ -64,12 +63,9 @@ pub async fn ensure_daemon() -> Result<(DaemonEndpoint, Option<u32>), ManagerErr
     if discover_env().is_some() || autostart_disabled() {
         return locate_daemon().await.map(|endpoint| (endpoint, None));
     }
-    if let Some(endpoint) = autostart::healthy_local().await {
-        return Ok((endpoint, None));
-    }
-    autostart::start_local()
+    crate::cli::serve::ensure_local_daemon("", true)
         .await
-        .map_err(ManagerError::AutostartFailed)
+        .map_err(|error| ManagerError::AutostartFailed(error.to_string()))
 }
 
 /// Announce CLI autostart on stderr, also under `--json`.
@@ -81,10 +77,12 @@ pub async fn require_daemon() -> Result<DaemonEndpoint, ManagerError> {
     Ok(endpoint)
 }
 
-/// Only initial native bootstrap and explicit reconnect may start a local Core.
+/// Initial native bootstrap and explicit reconnect may start the local Daemon.
 pub async fn ensure_native_daemon(profile: &str) -> anyhow::Result<DaemonEndpoint> {
     if discover_env().is_some() {
         return locate_daemon().await.map_err(Into::into);
     }
-    crate::cli::serve::ensure_core_daemon(profile, !autostart_disabled()).await
+    crate::cli::serve::ensure_local_daemon(profile, !autostart_disabled())
+        .await
+        .map(|(endpoint, _)| endpoint)
 }

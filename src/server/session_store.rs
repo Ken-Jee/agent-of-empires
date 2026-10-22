@@ -11,6 +11,11 @@ thread_local! {
 }
 
 #[cfg(test)]
+pub(crate) fn before_next_adoption_for_test(hook: impl FnOnce() + 'static) {
+    BEFORE_ADOPTION.set(Some(Box::new(hook)));
+}
+
+#[cfg(test)]
 fn before_adoption_for_test() {
     BEFORE_ADOPTION.with(|hook| {
         if let Some(hook) = hook.borrow_mut().take() {
@@ -52,6 +57,7 @@ impl NativeSessionStore {
                     && row.title == title
                     && row.agent_provider == provider
                     && row.is_structured()
+                    && row.terminal_handoff.is_none()
                     && row.launch_is_finalized(),
                 crate::session::LifecycleReservationError::Superseded
             );
@@ -75,6 +81,7 @@ impl NativeSessionStore {
                 && row.lifecycle_generation == *generation
                 && &row.agent_provider == provider
                 && row.is_structured()
+                && row.terminal_handoff.is_none()
                 && row.launch_is_finalized(),
             crate::session::LifecycleReservationError::Superseded
         );
@@ -366,6 +373,58 @@ impl SessionStore for NativeSessionStore {
         &self.storage
     }
 
+    fn release_lifecycle_reservation(
+        &self,
+        id: &str,
+        operation: crate::session::LifecycleOperation,
+        generation: u64,
+        lifecycle: Option<crate::session::StorageFlock>,
+    ) -> Result<()> {
+        // Cleanup must not depend on canonical adoption health.
+        crate::migrations::ensure_schema_supported()?;
+        self.storage.verify_bound_profile()?;
+        let _lifecycle = match lifecycle {
+            Some(lifecycle) => lifecycle,
+            None => self.storage.acquire_instance_lifecycle_lock(id)?,
+        };
+        let reload = self
+            .runtime
+            .block_on(self.state.session_service.disk_reload_guard());
+        let transition = self.storage.acquire_write_transition();
+        let publication = self.state.publication.blocking_write();
+        let committed = transition.and_then(|transition| {
+            self.storage.verify_bound_profile()?;
+            transition.update_with_snapshot(&self.storage, |rows, _| {
+                if let Some(row) = rows.iter_mut().find(|row| row.id == id) {
+                    row.release_lifecycle_reservation_if_owned(operation, generation);
+                }
+                Ok(())
+            })
+        });
+        let ((), rows, groups) = match committed {
+            Ok(committed) => committed,
+            Err(error) => {
+                mark_profile_failure(&self.state, self.storage.profile(), &error, &publication);
+                return Err(error);
+            }
+        };
+        if let Err(error) = self
+            .runtime
+            .block_on(super::reload::adopt_committed_profiles(
+                &self.state,
+                [(self.storage.profile(), rows, groups)],
+                |_| false,
+                &reload,
+                &publication,
+            ))
+        {
+            *self.state.canonical_health.blocking_write() = error.health.clone();
+            self.state.runtime.request_publish();
+            return Err(anyhow::Error::new(error).context(crate::session::SessionCommitApplied));
+        }
+        Ok(())
+    }
+
     fn defer_lifecycle_release(
         self,
         id: String,
@@ -379,7 +438,7 @@ impl SessionStore for NativeSessionStore {
         let runtime = self.runtime.clone();
         let work = self.state.runtime.work.clone();
         let _entered = runtime.enter();
-        work.spawn("purge reservation release", async move {
+        work.spawn("lifecycle reservation release", async move {
             let fresh_namespace = if namespace.is_none() {
                 Some(self.state.profile_namespace.clone().read_owned().await)
             } else {

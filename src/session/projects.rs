@@ -331,20 +331,25 @@ fn parse_projects(content: &str, scope: ProjectScope) -> Result<Vec<Project>> {
 }
 
 fn read_file(path: &Path, scope: ProjectScope) -> Result<Vec<Project>> {
-    let mut file = match crate::process::open_read_nonblocking(path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => return Err(error.into()),
-    };
-    if !file.metadata()?.is_file() {
-        anyhow::bail!("{} is not a regular file", path.display());
-    }
-    let mut content = String::new();
-    file.read_to_string(&mut content)?;
-    if content.trim().is_empty() {
-        return Ok(Vec::new());
-    }
-    parse_projects(&content, scope)
+    let result = (|| {
+        let mut file = match crate::process::open_read_nonblocking(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error.into()),
+        };
+        if !file.metadata()?.is_file() {
+            anyhow::bail!("{} is not a regular file", path.display());
+        }
+        let mut content = String::new();
+        file.read_to_string(&mut content)?;
+        if content.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        parse_projects(&content, scope)
+    })();
+    result.map_err(|error: anyhow::Error| {
+        error.context(crate::session::LoadSource(path.to_path_buf()))
+    })
 }
 
 /// Load global registry only.

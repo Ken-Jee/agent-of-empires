@@ -571,46 +571,119 @@ pub(crate) fn kill_session_if_present(name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Kill indexed terminals and tool sessions, including names left behind by retitles.
+/// Retire independent terminals even when tool ownership cannot be settled.
 pub(crate) fn kill_ancillary_sessions_for_id(id: &str) -> Result<()> {
-    use crate::tmux::{CONTAINER_TERMINAL_PREFIX, TERMINAL_PREFIX, TOOL_PREFIX};
-    crate::tmux::ToolSession::settle_pending_retirements_for(id)?;
-    let output = crate::tmux::tmux_query_command()
-        .args(["list-sessions", "-F", "#{session_name}"])
-        .output()?;
-    if !output.status.success() {
-        if crate::tmux::tmux_no_server_running(&output.stderr) {
-            crate::tmux::refresh_session_cache();
-            return Ok(());
+    use crate::tmux::{
+        ToolPaneOwner, ToolSession, CONTAINER_TERMINAL_PREFIX, TERMINAL_PREFIX, TOOL_PREFIX,
+    };
+    let mut errors = Vec::new();
+    let protected = match ToolSession::settle_pending_retirements_for(id) {
+        Ok((protected, failures)) => {
+            errors.extend(failures.into_iter().map(|error| format!("{error:#}")));
+            Some(protected)
         }
-        bail!(
-            "Failed to enumerate ancillary tmux sessions: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
+        Err(error) => {
+            errors.push(format!("Tool retirement inventory: {error:#}"));
+            None
+        }
+    };
+    let panes = crate::tmux::batch_pane_metadata();
     let suffix = super::id_suffix(id);
-    for name in std::str::from_utf8(&output.stdout)?.lines() {
-        let matches = if name.starts_with(TOOL_PREFIX) {
-            name.ends_with(&suffix)
-        } else if name.starts_with(TERMINAL_PREFIX) || name.starts_with(CONTAINER_TERMINAL_PREFIX) {
-            name.rsplit_once(&suffix).is_some_and(|(_, tail)| {
+    let sweep = |name: &str, metadata: Option<&crate::tmux::PaneMetadata>| -> Result<()> {
+        if name.starts_with(TOOL_PREFIX) {
+            if !name.ends_with(&suffix) {
+                return Ok(());
+            }
+            let Some(protected) = &protected else {
+                return Ok(());
+            };
+            let metadata =
+                metadata.ok_or_else(|| anyhow::anyhow!("Tool pane inventory unavailable"))?;
+            let tool_name = match &metadata.tool_owner {
+                ToolPaneOwner::Named {
+                    instance_id,
+                    tool_name,
+                } if instance_id == id => tool_name,
+                ToolPaneOwner::Named { .. } => return Ok(()),
+                _ => {
+                    bail!("Tool {name} has no verified owner; confirm its ownership before cleanup")
+                }
+            };
+            if protected.contains(tool_name) {
+                return Ok(());
+            }
+            let snapshot = panes
+                .as_ref()
+                .map_err(|error| anyhow::anyhow!("{error:#}"))?;
+            let tool = ToolSession::from_snapshot(id, "", tool_name, snapshot)?;
+            return tool.kill_verified(
+                id,
+                tool_name,
+                &ToolSession::legacy_identity(metadata)?,
+                metadata.server.as_deref(),
+            );
+        }
+        let indexed =
+            name.starts_with(TERMINAL_PREFIX) || name.starts_with(CONTAINER_TERMINAL_PREFIX);
+        let selected = indexed
+            && name.rsplit_once(&suffix).is_some_and(|(_, tail)| {
                 tail.is_empty()
                     || tail.strip_prefix("_t").is_some_and(|index| {
                         !index.is_empty() && index.bytes().all(|byte| byte.is_ascii_digit())
                     })
-            })
-        } else {
-            false
-        };
-        if matches {
-            if let Some(pid) = crate::process::get_pane_pid(name) {
+            });
+        if selected {
+            let pid = match metadata {
+                Some(metadata) => metadata.pane_pid,
+                None => crate::process::get_pane_pid(name),
+            };
+            if let Some(pid) = pid {
                 crate::process::kill_process_tree(pid);
             }
             kill_session_if_present(name)?;
         }
+        Ok(())
+    };
+    match &panes {
+        Ok(panes) => {
+            for (name, metadata) in panes {
+                if let Err(error) = sweep(name, Some(metadata)) {
+                    errors.push(format!("{name}: {error:#}"));
+                }
+            }
+        }
+        Err(error) => {
+            errors.push(format!("Pane inventory: {error:#}"));
+            let fallback = (|| -> Result<()> {
+                let mut command = crate::tmux::tmux_query_command();
+                command.args(["list-sessions", "-F", "#{session_name}"]);
+                let output = crate::tmux::TmuxCommandDeadline::new().run(&mut command)?;
+                if !output.status.success() {
+                    anyhow::ensure!(
+                        crate::tmux::tmux_no_server_running(&output.stderr),
+                        "Ancillary tmux inventory failed: {}",
+                        String::from_utf8_lossy(&output.stderr),
+                    );
+                    return Ok(());
+                }
+                for name in std::str::from_utf8(&output.stdout)?.lines() {
+                    if let Err(error) = sweep(name, None) {
+                        errors.push(format!("{name}: {error:#}"));
+                    }
+                }
+                Ok(())
+            })();
+            if let Err(error) = fallback {
+                errors.push(format!("{error:#}"));
+            }
+        }
     }
     crate::tmux::refresh_session_cache();
-    Ok(())
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        bail!("Ancillary cleanup incomplete: {}", errors.join("; "))
+    }
 }
 
 /// Convert tmux's raw prefix notation (e.g. "C-a", "M-b", "F12") to the
@@ -1295,8 +1368,9 @@ esac
                         &crate::session::LegacyToolIdentity {
                             session_id: "$1".into(),
                             pane_id: "%1".into(),
-                            pane_pid: 1,
+                            pane_pid: Some(1),
                         },
+                        None,
                     ),
                 ),
             ];
@@ -1432,6 +1506,19 @@ esac
                     String::from_utf8_lossy(&output.stderr)
                 );
             }
+            let marker = serde_json::to_string(&(id, "old-tool")).unwrap();
+            let tool_session_id = crate::tmux::test_helpers::pane_field(&owned[3], "#{session_id}");
+            assert!(crate::tmux::tmux_command()
+                .args([
+                    "set-option",
+                    "-t",
+                    &tool_session_id,
+                    "@aoe_tool_owner",
+                    &marker,
+                ])
+                .status()
+                .unwrap()
+                .success());
             assert_eq!(
                 crate::process::get_pane_pid(&missing),
                 None,

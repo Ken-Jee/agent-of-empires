@@ -23,6 +23,7 @@ export function makeSession(over: Partial<SessionResponse> = {}): SessionRespons
     tool: "claude",
     status: "Idle",
     yolo_mode: false,
+    lifecycle_generation: 0,
     created_at: "2025-01-01T00:00:00Z",
     last_accessed_at: null,
     idle_entered_at: null,

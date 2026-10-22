@@ -578,6 +578,24 @@ pub(crate) fn scope_stopped(
     );
     Ok(matches!(active, "inactive" | "failed") && cgroup.is_empty())
 }
+pub(crate) fn legacy_unknown_scope_absent(
+    session_id: &str,
+    known: &[crate::process::worker_registry::ScopeOwnership],
+) -> anyhow::Result<bool> {
+    anyhow::ensure!(
+        crate::session::is_valid_session_id(session_id),
+        "Invalid legacy session identity"
+    );
+    #[cfg(target_os = "linux")]
+    {
+        super::linux::legacy_scope_inventory_clear(&format!("{}-", escaped_id(session_id)), known)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = known;
+        anyhow::bail!("Legacy Linux scope authority requires a complete Linux inventory")
+    }
+}
 
 /// Blocking exact-unit retirement; only completed, empty scope exit is success.
 pub(crate) fn retire_scope(

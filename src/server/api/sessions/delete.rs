@@ -948,11 +948,7 @@ pub async fn abandon_purge(
 
 // --- Delete workspace (atomic multi-session) ---
 
-/// Body for `DELETE /api/workspaces`. `session_ids` are sessions of one web-UI
-/// workspace, sharing a git worktree and branch; they need not be all of them.
-/// The cleanup flags mirror [`DeleteSessionBody`]. The worktree and branch are
-/// cleaned up once, on the first listed session that manages a worktree, and
-/// kept with a message while any session outside the request still uses them.
+/// Delete selected sessions, keeping shared-worktree cleanup with its owner.
 #[derive(Default, Deserialize)]
 pub struct DeleteWorkspaceBody {
     #[serde(default)]
@@ -967,6 +963,17 @@ pub struct DeleteWorkspaceBody {
     pub force_delete: bool,
     #[serde(default)]
     pub keep_scratch: bool,
+    #[serde(default)]
+    pub expected_trash: bool,
+    #[serde(default)]
+    pub trash_consents: std::collections::HashMap<String, TrashPurgeConsent>,
+}
+
+#[derive(Clone, Deserialize)]
+pub struct TrashPurgeConsent {
+    pub expected_trashed_at: chrono::DateTime<chrono::Utc>,
+    pub expected_trash_lifecycle_id: String,
+    pub expected_generation: u64,
 }
 
 #[derive(Serialize)]
@@ -975,31 +982,16 @@ pub(super) struct WorkspaceDeleteFailure {
     pub(super) error: String,
 }
 
-/// Drop duplicate session ids while preserving first-seen order. A workspace
-/// delete must never list the same session twice: with `["owner", "owner"]`
-/// the first pass would delete the owner using the record-only sibling flags
-/// and the second pass would skip the now-missing row, returning success
-/// without ever removing the shared worktree or branch (#2536 review).
+/// Preserve first-seen order without deleting the same row twice.
 pub(super) fn dedupe_session_ids(ids: &[String]) -> Vec<String> {
-    let mut seen = std::collections::HashSet::new();
+    let mut seen = std::collections::HashSet::with_capacity(ids.len());
     ids.iter()
-        .filter(|id| seen.insert((*id).clone()))
+        .filter(|id| seen.insert(id.as_str()))
         .cloned()
         .collect()
 }
 
-/// Build the per-session deletion order for a workspace delete. All sessions
-/// in a workspace share one git worktree + branch, so worktree/branch cleanup
-/// must run exactly once. The owner (`session_ids[0]`, the web primary)
-/// carries the caller's worktree/branch flags and is deleted LAST; every
-/// sibling is deleted first with worktree/branch removal forced off.
-///
-/// Owner-last is the safety property. Siblings hold only a record + container,
-/// never the shared worktree, so tearing them down while the worktree is still
-/// present lets a sibling failure abort before the worktree is touched, leaving
-/// nothing orphaned. Deleting the owner first (worktree gone) and then failing
-/// on a sibling would strand a live record pointing at a deleted worktree, the
-/// exact failure #2536 exists to remove.
+/// Remove siblings before their worktree owner, retaining consent by session id.
 pub(super) fn order_workspace_deletion(
     session_ids: &[String],
     body: &DeleteWorkspaceBody,
@@ -1007,27 +999,27 @@ pub(super) fn order_workspace_deletion(
     let Some((owner, siblings)) = session_ids.split_first() else {
         return Vec::new();
     };
-    let sibling_body = DeleteSessionBody {
-        delete_worktree: false,
-        delete_branch: false,
-        delete_sandbox: body.delete_sandbox,
-        force_delete: body.force_delete,
-        keep_scratch: body.keep_scratch,
-        ..Default::default()
-    };
-    let owner_body = DeleteSessionBody {
-        delete_worktree: body.delete_worktree,
-        delete_branch: body.delete_branch,
-        delete_sandbox: body.delete_sandbox,
-        force_delete: body.force_delete,
-        keep_scratch: body.keep_scratch,
-        ..Default::default()
+    let deletion = |id: &str, owner: bool| {
+        let consent = body.trash_consents.get(id);
+        DeleteSessionBody {
+            delete_worktree: owner && body.delete_worktree,
+            delete_branch: owner && body.delete_branch,
+            delete_sandbox: body.delete_sandbox,
+            force_delete: body.force_delete,
+            keep_scratch: body.keep_scratch,
+            expected_trash: body.expected_trash || consent.is_some(),
+            expected_trashed_at: consent.map(|consent| consent.expected_trashed_at),
+            expected_trash_lifecycle_id: consent
+                .map(|consent| consent.expected_trash_lifecycle_id.clone()),
+            expected_generation: consent.map(|consent| consent.expected_generation),
+            ..Default::default()
+        }
     };
     let mut plan: Vec<(String, DeleteSessionBody)> = siblings
         .iter()
-        .map(|id| (id.clone(), sibling_body.clone()))
+        .map(|id| (id.clone(), deletion(id, false)))
         .collect();
-    plan.push((owner.clone(), owner_body));
+    plan.push((owner.clone(), deletion(owner, true)));
     plan
 }
 
@@ -1225,14 +1217,30 @@ pub async fn delete_workspace(
     }
 
     let body = body.map(|Json(b)| b).unwrap_or_default();
-    // Dedupe up front so a repeated id cannot have the owner deleted with
-    // sibling flags and then skipped (#2536 review).
+    // Validate all selected lifecycles before any reservation or teardown.
     let mut session_ids = dedupe_session_ids(&body.session_ids);
     if session_ids.is_empty() {
         return api_error(
             StatusCode::BAD_REQUEST,
             "invalid_request",
             "session_ids must not be empty",
+        );
+    }
+    let selected_consents = session_ids
+        .iter()
+        .filter(|id| body.trash_consents.contains_key(*id))
+        .count();
+    if selected_consents != body.trash_consents.len()
+        || (body.expected_trash && selected_consents != session_ids.len())
+        || body
+            .trash_consents
+            .values()
+            .any(|consent| uuid::Uuid::parse_str(&consent.expected_trash_lifecycle_id).is_err())
+    {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_trash_consent",
+            "Provide complete original trash consent for each selected session",
         );
     }
     // The owner is whichever session manages the worktree, not the client's first id.

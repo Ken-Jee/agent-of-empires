@@ -30,6 +30,7 @@ pub(crate) struct NativeRuntime {
     /// Latest advisory creation progress. Only local-owner streams are sent
     /// it, so it stays a `watch` full-state value rather than a log.
     creation_progress: watch::Sender<Arc<Vec<CreationProgress>>>,
+    owner_diagnostics: watch::Sender<Arc<Vec<crate::daemon::OwnerLoadDiagnostic>>>,
     purge_namespace: watch::Sender<std::sync::Weak<tokio::sync::OwnedRwLockReadGuard<()>>>,
     publish_lane: Mutex<()>,
     wake: Notify,
@@ -139,6 +140,7 @@ impl NativeRuntime {
             tmux_socket,
             snapshots: watch::channel(None).0,
             creation_progress: watch::channel(Arc::new(Vec::new())).0,
+            owner_diagnostics: watch::channel(Arc::new(Vec::new())).0,
             purge_namespace: watch::channel(std::sync::Weak::new()).0,
             publish_lane: Mutex::new(()),
             wake: Notify::new(),
@@ -225,6 +227,27 @@ impl NativeRuntime {
             workspace_ordering,
             global_projects: metadata.global_projects.clone(),
         };
+        if contents.health == RuntimeHealth::Healthy {
+            self.owner_diagnostics.send_if_modified(|current| {
+                if current.is_empty() {
+                    return false;
+                }
+                *current = Arc::new(Vec::new());
+                true
+            });
+        } else {
+            let diagnostics = state
+                .canonical_diagnostics
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            self.owner_diagnostics.send_if_modified(|current| {
+                if current.as_ref() == &*diagnostics {
+                    return false;
+                }
+                *current = Arc::new(diagnostics.clone());
+                true
+            });
+        }
         let previous = self.snapshots.borrow().clone();
         if let Some(previous) = &previous {
             if previous.mutation_epoch == mutation_epoch && previous.value.contents == contents {
@@ -369,6 +392,21 @@ impl NativeRuntime {
             cityhall_mode: state.cityhall_mode,
             health: snapshot.contents.health.clone(),
             interaction_capabilities,
+            owner_diagnostics: if local_owner && snapshot.contents.health != RuntimeHealth::Healthy
+            {
+                state
+                    .canonical_diagnostics
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone()
+            } else {
+                Vec::new()
+            },
+            owner_instance_id: if local_owner {
+                std::env::var("AOE_SERVE_INSTANCE_ID").ok()
+            } else {
+                None
+            },
         }
     }
 }
@@ -543,6 +581,7 @@ async fn follow_runtime(
     let mut snapshots = state.runtime.snapshots.subscribe();
     let progress_granted = creation_progress_granted(local.as_ref());
     let mut creation_progress = state.runtime.creation_progress.subscribe();
+    let mut owner_diagnostics = state.runtime.owner_diagnostics.subscribe();
     if first_subscriber {
         state.runtime.terminal_wake.notify_one();
     }
@@ -572,6 +611,19 @@ async fn follow_runtime(
             return;
         }
     }
+    if progress_granted {
+        let current = owner_diagnostics.borrow_and_update().clone();
+        let frame = RuntimeFrame::<RuntimeSnapshot>::OwnerDiagnostics {
+            epoch: state.runtime.epoch.clone(),
+            diagnostics: current.as_ref().clone(),
+        };
+        let Ok(frame) = serde_json::to_string(&frame) else {
+            return;
+        };
+        if !send_frame(&mut socket, &state, Message::Text(frame.into())).await {
+            return;
+        }
+    }
     let mut heartbeat = tokio::time::interval(Duration::from_secs(30));
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut last_pong = tokio::time::Instant::now();
@@ -596,6 +648,15 @@ async fn follow_runtime(
                 if changed.is_err() { break; }
                 let current = creation_progress.borrow_and_update().clone();
                 if !send_creation_progress(&mut socket, &state, &current).await { break; }
+            }
+            changed = owner_diagnostics.changed(), if progress_granted => {
+                if changed.is_err() { break; }
+                let current = owner_diagnostics.borrow_and_update().clone();
+                let frame = RuntimeFrame::<RuntimeSnapshot>::OwnerDiagnostics {
+                    epoch: state.runtime.epoch.clone(), diagnostics: current.as_ref().clone(),
+                };
+                let Ok(frame) = serde_json::to_string(&frame) else { break; };
+                if !send_frame(&mut socket, &state, Message::Text(frame.into())).await { break; }
             }
             _ = heartbeat.tick() => {
                 if last_pong.elapsed() >= Duration::from_secs(90)
@@ -835,17 +896,170 @@ mod tests {
         Ok(())
     }
 
-    /// Hook output is the documented secret channel, so the local unix peer is
-    /// the only stream allowed to receive it: a loopback bearer client and an
-    /// unknown peer must both be refused.
+    /// Only kernel-authenticated Unix owners receive hook output.
     #[test]
     fn creation_progress_is_granted_only_to_the_local_owner() {
         assert!(creation_progress_granted(Some(
             &LocalAuthorization::UnixOwner(501)
         )));
-        assert!(!creation_progress_granted(Some(
-            &LocalAuthorization::TcpLoopback
-        )));
         assert!(!creation_progress_granted(None));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn owner_diagnostics_name_actual_source_without_parser_contents() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let app = crate::session::get_app_dir().unwrap();
+        crate::session::get_profile_dir("test").unwrap();
+        crate::session::config::update_config(|config| config.default_profile = "test".into())
+            .unwrap();
+        let storage = crate::session::Storage::new_unwatched("test").unwrap();
+        storage.update(|_, _| Ok(())).unwrap();
+        let state = crate::server::test_support::build_test_app_state_with_policy(
+            Vec::new(),
+            vec!["localhost".into()],
+            Vec::new(),
+            None,
+        );
+        for relative in [
+            "config.toml",
+            "projects.json",
+            "profiles/test/config.toml",
+            "profiles/test/projects.json",
+            "profiles/test/groups.json",
+            "profiles/test/sessions.json",
+        ] {
+            let path = app.join(relative);
+            let previous = std::fs::read(&path).ok();
+            std::fs::write(&path, b"{{SECRET_DIAGNOSTIC_PAYLOAD_DO_NOT_RENDER\n").unwrap();
+            let failure = crate::server::reload::load_all_profiles(&state.file_watch)
+                .err()
+                .expect("actual source must fail");
+            let diagnostics = failure.owner_diagnostics();
+            assert_eq!(diagnostics.len(), 1, "{relative}");
+            assert_eq!(diagnostics[0].path, path.to_string_lossy(), "{relative}");
+            *state.canonical_health.write().await = failure.health;
+            *state.canonical_diagnostics.write().unwrap() = diagnostics;
+            let snapshot = state.runtime.publish(&state).await.unwrap();
+            for owner in [false, true] {
+                let authorization =
+                    owner.then(|| LocalAuthorization::UnixOwner(nix::unistd::geteuid().as_raw()));
+                let info = state
+                    .runtime
+                    .info(&state, authorization.as_ref(), &snapshot.value);
+                let encoded = serde_json::to_string(&info).unwrap();
+                assert!(!encoded.contains("SECRET_DIAGNOSTIC_PAYLOAD_DO_NOT_RENDER"));
+                assert_eq!(!info.owner_diagnostics.is_empty(), owner);
+                if !owner {
+                    assert!(!encoded.contains(path.to_str().unwrap()));
+                }
+            }
+            match previous {
+                Some(bytes) => std::fs::write(&path, bytes).unwrap(),
+                None => std::fs::remove_file(&path).unwrap(),
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn diagnostic_only_source_change_reaches_existing_owner_stream_without_new_cursor() {
+        use crate::daemon::{RuntimeConnection, RuntimeEvent};
+        let _home = crate::session::test_support::isolate_app_dir();
+        let app = crate::session::get_app_dir().unwrap();
+        crate::session::get_profile_dir("test").unwrap();
+        crate::session::config::update_config(|config| config.default_profile = "test".into())
+            .unwrap();
+        let storage = crate::session::Storage::new_unwatched("test").unwrap();
+        storage.update(|_, _| Ok(())).unwrap();
+        let original = crate::server::test_support::build_test_app_state_with_policy(
+            Vec::new(),
+            vec!["localhost".into()],
+            Vec::new(),
+            None,
+        );
+        crate::server::test_support::refresh_canonical_metadata_for_test(&original).await;
+        let mut owned = Arc::try_unwrap(original)
+            .ok()
+            .expect("fixture has one strong state owner");
+        let work = owned.runtime.work.clone();
+        owned.runtime = NativeRuntime::new(app.to_string_lossy().into_owned(), None, work);
+        let state = Arc::new(owned);
+        let socket = app.join("daemon/api.sock");
+        let router = crate::server::test_support::build_router_for_test(state.clone());
+        let server =
+            crate::server::test_support::serve_owner_router_for_test(&socket, router).await;
+        let endpoint = crate::acp::client::DaemonEndpoint::local_unix(socket);
+        let mut connection = RuntimeConnection::connect(&endpoint, Some("test"))
+            .await
+            .unwrap();
+        let groups = app.join("profiles/test/groups.json");
+        let projects = app.join("profiles/test/projects.json");
+        std::fs::write(&groups, "[]").unwrap();
+        let valid_groups = std::fs::read(&groups).unwrap();
+        std::fs::write(&groups, "{ SECRET_GROUP_CONTENT").unwrap();
+        let first = crate::server::reload::load_all_profiles(&state.file_watch)
+            .err()
+            .unwrap();
+        *state.canonical_diagnostics.write().unwrap() = first.owner_diagnostics();
+        *state.canonical_health.write().await = first.health;
+        let degraded = state.runtime.publish(&state).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            let mut source_seen = false;
+            loop {
+                if let RuntimeEvent::OwnerDiagnostics(diagnostics) =
+                    connection.next_event().await.unwrap()
+                {
+                    source_seen = diagnostics
+                        .iter()
+                        .any(|diagnostic| diagnostic.path == groups.to_string_lossy());
+                }
+                if source_seen && connection.snapshot().cursor == degraded.value.cursor {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("first degraded source and canonical frame arrive on existing stream");
+        std::fs::write(&projects, "{ SECRET_PROJECT_CONTENT").unwrap();
+        std::fs::write(&groups, valid_groups).unwrap();
+        let second = crate::server::reload::load_all_profiles(&state.file_watch)
+            .err()
+            .unwrap();
+        *state.canonical_diagnostics.write().unwrap() = second.owner_diagnostics();
+        *state.canonical_health.write().await = second.health;
+        let same = state.runtime.publish(&state).await.unwrap();
+        assert_eq!(same.value.cursor, degraded.value.cursor);
+        assert_eq!(same.value.contents, degraded.value.contents);
+        let diagnostics = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match connection.next_event().await.unwrap() {
+                    RuntimeEvent::OwnerDiagnostics(diagnostics)
+                        if diagnostics
+                            .iter()
+                            .any(|diagnostic| diagnostic.path == projects.to_string_lossy()) =>
+                    {
+                        break diagnostics
+                    }
+                    RuntimeEvent::Snapshot(_) => panic!(
+                        "diagnostic-only source switch must not manufacture a canonical revision"
+                    ),
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("diagnostic source switch cannot wait for another row mutation or reconnect");
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].path, projects.to_string_lossy());
+        let serialized = serde_json::to_string(&diagnostics).unwrap();
+        assert!(
+            !serialized.contains("SECRET_GROUP_CONTENT")
+                && !serialized.contains("SECRET_PROJECT_CONTENT")
+        );
+        connection.close().await;
+        state.shutdown.cancel();
+        server.abort();
+        let _ = server.await;
     }
 }

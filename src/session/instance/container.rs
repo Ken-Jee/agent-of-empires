@@ -144,6 +144,7 @@ impl Instance {
     ) -> Result<containers::DockerContainer> {
         let storage = Storage::new(&self.effective_profile(), self.resolve_file_watch())?;
         self.ensure_container_with_hook_in(&storage, cancel, Self::mint_before_start_env)
+            .map(|(container, _)| container)
     }
 
     pub(crate) fn ensure_container_in(
@@ -155,6 +156,7 @@ impl Instance {
             &tokio_util::sync::CancellationToken::new(),
             Self::mint_before_start_env,
         )
+        .map(|(container, _)| container)
     }
 
     pub(crate) fn ensure_container_with_hook_in(
@@ -162,7 +164,7 @@ impl Instance {
         store: &dyn SessionStore,
         cancel: &tokio_util::sync::CancellationToken,
         mut run_hook: impl FnMut(&mut Self, &crate::session::LaunchConfig) -> Result<()>,
-    ) -> Result<containers::DockerContainer> {
+    ) -> Result<(containers::DockerContainer, bool)> {
         let launch_config = store.launch_configuration(Path::new(&self.project_path))?;
         let global_config = &launch_config.global;
         let profile_config = &launch_config.profile;
@@ -262,7 +264,7 @@ impl Instance {
             self.ensure_before_start_env(false, &launch_config, &mut scoped_hook)?;
             if self.sandbox_store_generation < container_config::CURRENT_SANDBOX_STORE_GENERATION {
                 self.backfill_container_workdir(&container);
-                return Ok(container);
+                return Ok((container, false));
             }
             // Still rotating the copy in its store.
             if self.predates_shared_credential(&container, &command, &profile_config.session)? {
@@ -287,7 +289,7 @@ impl Instance {
             );
             let config = self.build_container_config_with(&launch_config, fold)?;
             self.finish_container_reuse(&container, &config, &command, &profile_config.session)?;
-            return Ok(container);
+            return Ok((container, false));
         }
 
         if self.sandbox_store_generation < container_config::CURRENT_SANDBOX_STORE_GENERATION {
@@ -335,7 +337,7 @@ impl Instance {
                         &command,
                         &profile_config.session,
                     )?;
-                    return Ok(container);
+                    return Ok((container, false));
                 }
             }
         }
@@ -367,7 +369,7 @@ impl Instance {
         container.remove_stranded_named_ignore_volumes(&self.id, &stranded);
         container_config::place_shadowed_credential_mountpoints(&config);
         checkpoint()?;
-        let container_id = container.create(&config)?;
+        let (container_id, created) = container.create(&config)?;
         self.identity_publisher_launched = config.identity_publisher_installed
             && identity_publisher_dependencies_available(&container)
             && self.hook_session_publisher_allowed_by_argv();
@@ -379,7 +381,7 @@ impl Instance {
             sandbox.container_workdir = Some(config.working_dir.clone());
         }
 
-        Ok(container)
+        Ok((container, created))
     }
 
     /// Store-scoped `try_reconcile_from_disk`: `Ok(false)` when the row is

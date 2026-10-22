@@ -1065,6 +1065,7 @@ Esc to cancel \u{b7} Tab to amend \u{b7} ctrl+e to explain\n\
     /// dead-pane branch nor the stale-shell check spawns tmux behind the test.
     fn agent_pane_metadata(command: &str, window_activity: Option<i64>) -> tmux::PaneMetadata {
         tmux::PaneMetadata {
+            server: None,
             session_id: "$42".into(),
             pane_id: "%42".into(),
             session_kind: None,
@@ -1501,7 +1502,7 @@ Esc to cancel \u{b7} Tab to amend \u{b7} ctrl+e to explain\n\
             .status()
             .unwrap()
             .success());
-        let cache = crate::tmux::SessionCacheGuard::capture();
+        let cache = crate::tmux::SessionCacheGuard::capture_restore_only();
         cache.force_present(&[&session_name]);
         inst.update_status_once(None, Some(&session_name));
         assert_eq!(

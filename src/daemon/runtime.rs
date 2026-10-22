@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use super::SessionResponse;
 
-pub const RUNTIME_PROTOCOL_VERSION: u16 = 2;
+pub const RUNTIME_PROTOCOL_VERSION: u16 = 3;
 pub const RUNTIME_EPOCH_HEADER: &str = "aoe-runtime-epoch";
 pub const RUNTIME_REVISION_HEADER: &str = "aoe-runtime-revision";
 
@@ -135,7 +135,16 @@ pub struct RuntimeCapabilities {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OwnerLoadDiagnostic {
+    pub path: String,
+    pub message: String,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeInfo {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub owner_diagnostics: Vec<OwnerLoadDiagnostic>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_instance_id: Option<String>,
     pub protocol_version: u16,
     pub epoch: String,
     pub namespace: String,
@@ -230,4 +239,8 @@ pub enum RuntimeFrame<T = RuntimeSnapshot> {
     /// Creation progress, sent only to streams the daemon authorized as the
     /// local owner. See [`CreationProgress`].
     Creation(Vec<CreationProgress>),
+    OwnerDiagnostics {
+        epoch: String,
+        diagnostics: Vec<OwnerLoadDiagnostic>,
+    },
 }

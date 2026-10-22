@@ -1,4 +1,16 @@
 use std::process::{Child, Command};
+pub(super) fn validate_recovery_file(file: &std::fs::File) -> anyhow::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = file.metadata()?;
+    anyhow::ensure!(
+        metadata.is_file()
+            && metadata.uid() == nix::unistd::geteuid().as_raw()
+            && metadata.nlink() == 1
+            && metadata.mode() & 0o022 == 0,
+        "Recovery evidence must be an owned, non-shared regular file"
+    );
+    Ok(())
+}
 
 pub(super) fn close_frozen_payload() -> std::io::Result<()> {
     nix::unistd::close(4).map_err(std::io::Error::from)

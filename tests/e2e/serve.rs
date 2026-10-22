@@ -807,7 +807,7 @@ async fn native_creation_progress_reports_phases_to_the_local_stream() {
                         return entry.clone();
                     }
                 }
-                RuntimeEvent::Snapshot(_) => {}
+                RuntimeEvent::Snapshot(_) | RuntimeEvent::OwnerDiagnostics(_) => {}
             }
         }
     }
@@ -2783,24 +2783,11 @@ fn cli_serve_auth_passphrase_login_round_trip() {
     }
 }
 
-/// Regression test for #1525. With `--auth=passphrase` the daemon used
-/// to route loopback callers through the passphrase wall, breaking the
-/// local TUI structured view attach: it had no session cookie + device binding
-/// to present so `/api/sessions/{id}/structured view/replay` and the structured view ws
-/// upgrade always 401'd. The fix mirrors the token-auth path's #1168
-/// carve-out and treats loopback as fs-trusted.
-///
-/// Flow:
-///   1. Start `aoe serve --daemon --auth=passphrase`.
-///   2. GET `/api/about` from 127.0.0.1 with no session cookie, no
-///      device binding, no XFF -> 200 with `"auth_mode":"passphrase"`.
-///      Without the bypass this would 401 `login_required`.
-///   3. GET `/api/sessions` from 127.0.0.1 -> 200 (proves the bypass
-///      covers the structured view REST surface, not just `/api/about`).
+/// TCP requires login; native clients use kernel-authenticated Unix sockets.
 #[test]
 #[parallel]
-fn cli_serve_auth_passphrase_loopback_bypass() {
-    let h = TuiTestHarness::new("serve_auth_passphrase_loopback");
+fn cli_serve_passphrase_keeps_unix_owner_access_without_tcp_bypass() {
+    let h = TuiTestHarness::new("serve_passphrase_native_owner");
     let port = pick_free_port();
     let port_s = port.to_string();
 
@@ -2834,47 +2821,33 @@ fn cli_serve_auth_passphrase_loopback_bypass() {
             .build()
             .map_err(|e| format!("build client: {e}"))?;
 
-        // No cookie, no device binding, no XFF: the loopback bypass
-        // (#1525) lets the request through. Pre-fix this would have
-        // returned 401 login_required.
-        let about = client
-            .get(format!("{base}/api/about"))
-            .send()
-            .await
-            .map_err(|e| format!("GET /api/about (loopback bypass): {e}"))?;
-        if !about.status().is_success() {
-            let s = about.status();
-            let b = about.text().await.unwrap_or_default();
-            return Err(format!(
-                "loopback /api/about should 200 under --auth=passphrase, got status={s} body={b}"
-            ));
+        for path in ["/api/about", "/api/sessions"] {
+            let response = client
+                .get(format!("{base}{path}"))
+                .send()
+                .await
+                .map_err(|error| format!("GET {path}: {error}"))?;
+            if response.status() != reqwest::StatusCode::UNAUTHORIZED {
+                return Err(format!(
+                    "Unauthenticated TCP {path} returned {}",
+                    response.status()
+                ));
+            }
         }
-        let body: serde_json::Value = about
-            .json()
+        let socket = crate::harness::app_dir_in(h.home_path()).join("daemon/api.sock");
+        let native = agent_of_empires::daemon::DaemonClient::new_unix(socket)
+            .map_err(|error| error.to_string())?;
+        let info = native
+            .runtime_info()
             .await
-            .map_err(|e| format!("decode about body: {e}"))?;
-        if body.get("auth_mode").and_then(|v| v.as_str()) != Some("passphrase") {
-            return Err(format!(
-                "expected auth_mode=passphrase on loopback bypass, got {body}"
-            ));
+            .map_err(|error| error.to_string())?;
+        if !info.local_owner {
+            return Err("Unix peer did not receive owner authority".into());
         }
-
-        // The structured view REST surface lives under the same wall, so the
-        // bypass must extend to it. A successful 200 on `/api/sessions`
-        // from loopback without a session is what unblocks the local
-        // TUI structured view attach in the issue report.
-        let sessions = client
-            .get(format!("{base}/api/sessions"))
-            .send()
+        native
+            .list_sessions(None)
             .await
-            .map_err(|e| format!("GET /api/sessions (loopback bypass): {e}"))?;
-        if !sessions.status().is_success() {
-            let s = sessions.status();
-            let b = sessions.text().await.unwrap_or_default();
-            return Err(format!(
-                "loopback /api/sessions should 200 under --auth=passphrase, got status={s} body={b}"
-            ));
-        }
+            .map_err(|error| error.to_string())?;
 
         Ok(())
     });

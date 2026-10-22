@@ -128,6 +128,9 @@ impl HomeView {
 
     pub fn connect_runtime(&mut self) {
         self.session_feed_reload_retry_at = None;
+        self.session_feed_failed_cursor = None;
+        self.canonical_metadata_lag = None;
+        self.pending_created_attach = None;
         self.set_sidebar_source(crate::tui::session_feed::SidebarSource::Connecting, None);
         self.session_feed
             .connect(self.active_profile.clone().unwrap_or_default());
@@ -137,7 +140,7 @@ impl HomeView {
     /// transition so a sidebar stuck on stale structured status is
     /// diagnosable from the log alone. `reason` says why the daemon is not
     /// the source and is ignored for `Daemon`.
-    pub(super) fn set_sidebar_source(
+    pub(in crate::tui) fn set_sidebar_source(
         &mut self,
         source: crate::tui::session_feed::SidebarSource,
         reason: Option<&str>,
@@ -169,12 +172,12 @@ impl HomeView {
             self.project_registry_authoritative = true;
         }
         if source != SidebarSource::Daemon {
+            self.pending_created_attach = None;
             self.cancel_native_attachment();
             self.teardown_live_send();
             self.structured_preview = None;
             self.preview_capture_worker = None;
             self.preview_capture_target = None;
-            self.pending_paste = None;
         }
         match source {
             SidebarSource::Connecting => {
@@ -456,25 +459,34 @@ impl HomeView {
             let reports = duplicate_reports
                 .as_deref()
                 .unwrap_or(&self.legacy_duplicate_reports);
-            anyhow::ensure!(
-                !reports.iter().any(|report| report.id == row.id),
-                "Canonical session '{}' has ambiguous native metadata copies",
-                row.id
-            );
+            if let Some(report) = reports.iter().find(|report| report.id == row.id) {
+                return Err(anyhow::Error::new(CanonicalMetadataConflict(
+                    crate::session::safe_load_label(&report.actionable_message()),
+                )));
+            }
             // A refreshed profile must contain the row, even if the old display did.
             // Never manufacture native worktree/conversation metadata from a wire row.
             let mut instance = if let Some(rows) = persisted_profiles.get_mut(&row.profile) {
                 let mut instance = rows.swap_remove(&row.id).ok_or_else(|| {
-                    anyhow::anyhow!("Canonical session '{}' is not available in the read-only metadata projection", row.id)
+                    anyhow::Error::new(CanonicalMetadataLag {
+                        profile: row.profile.clone(),
+                        id: row.id.clone(),
+                    })
                 })?;
                 if let Some(previous) = self.instances.get(&row.id) {
                     instance.merge_runtime_from_reload(previous);
                 }
                 instance
             } else {
-                self.instances.get(&row.id).filter(|local| local.source_profile == row.profile)
-                    .cloned().ok_or_else(|| {
-                        anyhow::anyhow!("Canonical session '{}' is not available in the read-only metadata projection", row.id)
+                self.instances
+                    .get(&row.id)
+                    .filter(|local| local.source_profile == row.profile)
+                    .cloned()
+                    .ok_or_else(|| {
+                        anyhow::Error::new(CanonicalMetadataLag {
+                            profile: row.profile.clone(),
+                            id: row.id.clone(),
+                        })
                     })?
             };
             instance.title.clone_from(&row.title);
@@ -615,6 +627,73 @@ impl HomeView {
         self.refresh_registered_projects();
         Ok(())
     }
+    pub(super) fn record_canonical_projection_failure(
+        &mut self,
+        cursor: &crate::daemon::RuntimeCursor,
+        error: &anyhow::Error,
+    ) {
+        let now = std::time::Instant::now();
+        self.session_feed_failed_cursor = Some(cursor.clone());
+        self.session_feed_reload_retry_at = Some(now + Self::CANONICAL_RELOAD_RETRY_INTERVAL);
+        let message = if let Some(lag) = error.downcast_ref::<CanonicalMetadataLag>() {
+            let same = self.canonical_metadata_lag.as_ref().is_some_and(|prior| {
+                prior.epoch == cursor.epoch && prior.profile == lag.profile && prior.id == lag.id
+            });
+            if !same {
+                self.reload_failure_state.record_canonical(&Ok(()));
+                self.canonical_metadata_lag = Some(CanonicalMetadataLagState {
+                    epoch: cursor.epoch.clone(),
+                    profile: lag.profile.clone(),
+                    id: lag.id.clone(),
+                    first_seen: now,
+                });
+            }
+            if now.duration_since(self.canonical_metadata_lag.as_ref().unwrap().first_seen)
+                < Self::CANONICAL_RELOAD_RETRY_INTERVAL
+            {
+                return;
+            }
+            format!("Native metadata is still unavailable for profile '{}', session '{}'. Last complete state retained; waiting for a compatible canonical frame.",
+                crate::session::safe_load_label(&lag.profile), crate::session::safe_load_label(&lag.id))
+        } else {
+            self.canonical_metadata_lag = None;
+            match error.downcast_ref::<CanonicalMetadataConflict>() {
+                Some(conflict) => conflict.to_string(),
+                None => crate::session::sanitized_load_failure(error),
+            }
+        };
+        self.reload_failure_state
+            .record_canonical(&Err(anyhow::anyhow!(message)));
+    }
+
+    fn record_runtime_diagnostics(&mut self, health: &crate::daemon::RuntimeHealth) {
+        let diagnostic = match health {
+            crate::daemon::RuntimeHealth::Healthy => Ok(()),
+            crate::daemon::RuntimeHealth::Degraded { profiles, .. } => {
+                let owners = profiles
+                    .iter()
+                    .map(|profile| crate::session::safe_load_label(profile))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let files = self
+                    .runtime_diagnostics
+                    .iter()
+                    .map(|diagnostic| format!("{}: {}", diagnostic.path, diagnostic.message))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                Err(anyhow::anyhow!(
+                    "Runtime read-only. Affected profiles: {}.\n{}",
+                    if owners.is_empty() {
+                        "global metadata"
+                    } else {
+                        &owners
+                    },
+                    files
+                ))
+            }
+        };
+        self.reload_failure_state.record_daemon(&diagnostic);
+    }
 
     /// Apply a pending session-list result from the daemon. Returns true if
     /// the caller should redraw.
@@ -625,19 +704,32 @@ impl HomeView {
         let pending_before =
             self.session_feed.any_pending() || self.pending_namespace_intent.is_some();
         let mut snapshot_applied = false;
+        let diagnostics_changed = if let Some(diagnostics) = self.session_feed.take_diagnostics() {
+            self.runtime_diagnostics = diagnostics;
+            if let Some(snapshot) = self.session_feed.latest_snapshot() {
+                self.record_runtime_diagnostics(&snapshot.contents.health);
+            }
+            true
+        } else {
+            false
+        };
         let updated = match self.session_feed.try_recv() {
             Ok(result) => match result {
                 SessionFeedResult::Snapshot(snapshot) => {
+                    self.record_runtime_diagnostics(&snapshot.contents.health);
                     if self
                         .session_feed_reload_retry_at
                         .is_some_and(|retry_at| std::time::Instant::now() < retry_at)
+                        && self.session_feed_failed_cursor.as_ref() == Some(&snapshot.cursor)
                     {
                         false
                     } else {
                         self.bind_in_flight_creation(&snapshot.contents.sessions);
-                        let persisted_ordering = crate::session::load_workspace_ordering()
-                            .map(|ordering| ordering.order)
-                            .unwrap_or_default();
+                        let (persisted_ordering, ordering_error) =
+                            match crate::session::load_workspace_ordering() {
+                                Ok(ordering) => (ordering.order, None),
+                                Err(error) => (Vec::new(), Some(error)),
+                            };
                         let unknown_row = snapshot.contents.sessions.iter().any(|row| {
                             self.active_profile
                                 .as_ref()
@@ -655,18 +747,13 @@ impl HomeView {
                             || self
                                 .snapshot_requires_storage_reload(&snapshot, &persisted_ordering);
                         let mut metadata_changed = false;
-                        match self.apply_canonical_projection(&snapshot, refresh_metadata) {
+                        let projection = match ordering_error {
+                            Some(error) => Err(error),
+                            None => self.apply_canonical_projection(&snapshot, refresh_metadata),
+                        };
+                        match projection {
                             Err(error) => {
-                                self.session_feed_reload_retry_at = Some(
-                                    std::time::Instant::now()
-                                        + Self::CANONICAL_RELOAD_RETRY_INTERVAL,
-                                );
-                                tracing::warn!(target: "tui.session_feed", %error,
-                                    "staging a canonical runtime revision failed");
-                                self.info_dialog = Some(InfoDialog::new(
-                                    "Runtime state not applied",
-                                    &error.to_string(),
-                                ));
+                                self.record_canonical_projection_failure(&snapshot.cursor, &error);
                             }
                             Ok(()) => {
                                 metadata_changed = true;
@@ -682,9 +769,11 @@ impl HomeView {
                                     self.instances.keys().map(String::as_str).collect();
                                 self.structured_pending_approvals
                                     .retain(|id, _| ids.contains(id.as_str()));
-                                self.rebuild_flat_items_keeping_cursor();
-                                self.update_selected();
+                                self.refresh_projection_presentation();
                                 self.session_feed_reload_retry_at = None;
+                                self.session_feed_failed_cursor = None;
+                                self.canonical_metadata_lag = None;
+                                self.reload_failure_state.record_canonical(&Ok(()));
                                 self.observed_workspace_ordering = persisted_ordering;
                                 metadata_changed |=
                                     self.session_feed.mark_snapshot_applied(snapshot);
@@ -697,6 +786,9 @@ impl HomeView {
                 }
                 SessionFeedResult::Unavailable(reason) => {
                     self.session_feed_reload_retry_at = None;
+                    self.session_feed_failed_cursor = None;
+                    self.canonical_metadata_lag = None;
+                    self.pending_created_attach = None;
                     self.set_sidebar_source(SidebarSource::Disconnected, Some(&reason))
                 }
             },
@@ -708,11 +800,21 @@ impl HomeView {
             if snapshot_applied || self.live_send.is_some() {
                 self.teardown_live_send();
             }
-            self.pending_paste = None;
         }
         let archive_cursor_changed = snapshot_applied && self.apply_pending_archive_cursor();
         let drained = self.session_feed.drain_command_errors();
         let command_error = self.present_command_errors(drained);
+        let epoch = self.session_feed.applied_epoch();
+        let canonical_base = self.diff_view.as_ref().and_then(|diff| {
+            self.session_feed
+                .applied_session(diff.session_id.as_deref()?)
+                .filter(|row| row.profile == diff.profile)
+                .and_then(|row| row.base_branch_override.as_deref())
+        });
+        let diff_changed = self
+            .diff_view
+            .as_mut()
+            .is_some_and(|diff| diff.poll_base_save(epoch, canonical_base));
         if snapshot_applied {
             if let Some(id) = self
                 .live_send
@@ -731,7 +833,9 @@ impl HomeView {
         let pending_after =
             self.session_feed.any_pending() || self.pending_namespace_intent.is_some();
         updated
+            || diagnostics_changed
             || command_error
+            || diff_changed
             || archive_cursor_changed
             || outcomes_changed
             || pending_before != pending_after
@@ -898,7 +1002,7 @@ impl HomeView {
             ViewMode::Structured => PanePresence::Unknown,
         }
     }
-    fn record_runtime_message(&mut self, message: String) {
+    pub(super) fn record_runtime_message(&mut self, message: String) {
         tracing::info!(target: "tui.runtime_outcome", message, "Runtime domain outcome");
         self.runtime_outcome_messages.push(message);
     }
@@ -1014,14 +1118,27 @@ impl HomeView {
             let intent = self.pending_namespace_intent.take();
             match result {
                 Err(CommandFailure::Rejected(message)) => {
+                    if matches!(&intent, Some(NamespaceIntent::Reveal { .. })) {
+                        self.retained_reveal = intent;
+                        self.offer_retained_reveal();
+                    }
                     self.record_runtime_message(format!("Namespace change rejected: {message}"))
                 }
                 Err(CommandFailure::Unknown(message)) => {
+                    if matches!(&intent, Some(NamespaceIntent::Reveal { .. })) {
+                        self.retained_reveal = intent;
+                    }
+                    self.pending_created_attach = None;
                     self.namespace_unknown_message = Some(message);
                     self.open_namespace_indeterminate_dialog();
                 }
                 Ok(receipt) => match receipt.outcome {
                     NamespaceOutcome::Committed => match intent {
+                        Some(intent @ NamespaceIntent::Reveal { .. }) => {
+                            if let Err(error) = self.continue_reveal(intent) {
+                                self.record_runtime_message(format!("Reveal cancelled: {error}"));
+                            }
+                        }
                         Some(NamespaceIntent::ProfileCreated(name)) => {
                             if let Err(error) = self.switch_profile(Some(name)) {
                                 self.record_runtime_message(format!("Profile created, but changing the displayed profile failed: {error}"));

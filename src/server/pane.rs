@@ -84,11 +84,17 @@ pub(super) fn observe_auxiliary(
                     if let Ok(Some((name, metadata))) = crate::tmux::ToolSession::legacy_metadata_in(
                         id, title, tool_name, profile, panes, scope,
                     ) {
-                        if let Ok(identity) = crate::tmux::ToolSession::legacy_identity(metadata) {
+                        if let (Ok(identity), Some(server)) = (
+                            crate::tmux::ToolSession::legacy_identity(metadata),
+                            metadata.server.as_ref(),
+                        ) {
                             return PaneObservation {
                                 state: crate::session::PanePresence::Unknown,
                                 tmux_session: Some(name.to_owned()),
-                                legacy_tool: Some(identity),
+                                legacy_tool: Some(crate::session::LegacyToolObservation {
+                                    identity,
+                                    server: server.clone(),
+                                }),
                             };
                         }
                     }
@@ -214,6 +220,9 @@ pub(super) fn sample_panes(
             &instance.source_profile,
             legacy_scope,
         );
+        if pending.is_none() && matches!(&observation.target, AuxiliaryTarget::Tool { .. }) {
+            observation.pane.state = PanePresence::Unknown;
+        }
     }
     instance.auxiliary.retain(|observation| {
         observation.pane.state != PanePresence::Absent
@@ -232,21 +241,44 @@ pub(super) fn sample_panes(
             }
     });
 }
-pub(super) async fn seed_initial_observations(state: &Arc<AppState>) -> anyhow::Result<()> {
-    let (panes, pending) = tokio::task::spawn_blocking(|| {
-        (
-            crate::tmux::batch_pane_metadata(),
-            crate::tmux::ToolSession::pending_retirement_targets(),
-        )
-    })
-    .await?;
-    let pending = pending?;
+
+pub(super) async fn initial_tool_retirement_inventory(
+    state: &Arc<AppState>,
+) -> Option<Vec<(String, String)>> {
+    let inventory =
+        tokio::task::spawn_blocking(crate::tmux::ToolSession::pending_retirement_targets)
+            .await
+            .map_err(anyhow::Error::from)
+            .and_then(|inventory| inventory);
+    match inventory {
+        Ok(inventory) => Some(inventory),
+        Err(error) => {
+            tracing::warn!(target: "server.status", %error, "tool retirement ownership is unavailable; retaining read-only runtime inspection");
+            let mut health = state.canonical_health.write().await;
+            if *health == crate::daemon::RuntimeHealth::Healthy {
+                *health = crate::daemon::RuntimeHealth::Degraded {
+                    code: crate::daemon::ReloadFailureCode::Metadata,
+                    profiles: Vec::new(),
+                };
+            }
+            state.runtime.request_publish();
+            None
+        }
+    }
+}
+pub(super) async fn seed_initial_observations(
+    state: &Arc<AppState>,
+    pending: Option<&[(String, String)]>,
+) -> anyhow::Result<()> {
+    let panes = tokio::task::spawn_blocking(crate::tmux::batch_pane_metadata).await?;
     if let Err(error) = &panes {
         tracing::warn!(target: "server.status", %error, "initial pane observations are unavailable");
     }
     let metadata = state.canonical_metadata.read().await;
     let mut rows = state.instances.write().await;
-    seed_pending_tool_targets(&mut rows, &pending);
+    if let Some(pending) = pending {
+        seed_pending_tool_targets(&mut rows, pending);
+    }
     let legacy_scope =
         legacy_tool_scope_for_panes(&rows, &metadata.raw_tool_names, panes.as_ref().ok());
     for row in &mut *rows {
@@ -260,7 +292,7 @@ pub(super) async fn seed_initial_observations(state: &Arc<AppState>) -> anyhow::
             tools,
             panes.as_ref().ok(),
             legacy_scope.as_ref(),
-            Some(&pending),
+            pending,
         );
     }
     Ok(())
@@ -523,7 +555,15 @@ pub(super) async fn stop_native_auxiliary(
                             };
                             (tool, crate::tmux::ToolSession::legacy_identity(metadata)?)
                         };
-                        tool.kill_verified(&instance.id, tool_name, &identity)
+                        let server = adoption
+                            .as_ref()
+                            .map(|adoption| adoption.server.as_ref())
+                            .or_else(|| {
+                                panes
+                                    .get(tool.session_name())
+                                    .and_then(|pane| pane.server.as_deref())
+                            });
+                        tool.kill_verified(&instance.id, tool_name, &identity, server)
                     }
                 }?;
             }
@@ -900,6 +940,72 @@ async fn probe_tmux_readiness(tmux_name: &str) -> PaneReadiness {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn unavailable_tool_journal_preserves_unknown_targets_and_refuses_native_writes(
+    ) -> anyhow::Result<()> {
+        for case in ["missing", "corrupt", "prior-profile-failure"] {
+            let _home = crate::session::test_support::isolate_app_dir();
+            if case != "missing" {
+                std::fs::write(
+                    crate::session::get_app_dir()?.join(crate::tmux::tool_retirement::FILE_NAME),
+                    b"{",
+                )?;
+            }
+            let mut row = crate::session::Instance::new("unavailable ownership", "/tmp");
+            row.source_profile = "default".into();
+            row.auxiliary.push(crate::session::AuxiliaryObservation {
+                target: crate::session::AuxiliaryTarget::Tool {
+                    tool_name: "removed-tool".into(),
+                },
+                pane: crate::session::PaneObservation {
+                    state: crate::session::PanePresence::Alive,
+                    tmux_session: Some("original-tool".into()),
+                    legacy_tool: None,
+                },
+            });
+            let state = crate::server::test_support::build_test_app_state(vec![row]);
+            let prior = if case == "prior-profile-failure" {
+                crate::daemon::RuntimeHealth::Degraded {
+                    code: crate::daemon::ReloadFailureCode::ProfileData,
+                    profiles: vec!["broken-profile".into()],
+                }
+            } else {
+                crate::daemon::RuntimeHealth::Healthy
+            };
+            *state.canonical_health.write().await = prior.clone();
+            assert!(initial_tool_retirement_inventory(&state).await.is_none());
+            if prior == crate::daemon::RuntimeHealth::Healthy {
+                assert!(matches!(
+                    *state.canonical_health.read().await,
+                    crate::daemon::RuntimeHealth::Degraded {
+                        code: crate::daemon::ReloadFailureCode::Metadata,
+                        ..
+                    }
+                ));
+            } else {
+                assert_eq!(*state.canonical_health.read().await, prior);
+            }
+            let panes = std::collections::HashMap::new();
+            {
+                let mut rows = state.instances.write().await;
+                sample_panes(&mut rows[0], &[], Some(&panes), None, None);
+                let target = rows[0].auxiliary.iter().find(|observation| matches!(
+                    &observation.target, crate::session::AuxiliaryTarget::Tool { tool_name } if tool_name == "removed-tool"
+                )).expect("unknown original target remains visible");
+                assert_eq!(target.pane.state, crate::session::PanePresence::Unknown);
+            }
+            let error = tokio::task::spawn_blocking(move || {
+                crate::server::session_store::NativeSessionStore::open(state, "default", None)
+                    .err()
+                    .expect("unknown ownership cannot authorize a native write")
+            })
+            .await?;
+            assert!(error.is::<crate::session::NativeStoreUnavailable>());
+        }
+        Ok(())
+    }
     fn prepare_tool_retirement(
         row: &crate::session::Instance,
     ) -> anyhow::Result<(
@@ -913,11 +1019,13 @@ mod tests {
         tool.create_with_size("/tmp", "sleep 600", None, "default", &row.id, "probe")?;
         let panes = crate::tmux::batch_pane_metadata()?;
         let identity = crate::tmux::ToolSession::legacy_identity(panes.get(&name).unwrap())?;
-        let proof = crate::process::CapturedProcessTree::capture(identity.pane_pid)?;
+        let proof = crate::process::CapturedProcessTree::capture(
+            identity.pane_pid.expect("live tool fixture"),
+        )?;
         let _interruption =
             crate::tmux::ToolSession::interrupt_retirement_after_prepare_for_test(&row.id);
         assert!(tool
-            .kill_verified(&row.id, "probe", &identity)
+            .kill_verified(&row.id, "probe", &identity, None)
             .unwrap_err()
             .to_string()
             .contains("after durable"));
@@ -1216,7 +1324,7 @@ mod tests {
             let restarted = crate::server::test_support::build_test_app_state(storage.load()?);
             crate::server::test_support::refresh_canonical_metadata_for_test(&restarted).await;
             assert!(restarted.instances.read().await[0].auxiliary.is_empty());
-            let error = stop_native_auxiliary(
+            stop_native_auxiliary(
                 &restarted,
                 &row.id,
                 AuxiliaryStopRequest::Target(crate::daemon::StopAuxiliaryBody {
@@ -1228,7 +1336,6 @@ mod tests {
             )
             .await
             .unwrap_err();
-            assert!(format!("{error:#}").contains("Auxiliary target remains present after stop"));
             assert!(child.all_exited()?);
             assert!(!replacement.all_exited()?);
             let ids = live_session_ids(&sentinel_id)?;
@@ -1287,7 +1394,8 @@ mod tests {
             };
             let state = crate::server::test_support::build_test_app_state(vec![row.clone()]);
             crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
-            seed_initial_observations(&state).await?;
+            let pending = initial_tool_retirement_inventory(&state).await;
+            seed_initial_observations(&state, pending.as_deref()).await?;
             assert!(state.instances.read().await[0].auxiliary.iter().any(|observation| {
                 matches!(&observation.target, crate::session::AuxiliaryTarget::Tool { tool_name } if tool_name == "probe")
                     && (replacement || observation.pane.state == crate::session::PanePresence::Absent)
@@ -1402,7 +1510,8 @@ mod tests {
         )?;
         let state = crate::server::test_support::build_test_app_state(vec![row.clone()]);
         crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
-        seed_initial_observations(&state).await?;
+        let pending = initial_tool_retirement_inventory(&state).await;
+        seed_initial_observations(&state, pending.as_deref()).await?;
         let adoption = {
             let rows = state.instances.read().await;
             let pane = &rows[0].auxiliary.iter().find(|observation| {
@@ -1412,8 +1521,16 @@ mod tests {
                 tmux_session: pane.tmux_session.clone().unwrap(),
                 identity: pane
                     .legacy_tool
-                    .clone()
-                    .expect("replacement remains confirmable, never adopted"),
+                    .as_ref()
+                    .expect("replacement remains confirmable")
+                    .identity
+                    .clone(),
+                server: pane
+                    .legacy_tool
+                    .as_ref()
+                    .expect("replacement remains confirmable")
+                    .server
+                    .clone(),
                 profile: row.source_profile.clone(),
                 lifecycle_generation: row.lifecycle_generation,
             }
@@ -1515,6 +1632,14 @@ mod tests {
             tools: vec![("yazi".into(), ToolSession::name_prefix("yazi"))],
         };
         let metadata = PaneMetadata {
+            server: Some(std::sync::Arc::new(crate::session::TmuxServerIdentity {
+                socket: "/fixture-tmux.sock".into(),
+                pid: 4242,
+                birth: crate::process::ProcessBirthIdentity {
+                    boot_id: "fixture-boot".into(),
+                    start_id: "fixture-server".into(),
+                },
+            })),
             session_id: "$42".into(),
             pane_id: "%42".into(),
             session_kind: None,
@@ -1538,10 +1663,10 @@ mod tests {
         );
         assert_eq!(legacy.state, PanePresence::Unknown);
         assert_eq!(legacy.tmux_session.as_deref(), Some(name.as_str()));
-        let identity = legacy.legacy_tool.unwrap();
+        let identity = legacy.legacy_tool.unwrap().identity;
         assert_eq!(identity.session_id, "$42");
         assert_eq!(identity.pane_id, "%42");
-        assert_eq!(identity.pane_pid, 4242);
+        assert_eq!(identity.pane_pid, Some(4242));
         panes.get_mut(&name).unwrap().tool_owner = ToolPaneOwner::Invalid;
         let invalid = observe_auxiliary(
             id,

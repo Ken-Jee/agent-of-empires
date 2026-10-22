@@ -322,16 +322,7 @@ async fn run(
         }
     }
 
-    // `settings explain` and `mcp list` answer from `config.toml`, which every
-    // pending migration is free to rewrite in place: v009 renames
-    // `updates.check_enabled`, v021 moves `[app_state]` into `state.toml`, v046
-    // drops `session.daemon_sidebar`. Asked before the migrations below, they
-    // read that pre-migration file, so `settings explain` reports the schema
-    // default for a value the user did set and calls a live setting "not a
-    // known setting" purely because the key is still spelled the old way. Both
-    // keep dispatching from the arm below, so neither picks up the startup
-    // warning block; only the migration run is hoisted above it, for these two
-    // arms alone.
+    // Settings and MCP commands must resolve migrated configuration.
     let command_name = cli.command.as_ref().and_then(cli::command_name);
     if matches!(
         cli.command,
@@ -388,7 +379,7 @@ async fn run(
         Some(Commands::Skill { command }) => return exit_zero(cli::skill::run(command)),
         Some(Commands::Uninstall(args)) => return exit_zero(cli::uninstall::run(args).await),
         Some(Commands::Update(args)) => return exit_zero(cli::update::run(args).await),
-        Some(Commands::Migrate) => return exit_zero(cli::migrate::run().await),
+        Some(Commands::Migrate(args)) => return exit_zero(cli::migrate::run(&args).await),
 
         Some(Commands::Stop { .. }) => return exit_zero(cli::killall::stop_trap()),
         // Before the startup lock and migrations: see `cli::serve::run_control`.

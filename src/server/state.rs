@@ -104,6 +104,7 @@ pub struct AppState {
     pub(crate) reload_lane: tokio::sync::Mutex<()>,
     pub(crate) canonical_metadata: RwLock<super::reload::CanonicalMetadata>,
     pub(crate) canonical_health: RwLock<crate::daemon::RuntimeHealth>,
+    pub(crate) canonical_diagnostics: std::sync::RwLock<Vec<crate::daemon::OwnerLoadDiagnostic>>,
     pub(crate) runtime: super::runtime::NativeRuntime,
     // Lock instances before the cache for coherent reads and reload commits.
     pub(crate) runtime_read_cache: std::sync::RwLock<super::reload::RuntimeReadCache>,
@@ -366,6 +367,10 @@ impl AppState {
     pub(crate) async fn mark_reload_failure(&self, health: crate::daemon::RuntimeHealth) {
         let _publication = self.publication.write().await;
         *self.canonical_health.write().await = health;
+        self.canonical_diagnostics
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
         self.runtime.request_publish();
     }
 

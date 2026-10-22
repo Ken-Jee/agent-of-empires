@@ -1,25 +1,19 @@
 # Web Dashboard
 
-Monitor and interact with agent sessions from any browser (phone, tablet, or another computer). The dashboard runs as an embedded server inside the `aoe` binary; start it with `aoe serve`. Sessions run server-side (a real `tmux` session for terminal sessions, a persistent worker for structured-view sessions), so your work survives browser crashes, network drops, and reconnects.
+Monitor and drive agent sessions from any browser. Web serving is part of the `aoe` Daemon; start it with `aoe serve`. Terminal sessions run in tmux and structured sessions use persistent workers, so browser crashes and reconnects do not stop the work.
 
 ![The web dashboard on desktop: workspace sidebar, live agent terminal, and diff panel](../assets/web/dashboard.png)
 
 ## In this section
 
-This page covers running the server, access modes, the security model, and PWA install. The rest of the surface has its own pages:
+This page covers launch, access modes, security and PWA installation. Other surfaces have their own guides:
 
-- **[Dashboard & workspaces](web/dashboard.md)**: layout, status glyphs, session-creation wizard, sidebar sort/grouping, triage (pin / archive / snooze), command palette, first-run tutorial.
-- **[Terminal view](web/terminal.md)**: agent and paired terminals, reconnect behavior, WebSocket close codes, read-only mode.
-- **[Diff view](diff-view.md)**: reviewing changed files, flat / tree file list, per-repo base override, inline review comments.
-- **Settings & profiles**: no separate page; the settings tabs, profile picker, and connected-device tracking are covered under [Security](#security) and in [Configuration](configuration.md).
+- **[Dashboard & workspaces](web/dashboard.md)**: layout, session wizard, sorting, grouping, triage and mobile behavior.
+- **[Terminal view](web/terminal.md)**: agent and paired terminals, reconnects and read-only mode.
+- **[Diff view](diff-view.md)**: changes, comparison bases and inline review.
+- **[Configuration](configuration.md)** and [Security](#security): settings, profiles and connected devices.
 
-Mobile and touch behavior is documented inline on each page.
-
-## Availability
-
-The dashboard ships in all release binaries: [GitHub Releases](https://github.com/agent-of-empires/agent-of-empires/releases), the [quick install script](../installation.md#quick-install-recommended), and Homebrew (`brew install aoe`). Just run `aoe serve`.
-
-Building from source requires the `web` Cargo feature and Node.js to compile the embedded frontend. A plain `cargo build` still ships the daemon, so `aoe serve` runs and answers the API; there is just no dashboard to open.
+The dashboard ships in release binaries. Source builds need the `web` Cargo feature and Node.js; plain `cargo build` still serves the API without a dashboard.
 
 ## Starting the server
 
@@ -34,14 +28,7 @@ aoe serve --remote --read-only  # Monitor without terminal input
 
 From the TUI, press `R` (`Ctrl+R` with strict hotkeys), shown as `R Web` in the shortcut bar, to start a background server on your network or over a tunnel. While it runs, the entry reads `R ● Web` in green.
 
-The server prints a URL with an auth token:
-
-```
-aoe web dashboard running at:
-  http://localhost:8080/?token=a1b2c3...
-```
-
-Open it in any browser. The token is set as a cookie on first visit, so you don't need to keep it in the URL.
+The Daemon prints a URL carrying an auth token. Open it in a browser; the token becomes a cookie on first visit.
 
 When a poll expires, the dashboard aborts its request and shows the server as
 unreachable while retaining the last session list and workspace order. A later
@@ -49,9 +36,9 @@ successful poll restores the online state. A save acknowledgement alone does not
 clear a cancelled color or notification choice; it is reconciled against the
 affected sessions' canonical mutation results.
 
-`--open` is suppressed with `--daemon` or `--remote`, and whenever no browser you could see is reachable: over SSH without a forwarded `DISPLAY`, and on Linux/BSD with no display server. Setting `BROWSER` overrides the check on platforms whose browser launcher reads it, which excludes macOS. The preview's link handling uses the same rules.
+`--open` is suppressed with `--daemon`, `--remote`, SSH without a forwarded `DISPLAY`, or a Linux/BSD host without a display server. `BROWSER` overrides that visibility check where the platform launcher supports it, not on macOS. Preview links use the same rules.
 
-### Private core and recovery
+### Private API and recovery
 
 Run only the private local API, without TCP or a dashboard, with:
 
@@ -59,59 +46,34 @@ Run only the private local API, without TCP or a dashboard, with:
 aoe serve --core-only --daemon
 ```
 
-An explicit `aoe serve` request replaces an existing managed core under the daemon lifecycle lock. It validates the requested exposure before stopping the core, then waits for the dashboard to become ready. Existing terminal sessions remain running. A successful promotion retains the previous core launch so it can still be restored explicitly.
+An explicit `aoe serve` request enables Web serving by replacing a managed private-API Daemon under its lifecycle lock. It validates the requested exposure before stopping the old process, waits for dashboard readiness, and leaves terminal sessions running. Successful promotion retains the prior private-API launch for explicit recovery.
 
-`aoe serve --restart` replays the current managed launch. If a replacement fails after stopping the daemon, there is no automatic fallback. Run `aoe serve --rollback` to restore the retained launch explicitly. Rollback also works after `--stop`, including when the web plugin is disabled and the retained launch is core-only. It refuses missing or mismatched credentials instead of dropping authentication. The retained launch can still fail if its prerequisites are no longer available.
+`aoe serve --restart` replays the current managed launch. A failed replacement has no automatic fallback: use `aoe serve --rollback` to restore the retained launch, including after `--stop` or when the web plugin is disabled. Missing or mismatched credentials refuse rollback rather than dropping authentication; unavailable prerequisites can still make replay fail.
 
-The retained launch and its credential remain private (`0600`). Successful restart or rollback consumes the retained pair only after the replay reaches readiness; failed replay keeps it available for retry. Successful core-to-dashboard promotion does not consume the core recovery pair. Foreground and service-supervised processes must be stopped through their owning shell or service manager before rollback can replace them.
+The retained launch and credential stay private (`0600`). Restart or rollback consumes them only after readiness; failed replay retains them. Promotion to Web serving does not consume the private-API recovery pair. Stop foreground or service-supervised processes through their owning shell or manager before rollback replaces them.
+
+When the TUI starts or restarts a dashboard, its Remote Access view stays open while the Daemon changes. The TUI accepts exactly one verified successor connection for that request. Existing form and paste drafts stay in memory; native attach and live-send continuations stop. Pending changes with an unknown outcome stay blocked and are never replayed automatically. A failed start remains visible in Remote Access; close it and reconnect explicitly after repairing the cause. Stop remains responsive while startup settles: the TUI stops asynchronously afterward and does not reconnect or queue another start. Closing Remote Access does not discard other drafts.
+
+A degraded runtime can still provide its last complete canonical list read-only. Owner diagnostics name the file that actually failed, without displaying its contents. If the failing source changes while the list stays unchanged, an already-connected owner TUI updates the diagnostic without inventing a new list revision. Repair that file and wait for a fresh healthy snapshot before writing. A runtime protocol mismatch requires `aoe serve --restart`; reconnecting does not silently replace a live incompatible Daemon.
 
 ### Retrieving the live URL
 
-In `--remote` mode the auth token rotates every 4 hours, so a URL captured at startup eventually stops working. Use `aoe url` against a running daemon (exits non-zero if none is running):
-
-```bash
-aoe url               # Primary URL with the live token
-aoe url --all         # Every labeled URL (Tailscale / LAN / localhost), tab-separated
-aoe url --token-only  # Just the token (for scripted login)
-```
-
-`--remote` mode also prints a QR code for phone pairing.
+In `--remote` mode the token rotates every four hours. Use `aoe url` for the live URL (`--all` for labeled URLs, `--token-only` for scripted login); it exits non-zero if no Daemon runs. Remote mode also prints a phone-pairing QR code.
 
 ## Remote access
 
-`--remote` is the recommended way to reach the dashboard from your phone. aoe picks a transport automatically, in this order.
+`--remote` selects a tunnel in this order, unless named-tunnel flags override it:
 
-### 1. Tailscale Funnel (preferred when available)
+1. **Tailscale Funnel:** if `tailscale` is installed and logged in, AoE runs `tailscale funnel --bg --yes <port>` for a stable `https://<machine>.<tailnet>.ts.net` URL. Install Tailscale, run `tailscale up`, enable [Funnel](https://login.tailscale.com/f/funnel), and grant the node the `funnel` nodeAttr in its [ACL](https://login.tailscale.com/admin/acls/file). Target the node's tag if tagged. A conflicting non-loopback Funnel on port 443 is refused, not replaced; clear it with `tailscale funnel reset`, or use `--no-tailscale`. Stale loopback AoE configuration can be replaced.
+2. **Named Cloudflare tunnel:** an explicit named tunnel takes precedence over Tailscale and provides a stable hostname on your domain:
 
-If `tailscale` is on PATH and logged in, aoe runs `tailscale funnel --bg --yes <port>` and exposes the dashboard at your stable `https://<machine>.<tailnet>.ts.net` URL. No domain, no Cloudflare account, no rotating URLs. **This is the only option where a PWA installed on your phone keeps working across server restarts** (the URL is stable).
+   ```bash
+   cloudflared tunnel create my-tunnel
+   # Add a CNAME: aoe.example.com -> <tunnel-id>.cfargotunnel.com
+   aoe serve --remote --tunnel-name my-tunnel --tunnel-url aoe.example.com
+   ```
 
-One-time setup (aoe surfaces the fix if a gate is missing):
-1. Install Tailscale ([tailscale.com/download](https://tailscale.com/download)) and run `tailscale up`.
-2. Enable Funnel for your tailnet: [login.tailscale.com/f/funnel](https://login.tailscale.com/f/funnel).
-3. Grant the `funnel` nodeAttr to this node in your ACL: [login.tailscale.com/admin/acls/file](https://login.tailscale.com/admin/acls/file). A rule like `{ "target": ["autogroup:member"], "attr": ["funnel"] }` works for personal tailnets; target the tag instead if your node is tagged.
-4. `aoe serve --remote`.
-
-If port 443 already has a non-loopback Funnel service on this node, aoe refuses to start rather than replace it (a stale loopback config from a prior aoe run is overwritten cleanly). Clear the conflict with `tailscale funnel reset` (the Error dialog offers `[R]`), or pass `--no-tailscale` to use Cloudflare.
-
-### 2. Named Cloudflare tunnel
-
-Stable hostname on your own Cloudflare-managed domain. Takes precedence over Tailscale when you pass the flags:
-
-```bash
-cloudflared tunnel create my-tunnel
-# Add a CNAME: aoe.example.com -> <tunnel-id>.cfargotunnel.com
-aoe serve --remote --tunnel-name my-tunnel --tunnel-url aoe.example.com
-```
-
-### 3. Cloudflare quick tunnel (fallback)
-
-Zero-config but the URL rotates on every restart. Fine for one-off sessions, **bad for installed PWAs** (the home-screen app is bound to its install URL, so a restart means delete-and-reinstall). aoe prints a notice when it falls back here.
-
-Requires `cloudflared` on the host:
-- macOS: `brew install cloudflared`
-- Linux: `sudo apt install cloudflared`
-- Other: [Cloudflare's downloads page](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/)
-
+3. **Cloudflare quick tunnel:** the fallback requires [`cloudflared`](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/) on the host. No domain or account is needed, but the URL changes on restart and breaks installed PWAs. AoE reports this fallback. Install PWAs from a stable Funnel or named-tunnel URL.
 ## Flags
 
 | Flag | Default | Description |
@@ -132,40 +94,23 @@ Requires `cloudflared` on the host:
 | `--daemon` | off | Fork to background and detach from terminal |
 | `--stop` | | Stop a running daemon |
 
-### Auth mode matrix
-
-| Mode | Token URL | Passphrase wall | Use case |
-|------|-----------|-----------------|----------|
-| `--auth=token` (default) | required | optional (`--passphrase`) | Standard local / VPN / Tailscale deployments |
-| `--auth=passphrase --passphrase X` | none | required | Reverse-proxy deployments where pasting a token URL on mobile is too high friction |
-| `--auth=none` (alias `--no-auth`) | none | none | Localhost-only quick testing |
-
-- `--auth=passphrase` and `--auth=none` on a non-loopback bind require `--behind-proxy` (which asserts an upstream proxy terminates TLS and forwards the client IP). Without it, reduced-auth modes refuse to bind to a routable address.
-- `--auth=passphrase` requires `--passphrase <VALUE>` (or `AOE_SERVE_PASSPHRASE`).
-- `--auth=none --passphrase X` is rejected; use `--auth=passphrase` for a passphrase wall.
-- `--remote` is incompatible with `--auth=none` and `--auth=passphrase`; the public tunnel mandates both token auth and a passphrase.
+`--auth=passphrase` and `--auth=none` on a non-loopback bind require `--behind-proxy`. Passphrase mode requires `--passphrase` or `AOE_SERVE_PASSPHRASE`; combining a passphrase with `--auth=none` is refused. Public `--remote` tunnels require both token auth and a passphrase and refuse reduced-auth modes. See [Authentication](#authentication).
 
 ### CityHall client mode
 
-Set the `AOE_CITYHALL_MODE` environment variable (to any value), or pass `--cityhall`, to start the dashboard as a locked-down end-user client: only the message composer and the structured (chat) view are reachable. Terminal and diff panes and project management are hidden in the UI and rejected server-side, so a direct API or WebSocket call cannot reach them either: the terminal keystroke and raw-output routes, git clone/branch/is-repo probes, agent/worker lifecycle and config routes, project CRUD, profile CRUD, the MCP keep/drop/resolve routes, and the plugin install/uninstall/enable/update routes all return 403, and session creation is server-derived (every client-controlled spawn field, including `command_override` and `trust_hooks`, is reset). The session list is filtered to the structured sessions the mode creates, and the session-lifecycle routes (ensure/start/stop/delete/rename/etc) refuse any non-structured target, so a locked-down client cannot enumerate and respawn or destroy a plain/terminal session created by the TUI or another client on the same daemon. Reachability is enforced default-deny by a middleware in front of the router: in CityHall mode every mutating request (POST/PUT/PATCH/DELETE) whose route is not on an explicit allowlist is refused before the handler runs, so a newly added route is closed until it is deliberately classified (an exhaustiveness test fails the build otherwise). The per-route checks remain as defense in depth. Settings are curated down to Theme (without the color-mode and idle-decay knobs; the server also drops a client-supplied color mode), a delete-to-trash toggle (the profile-settings write is field-filtered to just the trash cluster), MCP servers (display only), Telemetry, and Plugins (display only: the marketplace and every lifecycle control are hidden and closed server-side); the profile switcher and all other settings are removed. New sessions are created by name only; each spans every configured project and runs the default agent in structured view, so the deployment's default agent must be ACP-capable (session creation is rejected otherwise, and it fails if no project is configured). Worktrees are enabled by default and the ACP worker ceiling is raised.
+Set `AOE_CITYHALL_MODE` to any value, or pass `--cityhall`, for a locked-down end-user client. Only the message composer and structured view are reachable. Terminal/raw-output and diff routes, git probes, project/profile management, agent/worker/config controls, MCP keep/drop/resolve, and plugin lifecycle are hidden and refused server-side. Mutating routes are default-deny unless explicitly allowlisted.
 
-```bash
-AOE_CITYHALL_MODE=1 aoe serve --host 0.0.0.0
-```
+Session creation resets client-controlled spawn fields, including `command_override` and `trust_hooks`, and derives the launch on the server. Lists include only the structured sessions this mode creates; lifecycle routes refuse non-structured targets. New sessions accept a name only, span every configured project, and require an ACP-capable default agent and at least one project. Worktrees default on and the worker ceiling is raised.
 
-The flag and the env var are equivalent; the daemon replays `--cityhall` to its child and persists it in `serve.launch`, so the mode survives `aoe serve --restart` and the post-`aoe update` re-exec (it is not silently dropped when the restart shell lacks the env var).
+Settings expose Theme without color-mode or idle-decay controls, field-filtered trash settings, Telemetry, and display-only MCP servers and Plugins. Other settings and profile switching stay unavailable. The mode persists in `serve.launch` across `--restart` and post-update re-exec.
 
 #### The CityHall config bundle
 
-A locked-down client cannot configure itself: `PATCH /api/settings`, the project CRUD routes, and `POST /api/git/clone` are all closed in CityHall mode, and the project registry starts empty, so a fresh workspace has no project to launch a session against. The config bundle fills that gap. It is one TOML document describing how a workspace should be set up:
+A bundle configures a locked-down client with one TOML document:
 
 ```toml
 schema_version = 1
 
-[meta]
-generated_by = "aoe 1.13.2"
-
-# Sparse settings overrides: only the fields that differ from the defaults.
 [settings.acp]
 default_agent = "claude-code"
 
@@ -175,22 +120,13 @@ remote = "https://github.com/agent-of-empires/cityhall.git"
 default_base_branch = "main"
 ```
 
-Projects are addressed by **git remote**, not by path: an admin's local checkout path means nothing inside a workspace, so `apply` clones each remote into `<app_dir>/repos/<name>` and registers that path. Settings are a sparse patch keyed by section then field, the same shape a `PATCH /api/settings` body takes, so they go through the same validation.
+Projects use git remotes, not the administrator's paths; `apply` clones into `<app_dir>/repos/<name>` and registers them. Settings are sparse section/field patches, validated like `PATCH /api/settings`.
 
-Produce one from a configured install with `aoe cityhall export --out cityhall.toml`, or from the dashboard's **Settings → CityHall** tab. The export deliberately omits host-specific fields (the ones marked local-only in the settings schema, such as binary paths) and never contains a credential. Apply one by hand with `aoe cityhall apply cityhall.toml`.
+Export with `aoe cityhall export --out cityhall.toml` or **Settings > CityHall**. Exports omit host-specific/local-only fields and all credentials. Apply with `aoe cityhall apply cityhall.toml`. Application is idempotent: existing checkouts and uncommitted work stay untouched, registrations are not duplicated, and one failed clone does not stop others. Bundles set values but cannot unset them.
 
-Applying is idempotent, because a workspace does it on every boot: an existing checkout is left untouched so uncommitted work survives a restart, and an already-registered project is not re-added. A repo that fails to clone is reported without taking the other projects down. A bundle sets values; it cannot unset them.
+`AOE_CITYHALL_BUNDLE_URL` fetches a bundle before config loading; `AOE_CITYHALL_BUNDLE_TOKEN` supplies its bearer token. Without a cached bundle, fetch failure aborts startup. After a successful application, later fetch failure warns and uses the cache. Malformed bundles or unknown settings remain fatal.
 
-To have a workspace fetch its bundle at startup, point it at the URL that serves one:
-
-| Variable | Meaning |
-| --- | --- |
-| `AOE_CITYHALL_BUNDLE_URL` | URL to fetch the bundle from at `aoe serve` startup. Unset disables the fetch entirely. |
-| `AOE_CITYHALL_BUNDLE_TOKEN` | Bearer token sent with that request. |
-
-The fetch happens before the server reads any config, and its failure handling is asymmetric on purpose. On a first boot there is no cached bundle, so a fetch failure fails the startup rather than leaving the user in a workspace with default settings and no projects. Once a bundle has been applied it is cached in the app dir, and a later fetch failure only logs a warning and serves the cached configuration, so a transient outage cannot brick a working workspace. A bundle that arrives but is malformed, or names a setting this aoe does not know, is fatal either way.
-
-The document the bundle carries is also where a git identity and credential arrive (`[git]`), which is what makes clone, pull, and push work inside a workspace. That section is never written by `export`; the host serving the bundle composes it per user.
+The serving host can compose a per-user `[git]` identity and credential for clone, pull and push. Export never writes that section.
 
 ### Behind a reverse proxy
 
@@ -238,37 +174,27 @@ A plugin page is framed with `sandbox="allow-scripts allow-downloads"` and serve
 
 ### DNS rebinding
 
-`aoe serve` validates the `Host` and `Origin` of every request before authentication: a request whose `Host` is unlisted, or whose browser `Origin` is present but neither allowlisted nor on the exact same authority (host and effective port, including default ports and bracketed IPv6) as `Host`, gets `403 Forbidden`. A different routable IP is therefore rejected. A request with no `Origin` header is exempt from the origin check; any `Origin` that is sent, including the opaque `Origin: null`, is rejected unless allowlisted, and since `--allowed-origin` requires a full `scheme://host[:port]`, `Origin: null` can never be allowlisted. This closes the DNS-rebinding vector: a page that rebinds its hostname to your machine's IP still sends that hostname as `Host`, which is not in the allowlist.
+`aoe serve` checks `Host` and browser `Origin` before authentication. An unlisted host, or an origin neither allowlisted nor on the same host and effective port, receives `403 Forbidden`. This includes default ports and bracketed IPv6. Requests without `Origin` skip only the origin check; `Origin: null` is refused and cannot be allowlisted.
 
-The allowlist is derived automatically:
+Automatic hosts include `localhost`, `127.0.0.1`, `::1`, a concrete bind address and routable IP literals. A browser origin for an IP literal must still match that host's exact authority. Unspecified, link-local and multicast addresses cannot be trusted or explicitly allowlisted. Remote tunnels add their public hostname and HTTPS origin.
 
-- `localhost`, `127.0.0.1`, and `::1` are always accepted, plus the value of `--host` when it is a concrete (non-wildcard) address.
-- Any routable **IP literal `Host`** (LAN, tailnet `100.x`, ULA, global) is accepted unconditionally: an IP is dialed directly and never DNS-resolved, so it cannot be rebound. A browser `Origin` is accepted without `--allowed-origin` only when its authority exactly matches that `Host`. The unspecified address (`0.0.0.0` / `::`), link-local (`169.254.0.0/16`, `fe80::/10`), and multicast are excluded from automatic trust and cannot be allowlisted at all: `--allowed-host` / `--allowed-origin` reject them at startup, since allowlisting one would reopen the hole the gate closes.
-- `--remote` tunnels (Cloudflare and Tailscale) inject their public hostname and its `https://` origin, so remote dashboards and the live terminal WebSocket work with no extra flag.
-- `--allowed-host` / `--allowed-origin` add operator-declared entries (see below).
-
-A wildcard bind (`--host 0.0.0.0` / `::`) is therefore reachable by its LAN/tailnet **IP** with no extra flag. Only reaching it by a **hostname** (mDNS `.local`, Tailscale MagicDNS name, custom DNS) needs an explicit `--allowed-host`, because a hostname is what a DNS-rebinding attacker controls:
+A wildcard bind is reachable by LAN or tailnet **IP** without another flag. Hostnames, including mDNS, MagicDNS and custom tunnel names, require an explicit allowlist entry:
 
 ```bash
-# Add a NAME only to reach it by hostname:
 aoe serve --host 0.0.0.0 --allowed-host my-box.tailnet.ts.net
 ```
 
 ### `--allowed-host` for a reverse proxy or custom tunnel
 
-For a reverse proxy or a manually managed tunnel (anything that is not `--remote`), aoe cannot infer the public hostname, so declare it explicitly. Standard 80/443 origins for each `--allowed-host` are derived automatically; only a proxy on a nonstandard port needs an explicit `--allowed-origin`:
+Declare the public hostname with `--allowed-host`. Standard HTTP/HTTPS origins on ports 80/443 are derived automatically; add the full `--allowed-origin` for a nonstandard port:
 
 ```bash
-# Reverse proxy terminating TLS on the standard 443
-aoe serve --host 127.0.0.1 --behind-proxy --allowed-host aoe.example.com
-
-# Reverse proxy on a nonstandard port
 aoe serve --host 127.0.0.1 --behind-proxy \
   --allowed-host aoe.example.com \
   --allowed-origin https://aoe.example.com:8443
 ```
 
-Both flags are repeatable and are replayed across `aoe serve --restart`, so a restart preserves the posture.
+Both flags are repeatable and replayed across `aoe serve --restart`.
 
 ### Safe usage patterns
 
@@ -286,15 +212,6 @@ Both flags are repeatable and are replayed across `aoe serve --restart`, so a re
 
 ## Installing as a PWA
 
-The dashboard installs as a Progressive Web App for an app-like, standalone window:
+Install the dashboard as a Progressive Web App: Chrome's **Install Agent of Empires**, Safari's **File > Add to Dock**, iOS **Share > Add to Home Screen**, or Android's install prompt. Use a stable Funnel or named-Cloudflare URL; a quick-tunnel URL changes on restart.
 
-- **macOS (Chrome)**: three-dot menu > "Install Agent of Empires".
-- **macOS (Safari)**: File > Add to Dock.
-- **iOS**: Share > Add to Home Screen.
-- **Android (Chrome)**: "Add to Home Screen" prompt or install banner.
-
-The PWA needs the server running; use `--daemon` to keep it up (`aoe serve --stop` to stop). For a stable URL that survives restarts, install from a Tailscale Funnel or named-Cloudflare URL, not a quick tunnel.
-
-When you leave the PWA and come back, it reopens to the session you last had open rather than the dashboard. The last session is remembered per device (not synced across devices); if you were on the dashboard when you left, or that session no longer exists, you land on the dashboard.
-
-`Ctrl-C` on a foreground server, or `aoe serve --stop` against a daemon, both exit within ~5 seconds even with open tabs. Live clients receive a `1001` ("going away") close frame and reconnect once a fresh server is running.
+Keep the Daemon running with `--daemon`; stop it with `aoe serve --stop`. The PWA returns to the last session on that device, or the dashboard if no session was selected or that session is gone. Stopping a foreground or background Daemon exits within about five seconds with open tabs; clients receive `1001` (going away) and reconnect when a new Daemon runs.

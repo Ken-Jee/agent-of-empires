@@ -2835,13 +2835,39 @@ async fn set_session_id(profile: &str, args: SetSessionIdArgs) -> Result<()> {
             .id
             .clone()
     };
+    let _handoff_driver = crate::session::try_acquire_terminal_handoff_driver(&target_id)?
+        .context("terminal handoff driver is active; retry after it finishes")?;
     let lifecycle_lock = storage
         .acquire_instance_lifecycle_lock(&target_id)
         .context("failed to acquire instance resume-target lock")?;
     let title = storage.update(|instances, _groups| {
         super::patch_instance(instances, &target_id, |inst| {
+            let pending_recovery = inst.terminal_handoff.as_ref().map(|intent| (intent.id, intent.stage));
+            if let Some((_, stage)) = pending_recovery {
+                anyhow::ensure!(matches!(stage,
+                    crate::session::TerminalHandoffStage::TerminalCommitOwed
+                        | crate::session::TerminalHandoffStage::TerminalLaunchOwed),
+                    "terminal handoff must finish original retirement before its native target can change");
+                let pending = inst.terminal_handoff.as_ref().expect("pending recovery");
+                anyhow::ensure!(pending.final_event_seq.is_some(),
+                    "original retirement completion has not been durably captured");
+                anyhow::ensure!(pending.profile == storage.profile()
+                    && pending.profile_identity == storage.bound_profile_identity()?
+                    && pending.generation == inst.lifecycle_generation,
+                    crate::session::LifecycleReservationError::Superseded);
+                pending.ensure_original_stopped(&inst.id)?;
+                let pane = inst.tmux_session()?;
+                if pane.exists_live() {
+                    anyhow::ensure!(pane.is_pane_dead(),
+                        "terminal handoff pane is live; retry disable to complete adoption before changing its target");
+                    let launch = pending.launch.as_ref().ok_or_else(|| anyhow::anyhow!(
+                        "existing dead pane has no handoff receipt; pane retained"))?;
+                    crate::session::Instance::ensure_terminal_handoff_pane_matches(pane.name(),
+                        crate::session::TerminalHandoffKey { id: pending.id, generation: pending.generation }, launch)?;
+                }
+            }
             inst.source_profile = storage.profile().to_string();
-            if inst.is_structured() {
+            if inst.is_structured() && pending_recovery.is_none() {
                 anyhow::ensure!(args.store.is_some() && matches!((&new_intent, inst.acp_session_id.as_deref()), (crate::session::ResumeIntent::Use(sid), Some(acp_sid)) if sid == acp_sid),
                     "ACP manages its own conversation; a native handoff assertion requires its current ID and an explicit --store");
             }
@@ -2849,11 +2875,39 @@ async fn set_session_id(profile: &str, args: SetSessionIdArgs) -> Result<()> {
                 crate::session::ResumeIntent::Use(sid) => Some(inst.asserted_resume_binding(sid, args.store.as_deref())?),
                 _ => None,
             };
-            anyhow::ensure!(!inst.is_structured() || binding.as_ref().and_then(|binding| binding.execution.as_ref()).is_some_and(|execution| execution.agent == "claude"),
+            anyhow::ensure!(pending_recovery.is_some() || !inst.is_structured() || binding.as_ref().and_then(|binding| binding.execution.as_ref()).is_some_and(|execution| execution.agent == "claude"),
                 "ACP terminal handoff is supported only for an explicitly bound Claude conversation");
             inst.resume_binding = binding;
             inst.resume_intent = new_intent.clone();
             inst.resume_probe_failed_sid = None;
+            if let Some((intent_id, _)) = pending_recovery {
+                let context = match &new_intent {
+                    crate::session::ResumeIntent::Use(_) => {
+                        let native_store = inst.resume_binding.as_ref().and_then(|binding| binding.execution.clone())
+                            .context("pending handoff recovery requires a proven native store")?;
+                        crate::session::TerminalHandoffContext::Keep { native_store }
+                    }
+                    crate::session::ResumeIntent::Cleared => crate::session::TerminalHandoffContext::Discard,
+                    _ => unreachable!(),
+                };
+                let generation = inst.lifecycle_generation.checked_add(1)
+                    .ok_or(crate::session::LifecycleReservationError::GenerationOverflow)?;
+                let target = inst.conversation_state();
+                let source_acp_session_id = inst.acp_session_id.clone();
+                inst.lifecycle_generation = generation;
+                inst.lifecycle_reservation = None;
+                let pending = inst.terminal_handoff.as_mut().expect("validated handoff");
+                anyhow::ensure!(pending.id == intent_id,
+                    crate::session::LifecycleReservationError::Superseded);
+                pending.generation = generation;
+                pending.target_generation = generation;
+                pending.context = context;
+                pending.source_conversation = target.clone();
+                pending.source_acp_session_id = source_acp_session_id;
+                pending.terminal = Some(target);
+                pending.launch_started = false;
+                // Retain the original checkpoint solely as the owned dead-pane receipt.
+            }
             Ok(inst.title.clone())
         })
     })?;

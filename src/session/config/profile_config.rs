@@ -47,19 +47,22 @@ impl ProfileConfig {
 /// not pollute `profiles/` with a stub directory.
 pub fn load_profile_config(profile: &str) -> Result<ProfileConfig> {
     let path = crate::session::get_profile_dir_path(profile)?.join("config.toml");
-    let Some(content) = super::read_optional_config(&path)? else {
-        return Ok(ProfileConfig::default());
-    };
-    if content.trim().is_empty() {
-        return Ok(ProfileConfig::default());
-    }
-    let config: ProfileConfig = toml::from_str(&content)?;
-    // Type-check the overrides by merging onto a default Config. The sparse map
-    // accepts any JSON, so a wrong-typed value (e.g. `worktree.enabled = "yes"`)
-    // would otherwise only surface as a panic at merge time; reject it here so
-    // the caller warns and falls back to defaults.
-    validate_overrides_typecheck(&config.overrides_value())?;
-    Ok(config)
+    let result = (|| {
+        let Some(content) = super::read_optional_config(&path)? else {
+            return Ok(ProfileConfig::default());
+        };
+        if content.trim().is_empty() {
+            return Ok(ProfileConfig::default());
+        }
+        let config: ProfileConfig = toml::from_str(&content)?;
+        // Type-check the overrides by merging onto a default Config. The sparse map
+        // accepts any JSON, so a wrong-typed value (e.g. `worktree.enabled = "yes"`)
+        // would otherwise only surface as a panic at merge time; reject it here so
+        // the caller warns and falls back to defaults.
+        validate_overrides_typecheck(&config.overrides_value())?;
+        Ok(config)
+    })();
+    result.map_err(|error: anyhow::Error| error.context(crate::session::LoadSource(path)))
 }
 
 /// Merge a sparse override object onto a full serialized `Config::default()`,

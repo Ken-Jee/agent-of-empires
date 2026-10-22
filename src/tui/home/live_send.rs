@@ -70,44 +70,29 @@ static LIVE_SEND_WORKER_COUNTER: std::sync::atomic::AtomicU64 =
 static LIVE_CAPTURE_WORKER_TEST_COUNTER: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
-/// Default exit chord set when the user hasn't configured one.
-/// `Ctrl+q` is the sole default: works on mobile / restrictive SSH
-/// clients (Termius), reachable on every keyboard layout we ship to,
-/// and well-known as a "quit" chord. Users who need `C-q` to reach
-/// the agent (vim quoted-insert, etc.) can configure a different
-/// exit chord, or any comma-separated list, via settings.
+/// Default exit chord set: `C-q` alone, which works on mobile and restrictive SSH
+/// clients, is reachable on every shipped keyboard layout, and reads as "quit". Users who
+/// need `C-q` downstream configure another chord, or a comma-separated list.
 ///
-/// `Ctrl+]` (briefly shipped in 1.9.0) and `Ctrl+\` (tried during
-/// development) each silently failed on at least one common
-/// terminal/keyboard combination on macOS. Rather than trap users
-/// with a chord that looks like it should work and doesn't, the
-/// default is one chord; users who want a two-hand exit configure
-/// one. 1.9.0 users who saved settings while that release's default
-/// was in effect have `"C-q,C-]"` baked into config.toml; re-saving
-/// settings (or hand-editing the line out) restores the new default.
+/// `Ctrl+]` and `Ctrl+\` were each tried and silently failed on at least one common
+/// macOS terminal/keyboard combination, so the default is one chord rather than a
+/// two-hand exit that looks like it should work. Settings saved under 1.9.0 have
+/// `"C-q,C-]"` in config.toml; re-saving restores this default.
 pub(super) const DEFAULT_EXIT_CHORD: &str = "C-q";
 
-/// Default live-send leader (prefix) chord. `Ctrl+b` matches the tmux
-/// and herdr leader, so multiplexer users already have the muscle
-/// memory, and it's the one chord we steal from the agent (double-tap
-/// `C-b C-b` still delivers a literal `C-b` downstream). Kept in sync
-/// with `default_live_send_leader()` in `session::config`. An empty
-/// configured value disables the leader entirely.
+/// Default live-send leader (prefix) chord. `Ctrl+b` matches tmux and herdr, so
+/// multiplexer users have the muscle memory, and it is the one chord stolen from the
+/// agent (double-tap still delivers a literal `C-b`). Kept in sync with
+/// `default_live_send_leader()` in `session::config`; an empty value disables the leader.
 pub(super) const DEFAULT_LEADER: &str = "C-b";
 
-/// Parse a tmux-style chord spec into a `(KeyCode, KeyModifiers)`
-/// pair. Accepts `C-` / `Ctrl-`, `M-` / `Alt-`, `S-` / `Shift-`
-/// prefixes (any order, separated by `-` or `+`) followed by a key
-/// name. Key names: single ASCII chars (`q`, `]`, `1`), or one of the
-/// tmux-named keys (`Escape`, `Tab`, `BTab`, `Up`, `Down`, `Left`,
-/// `Right`, `Enter`, `BSpace` / `Backspace`, `DC` / `Delete`, `IC` /
-/// `Insert`, `Home`, `End`, `PPage` / `PageUp`, `NPage` / `PageDown`,
-/// `Space`, `F1`..`F12`).
+/// Parse a tmux-style chord spec into `(KeyCode, KeyModifiers)`. Accepts `C-` / `Ctrl-`,
+/// `M-` / `Alt-`, `S-` / `Shift-` prefixes in any order, separated by `-` or `+`, followed
+/// by a single ASCII char or a tmux key name (`Escape`, `Tab`, `BTab`, arrows, `Enter`,
+/// `BSpace`, `DC`, `IC`, `Home`, `End`, `PPage`, `NPage`, `Space`, `F1`..`F12`).
 ///
-/// Returns `None` on parse failure so the caller can fall back to the
-/// default chord and warn the user. Chord case is normalized: char
-/// keys lowercase under any modifier so `C-q` and `C-Q` parse to the
-/// same canonical form.
+/// `None` on parse failure, so the caller can fall back to the default and warn. Char keys
+/// lowercase under any modifier, so `C-q` and `C-Q` share one canonical form.
 pub(super) fn parse_chord(spec: &str) -> Option<(KeyCode, KeyModifiers)> {
     let trimmed = spec.trim();
     if trimmed.is_empty() {
@@ -180,11 +165,9 @@ fn parse_key_name(name: &str, has_ctrl: bool) -> Option<KeyCode> {
     Some(code)
 }
 
-/// True when `event` is the configured exit chord. Char codes
-/// normalize under Ctrl (matches the canonical form `parse_chord`
-/// produces). Strict modifier match otherwise: a chord configured as
-/// `C-q` does not fire on `Ctrl+Shift+q` so the user can still
-/// deliver `C-q` to the agent via Shift.
+/// True when `event` is a configured exit chord. Char codes normalize under Ctrl (the
+/// canonical form `parse_chord` produces); modifiers match strictly otherwise, so `C-q`
+/// does not fire on `Ctrl+Shift+q` and the user can still deliver `C-q` to the agent.
 pub(super) fn chord_matches(spec: (KeyCode, KeyModifiers), event: KeyEvent) -> bool {
     let mut event_code = event.code;
     if event.modifiers.contains(KeyModifiers::CONTROL) {
@@ -195,12 +178,10 @@ pub(super) fn chord_matches(spec: (KeyCode, KeyModifiers), event: KeyEvent) -> b
     spec.0 == event_code && spec.1 == event.modifiers
 }
 
-/// Parse a comma-separated list of chord specs (e.g. `"C-q,F12"`)
-/// into the list of `(code, modifiers)` pairs the exit check
-/// compares against. Invalid pieces are dropped with a warning so a
-/// typo in one entry doesn't disable the whole list; an entirely
-/// unparseable string falls back to the default chord set so the
-/// user is never trapped in live mode without a working exit.
+/// Parse a comma-separated chord list (`"C-q,F12"`) into the pairs the exit check
+/// compares against. Invalid pieces are dropped with a warning so one typo doesn't
+/// disable the list, and an entirely unparseable string falls back to the default, so the
+/// user is never trapped in live mode.
 pub(super) fn parse_chord_list(spec: &str) -> Vec<(KeyCode, KeyModifiers)> {
     let mut out = Vec::new();
     for piece in spec.split(',') {
@@ -233,9 +214,8 @@ pub(super) fn chord_list_matches(chords: &[(KeyCode, KeyModifiers)], event: KeyE
     chords.iter().any(|c| chord_matches(*c, event))
 }
 
-/// Render the configured chord list as a banner-friendly string,
-/// e.g. `"Ctrl+Q"` or `"Ctrl+Q / F12"`. Used for the status-bar live
-/// banner so the user sees every chord they can press to exit.
+/// Render the configured chord list for the banner, e.g. `"Ctrl+Q / F12"`, so the user
+/// sees every chord that exits.
 pub(super) fn display_chord_list(chords: &[(KeyCode, KeyModifiers)]) -> String {
     chords
         .iter()
@@ -244,10 +224,8 @@ pub(super) fn display_chord_list(chords: &[(KeyCode, KeyModifiers)]) -> String {
         .join(" / ")
 }
 
-/// Render a parsed chord back as a human-readable string for the
-/// banner: e.g. `(KeyCode::Char('q'), CONTROL)` → "Ctrl+Q". Uses
-/// uppercase for letters so the banner reads like the rest of the
-/// chord hints in the TUI (Ctrl+T, Ctrl+K, etc.).
+/// Render a parsed chord as a human-readable string for the banner, uppercasing letters
+/// so it reads like the TUI's other chord hints.
 pub(super) fn display_chord(spec: (KeyCode, KeyModifiers)) -> String {
     let (code, mods) = spec;
     let mut out = String::new();
@@ -319,10 +297,8 @@ pub(in crate::tui) struct LiveSendState {
     pub leader: Option<(KeyCode, KeyModifiers)>,
 }
 
-/// Which paired tmux pane a live-send dispatch targets. The agent
-/// pane is the historical default; terminal panes (host and
-/// container) reuse the same live-send dispatch machinery but route
-/// to the paired terminal's tmux session.
+/// Which paired tmux pane a live-send dispatch targets: the agent pane is the historical
+/// default, and the host and container terminal panes reuse the same machinery.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(in crate::tui) enum LiveSendTarget {
     /// The agent's tmux pane (default, pre-existing behavior).
@@ -348,11 +324,9 @@ impl LiveSendTarget {
     }
 }
 
-/// Format a display label for a `(title, target)` pair so the compose
-/// dialog header and the live-mode status banner stay in lockstep.
-/// Agent keeps the bare title (historical look); terminal variants
-/// get a short parenthetical so the user sees which pane the
-/// keystrokes will land on without having to read the preview chrome.
+/// Format a `(title, target)` label so the compose dialog header and the live banner stay
+/// in lockstep: Agent keeps the bare title, terminal variants get a short parenthetical
+/// naming the pane the keystrokes land on.
 pub(in crate::tui) fn format_target_label(title: &str, target: &LiveSendTarget) -> String {
     match target {
         LiveSendTarget::Agent => title.to_string(),
@@ -4035,6 +4009,24 @@ mod tests {
         assert!(
             matches!(session.size_owner(), Some((id, _)) if id.starts_with("tui-")),
             "vacant lock must still be claimed on the retry path"
+        );
+    }
+
+    #[test]
+    fn queued_resize_batch_does_not_dispatch_after_its_native_lease_is_revoked() {
+        let lease = crate::tui::session_feed::NativeLease::valid_for_test();
+        let queued = vec![WorkerMsg::Resize { cols: 80, rows: 24 }];
+        let missing_target = format!("aoe_absent_lease_probe_{}", uuid::Uuid::new_v4());
+        assert_eq!(
+            dispatch_batch(&missing_target, "fixture-owner", queued.clone(), &lease),
+            ResizeDispatchResult::Failed,
+            "positive control reaches real resize dispatch for a valid lease and absent target"
+        );
+        lease.cancel_continuation();
+        assert_eq!(
+            dispatch_batch(&missing_target, "fixture-owner", queued, &lease),
+            ResizeDispatchResult::None,
+            "already queued native work must not reach resize dispatch after revocation"
         );
     }
 }

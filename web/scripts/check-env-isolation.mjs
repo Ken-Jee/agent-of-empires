@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Static production-env inventory. Behavioral isolation stays in Vitest.
+// Classify production and test reads; keep behavioral isolation in Vitest.
 import { readdirSync, readFileSync } from "node:fs";
 import { dirname, join, basename, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -10,25 +10,10 @@ const helper = join(web, "tests/helpers/isolatedEnv.ts");
 const compiled = ts.transpileModule(readFileSync(helper, "utf8"), {
   compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 },
 }).outputText;
-const { isolateEnv, INHERITED_PATH_VARS, HOST_STATE_VARS } = await import(
+const { isolateEnv, INHERITED_PATH_VARS } = await import(
   "data:text/javascript;base64," + Buffer.from(compiled).toString("base64")
 );
-const cases = ts.createSourceFile(
-  "isolatedEnv.test.ts",
-  readFileSync(join(web, "tests/helpers/isolatedEnv.test.ts"), "utf8"),
-  ts.ScriptTarget.Latest,
-  true,
-);
-const declarations = cases.statements
-  .filter(ts.isVariableStatement)
-  .flatMap((statement) => statement.declarationList.declarations);
-const hostileCases = declarations.find((declaration) => declaration.name.getText(cases) === "NON_SUFFIX_HOST_STATE");
-if (!hostileCases?.initializer || !ts.isObjectLiteralExpression(hostileCases.initializer))
-  throw new Error("Missing hostile isolation cases");
-const covered = new Set(hostileCases.initializer.properties.map((property) => property.name?.getText(cases)));
-const uncovered = [...HOST_STATE_VARS].filter((name) => !covered.has(name));
-if (uncovered.length) throw new Error("Host-state isolation has no behavioral hostile case: " + uncovered.join(", "));
-/** Every src/ environment read must be neutralized or explicitly safe to inherit. */
+/** Production reads require isolation or explicit inheritance. */
 const INHERITED_BY_CONTRACT = new Set([
   ...INHERITED_PATH_VARS,
   // systemd's id of the unit invocation; aoe only restores the caller's value
@@ -42,10 +27,6 @@ const INHERITED_BY_CONTRACT = new Set([
   "AOE_ACP_TRACE",
   "AOE_ACP_WATCHDOG_POLL_MS",
   "AOE_E2E_DEBUG",
-  "AOE_ENVGUARD_DUP",
-  "AOE_ENVGUARD_EMPTY",
-  "AOE_ENVGUARD_UNSET",
-  "AOE_ENVGUARD_UNSET_ME",
   "AOE_FILE_WATCH",
   "AOE_LOG_LEVEL",
   "AOE_MOUSE_CAPTURE",
@@ -89,6 +70,23 @@ const INHERITED_BY_CONTRACT = new Set([
   "VISUAL",
 ]);
 
+const TEST_BINARY_READS = new Set([
+  "AOE_AGENT_PROBE_TEST_CHILD",
+  "AOE_FROZEN_NATIVE_TEST_CHILD",
+  "AOE_LOOPBACK_PROXY_TEST_CHILD",
+  "AOE_RECHECK_TEST_CHILD",
+  "AOE_TEST_KILL_LAST_PANE_CHILD",
+  "AOE_TEST_TMUX_EMPTY_CHILD",
+  "AOE_TEST_TMUX_ABSENCE_CHILD",
+  "AOE_TEST_TMUX_KILL_CHILD",
+  "AOE_TEST_ANCILLARY_KILL_CHILD",
+  "AOE_TEST_TOOL_ADMISSION_CHILD",
+  "AOE_ENVGUARD_DUP",
+  "AOE_ENVGUARD_EMPTY",
+  "AOE_ENVGUARD_UNSET",
+  "AOE_ENVGUARD_UNSET_ME",
+]);
+
 const rust = join(web, "../src");
 const files = rustFiles(rust);
 const excluded = new Set();
@@ -106,36 +104,49 @@ for (const file of files) {
 const names = new Set();
 const constants = new Map();
 const constantReads = new Set();
+const allNames = new Set();
+const allConstants = new Map();
+const allConstantReads = new Set();
 const patterns = [
   /env::var(?:_os)?\(\s*"([A-Z][A-Z0-9_]*)"/g,
   /\benv\s*=\s*"([A-Z][A-Z0-9_]*)"/g,
   /"([A-Z][A-Z0-9_]*_(?:HOME|DIR|DB|PATH|CREDENTIALS))"/g,
 ];
 for (const file of files) {
+  const source = readFileSync(file, "utf8");
+  collectReads(inventorySource(source, true), allNames, allConstants, allConstantReads);
   if ([...excluded].some((path) => file === path || file.startsWith(path + "/"))) continue;
-  const source = productionSource(readFileSync(file, "utf8"));
+  collectReads(inventorySource(source, false), names, constants, constantReads);
+}
+for (const [inventoryNames, inventoryConstants, reads] of [
+  [names, constants, constantReads],
+  [allNames, allConstants, allConstantReads],
+]) {
+  for (const identifier of reads) {
+    for (const name of inventoryConstants.get(identifier) ?? []) inventoryNames.add(name);
+  }
+}
+
+function collectReads(source, inventoryNames, inventoryConstants, reads) {
   for (const [, identifier, name] of source.matchAll(
     /const\s+([A-Z0-9_]+)\s*:\s*&(?:'static\s+)?str\s*=\s*"([A-Z][A-Z0-9_]+)"/g,
   )) {
-    const values = constants.get(identifier) ?? new Set();
+    const values = inventoryConstants.get(identifier) ?? new Set();
     values.add(name);
-    constants.set(identifier, values);
+    inventoryConstants.set(identifier, values);
   }
   for (const [, identifier] of source.matchAll(
     /env::var(?:_os)?\(\s*(?:[A-Za-z_][A-Za-z0-9_]*::)*([A-Z][A-Z0-9_]*)\s*\)/g,
   ))
-    constantReads.add(identifier);
+    reads.add(identifier);
   for (const pattern of patterns) {
-    for (const [, name] of source.matchAll(pattern)) names.add(name);
+    for (const [, name] of source.matchAll(pattern)) inventoryNames.add(name);
   }
-}
-for (const identifier of constantReads) {
-  for (const name of constants.get(identifier) ?? []) names.add(name);
 }
 if (names.size === 0) throw new Error("No production environment reads inventoried");
 const host = "/host/dev";
 const home = "/tmp/aoe-static-isolation";
-const hostile = Object.fromEntries([...names].map((name) => [name, host + "/" + name.toLowerCase()]));
+const hostile = Object.fromEntries([...allNames].map((name) => [name, host + "/" + name.toLowerCase()]));
 const env = isolateEnv(hostile, {
   home,
   xdgConfig: join(home, "config"),
@@ -145,12 +156,21 @@ const env = isolateEnv(hostile, {
 });
 const unsafe = [...names].filter((name) => env[name]?.startsWith(host) && !INHERITED_BY_CONTRACT.has(name));
 const missing = [...names].filter((name) => INHERITED_BY_CONTRACT.has(name) && !env[name]?.startsWith(host));
-if (unsafe.length || missing.length) {
+const unclassifiedTests = [...allNames].filter(
+  (name) =>
+    !names.has(name) && !TEST_BINARY_READS.has(name) && !INHERITED_BY_CONTRACT.has(name) && env[name]?.startsWith(host),
+);
+const testReadsInProduction = [...names].filter((name) => TEST_BINARY_READS.has(name));
+if (unsafe.length || missing.length || unclassifiedTests.length || testReadsInProduction.length) {
   throw new Error(
     "Environment isolation contract failed: unsafe host reads [" +
       unsafe.join(", ") +
       "], incorrectly dropped inherited reads [" +
       missing.join(", ") +
+      "], unclassified test reads [" +
+      unclassifiedTests.join(", ") +
+      "], test-binary reads reachable in production [" +
+      testReadsInProduction.join(", ") +
       "]",
   );
 }
@@ -163,13 +183,13 @@ function rustFiles(dir) {
 }
 
 // Mask literals/comments only for item boundaries; retain literal env names for inventory.
-function productionSource(source) {
+function inventorySource(source, includeTests) {
   const tokens = /r(#{0,})"[\s\S]*?"\1|"(?:\\[\s\S]|[^"\\])*"|'(?:\\.|[^'\\\n])'|\/\/[^\n]*|\/\*[\s\S]*?\*\//g;
   const spaces = (text) => text.replace(/[^\n]/g, " ");
   const masked = source.replace(tokens, spaces);
   const test = /#\[cfg\(test\)\]/g;
   const cuts = [];
-  for (const match of masked.matchAll(test)) {
+  for (const match of includeTests ? [] : masked.matchAll(test)) {
     let position = match.index + match[0].length;
     let parentheses = 0;
     let brackets = 0;

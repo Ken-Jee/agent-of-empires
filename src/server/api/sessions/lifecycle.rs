@@ -177,6 +177,131 @@ pub async fn update_session_color(
     crate::server::runtime::session_mutation_response(&state, &id, None::<()>).await
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("archive outcome is unconfirmed")]
+struct ArchiveOutcomeUnconfirmed;
+
+struct ArchiveReservationRelease {
+    native: Option<crate::server::session_store::NativeSessionStore>,
+    id: String,
+    generation: Option<u64>,
+}
+
+impl Drop for ArchiveReservationRelease {
+    fn drop(&mut self) {
+        if let (Some(native), Some(generation)) = (self.native.take(), self.generation.take()) {
+            crate::session::SessionStore::defer_lifecycle_release(
+                native,
+                std::mem::take(&mut self.id),
+                LifecycleOperation::Stop,
+                generation,
+                None,
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod archive_reservation_tests {
+    use super::*;
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn abandoned_archive_releases_only_its_bound_reservation_during_degraded_health(
+    ) -> anyhow::Result<()> {
+        for case in ["owned", "new-generation", "replaced-profile"] {
+            let _home = crate::session::test_support::isolate_app_dir();
+            let mut row = Instance::new("original archive", "/tmp");
+            row.source_profile = "default".into();
+            row.archive();
+            let generation = row.try_acquire_lifecycle_reservation(
+                LifecycleOperation::Stop,
+                Instance::LIFECYCLE_RESERVATION_TTL,
+                chrono::Utc::now(),
+            )?;
+            crate::server::test_support::seed_instances_on_disk_for_test(
+                "default",
+                vec![row.clone()],
+            );
+            let state = crate::server::test_support::build_test_app_state(vec![row.clone()]);
+            crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+            let opening_state = state.clone();
+            let native = tokio::task::spawn_blocking(move || {
+                crate::server::session_store::NativeSessionStore::open(
+                    opening_state,
+                    "default",
+                    None,
+                )
+            })
+            .await??;
+            *state.canonical_health.write().await = crate::daemon::RuntimeHealth::Degraded {
+                code: crate::daemon::ReloadFailureCode::Metadata,
+                profiles: vec!["default".into()],
+            };
+            let namespace = state.profile_namespace.clone().write_owned().await;
+            let storage = Storage::open_unwatched("default")?;
+            let original_bytes = std::fs::read(storage.sessions_path())?;
+            drop(ArchiveReservationRelease {
+                native: Some(native),
+                id: row.id.clone(),
+                generation: Some(generation),
+            });
+            let mut expected_generation = generation;
+            let mut retired_file = None;
+            if case == "new-generation" {
+                storage.update(|rows, _| {
+                    rows[0].release_lifecycle_reservation_if_owned(
+                        LifecycleOperation::Stop,
+                        generation,
+                    );
+                    expected_generation = rows[0].try_acquire_lifecycle_reservation(
+                        LifecycleOperation::Stop,
+                        Instance::LIFECYCLE_RESERVATION_TTL,
+                        chrono::Utc::now(),
+                    )?;
+                    Ok(())
+                })?;
+                assert_ne!(expected_generation, generation);
+            } else if case == "replaced-profile" {
+                let retired = crate::session::get_app_dir()?.join("retired-original-profile");
+                let directory = storage.sessions_path().parent().unwrap();
+                std::fs::rename(directory, &retired)?;
+                retired_file = Some(retired.join(storage.sessions_path().file_name().unwrap()));
+                let replacement = Storage::new_unwatched("default")?;
+                row.title = "replacement must retain its matching numeric token".into();
+                row.created_at += chrono::Duration::seconds(1);
+                replacement.update(|rows, _| {
+                    *rows = vec![row.clone()];
+                    Ok(())
+                })?;
+            }
+            let selected_before_release = std::fs::read(storage.sessions_path())?;
+            drop(namespace);
+            tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                state.runtime.work.drain(),
+            )
+            .await?;
+            let rows = Storage::open_unwatched("default")?.load()?;
+            assert!(rows[0].is_archived());
+            if case == "owned" {
+                assert!(rows[0].lifecycle_reservation.is_none());
+            } else {
+                assert!(rows[0]
+                    .lifecycle_reservation_is_owned(LifecycleOperation::Stop, expected_generation));
+                assert_eq!(
+                    std::fs::read(storage.sessions_path())?,
+                    selected_before_release
+                );
+            }
+            if let Some(retired_file) = retired_file {
+                assert_eq!(std::fs::read(retired_file)?, original_bytes);
+            }
+        }
+        Ok(())
+    }
+}
+
 pub async fn update_session_archive(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -221,6 +346,7 @@ pub async fn update_session_archive(
         let store: &dyn crate::session::SessionStore = &native;
         let _title = crate::session::acquire_session_title_lock(&worker_id)?;
         let _lifecycle = store.storage().acquire_instance_lifecycle_lock(&worker_id)?;
+        let mut candidate = None;
         let reserved = store.update(|rows, _| {
             let row = rows.iter_mut().find(|row| row.id == worker_id)
                 .ok_or(LifecycleTargetError::Missing)?;
@@ -240,11 +366,50 @@ pub async fn update_session_archive(
                 LifecycleOperation::Stop, Instance::LIFECYCLE_RESERVATION_TTL, now,
             )?;
             row.archive();
+            candidate = Some((generation, row.created_at));
             Ok(Some((generation, row.clone())))
-        })?;
+        });
+        let reserved = match reserved {
+            Ok(reserved) => reserved,
+            Err(error) => {
+                if let Some((generation, created_at)) = candidate {
+                    let owned = if error.is::<crate::session::SessionCommitApplied>() {
+                        true
+                    } else {
+                        let proof = (|| -> anyhow::Result<bool> {
+                            store.storage().verify_bound_profile()?;
+                            let (rows, _) = store.storage().load_complete_with_groups()?;
+                            Ok(rows.iter().any(|row| row.id == worker_id
+                                && row.created_at == created_at
+                                && row.is_archived()
+                                && row.lifecycle_reservation_is_owned(LifecycleOperation::Stop, generation)))
+                        })();
+                        match proof {
+                            Ok(owned) => owned,
+                            Err(proof_error) => return Err(error
+                                .context(format!("Archive reservation ownership is unavailable: {proof_error:#}"))
+                                .context(ArchiveOutcomeUnconfirmed)),
+                        }
+                    };
+                    if owned {
+                        let _release = ArchiveReservationRelease {
+                            native: Some(native), id: worker_id.clone(), generation: Some(generation),
+                        };
+                        return Err(error.context(ArchiveOutcomeUnconfirmed));
+                    }
+                    return Err(error.context(ArchiveOutcomeUnconfirmed));
+                }
+                return Err(error);
+            }
+        };
         let Some((generation, mut instance)) = reserved else {
             return Ok(());
         };
+        let mut release = ArchiveReservationRelease {
+            native: Some(native), id: worker_id.clone(), generation: Some(generation),
+        };
+        let native = release.native.as_ref().expect("owned archive store");
+        let store: &dyn crate::session::SessionStore = native;
         instance.source_profile = profile;
         instance.file_watch = Some(worker_state.file_watch.clone());
         let stopped = if instance.is_structured() {
@@ -258,7 +423,7 @@ pub async fn update_session_archive(
         } else if body.kill_pane {
             instance.kill_all_tmux_sessions_locked()
         } else { Ok(()) };
-        store.update(|rows, _| {
+        let finalized = store.update(|rows, _| {
             let row = rows.iter_mut().find(|row| row.id == worker_id)
                 .ok_or(LifecycleTargetError::Missing)?;
             let status = if stopped.is_err() {
@@ -273,13 +438,30 @@ pub async fn update_session_archive(
             }
             if let Err(error) = &stopped { row.last_error = Some(error.to_string()); }
             Ok(())
-        })?;
-        if instance.is_structured() || body.kill_pane {
-            native.refresh_pane_observations(&instance)?;
+        });
+        if let Err(error) = finalized {
+            if error.is::<crate::session::SessionCommitApplied>() {
+                release.generation = None;
+            }
+            return Err(error.context(ArchiveOutcomeUnconfirmed));
         }
-        stopped
+        release.generation = None;
+        if instance.is_structured() || body.kill_pane {
+            native.refresh_pane_observations(&instance)
+                .map_err(|error| error.context(ArchiveOutcomeUnconfirmed))?;
+        }
+        stopped.map_err(|error| error.context(ArchiveOutcomeUnconfirmed))
     }).await.map_err(anyhow::Error::from).and_then(|result| result);
     if let Err(error) = result {
+        if error.is::<ArchiveOutcomeUnconfirmed>()
+            || error.is::<crate::session::SessionCommitApplied>()
+        {
+            return crate::server::api::api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "outcome_unconfirmed",
+                "Archive may have committed, but completion is unconfirmed. Check canonical state before retrying.",
+            );
+        }
         if let Some(response) = lifecycle_rejection(&state, &error) {
             return response;
         }
@@ -908,6 +1090,8 @@ pub(super) enum LifecycleTargetError {
     CityHall,
     #[error("session lifecycle is busy or superseded")]
     Busy,
+    #[error("session is not in structured view")]
+    NotStructured,
     /// An archived or trashed session refuses to launch or resume (#4116).
     #[error(transparent)]
     Blocked(#[from] crate::session::StartBlocked),
@@ -927,6 +1111,13 @@ pub(crate) fn lifecycle_rejection(
         }
         Some(LifecycleTargetError::CityHall) => {
             return Some(crate::server::api::cityhall_response())
+        }
+        Some(LifecycleTargetError::NotStructured) => {
+            return Some(api_error(
+                StatusCode::CONFLICT,
+                "not_structured",
+                "Switch the session to structured view before stopping an ACP worker",
+            ))
         }
         _ => {}
     }
@@ -993,12 +1184,290 @@ async fn adopt_lifecycle_commit<R>(
     .await
 }
 
+fn structured_lifecycle_error(state: &AppState, error: anyhow::Error) -> axum::response::Response {
+    if error.is::<crate::session::SessionCommitApplied>() {
+        return api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "outcome_unconfirmed",
+            "The change committed, but runtime publication is unconfirmed. Check canonical state before retrying.",
+        );
+    }
+    if let Some(response) = lifecycle_rejection(state, &error) {
+        return response;
+    }
+    tracing::warn!(target: "http.api.sessions", %error, "structured lifecycle failed");
+    StatusCode::SERVICE_UNAVAILABLE.into_response()
+}
+
+fn reserve_structured_user_stop(row: &mut Instance) -> anyhow::Result<u64> {
+    if !row.is_structured() {
+        return Err(LifecycleTargetError::NotStructured.into());
+    }
+    if row.status == Status::Deleting || row.terminal_handoff.is_some() {
+        return Err(LifecycleTargetError::Busy.into());
+    }
+    // Stop supersedes an unpublished launch and an older stop, not unrelated work.
+    if let Some((operation, generation)) = row
+        .lifecycle_reservation
+        .as_ref()
+        .map(|reservation| (reservation.op, reservation.generation))
+    {
+        if matches!(
+            operation,
+            LifecycleOperation::Launch | LifecycleOperation::Stop
+        ) {
+            row.release_lifecycle_reservation_if_owned(operation, generation);
+        }
+    }
+    let generation = row.try_acquire_lifecycle_reservation(
+        LifecycleOperation::Stop,
+        Instance::LIFECYCLE_RESERVATION_TTL,
+        chrono::Utc::now(),
+    )?;
+    // Even a row already presented as Stopped can own a live or pending worker.
+    row.status = Status::Stopped;
+    row.mark_idle_dormant();
+    Ok(generation)
+}
+
+struct StructuredStopCommit {
+    native: crate::server::session_store::NativeSessionStore,
+    generation: u64,
+    target: crate::acp::supervisor::RetirementTarget,
+    publication: anyhow::Result<()>,
+}
+
+fn commit_structured_user_stop(
+    state: Arc<AppState>,
+    profile: &str,
+    id: &str,
+) -> anyhow::Result<StructuredStopCommit> {
+    use crate::session::SessionStore;
+    let native = crate::server::session_store::NativeSessionStore::open(
+        state.clone(),
+        profile,
+        Some(id.to_owned()),
+    )?;
+    let _title = crate::session::acquire_session_title_lock(id)?;
+    let _lifecycle = native.storage().acquire_instance_lifecycle_lock(id)?;
+    // Capture after the birth flock: a child born before this fence is ours to settle.
+    let target = state.acp_supervisor.capture_retirement(id)?;
+    let mut generation = None;
+    let publication = match (&native as &dyn SessionStore).update(|rows, _| {
+        let row = rows
+            .iter_mut()
+            .find(|row| row.id == id)
+            .ok_or(crate::session::SessionGone)?;
+        generation = Some(reserve_structured_user_stop(row)?);
+        Ok(())
+    }) {
+        Ok(()) => Ok(()),
+        Err(error) if error.is::<crate::session::SessionCommitApplied>() => Err(error),
+        Err(error) => return Err(error),
+    };
+    let generation = generation.ok_or_else(|| anyhow::anyhow!("stop commit has no generation"))?;
+    // Both flocks drop here, before a late constructor's admission or cleanup.
+    Ok(StructuredStopCommit {
+        native,
+        generation,
+        target,
+        publication,
+    })
+}
+
+async fn finish_structured_user_stop(
+    state: &Arc<AppState>,
+    id: &str,
+    committed: StructuredStopCommit,
+) -> Result<(), axum::response::Response> {
+    use crate::session::SessionStore;
+    let StructuredStopCommit {
+        native,
+        generation,
+        target,
+        publication,
+    } = committed;
+    let retirement = state
+        .acp_supervisor
+        .shutdown_captured_and_wait(id, &target, std::time::Duration::from_secs(5))
+        .await;
+    let released = if retirement.is_ok() {
+        let release_id = id.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let lifecycle = native
+                .storage()
+                .acquire_instance_lifecycle_lock(&release_id)?;
+            native.storage().verify_bound_profile()?;
+            // A newer stop or explicit resume owns its own hook status files.
+            if native
+                .storage()
+                .load()?
+                .iter()
+                .any(|row| row.id == release_id && row.lifecycle_generation == generation)
+            {
+                crate::hooks::cleanup_hook_status_dir(&release_id);
+            }
+            native.release_lifecycle_reservation(
+                &release_id,
+                LifecycleOperation::Stop,
+                generation,
+                Some(lifecycle),
+            )
+        })
+        .await
+        .map_err(anyhow::Error::from)
+        .and_then(|result| result)
+    } else {
+        Ok(())
+    };
+    // A committed stop must still settle its captured runner when adoption fails.
+    publication.map_err(|error| structured_lifecycle_error(state, error))?;
+    if let Err(error) = retirement {
+        tracing::warn!(target: "http.api.sessions", session = %id, %error, "structured stop retirement unproven");
+        return Err(api_error(
+            StatusCode::CONFLICT,
+            "teardown_pending",
+            "The original structured worker is still stopping",
+        ));
+    }
+    released.map_err(|error| structured_lifecycle_error(state, error))?;
+    {
+        let _publication = state.publication.write().await;
+        if let Some(row) = state
+            .instances
+            .write()
+            .await
+            .iter_mut()
+            .find(|row| row.id == id && row.lifecycle_generation == generation)
+        {
+            row.plugin_revival_pending = false;
+        }
+    }
+    Ok(())
+}
+
+/// The caller retains namespace, submission and instance exclusion.
+pub(crate) async fn stop_structured_with_commit(
+    state: &Arc<AppState>,
+    profile: String,
+    id: &str,
+) -> Result<(), axum::response::Response> {
+    let worker_state = state.clone();
+    let stop_id = id.to_owned();
+    let committed = tokio::task::spawn_blocking(move || {
+        commit_structured_user_stop(worker_state, &profile, &stop_id)
+    })
+    .await
+    .map_err(anyhow::Error::from)
+    .and_then(|result| result)
+    .map_err(|error| structured_lifecycle_error(state, error))?;
+    finish_structured_user_stop(state, id, committed).await
+}
+
+/// Explicit resume consumes only the stop observed before original retirement.
+pub(crate) async fn resume_structured_stop(
+    state: &Arc<AppState>,
+    expected: Instance,
+) -> Result<Instance, axum::response::Response> {
+    use crate::process::worker_registry::{self, ResumeAuthority};
+    use crate::session::SessionStore;
+    if expected.status != Status::Stopped && !expected.is_idle_dormant() {
+        return Ok(expected);
+    }
+    let probe_state = state.clone();
+    let probe_profile = expected.source_profile.clone();
+    let probe_id = expected.id.clone();
+    let expected_generation = expected.lifecycle_generation;
+    let (native, observed_stop) = tokio::task::spawn_blocking(move || {
+        let native = crate::server::session_store::NativeSessionStore::open(
+            probe_state,
+            &probe_profile,
+            Some(probe_id.clone()),
+        )?;
+        let _lifecycle = native
+            .storage()
+            .acquire_instance_lifecycle_lock(&probe_id)?;
+        let row = native
+            .load()?
+            .into_iter()
+            .find(|row| row.id == probe_id)
+            .ok_or(crate::session::SessionGone)?;
+        row.ensure_startable()?;
+        anyhow::ensure!(row.is_structured(), LifecycleTargetError::NotStructured);
+        if row.terminal_handoff.is_some()
+            || matches!(row.status, Status::Creating | Status::Deleting)
+            || (row.has_fresh_lifecycle_reservation(chrono::Utc::now())
+                && !row
+                    .lifecycle_reservation_is_owned(LifecycleOperation::Stop, expected_generation))
+        {
+            return Err(LifecycleTargetError::Busy.into());
+        }
+        anyhow::ensure!(
+            row.lifecycle_generation == expected_generation,
+            crate::session::LifecycleReservationError::Superseded
+        );
+        let observed_stop = worker_registry::stop_intent(&probe_id)?;
+        Ok::<_, anyhow::Error>((native, observed_stop))
+    })
+    .await
+    .map_err(anyhow::Error::from)
+    .and_then(|result| result)
+    .map_err(|error| structured_lifecycle_error(state, error))?;
+    let target = state
+        .acp_supervisor
+        .capture_retirement(&expected.id)
+        .map_err(|error| structured_lifecycle_error(state, error.into()))?;
+    state.acp_supervisor.shutdown_captured_and_wait(
+        &expected.id,
+        &target,
+        std::time::Duration::from_secs(5),
+    ).await.map_err(|error| {
+        tracing::warn!(target: "http.api.sessions", session = %expected.id, %error, "resume requires original retirement");
+        api_error(StatusCode::CONFLICT, "teardown_pending", "The original structured worker is still stopping")
+    })?;
+    tokio::task::spawn_blocking(move || {
+        let _title = crate::session::acquire_session_title_lock(&expected.id)?;
+        let _lifecycle = native
+            .storage()
+            .acquire_instance_lifecycle_lock(&expected.id)?;
+        (&native as &dyn SessionStore).update(|rows, _| {
+            let row = rows
+                .iter_mut()
+                .find(|row| row.id == expected.id)
+                .ok_or(crate::session::SessionGone)?;
+            row.ensure_startable()?;
+            anyhow::ensure!(row.is_structured(), LifecycleTargetError::NotStructured);
+            anyhow::ensure!(
+                row.lifecycle_generation == expected.lifecycle_generation,
+                crate::session::LifecycleReservationError::Superseded
+            );
+            // Retirement above, plus exact row/token comparison, excludes newer stops.
+            worker_registry::admit_resume(&expected.id, ResumeAuthority::Explicit, &observed_stop)?;
+            row.resume_structured_after_retirement(expected.lifecycle_generation)?;
+            Ok(row.clone())
+        })
+    })
+    .await
+    .map_err(anyhow::Error::from)
+    .and_then(|result| result)
+    .map_err(|error| structured_lifecycle_error(state, error))
+}
+
 // The caller retains namespace, submission, and instance exclusion.
 async fn stop_with_commit(
     state: &Arc<AppState>,
     profile: String,
     id: &str,
 ) -> Result<(), axum::response::Response> {
+    if state
+        .instances
+        .read()
+        .await
+        .iter()
+        .any(|row| row.id == id && row.is_structured())
+    {
+        return stop_structured_with_commit(state, profile, id).await;
+    }
     let stop_profile = profile.clone();
     let stop_id = id.to_owned();
     let file_watch = state.file_watch.clone();
@@ -1051,6 +1520,10 @@ async fn stop_with_commit(
             if cityhall && !row.is_structured() {
                 return Err(LifecycleTargetError::CityHall.into());
             }
+            // A peer changed the view after the caller selected the terminal stop path.
+            if row.is_structured() {
+                return Err(LifecycleTargetError::Busy.into());
+            }
             if matches!(row.status, Status::Creating | Status::Deleting) {
                 return Err(LifecycleTargetError::Busy.into());
             }
@@ -1062,10 +1535,6 @@ async fn stop_with_commit(
             if row.status == Status::Stopped {
                 row.release_lifecycle_reservation_if_owned(LifecycleOperation::Stop, generation);
                 return Ok(None);
-            }
-            if row.is_structured() {
-                row.status = Status::Stopped;
-                row.mark_idle_dormant();
             }
             Ok(Some(generation))
         });
@@ -1096,27 +1565,19 @@ async fn stop_with_commit(
         .cloned()
         .ok_or_else(crate::server::api::session_gone_after_persist)?;
 
-    let (effect, pi_update) = if instance.is_structured() {
-        let result = match state.acp_supervisor.shutdown(id).await {
-            Ok(()) | Err(crate::acp::supervisor::SupervisorError::UnknownSession(_)) => Ok(()),
-            Err(error) => Err(anyhow::Error::from(error)),
+    let (effect, pi_update) = match tokio::task::spawn_blocking(move || {
+        let result = instance.stop_resources_locked();
+        let pi = if result.is_ok() {
+            instance.read_pi_sidecar_update()
+        } else {
+            None
         };
-        (result, None)
-    } else {
-        match tokio::task::spawn_blocking(move || {
-            let result = instance.stop_resources_locked();
-            let pi = if result.is_ok() {
-                instance.read_pi_sidecar_update()
-            } else {
-                None
-            };
-            (result, pi)
-        })
-        .await
-        {
-            Ok(result) => result,
-            Err(error) => (Err(error.into()), None),
-        }
+        (result, pi)
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(error) => (Err(error.into()), None),
     };
     let stopped = effect.is_ok();
     let prepared = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
@@ -1392,7 +1853,8 @@ fn reserve_structured_restart(
         .find(|row| row.id == instance.id)
         .ok_or(crate::session::SessionGone)?;
     anyhow::ensure!(
-        expected_generation.is_none_or(|expected| expected == probe.lifecycle_generation),
+        probe.lifecycle_generation == instance.lifecycle_generation
+            && expected_generation.is_none_or(|expected| expected == probe.lifecycle_generation),
         crate::session::LifecycleReservationError::Superseded
     );
     admit_restart(&mut probe, body, false)?;
@@ -1424,6 +1886,10 @@ fn reserve_structured_restart(
             .find(|row| row.id == instance.id)
             .ok_or(crate::session::SessionGone)?;
         row.ensure_startable()?;
+        anyhow::ensure!(
+            row.lifecycle_generation == instance.lifecycle_generation,
+            crate::session::LifecycleReservationError::Superseded
+        );
         if matches!(row.status, Status::Creating | Status::Deleting)
             || row.has_fresh_lifecycle_reservation(chrono::Utc::now())
         {
@@ -1780,6 +2246,22 @@ async fn prepare_agent_session_inner(
             );
         }
     }
+    if instance.is_structured()
+        && expected_generation.is_some()
+        && (instance.status == Status::Stopped || instance.is_idle_dormant())
+    {
+        // Recovery is not an explicit user resume and cannot consume a native stop.
+        return lifecycle_rejection(&state, &LifecycleTargetError::Busy.into())
+            .unwrap_or_else(|| StatusCode::CONFLICT.into_response());
+    }
+    if instance.is_structured()
+        && (instance.status == Status::Stopped || instance.is_idle_dormant())
+    {
+        instance = match resume_structured_stop(&state, instance).await {
+            Ok(instance) => instance,
+            Err(response) => return response,
+        };
+    }
     if instance.is_structured() && restart.is_some() {
         let worker_state = state.clone();
         let candidate = instance.clone();
@@ -1981,6 +2463,12 @@ async fn prepare_agent_session_inner(
                     return Ok(Some(row.clone()));
                 }
                 let now = chrono::Utc::now();
+                if row.is_structured() {
+                    anyhow::ensure!(
+                        row.lifecycle_generation == instance.lifecycle_generation,
+                        crate::session::LifecycleReservationError::Superseded
+                    );
+                }
                 // Re-read from the store under the lifecycle lock, so a peer
                 // that archived or trashed the row while this request waited
                 // is refused with its own code, not a generic busy (#4116).
@@ -2322,6 +2810,323 @@ async fn prepare_agent_session_inner(
         }
     } else {
         crate::server::runtime::session_mutation_response(&state, &id, None::<()>).await
+    }
+}
+
+#[cfg(all(test, unix))]
+mod durable_stop_tests {
+    use super::*;
+    use crate::process::worker_registry::{self, WorkerRecord};
+
+    async fn live_runner(row: &Instance) -> (tokio::process::Child, WorkerRecord) {
+        let child = tokio::process::Command::new("sleep")
+            .arg("60")
+            .process_group(0)
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let record = WorkerRecord::new(
+            row.id.clone(),
+            child.id().unwrap(),
+            worker_registry::socket_path_for(&row.id).unwrap(),
+            "sleep".into(),
+            "claude".into(),
+            std::path::PathBuf::from(&row.project_path),
+            None,
+            Vec::new(),
+            Vec::new(),
+            None,
+            Some(row.source_profile.clone()),
+        )
+        .with_generation(81);
+        assert!(record.runner_identity.is_some());
+        worker_registry::save(&record).unwrap();
+        (child, record)
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn explicit_generic_restart_consumes_a_stopped_native_generation_before_birth() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let _home = crate::session::test_support::isolate_app_dir();
+        crate::session::config::update_app_state(|state| {
+            state.has_acknowledged_agent_hooks = true;
+        })
+        .unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let mut row = Instance::new("stopped generic restart", project.path().to_str().unwrap());
+        row.source_profile = "default".into();
+        row.view = crate::session::View::Structured;
+        row.status = Status::Stopped;
+        row.tool = "claude".into();
+        row.agent_name = Some("claude".into());
+        row.mark_idle_dormant();
+        let observed = row
+            .try_acquire_lifecycle_reservation(
+                LifecycleOperation::Stop,
+                Instance::LIFECYCLE_RESERVATION_TTL,
+                chrono::Utc::now(),
+            )
+            .unwrap();
+        crate::server::test_support::seed_instances_on_disk_for_test("default", vec![row.clone()]);
+        let births = Arc::new(AtomicUsize::new(0));
+        let calls = births.clone();
+        let state = crate::server::test_support::build_test_app_state_with_launcher(
+            vec![row.clone()],
+            Arc::new(move |_, _| {
+                let calls = calls.clone();
+                Box::pin(async move {
+                    assert!(tokio::process::Command::new("true")
+                        .status()
+                        .await
+                        .unwrap()
+                        .success());
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Err(crate::acp::acp_client::AcpError::Spawn(
+                        "controlled post-admission launch failure".into(),
+                    ))
+                })
+            }),
+        );
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+        let response = restart_session(
+            State(state.clone()),
+            Path(row.id.clone()),
+            Ok(Some(Json(crate::daemon::RestartSessionBody {
+                skip_on_launch: true,
+                wake_message: Some(String::new()),
+                ..Default::default()
+            }))),
+        )
+        .await;
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 8192)
+            .await
+            .unwrap();
+        assert!(!status.is_success());
+        assert_eq!(
+            births.load(Ordering::SeqCst),
+            1,
+            "{status}: {}",
+            String::from_utf8_lossy(&body)
+        );
+        let stored = Storage::open_unwatched("default")
+            .unwrap()
+            .load()
+            .unwrap()
+            .remove(0);
+        assert!(stored.lifecycle_generation > observed);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn generic_restart_reservation_cannot_consume_a_newer_native_stop() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let project = tempfile::tempdir().unwrap();
+        let mut row = Instance::new("stale restart", project.path().to_str().unwrap());
+        row.source_profile = "default".into();
+        row.view = crate::session::View::Structured;
+        row.status = Status::Running;
+        row.tool = "claude".into();
+        crate::server::test_support::seed_instances_on_disk_for_test("default", vec![row.clone()]);
+        let state = crate::server::test_support::build_test_app_state(vec![row.clone()]);
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+        stop_structured_with_commit(&state, "default".into(), &row.id)
+            .await
+            .unwrap_or_else(|response| panic!("stop failed: {}", response.status()));
+        let stop = Storage::open_unwatched("default")
+            .unwrap()
+            .load()
+            .unwrap()
+            .remove(0);
+        let worker_state = state.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            reserve_structured_restart(
+                worker_state,
+                &row,
+                None,
+                &crate::daemon::RestartSessionBody::default(),
+            )
+        })
+        .await
+        .unwrap();
+        let error = match result {
+            Ok(_) => panic!("stale restart must be refused"),
+            Err(error) => error,
+        };
+        assert!(error.is::<crate::session::LifecycleReservationError>());
+        let retained = Storage::open_unwatched("default")
+            .unwrap()
+            .load()
+            .unwrap()
+            .remove(0);
+        assert_eq!(retained.lifecycle_generation, stop.lifecycle_generation);
+        assert_eq!(retained.status, Status::Stopped);
+        assert!(retained.is_idle_dormant());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn native_stop_keeps_commit_failure_and_adoption_failure_distinct() {
+        for adoption_failure in [false, true] {
+            let _home = crate::session::test_support::isolate_app_dir();
+            let project = tempfile::tempdir().unwrap();
+            let mut row = Instance::new("stop commit boundary", project.path().to_str().unwrap());
+            row.source_profile = "default".into();
+            row.view = crate::session::View::Structured;
+            row.status = Status::Running;
+            if !adoption_failure {
+                row.lifecycle_generation = u64::MAX;
+            }
+            crate::server::test_support::seed_instances_on_disk_for_test(
+                "default",
+                vec![row.clone()],
+            );
+            let state = crate::server::test_support::build_test_app_state(vec![row.clone()]);
+            crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+            let (mut runner, record) = live_runner(&row).await;
+            let worker_state = state.clone();
+            let id = row.id.clone();
+            let committed = tokio::task::spawn_blocking(move || {
+                if adoption_failure {
+                    let failing_state = worker_state.clone();
+                    crate::server::session_store::before_next_adoption_for_test(move || {
+                        failing_state
+                            .canonical_metadata
+                            .blocking_write()
+                            .profiles
+                            .clear();
+                    });
+                }
+                commit_structured_user_stop(worker_state, "default", &id)
+            })
+            .await
+            .unwrap();
+            assert!(
+                runner.try_wait().unwrap().is_none(),
+                "admission commit cannot retire before its outcome"
+            );
+            if adoption_failure {
+                let committed =
+                    committed.expect("committed stop must retain physical retirement authority");
+                assert!(committed
+                    .publication
+                    .as_ref()
+                    .unwrap_err()
+                    .is::<crate::session::SessionCommitApplied>());
+                let response = finish_structured_user_stop(&state, &row.id, committed)
+                    .await
+                    .expect_err("unconfirmed adoption cannot report success");
+                assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+                let body = axum::body::to_bytes(response.into_body(), 8192)
+                    .await
+                    .unwrap();
+                let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(body["error"], "outcome_unconfirmed");
+                tokio::time::timeout(std::time::Duration::from_secs(5), runner.wait())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(worker_registry::load(&row.id).unwrap().is_none());
+                let stored = Storage::open_unwatched("default")
+                    .unwrap()
+                    .load()
+                    .unwrap()
+                    .remove(0);
+                assert_eq!(stored.status, Status::Stopped);
+                assert!(stored.is_idle_dormant());
+                assert!(stored.lifecycle_reservation.is_none());
+            } else {
+                let error = match committed {
+                    Ok(_) => panic!("overflowed stop generation must not commit"),
+                    Err(error) => error,
+                };
+                assert!(error.is::<crate::session::LifecycleReservationError>());
+                assert_eq!(
+                    worker_registry::load(&row.id).unwrap().unwrap().pid,
+                    record.pid
+                );
+                let stored = Storage::open_unwatched("default")
+                    .unwrap()
+                    .load()
+                    .unwrap()
+                    .remove(0);
+                assert_eq!(stored.status, Status::Running);
+                assert_eq!(stored.lifecycle_generation, u64::MAX);
+                assert!(!stored.is_idle_dormant());
+                runner.kill().await.unwrap();
+                worker_registry::retire_selected(&record).unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn internal_shutdown_idle_and_detach_do_not_commit_user_stop_admission() {
+        for reason in ["provider_switch", "idle", "detach"] {
+            let _home = crate::session::test_support::isolate_app_dir();
+            let project = tempfile::tempdir().unwrap();
+            let mut row = Instance::new(reason, project.path().to_str().unwrap());
+            row.source_profile = "default".into();
+            row.view = crate::session::View::Structured;
+            row.status = Status::Running;
+            crate::server::test_support::seed_instances_on_disk_for_test(
+                "default",
+                vec![row.clone()],
+            );
+            let state = crate::server::test_support::build_test_app_state(vec![row.clone()]);
+            crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+            let (mut runner, record) = live_runner(&row).await;
+            state
+                .acp_supervisor
+                .test_install_attached(
+                    &row.id,
+                    crate::acp::runner_lifecycle::RunnerIdentity::from_record(&record),
+                )
+                .await;
+            match reason {
+                "provider_switch" => state.acp_supervisor.shutdown(&row.id).await.unwrap(),
+                "idle" => state.acp_supervisor.shutdown_idle(&row.id).await.unwrap(),
+                "detach" => state.acp_supervisor.detach_all().await,
+                _ => unreachable!(),
+            }
+            let stored = Storage::open_unwatched("default")
+                .unwrap()
+                .load()
+                .unwrap()
+                .remove(0);
+            assert_eq!(stored.status, Status::Running, "{reason}");
+            assert_eq!(
+                stored.lifecycle_generation, row.lifecycle_generation,
+                "{reason}"
+            );
+            assert!(!stored.is_idle_dormant(), "{reason}");
+            assert!(
+                worker_registry::stop_intent(&row.id).unwrap().is_none(),
+                "{reason}"
+            );
+            let admission = crate::acp::supervisor::LaunchAdmission {
+                store: Arc::new(Storage::open_unwatched("default").unwrap()),
+                generation: stored.lifecycle_generation,
+                namespace: None,
+            };
+            let mut child = crate::acp::supervisor::with_durable_launch(
+                Some(admission),
+                row.id.clone(),
+                || {
+                    std::process::Command::new("true")
+                        .spawn()
+                        .map_err(|error| crate::acp::acp_client::AcpError::Spawn(error.to_string()))
+                },
+            )
+            .await
+            .unwrap();
+            assert!(child.wait().unwrap().success());
+            if runner.try_wait().unwrap().is_none() {
+                runner.kill().await.unwrap();
+            }
+            worker_registry::retire_selected(&record).unwrap();
+        }
     }
 }
 

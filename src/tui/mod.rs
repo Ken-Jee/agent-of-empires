@@ -1,4 +1,4 @@
-//! Terminal User Interface module
+//! Terminal user interface.
 
 mod app;
 mod approval_poller;
@@ -86,10 +86,7 @@ fn isolated_test_process(test: &str, timeout: std::time::Duration) -> bool {
     false
 }
 
-/// Entry point for the hidden `aoe __vt-pipe <socket>` helper subprocess used
-/// by the VT live-preview path (`[tmux] vt_live`, default on). Copies the
-/// pane's piped output (stdin) to the unix socket, unbuffered. Dispatched in
-/// `main` before clap so it stays off the CLI/docs surface.
+/// Hidden `aoe __vt-pipe <socket>` helper: copies the pane's piped output to the socket.
 #[cfg(unix)]
 pub fn run_vt_pipe(socket: &str) -> std::io::Result<()> {
     crate::tmux::vt::run_pipe(socket)
@@ -119,16 +116,8 @@ use std::io::{self, IsTerminal};
 
 use crate::migrations;
 
-/// Whether the TUI should request mouse capture (`\e[?1000h` etc.) from the
-/// terminal. The Settings entry (Interaction > Mouse Capture, backed by
-/// `session.mouse_capture`) is the primary control; the `AOE_MOUSE_CAPTURE`
-/// env var stays as an opt-out backstop for environments where the toggle
-/// isn't reachable (e.g. iOS Mosh + Termius/Blink, which don't reliably
-/// forward mouse-tracking escapes to mobile clients). Capture is requested
-/// only when the config allows it AND the env var hasn't disabled it, so a
-/// `false` from either source wins and an existing `AOE_MOUSE_CAPTURE=0`
-/// keeps working. Default ON to preserve the preview-pane mouse-wheel scroll
-/// feature added in #795.
+/// Mouse capture needs both the `session.mouse_capture` setting and no
+/// `AOE_MOUSE_CAPTURE=0|false` opt-out.
 pub fn mouse_capture_requested(session: &crate::session::config::SessionConfig) -> bool {
     session.mouse_capture && env_mouse_capture_allows()
 }
@@ -302,7 +291,6 @@ pub async fn run(profile: &str, startup_warning: Option<String>) -> Result<()> {
         }
     }
 
-    // Check for tmux
     if !crate::tmux::is_tmux_available() {
         eprintln!("Error: tmux not found in PATH");
         eprintln!();
@@ -320,10 +308,6 @@ pub async fn run(profile: &str, startup_warning: Option<String>) -> Result<()> {
         anyhow::bail!("stdin is not a terminal; aoe requires an interactive TTY");
     }
 
-    // Preserve first-run local UI without minting a profile in the observer.
-    if crate::session::list_profiles()?.is_empty() {
-        crate::acp::client::daemon_manager::ensure_native_daemon(profile).await?;
-    }
     // Mosh mangles mouse-tracking escapes, so capture stays off under it.
     // `App` re-resolves the config so a mid-session toggle still applies.
     let mosh_active = std::env::var_os("MOSH_CONNECTION").is_some();
@@ -361,7 +345,6 @@ pub async fn run(profile: &str, startup_warning: Option<String>) -> Result<()> {
         crate::file_watch::FileWatchService::noop()
     });
 
-    // Create app and run
     let mut app = App::new(
         profile,
         available_tools,
@@ -398,9 +381,7 @@ mod clear_terminal_tests {
             .all(|c| c == &Cell::default())
     }
 
-    /// `clear_terminal` must wipe the backend AND reset ratatui's diff baseline,
-    /// so a clear followed by an identical redraw repaints every cell instead of
-    /// diffing to a no-op and leaving a blank screen.
+    /// The diff baseline must reset too, or an identical redraw paints nothing.
     #[test]
     fn clears_backend_and_repaints_on_next_identical_draw() {
         let mut terminal = Terminal::new(TestBackend::new(20, 3)).unwrap();
@@ -416,8 +397,6 @@ mod clear_terminal_tests {
             "clear_terminal should wipe the backend"
         );
 
-        // Same content again: without the diff-baseline reset the diff would be
-        // empty and the screen would stay blank after the clear.
         terminal
             .draw(|f| f.render_widget(Paragraph::new("HELLO"), f.area()))
             .unwrap();

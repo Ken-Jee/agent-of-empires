@@ -414,16 +414,23 @@ mod legacy_tool_body_tests {
             "adoption": {
                 "tmux_session":"aoe_tool_git_log_old_abc12345",
                 "identity":{"session_id":"$42", "pane_id":"%42", "pane_pid":4242},
+                "server":{"socket":"/fixture-tmux.sock","pid":4242,
+                    "birth":{"boot_id":"fixture-boot","start_id":"fixture-server"}},
                 "profile":"work", "lifecycle_generation":7,
             },
         });
         let decoded: StopAuxiliaryBody = serde_json::from_value(body.clone()).unwrap();
         assert_eq!(serde_json::to_value(decoded).unwrap(), body);
+        let mut dead = body.clone();
+        dead["adoption"]["identity"]["pane_pid"] = serde_json::Value::Null;
+        let decoded: StopAuxiliaryBody = serde_json::from_value(dead.clone()).unwrap();
+        assert_eq!(serde_json::to_value(decoded).unwrap(), dead);
         for bad in [
             serde_json::json!({"kind":"host","index":0,"adoption":body["adoption"]}),
             serde_json::json!({"kind":"tool","tool_name":"git","unexpected":true}),
             serde_json::json!({"kind":"tool","tool_name":"git","adoption":{
                 "tmux_session":"x", "identity":{"session_id":"$42", "pane_id":"%42"},
+                "server":body["adoption"]["server"],
                 "profile":"work","lifecycle_generation":7,
             }}),
         ] {

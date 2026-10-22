@@ -1101,11 +1101,23 @@ impl HomeView {
                 None
             }
             "stop_session" => self.pending_stop_session.take().map(Action::StopSession),
+            "resume_reveal" => {
+                if let Some(intent) = self.retained_reveal.take() {
+                    if let Err(error) = self.continue_reveal(intent) {
+                        self.info_dialog = Some(InfoDialog::sized_to_fit(
+                            "Session Not Revealed",
+                            &error.to_string(),
+                        ));
+                    }
+                }
+                None
+            }
             "resolve_namespace_indeterminate" => {
                 match self.session_feed.resolve_namespace_indeterminate() {
                     Ok(()) => {
                         self.namespace_unknown_message = None;
                         self.promote_next_indeterminate();
+                        self.offer_retained_reveal();
                     }
                     Err(error) => {
                         self.info_dialog = Some(InfoDialog::new(
@@ -1318,6 +1330,14 @@ impl HomeView {
     }
 
     pub fn handle_dialog_click(&mut self, col: u16, row: u16) -> bool {
+        if let Some(serve) = &mut self.serve_view {
+            let key = serve.handle_click(col, row);
+            self.press_dialog_key(key);
+            return true;
+        }
+        // The confirm dialog floats over settings, so it wins click routing the same way
+        // the keyboard path checks `settings_close_confirm` before `settings_view`;
+        // otherwise a click on Yes / No goes into settings and never reaches the modal.
         if let Some(dialog) = &mut self.intro_dialog {
             let click = dialog.handle_click(col, row);
             let preview = dialog.take_pending_preview();
@@ -1475,14 +1495,13 @@ impl HomeView {
             // preview underneath don't react.
             return true;
         }
-        if let Some(serve) = &mut self.serve_view {
-            let key = serve.handle_click(col, row);
-            self.press_dialog_key(key);
-            return true;
+        if self.settings_view.is_none() {
+            if let Some(view) = &mut self.diff_view {
+                view.handle_click(col, row);
+                self.drain_pending_diff_override();
+                return true;
+            }
         }
-        // The confirm dialog floats over settings, so it wins click routing the same way
-        // the keyboard path checks `settings_close_confirm` before `settings_view`;
-        // otherwise a click on Yes / No goes into settings and never reaches the modal.
         if let Some(dialog) = &mut self.confirm_dialog {
             if let Some(result) = dialog.handle_click(col, row) {
                 let action = dialog.action().to_string();
@@ -1541,13 +1560,6 @@ impl HomeView {
             let _ = view.handle_click(col, row);
             return true;
         }
-        // The diff view is a full-screen takeover: it owns every click, since the
-        // stale list rect underneath would otherwise outrank `hit_diff` in `app.rs`.
-        if let Some(view) = &mut self.diff_view {
-            view.handle_click(col, row);
-            self.drain_pending_diff_override();
-            return true;
-        }
         if let Some(dialog) = &self.info_dialog {
             if let Some(DialogResult::Cancel) = dialog.handle_click(col, row) {
                 self.info_dialog = None;
@@ -1592,15 +1604,9 @@ impl HomeView {
             }
             return true;
         }
-        if let Some(dialog) = &self.snooze_duration_dialog {
+        if let Some(dialog) = &mut self.snooze_duration_dialog {
             if let Some(DialogResult::Submit(minutes)) = dialog.handle_click(col, row) {
-                self.snooze_duration_dialog = None;
-                let sid = self.pending_snooze_session.take();
-                if let Some(id) = sid {
-                    if let Err(e) = self.snooze_session_for(&id, minutes) {
-                        tracing::error!("snooze_session_for failed: {}", e);
-                    }
-                }
+                self.submit_snooze_duration(minutes);
             }
             return true;
         }
@@ -1878,6 +1884,22 @@ impl HomeView {
         // it would point at unrelated content. Covers the live-send branch below too.
         self.clear_preview_selection();
 
+        // Handle serve view (full-screen takeover)
+        if let Some(ref mut serve) = self.serve_view {
+            match serve.handle_key(key) {
+                ServeAction::Continue => return None,
+                ServeAction::Stop => return Some(Action::StopDashboard),
+                ServeAction::Launch(request) => {
+                    self.pending_dashboard_launch = Some(request);
+                    return Some(Action::StartDashboard);
+                }
+                ServeAction::Close => {
+                    self.serve_view = None;
+                    return None;
+                }
+            }
+        }
+
         // Live-send capture normally wins over every other key handler: the home view is
         // a thin relay to the target pane, so dialog hotkeys, search and navigation
         // suspend until Ctrl+q. That holds while dialogs are keyboard-only, since
@@ -1958,17 +1980,6 @@ impl HomeView {
                 }
                 DiffAction::EditFile(path) => {
                     return Some(Action::EditFile(path));
-                }
-            }
-        }
-
-        // Handle serve view (full-screen takeover)
-        if let Some(ref mut serve) = self.serve_view {
-            match serve.handle_key(key) {
-                ServeAction::Continue => return None,
-                ServeAction::Close => {
-                    self.serve_view = None;
-                    return None;
                 }
             }
         }
@@ -2077,17 +2088,19 @@ impl HomeView {
             return None;
         }
 
-        if let Some(dialog) = &mut self.info_dialog {
-            match dialog.handle_key(key) {
-                DialogResult::Continue => {}
-                DialogResult::Cancel | DialogResult::Submit(_) => {
-                    self.info_dialog = None;
-                    if let Some(session_id) = self.pending_attach_after_warning.take() {
-                        return Some(Action::AttachSession(session_id));
+        if self.snooze_duration_dialog.is_none() || self.confirm_dialog.is_none() {
+            if let Some(dialog) = &mut self.info_dialog {
+                match dialog.handle_key(key) {
+                    DialogResult::Continue => {}
+                    DialogResult::Cancel | DialogResult::Submit(_) => {
+                        self.info_dialog = None;
+                        if let Some(session_id) = self.pending_attach_after_warning.take() {
+                            return Some(Action::AttachSession(session_id));
+                        }
                     }
                 }
+                return None;
             }
-            return None;
         }
 
         // Command palette captures input ahead of the help overlay so its own
@@ -2121,24 +2134,18 @@ impl HomeView {
             }
         }
 
-        if let Some(dialog) = &mut self.snooze_duration_dialog {
-            match dialog.handle_key(key) {
-                DialogResult::Continue => {}
-                DialogResult::Cancel => {
-                    self.snooze_duration_dialog = None;
-                    self.pending_snooze_session = None;
-                }
-                DialogResult::Submit(minutes) => {
-                    self.snooze_duration_dialog = None;
-                    let sid = self.pending_snooze_session.take();
-                    if let Some(id) = sid {
-                        if let Err(e) = self.snooze_session_for(&id, minutes) {
-                            tracing::error!("snooze_session_for failed: {}", e);
-                        }
+        if self.confirm_dialog.is_none() {
+            if let Some(dialog) = &mut self.snooze_duration_dialog {
+                match dialog.handle_key(key) {
+                    DialogResult::Continue => {}
+                    DialogResult::Cancel => {
+                        self.snooze_duration_dialog = None;
+                        self.pending_snooze_session = None;
                     }
+                    DialogResult::Submit(minutes) => self.submit_snooze_duration(minutes),
                 }
+                return None;
             }
-            return None;
         }
 
         // Handle other dialog input
@@ -2401,8 +2408,9 @@ impl HomeView {
             return None;
         }
 
+        let project_write_block = self.project_write_block();
         if let Some(dialog) = &mut self.projects_dialog {
-            match dialog.handle_key(key) {
+            match dialog.handle_key(key, project_write_block) {
                 DialogResult::Continue => {}
                 DialogResult::Cancel | DialogResult::Submit(()) => {
                     self.projects_dialog = None;
@@ -2866,25 +2874,62 @@ impl HomeView {
         None
     }
 
-    fn drain_pending_diff_override(&mut self) {
-        let Some((session_id, base_branch)) = self
+    pub(super) fn drain_pending_diff_override(&mut self) {
+        let Some((id, branch)) = self
             .diff_view
             .as_mut()
-            .and_then(|view| view.take_pending_override())
+            .and_then(DiffView::take_pending_override)
         else {
             return;
         };
-        if let Err(error) = self.session_feed.submit(
-            session_id,
-            crate::daemon::SessionMutation::DiffBase(crate::daemon::UpdateDiffBaseBody {
-                base_branch,
-                repo: None,
-            }),
-        ) {
-            self.info_dialog = Some(InfoDialog::new(
-                "Diff Base Not Saved",
-                &format!("Failed to set the base branch: {error}"),
-            ));
+        let Some(diff) = self.diff_view.as_ref() else {
+            return;
+        };
+        if diff.base_save.is_some() {
+            self.diff_view.as_mut().unwrap().base_not_saved(
+                "A base save is already pending; this comparison is not submitted.",
+            );
+            return;
+        }
+        let matches = self
+            .session_feed
+            .applied_session(&id)
+            .is_some_and(|row| row.profile == diff.profile);
+        let epoch = self.session_feed.applied_epoch().map(str::to_owned);
+        let result = if matches {
+            self.session_feed.submit_diff_base(id, branch.clone())
+        } else {
+            Err(anyhow::anyhow!(
+                "The original session/profile is not in the applied runtime; no change submitted"
+            ))
+        };
+        let diff = self.diff_view.as_mut().unwrap();
+        match result {
+            Ok(receiver) => {
+                diff.base_save_epoch = epoch;
+                diff.base_save_branch = branch;
+                diff.base_save = Some(receiver);
+            }
+            Err(error) => diff.base_not_saved(&error.to_string()),
+        }
+    }
+    fn submit_snooze_duration(&mut self, minutes: u32) {
+        let result = match self.pending_snooze_session.clone() {
+            Some(id) if self.get_instance(&id).is_some() => self.snooze_session_for(&id, minutes),
+            _ => Err(anyhow::anyhow!(
+                "The original snooze target is unavailable; no change submitted"
+            )),
+        };
+        match result {
+            Ok(()) => {
+                self.snooze_duration_dialog = None;
+                self.pending_snooze_session = None;
+            }
+            Err(error) => {
+                if let Some(dialog) = &mut self.snooze_duration_dialog {
+                    dialog.reject(minutes, &error.to_string());
+                }
+            }
         }
     }
 
@@ -3580,16 +3625,16 @@ impl HomeView {
                 .as_ref()
                 .map(|identity| crate::session::LegacyToolAdoption {
                     tmux_session: pane.tmux_session.clone().expect("legacy observation name"),
-                    identity: identity.clone(),
+                    identity: identity.identity.clone(),
+                    server: identity.server.clone(),
                     profile: inst.source_profile.clone(),
                     lifecycle_generation: inst.lifecycle_generation,
                 })
         };
         let message = if let Some(adoption) = &adoption {
-            format!("Adopt and kill legacy tool '{}' for '{}'\nRow: {} / {} / generation {}\nTmux: {} ({} / {}, PID {})\nThis confirmation assigns this exact unmarked pane to this tool before stopping it.",
+            format!("Adopt and kill legacy tool '{}' for '{}'\nRow: {} / {} / generation {}\nTmux: {} ({})\nThis confirmation assigns this exact unmarked pane to this tool before stopping it.",
                 tool_name, inst.title, inst.source_profile, inst.id, inst.lifecycle_generation,
-                adoption.tmux_session, adoption.identity.session_id, adoption.identity.pane_id,
-                adoption.identity.pane_pid)
+                adoption.tmux_session, adoption.identity)
         } else if recovery_only {
             format!(
                 "Finish original cleanup for '{}' on '{}'?\nCurrent replacement panes will not be adopted.",
@@ -4394,13 +4439,7 @@ impl HomeView {
                         .find(|candidate| candidate.path == path)
                 })
                 .is_some_and(|candidate| candidate.collapsed);
-            self.submit_namespace_intent(
-                crate::daemon::NamespaceMutation::CollapseGroup(crate::daemon::CollapseGroupBody {
-                    group,
-                    collapsed: !collapsed,
-                }),
-                NamespaceIntent::Plain,
-            )
+            self.set_group_collapsed(group, !collapsed, NamespaceIntent::Plain)
         })();
         if let Err(error) = result {
             self.info_dialog = Some(InfoDialog::new(
@@ -4929,7 +4968,7 @@ impl HomeView {
                 // The right-click already moved the cursor onto the row, so the
                 // toggle acts on the same session the menu was opened for.
                 if let Err(e) = self.toggle_archive_at_cursor() {
-                    tracing::error!("toggle_archive_at_cursor (context menu) failed: {}", e);
+                    self.info_dialog = Some(InfoDialog::new("Archive not changed", &e.to_string()));
                 }
             }
             ContextMenuAction::ToggleSnooze => {

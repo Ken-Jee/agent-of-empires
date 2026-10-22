@@ -1,14 +1,13 @@
 # Configuration Reference
 
-AoE uses a layered configuration system. Settings are resolved in this order:
+Settings resolve in layers, each overriding the one before it, field by field:
 
-1. **Global config**: `~/.agent-of-empires/config.toml` (or `~/.config/agent-of-empires/config.toml` on Linux)
-2. **Profile config**: `~/.agent-of-empires/profiles/<name>/config.toml`
-3. **Repo config**: `.agent-of-empires/config.toml` in the project root
+1. **Global**: `~/.agent-of-empires/config.toml`
+2. **Profile**: `~/.agent-of-empires/profiles/<name>/config.toml`
+3. **Repo**: `.agent-of-empires/config.toml` in the project root
 
-Later layers override earlier ones. Only explicitly set fields override; unset fields inherit from the previous layer.
+Unset fields inherit from the layer above. List fields replace rather than extend. Everything below is also editable from the TUI settings screen (`s`) and, unless noted, from the web dashboard.
 
-All settings below can also be edited from the TUI settings screen (press `s` or access via the menu).
 
 Over the web API, `GET /api/settings` returns the settings as they apply to the profile the server serves (or `?profile=<name>`): the profile's overrides over the global config. `PATCH /api/settings` saves each field to the layer it belongs in, that profile for fields it can override and the global config for the rest, so a save always lands where the read looks. Add `?layer=machine` to either to read or write the global config alone.
 
@@ -23,7 +22,7 @@ A project registry entry can override `worktree.enabled`, `session.smart_rename`
 | Linux | `$XDG_CONFIG_HOME/agent-of-empires/config.toml` (defaults to `~/.config/agent-of-empires/`) |
 | macOS | `~/.agent-of-empires/config.toml` by default, or `$XDG_CONFIG_HOME/agent-of-empires/config.toml` when you opt into the XDG layout (see below) |
 
-On macOS, AoE reads from `$XDG_CONFIG_HOME/agent-of-empires/` (e.g. `~/.config/agent-of-empires/`) when you set `XDG_CONFIG_HOME`, or whenever that directory already exists, so a dotfile manager like chezmoi can share one config path with Linux. Otherwise it uses `~/.agent-of-empires/`. Nothing is moved automatically: an existing `~/.agent-of-empires/` keeps being used even after you set `XDG_CONFIG_HOME`, until you relocate it yourself.
+On macOS, AoE uses `$XDG_CONFIG_HOME/agent-of-empires/` when `XDG_CONFIG_HOME` is set or that directory already exists. Nothing moves automatically: an existing `~/.agent-of-empires/` remains in use until you relocate it.
 
 ```
 ~/.agent-of-empires/
@@ -41,26 +40,11 @@ On macOS, AoE reads from `$XDG_CONFIG_HOME/agent-of-empires/` (e.g. `~/.config/a
 
 ### `state.toml`
 
-It also holds the one-time agent hook approval described in [Agent hook approval](#agent-hook-approval), set by `aoe hooks approve` or accepted in the TUI, and hand-editable.
+`state.toml` sits alongside `config.toml` and holds global-only runtime/UI bookkeeping, such as the welcome tour, last browse directory, sort order, and dismissed tips and updates. It has no profile or repo layer and is not part of the settings schema. `GET /api/settings` exposes `app_state.*` for read-only compatibility; `PATCH /api/settings` rejects those fields with HTTP 400.
 
-Sits alongside `config.toml` in the same app dir. It holds global-only
-runtime/UI bookkeeping, such as "seen the welcome tour", the last browse
-directory, sort order, and dismissed-tip/update tracking, none of which is
-a user-facing setting, so it has no profile or repo layer and is never part
-of the settings TUI or the web dashboard's settings schema. `GET
-/api/settings` still exposes these fields under the `app_state.*` key for
-backwards-compatible reads; only their on-disk home moved. That exposure is
-read-only: `PATCH /api/settings` rejects writes to `app_state.*` with a 400,
-because `AppStateConfig` is not a settings-schema section and the patch
-validator treats it as an unknown one.
+It also holds the one-time [agent hook approval](#agent-hook-approval), set by `aoe hooks approve` or accepted in the TUI, and hand-editable.
 
-`state.toml` is machine-owned runtime bookkeeping, but it is written with the
-same locked, read-modify-write guarantee as `config.toml`: both go through
-`storage::locked_update`, so a concurrent writer's changes survive and two
-`aoe` processes (the TUI and an `aoe serve` daemon) never lose an update. It
-lives in a separate file, with its own lock, so its highest-churn writes
-(every sidebar toggle, every tip dismissal) do not contend with a real
-settings save on `config.toml`.
+Updates use a locked read-modify-write operation, preserving concurrent changes. Its separate lock keeps bookkeeping writes from contending with configuration saves.
 
 ## Environment Variables
 
@@ -81,7 +65,7 @@ color_mode = "truecolor"   # truecolor | palette (TUI only)
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `name` | `"default"` | Color theme. Applies to **both the TUI and the web dashboard**. Available builtins: `default` (neutral zinc/amber), `empire` (warm navy/copper), `phosphor` (green), `tokyo-night-storm` (dark blue/purple), `catppuccin-latte` (light pastel), `dracula` (dark purple/pink), `rose-pine` (dark muted purple/pink), `deep-ocean` (Material Theme Deep Ocean, dark navy/cyan). Custom TOML themes in `~/.agent-of-empires/themes/*.toml` also appear in the picker. An empty `name` resolves to `default`. |
+| `name` | `"default"` | Theme for the TUI and web dashboard. Builtins: `default`, `empire`, `phosphor`, `tokyo-night-storm`, `catppuccin-latte`, `dracula`, `rose-pine`, `deep-ocean`. Custom TOML themes appear in the picker. Empty means `default`. |
 | `color_mode` | `"truecolor"` | TUI only. `palette` downsamples to xterm-256 for transports that mangle 24-bit RGB (e.g. some `mosh` setups). The web dashboard always renders truecolor. |
 
 ### Custom themes
@@ -140,10 +124,10 @@ You can browse tips from **Ctrl+K > Show tips** even with the bar hidden.
 | Option | Default | Description |
 |--------|---------|-------------|
 | `default_tool` | (auto-detect) | Default agent for new sessions. Falls back to the first available tool if unset or unavailable. Can be set to a custom agent name. |
-| `auto_stop_idle_secs` | `0` | Seconds a plain tmux session may sit `Idle` before it is auto-stopped: its tmux session and any sandbox container are killed, leaving a restartable `Stopped` row. `0` disables it; no session is ever auto-stopped for inactivity. Idle age is measured from the later of the last transition into `Idle` and the last user interaction, and a session with an attached tmux client is always spared, so a session you are reading is never reaped. Evaluated about once a minute (by the TUI and by `aoe serve`), so the stop can lag the threshold by up to a minute. Structured view workers use the separate `acp.auto_stop_idle_secs`. See #1689 and #1690. |
-| `prevent_sleep_when_active` | `false` | When enabled, the `aoe serve` daemon holds an OS assertion that prevents user-idle system sleep (the display still sleeps) while any session is active, releasing it once every session has been idle past `prevent_sleep_idle_grace_minutes`. Opt-in, daemon only: a TUI-only user without a running `aoe serve` gets no inhibition. Global toggle, not profile-overridable, since it drives a single process-wide assertion. Backed by `caffeinate -i` on macOS and `systemd-inhibit --what=idle:sleep` on Linux; hosts without those tools (or without logind) warn once and no-op. See #2733. |
+| `auto_stop_idle_secs` | `0` | Seconds a plain tmux session may stay `Idle` before its tmux session and sandbox container are stopped, leaving a restartable `Stopped` row. `0` disables it. Idle age starts at the later of the last `Idle` transition and last interaction; an attached tmux client spares the session. The Daemon checks about once a minute. Structured workers use `acp.auto_stop_idle_secs`. |
+| `prevent_sleep_when_active` | `false` | Have the Daemon inhibit user-idle system sleep while sessions are active; the display can sleep. Global only. Uses `caffeinate -i` or `systemd-inhibit --what=idle:sleep`; missing tools or logind warn once and skip inhibition. |
 | `prevent_sleep_idle_grace_minutes` | `15` | Minutes a session must stay idle before the sleep-inhibit assertion may be released. Only consulted when `prevent_sleep_when_active` is on. Range `0` to `240`; `0` releases as soon as every session leaves an active status. The grace period only begins once a session goes `Idle`, so a session that never reaches `Idle` keeps holding the assertion: `Waiting` on an unanswered prompt, or `Creating` on a container, worktree, or submodule setup that never returns, can hold sleep indefinitely. A `Starting` session is bounded by a short (~3s) launch guard and then re-resolves. |
-| `session_id_poller_max_threads` | `50` | Ceiling on concurrent session-id poller threads in one `aoe` process (the daemon, each TUI). Each poller keeps one session's agent session id refreshed for native resume; once more live sessions exist than the ceiling, the overflow's ids stop refreshing until another session stops, and the process retries those sessions on a 5 s to 60 s backoff instead of every status tick. Raise it for a fleet that keeps more than 50 sessions live at once. `0` keeps the default. Global, not profile-overridable; applied at process start, so a change takes effect on the next `aoe serve` or TUI start. |
+| `session_id_poller_max_threads` | `50` | Ceiling on concurrent native-session-ID pollers per process. Overflow IDs stop refreshing until a poller is available, with a 5 s to 60 s retry backoff. `0` keeps the default. Global only; applied when the Daemon starts. |
 | `row_tag` | `"branch"` | Controls the compact metadata shown next to each TUI session title: `none` shows nothing; `auto` shows the profile code only in all-profiles view; `profile` always shows the profile code; `sandbox` shows `sb` on sandboxed sessions; `branch` shows a compact worktree or workspace branch tag. |
 | `show_activity_age` | `true` | Show the age column at the right edge of each TUI session row: time since the agent stopped on `Idle` rows, time since last access on `Unknown` rows, and remaining snooze time under the Attention sort. |
 | `sidebar_position` | `"left"` | Places the TUI session list on the left or right. Narrow terminals keep the list above the preview. Global only. |
@@ -151,21 +135,21 @@ You can browse tips from **Ctrl+K > Show tips** even with the bar hidden.
 | `preview_link_prefixes` | `[]` | Link targets beyond http and https that a click in the preview may open, as case-insensitive `scheme://authority/` prefixes, for example `["vscode://file/"]` to open file links in VS Code. Entries not in that form, including a missing `/` after the authority, are ignored, and `file:`, `javascript:`, `data:` and `vbscript:` never open. Unlisted targets are neither opened nor passed to the terminal; a new entry applies to links printed after it. Global only and not editable from the web dashboard; under Settings > Global > Interaction (advanced). |
 | `tie_workdir_to_name` | `true` | Keep a managed worktree session's directory named after its title. See [Worktrees](worktrees.md#naming). |
 | `yolo_mode_default` | `false` | Enable YOLO mode by default for new sessions (skip permission prompts). Works with or without sandbox. In tmux mode this passes `--dangerously-skip-permissions` to the agent CLI; in structured view it maps to ACP `bypassPermissions` (see [Structured view: Permission modes and YOLO](../structured-view/controls.md#permission-modes-and-yolo) for the adapter caveat). |
-| `pre_trust_agent_folders` | `false` | Pre-trust each host session's worktree in the agent's own config so it does not open on a folder-trust prompt. Applies to Claude Code (`projects.<path>.hasTrustDialogAccepted` in `.claude.json`), Codex (`projects.<path>.trust_level`), and Gemini (a per-path entry in `trustedFolders.json`); other agents have no such prompt and are untouched. Config-location overrides (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `GEMINI_CLI_TRUSTED_FOLDERS_PATH`) are honored. An `agent_config_dir` entry for the session's agent wins over them. Sandboxed sessions pre-trust their container workspace regardless of this setting, because that config is staged per session; this setting covers host sessions, where the record is written to your real agent config and outlives the session. `.mcp.json` servers still ask per server and the session's permission mode is unchanged, but trust is also what activates the repo's own `.claude/settings.json`: an untrusted workspace drops its `permissions.allow` rules. And since the prompt is what holds a session before startup, pre-trusting lets that file's hooks run with nobody having looked at the repo first. Enable it only for directories you would have trusted by hand. |
+| `pre_trust_agent_folders` | `false` | Pre-trust host worktrees in Claude Code, Codex and Gemini config. Config-dir overrides are honored; `agent_config_dir` wins. The record outlives the session. Trust activates the repo's `.claude/settings.json`, including hooks and permission rules, so enable it only for directories you would trust by hand. MCP servers still ask separately and permission mode is unchanged. Sandboxed sessions pre-trust their staged config. |
 | `agent_status_hooks` | `true` | Install status-detection hooks into the agent's config file; see [Agent hook approval](#agent-hook-approval) for the approval that gates the write and [Adding a New Agent](../development/adding-agents.md#hook-format-reference) for the per-agent file and payload. Config-dir overrides are honored. When disabled, status detection reads the pane alone, but any authoritative identity hooks declared for native resume remain installed. A hook write is evidence rather than the last word: pane state and terminal title are weighed against it by declared priority. |
 | `opencode_preassign_session_id` | `false` | Pre-assign OpenCode's native session id before a new host launch. AoE starts a short-lived `opencode serve`, creates the session through `POST /api/session`, then launches `opencode --session <id>`. This avoids guessing from OpenCode's shared SQLite store, at the cost of about two seconds per new session. When disabled or unavailable, automatic capture stays off; an explicitly pinned exact id still resumes. Sandboxed OpenCode automatic capture is unsupported. |
 | `smart_rename` | `true` | Auto-rename a default-named session after its first completed turn. Structured sessions use their first-turn transcript; terminal sessions use the pane after a Running-to-Idle transition. A manually named session is never overwritten. Only the title changes, not the worktree directory. Sandboxed sessions run the one-shot inside their own running container; unsupported agents, command overrides, or a different sandbox rename agent prevent naming. A failed or timed-out call leaves the generated name. Daemon-owned naming jobs finish before daemon shutdown releases ownership. |
 | `smart_rename_agent` | `""` | Agent for smart-name and conversation-summary one-shots. Empty selects the session's own agent. A named agent must support one-shot mode; unknown or unsupported agents are rejected rather than replaced. Sandboxed sessions must use their own agent because only its credentials are mounted. |
-| `smart_rename_model` | `{}` | Per-agent model for the throwaway smart-rename title one-shot, keyed by agent name (e.g. `claude = "haiku"`). A three-to-five-word title should not bill the CLI's default frontier model. An absent key uses the agent's built-in default (claude pins its cheap `haiku` alias, others the CLI default); an empty value forces the CLI default; a non-empty value pins that model via the agent's model flag (`--model` / `-m`). Ids are free-form and not validated, so an id the CLI rejects simply keeps the generated name. Does not affect the conversation summary, which always uses the CLI default. Only agents with a one-shot mode are tunable; a configured value for an agent with no model flag is ignored. The web dashboard sets the built-in-default and pinned states; the empty-string "force CLI default" state is settable via the TUI or this file. |
+| `smart_rename_model` | `{}` | Per-agent rename model, e.g. `{ claude = "haiku" }`. Missing uses the agent's built-in default; empty forces its CLI default; another value passes its model flag. Invalid IDs leave the generated name. Applies only to one-shot agents with a model flag, not conversation summaries. The web dashboard sets default or pinned models; use the TUI or file for an empty value. |
 | `name_agent_session` | `false` | For a session whose title was typed in the TUI's New Session dialog, give its title at the first launch (including a rename in AoE before then) to the agent as its own session name, so it shows in the agent's own apps (Claude's `--name`). For a structured session that is its first terminal launch. Skipped for a generated or suggested title, a title starting with `-`, a launch that resumes a conversation, sandboxed sessions, a launch whose command, arguments or `PATH` AoE cannot attest (including your own `-n`/`--name`), and when the agent's `--help` does not list the flag. |
 | `inherit_host_environment` | `false` | Forward AoE's whole environment to host sessions. See [Host environment](#host-environment). |
 | `agent_extra_args` | `{}` | Per-agent extra arguments appended after the binary (e.g., `{ opencode = "--port 8080" }`). |
-| `agent_command_override` | `{}` | Per-agent command override replacing the binary (for example, `{ claude = "claude --model opus" }`). Managed resume and fork validate the actual native command and store; opaque wrappers require an explicit execution contract. Native conversation resume remains available when the command starts with that built-in's exact binary token, or is a single bare token, and contains no shell control syntax. Path-qualified scripts, remote launchers, redirections, pipes, and shell expansion fail closed. A bare token is resolved by the launch shell's `PATH`. See [session resume](session-resume.md) for how automatic capture narrows this further and [execution identity and wrappers](session-resume.md#execution-identity-and-wrappers). |
-| `custom_agents` | `{}` | User-defined agents: name to command mapping. Custom agent names appear in the TUI agent picker alongside built-in agents. |
-| `agent_detect_as` | `{}` | Maps a custom agent to a built-in agent it inherits. Reuses that built-in's status heuristics and, when available, its ACP adapter. It never proves which native CLI owns a terminal conversation. Native [session resume](session-resume.md) is enabled when the command starts with that built-in's exact binary token, or is a single bare token, and contains no shell control syntax. Path-qualified scripts, remote launchers, redirections, pipes, and shell expansion fail closed. A bare token is resolved by the launch shell's `PATH`. |
+| `agent_command_override` | `{}` | Per-agent command replacing the binary. Managed resume and fork validate the actual native command and store; opaque wrappers require an explicit execution contract. See [execution identity and wrappers](session-resume.md#execution-identity-and-wrappers). |
+| `custom_agents` | `{}` | User-defined agents (name to command). See [Custom agents](#custom-agents). |
+| `agent_detect_as` | `{}` | Built-in status detection and ACP adapter inheritance for a custom agent. This does not prove native execution or authorize terminal resume or fork. |
 | `agent_execution_as` | `{}` | Explicit native-agent contract for an opaque terminal wrapper. Requires `agent_config_dir` naming its store. Trusted global/profile configuration only; repository overrides are refused. |
 | `agent_acp_cmd` | `{}` | ACP launch command for a custom agent, enabling it to run in structured view (for example, `{ "oc-superpowers" = "ocp run sp acp" }`). A custom agent with an entry here is structured view-capable; without one it stays tmux-only. Unlike `custom_agents`, the value is split into argv and run directly, with no shell. |
-| `agent_config_dir` | `{}` | Config directory an agent reads instead of its built-in default, keyed by the session's agent name. Host sessions use the directory directly. Each sandboxed session uses its own `sandbox-v2/<instance-id>` subdirectory, mounted at the resolved built-in config path for hooks, credentials, and native-session capture. [Native MCP discovery](mcp-servers.md) reads it too, so the servers AoE reconciles against are the ones the agent loads. Wins over the agent's config-dir environment variable, whether that comes from the profile's `environment`, a `before_session` hook, or the daemon's own environment. Two names pointing at the same agent are two accounts of it; a restart that swaps between them carries the session's conversation across. A resumed host or structured Claude conversation keeps the store it recorded, which outranks this entry; a sandboxed one keeps the store its container was created with and follows the entry only once that container is recreated, see [Session Resume](session-resume.md#swapping-the-engine-on-a-restart). Global/profile only. |
+| `agent_config_dir` | `{}` | Agent config directory, keyed by agent name. Host sessions use it directly; sandboxed sessions use a private `sandbox-v2/<instance-id>` child at the canonical container path. Hooks and [native MCP discovery](mcp-servers.md) use it, and it wins over config-dir environment variables and host hooks. A recorded Claude conversation store outranks it; changing accounts or recreating a sandbox follows the [resume store rules](session-resume.md#swapping-the-engine-on-a-restart). Global/profile only. |
 Per-agent structured view defaults live under `[acp]`, not `[session]`:
 
 | Option | Default | Description |
@@ -186,7 +170,7 @@ Agent status overrides use `[agents.<name>]`:
 
 ## Status Hooks
 
-Status hooks run local shell commands when the core publishes a session status change, including while no TUI is open or a TUI is attached to tmux. They are disabled by default and are intended for personal machine behavior such as desktop notifications. The initial snapshot does not replay existing statuses.
+Status hooks run local shell commands when the Daemon publishes a session status change, including while no TUI is open or a TUI is attached to tmux. They are disabled by default and are intended for personal machine behavior such as desktop notifications. The initial snapshot does not replay existing statuses.
 
 ```toml
 [status_hooks]
@@ -198,7 +182,7 @@ on_error = "notify-send -u critical -a aoe 'AoE: Error' \"$AOE_SESSION_TITLE err
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `enabled` | `false` | Run configured status hook commands from the core. Commands fire once a status has stayed stable for a short built-in debounce (100ms), so rapid flickers do not spam hooks. |
+| `enabled` | `false` | Run configured status hook commands from the Daemon. Commands fire once a status has stayed stable for a short built-in debounce (100ms), so rapid flickers do not spam hooks. |
 | `on_starting` | unset | Command run when a session enters `Starting`. |
 | `on_running` | unset | Command run when a session enters `Running`. |
 | `on_waiting` | unset | Command run when a session enters `Waiting`. |
@@ -217,7 +201,7 @@ Commands run in the session project directory and receive context through enviro
 | `AOE_TOOL` | Agent name |
 | `AOE_GROUP_PATH` | Group hierarchy path |
 | `AOE_OLD_STATUS` / `AOE_NEW_STATUS` | Status before/after the transition |
-| `AOE_STATUS_CHANGED_AT` | Timestamp when the core observed the published transition |
+| `AOE_STATUS_CHANGED_AT` | Timestamp when the Daemon observed the published transition |
 
 When both a status-specific hook and `on_change` fire, AoE runs them sequentially (status-specific first), outside session locks. Each command has a 30-second timeout and owns its process group; remaining group members are killed when it exits. Stopping the daemon cancels pending hooks and terminates running hook groups. Disabling or changing the profile hook configuration, removing a session, or moving it to another profile invalidates its debounced transition. Hooks use the session profile's effective global and profile settings, never repo config, because they run arbitrary local commands.
 
@@ -232,7 +216,7 @@ Turning `agent_status_hooks` off stops AoE installing status hooks, but it does 
 
 ### Custom Agents
 
-Custom agents let you name commands for agents that AoE cannot detect as built-in binaries, such as SSH wrappers, local scripts, or remote Claude sessions. Configure them once in `custom_agents`, then select the configured name from the TUI picker, `aoe add --tool <name>`, or the Web session wizard.
+Custom agents name commands AoE cannot detect as built-in binaries: SSH wrappers, local scripts, or a CLI using another account. Configure them once, then select the name in the TUI, `aoe add --tool <name>`, or the web wizard.
 
 ```toml
 [session]
@@ -241,24 +225,19 @@ custom_agents = { "lenovo-claude" = "ssh -t lenovo claude" }
 agent_detect_as = { "lenovo-claude" = "claude" }
 ```
 
-- **`custom_agents`**: Maps a display name to the shell command AoE runs in a tmux pane when that agent is selected. Names appear in the TUI picker alongside built-ins like `claude`, `opencode`, and `codex`, and work with `aoe add --tool <name>`.
-- **`agent_detect_as`** (optional): Reuses a built-in agent's status detection for the custom agent, and marks the custom agent as inheriting that built-in. Without it (and without `status_rules`, below), custom agents default to `Idle`. Best for wrappers that run the *same* binary differently (SSH, scripts); for an agent whose output differs from every built-in, use `status_rules` instead. When the base agent has an ACP adapter, this mapping also lets the wrapper run in the structured view through that adapter (see [Running a custom agent in the structured view](#running-a-custom-agent-in-the-structured-view)). Native resume additionally requires the terminal command to start with the exact built-in binary and contain no shell control syntax; the mapping alone does not authorize resume through an opaque wrapper or remote launcher.
+- **`custom_agents`** maps a display name to the command AoE runs in a tmux pane.
+- **`agent_detect_as`** reuses built-in status detection and ACP adapter inheritance. It never proves which native CLI owns a terminal conversation. Use [status rules](#status-rules-for-custom-agents) when output differs from the built-in.
 - **`agent_acp_cmd`** (optional): ACP launch command that lets the agent run in the structured view (see below).
 - **`agent_execution_as`** declares the native agent actually invoked by an opaque wrapper, together with its `agent_config_dir` store contract. This is required for managed resume and fork through such a wrapper.
   Bare, non-path wrappers can receive Default automatic resume flags and pane-scoped capture without this contract. Cleared launches selected by a failed-resume marker or disabled `auto_resume_on_restart` start fresh, mint and pass fresh-session flags where supported, and capture the new pane-scoped ID; explicit resume and fork remain unavailable. See [Execution identity and wrappers](session-resume.md#execution-identity-and-wrappers).
 - **`agent_config_dir`** (optional): The config directory the wrapper points its CLI at, when that is not the built-in default (see below).
-- **`default_tool`** (optional): Can point at a custom-agent name to default new sessions to it.
+- **`default_tool`** can select a custom-agent name for new sessions.
 
-Custom agents are always shown as available in the picker since their command may target a remote host or wrapper. All custom-agent maps are editable in config files or the TUI settings screen; profile (and, for `agent_detect_as`, repo) values fully replace the global map, so redeclare any agents you want to keep. `agent_execution_as` and `agent_config_dir` are trusted global/profile declarations; repository overrides are refused. The Web wizard can select a configured custom agent but does not expose or edit the command strings.
+Custom agents remain selectable even for remote or unmanaged commands. Maps are editable in config files or the TUI. Profile maps replace global maps; `agent_detect_as` also permits repo overrides. `agent_execution_as` and `agent_config_dir` are trusted global/profile declarations, never repo overrides. The web wizard can select a custom agent but never edits these command strings.
 
 #### One CLI, two accounts
 
-A wrapper that runs the same CLI against a second login usually does it by
-exporting the agent's config-dir variable, which AoE cannot see: the wrapper
-sets it after AoE has already chosen which file to write. Name that directory
-in `agent_config_dir` so folder-trust records and native MCP discovery land on
-the config the agent will read, instead of the default one it never opens, for as long
-as the conversation has not recorded a store of its own.
+A wrapper selecting another login may export a config-dir variable after AoE has chosen its hook files. Name that directory in `agent_config_dir` so folder trust and [native MCP discovery](mcp-servers.md) use the agent's actual config, until the conversation records its own store.
 ```toml
 [session.custom_agents]
 claude-personal = "claude-personal"      # a wrapper that exports CLAUDE_CONFIG_DIR
@@ -290,7 +269,7 @@ tree, including Pi's pane-scoped identity extension.
 
 #### Status rules for custom agents
 
-`agent_detect_as` only works when the custom agent renders the same output as the built-in it aliases. For a harness that is *similar to but not the same binary as* any built-in, declare pane status rules instead; no change to the agent is needed:
+`agent_detect_as` fits wrappers whose output matches a built-in. For a different harness, declare pane status rules instead:
 
 ```toml
 [session.custom_agents]
@@ -366,20 +345,9 @@ environment = [
 ]
 ```
 
-Top-level `environment` injects env vars into every host (non-sandboxed) session spawned at global scope, in both the terminal and the structured view. Useful for pinning a Claude/Codex/Gemini config dir per profile, forwarding an API token, or otherwise scoping per-agent state without exporting variables shell-wide.
+The top-level `environment` list injects variables into every host (non-sandboxed) session, in both views. Entries follow the same grammar as [`sandbox.environment`](sandbox.md#environment-variables): `KEY=value` literal, `KEY=$VAR` read from AoE's environment at spawn, `KEY=$$literal` escape, and a bare `KEY` passthrough. Keys must match `[A-Za-z_][A-Za-z0-9_]*`; anything else is dropped with a warning.
 
-Each entry follows the same grammar as `sandbox.environment`:
-
-Keys must match `[A-Za-z_][A-Za-z0-9_]*` (an ASCII letter or `_` first, then ASCII alphanumerics or `_`). Any other key is dropped with a warning; Docker and `Command::env` are laxer than this, so a key like `FOO-BAR` or `foo.bar` is accepted by the runtime but silently rejected here.
-
-- **`KEY=value`**: literal value, passed through verbatim. `~` is not expanded; use an absolute path.
-- **`KEY=$VAR`**: read `$VAR` from the host env at spawn time (skipped with a warning if `$VAR` is unset).
-- **`KEY=$$literal`**: escape; emits `KEY=$literal`.
-- **`KEY`** (bare): passthrough from the host env (skipped with a warning if unset).
-
-In the terminal view every form resolves to a literal `KEY=value` prefix on the pane command and is therefore visible in `ps`; for secrets you want hidden from argv there, use [`sandbox.environment`](#sandbox-docker) instead. The structured view applies the same list to the agent process's environment rather than its argv, so values do not appear in `ps`. Host and sandbox sessions take disjoint code paths: a sandboxed session reads only `sandbox.environment`, an unsandboxed session reads only the top-level `environment`. Set both lists if you want a variable available regardless of how the session launches.
-
-Profile-scoped `environment` replaces the global list entirely (matching the `sandbox.environment` override semantics).
+In the terminal view each pair becomes a shell-assignment prefix on the pane command and is therefore visible in `ps`; the structured view applies the list to the agent process's environment instead. For genuine secrets prefer `sandbox.environment` or a [host hook](#host-hooks). Host and sandboxed sessions read disjoint lists, so set both if a variable must be present either way. A profile's `environment` replaces the global list.
 
 Native host Codex launches add `--no-daemon` only when the attested direct
 executable advertises it. The probe uses that frozen executable and environment,
@@ -388,19 +356,8 @@ Wrappers, sandboxed launches and unattested executables are not probed for this 
 
 ### What host sessions inherit automatically
 
-Independent of the `environment` list, AoE forwards a fixed set of desktop and
-session vars from its own environment into every host session, in both the
-terminal and the structured view: `DISPLAY`, `WAYLAND_DISPLAY`, `XAUTHORITY`,
-`DBUS_SESSION_BUS_ADDRESS`, `SSH_AUTH_SOCK`, and every `XDG_*` var. Without
-this, a browser an agent launches (an OIDC login, say) has no way to reach your
-desktop, since tmux carries only its own narrow `update-environment` set and the
-structured view starts its agent from a cleared environment.
+Independent of that list, AoE forwards `DISPLAY`, `WAYLAND_DISPLAY`, `XAUTHORITY`, `DBUS_SESSION_BUS_ADDRESS`, `SSH_AUTH_SOCK`, and every `XDG_*` variable into host sessions, so a browser the agent launches (an OIDC login) can reach your desktop. Worth knowing what that grants: `DISPLAY` plus `XAUTHORITY` is X11 access to your whole session, which includes screen capture and input injection. A sandboxed session never receives them.
 
-Worth knowing what that grants: `DISPLAY` plus `XAUTHORITY` is X11 access to
-your whole session, which means an agent can capture the screen and inject
-input, not just open a browser window. That is the point of forwarding them, and
-it has been the terminal view's behavior since #3079, but it is the tradeoff. A
-sandboxed session never receives them.
 
 To forward everything else too, rather than naming each var in `environment`:
 
@@ -409,51 +366,28 @@ To forward everything else too, rather than naming each var in `environment`:
 inherit_host_environment = true
 ```
 
-Every var AoE itself holds then reaches host sessions, so a `GOPATH` or
-`CARGO_HOME` you exported in your shell is simply there. `AOE_*` and
-`AGENT_OF_EMPIRES_*` keys are never forwarded (they are AoE's own wiring and
-credentials), and `TERM` stays owned by tmux so a pane's terminal type is not
-degraded. Off by default: it widens what every agent process can read, including
-any API token you exported in your shell, so it is opt-in per profile.
+Every variable AoE holds then reaches host sessions, except `AOE_*` and `AGENT_OF_EMPIRES_*` (its own wiring) and `TERM` (owned by tmux). Off by default, since it widens what every agent can read, including tokens exported in your shell. In the terminal view the pairs ride `tmux new-session -e`, so a secret is briefly visible in `ps` while that command runs.
 
-In the terminal view the forwarded pairs ride the short-lived `tmux new-session`
-invocation as `-e KEY=value`, so a secret is briefly visible in `ps` while that
-command runs. That is narrower than [`environment`](#host-environment), whose
-values sit in the pane command's argv for the pane's whole life, but it is the
-reason to prefer `sandbox.environment` for genuine secrets.
 
 Managed OpenCode selects this policy before probing or launching the native agent. It also retains process essentials and OpenCode database, configuration and workspace selector inputs for validation when wholesale inheritance is off. Unsupported selectors remain unsupported. Explicit profile `environment` entries and before-session overrides take precedence; login-only exports are not imported. See [managed OpenCode contexts](session-resume.md#supported-managed-contexts).
 
 ### When AoE has no environment to forward
 
-Both mechanisms above read AoE's *own* environment. Forwarding is a passthrough,
-not a store, so AoE can only hand a session what it holds itself. If the process
-that starts AoE has no `DISPLAY`, neither does your agent.
-
-That matters when something other than your shell starts the daemon. A systemd
-unit gets a near-empty environment by default, so give it your vars explicitly:
+Forwarding is a passthrough, not a store: AoE can only hand a session what its own process holds. A daemon started by systemd, launchd, cron, or an SSH command inherits that launcher's environment, not your shell's.
 
 ```ini
 [Service]
-# Either name the vars to inherit from the systemd user manager...
 PassEnvironment=DISPLAY XAUTHORITY XDG_RUNTIME_DIR DBUS_SESSION_BUS_ADDRESS
-# ...or load them from a file you maintain.
 EnvironmentFile=%h/.config/agent-of-empires/env
 ```
 
-For a user unit, run this from your graphical session to populate the manager
-AoE then inherits from, then restart the unit so it picks the values up
-(`import-environment` does not touch already-running units):
+For a user unit, populate the manager from your graphical session and restart the unit (`import-environment` does not touch running units); make it permanent with `~/.config/environment.d/*.conf`.
 
 ```bash
 systemctl --user import-environment DISPLAY XAUTHORITY XDG_RUNTIME_DIR DBUS_SESSION_BUS_ADDRESS
 systemctl --user restart agent-of-empires
 ```
 
-That is runtime-only and lost on reboot; `~/.config/environment.d/*.conf` is the
-persistent equivalent. The same principle applies to launchd, cron, and a bare
-SSH `command`: the launch context owns its environment, and AoE forwards
-whatever that is.
 
 To check what a running daemon can actually forward, read its environment
 directly. On Linux:
@@ -470,7 +404,7 @@ ps eww -o command= -p "$(cat ~/.agent-of-empires/serve.pid)"
 
 ## Worktree
 
-The `[worktree]` block controls automatic git worktree creation for new sessions. Common keys:
+`[worktree]` controls automatic worktree creation for new sessions:
 
 ```toml
 [worktree]
@@ -479,11 +413,11 @@ path_template = "../{repo-name}-worktrees/{branch}"   # template vars: {repo-nam
 auto_cleanup = true                                   # prompt to remove the worktree on session delete
 ```
 
-See [Git Worktrees](worktrees.md) for the full key reference (`bare_repo_path_template`, `delete_branch_on_cleanup`, `init_submodules`) and template details.
+See [Git Worktrees](worktrees.md) for the remaining keys and path templates.
 
 ## Sandbox (Docker)
 
-The `[sandbox]` block configures Docker sandboxing for sessions. Common keys:
+`[sandbox]` configures container sandboxing:
 
 ```toml
 [sandbox]
@@ -492,11 +426,11 @@ default_image = "ghcr.io/agent-of-empires/aoe-sandbox:latest" # container image
 environment = ["GH_TOKEN=$AOE_GH_TOKEN"]                      # env vars forwarded into the container
 ```
 
-See [Docker Sandbox](sandbox.md) for the full key reference (`cpu_limit`, `memory_limit`, `port_mappings`, `extra_volumes`, `volume_ignores`, `volume_ignores_strategy`, `auto_cleanup`, `default_terminal_mode`, and the run-policy keys `privileged`, `cap_add`, `cap_drop`, `security_opt`, `extra_run_args`), the `environment` grammar, and credential handling. For env vars on host (non-sandboxed) sessions, use [Host Environment](#host-environment) instead; the two lists are disjoint.
+See [Container Sandbox](sandbox.md) for options, environment grammar, credentials and storage isolation. Host sessions use the separate [Host Environment](#host-environment) list.
 
 ## Host Hooks
 
-The `[host_hooks]` block declares hooks that run on the **host** (not inside the sandbox container). Unlike `[hooks]`, which for sandboxed sessions runs inside the container, host hooks run in your host shell and can compute a value with host-only tooling and credentials, then hand only that value to the agent.
+`[host_hooks]` commands run on the **host**, including for sandboxed sessions. They can mint short-lived, repo-scoped credentials or choose an account at launch without exposing host tooling to the container.
 
 ```toml
 [host_hooks]
@@ -505,40 +439,28 @@ before_session = ['my-account-switcher env']                            # host s
 before_destroy = ['sync-transcripts "$AOE_SESSION_ID"']                 # any session, at purge
 ```
 
-The two fields mirror the split the static env lists already make: `before_start` serves sandboxed sessions (the dynamic counterpart of `sandbox.environment`), `before_session` serves host sessions (the counterpart of the top-level [`environment`](#host-environment)). A launch runs exactly one of them, chosen by whether the session is sandboxed, so the same key is never minted twice.
+A launch runs exactly one of `before_start` (sandboxed) and `before_session` (host), matching the split between `sandbox.environment` and the top-level [`environment`](#host-environment) list.
 
 `before_destroy` is not a launch hook: it runs on the host for every session, sandboxed or not, when the session is purged, before container and worktree cleanup. With `session.delete_to_trash` on (the default), moving a session to trash does not run it; it runs when retention expires, on `empty-trash`, or on `aoe remove --purge`. Its output is ignored and never logged. A failure is logged without blocking removal, and a command still running after 2 minutes is killed.
 
-`before_start` runs each time a sandbox container comes up (on create and on restart, so short-lived values are refreshed before the agent launches). It re-mints when the container is created fresh or restarted from a stopped state (including after a Docker daemon restart leaves it stopped); attaching to an already-running container reuses the values from the last run and only backfills if none are stashed yet, so it is not re-run on every reattach. Each `KEY=VALUE` line the command prints to stdout is injected into the container environment as an **inherited** variable: the value is passed to the `docker` invocation through the process environment, never in argv, so it does not appear in `ps`. Lines that are not `KEY=VALUE` are ignored, and the hook's stdout is never logged, so it is safe to print a secret. A non-zero exit aborts bringing the container up. A line whose key is a single token but does not match `[A-Za-z_][A-Za-z0-9_]*` (e.g. `FOO-BAR=x`) is dropped with a warning; a diagnostic line whose key contains spaces (e.g. `fetching token from url=https://...`) is ignored silently.
+`before_start` runs when a container is created or restarted, including after a runtime restart. An already-running container reuses its last values, backfilling only when none are stored. Stdout `KEY=VALUE` lines become inherited container environment variables, never Docker argv; other lines are ignored and stdout is never logged. A non-zero exit aborts startup. Invalid identifier keys are warned and dropped; diagnostic keys containing spaces are ignored.
 
-Paired-container creation retains a durable lifecycle reservation while host hooks run, but releases its title, lifecycle and store-transition flocks around the hook. Native HTTP and WebSocket entrypoints also release their API locks, so hooks can call the daemon; a competing lifecycle operation receives a conflict rather than taking ownership.
+Paired-container creation retains its durable lifecycle reservation while host hooks run, but releases title, lifecycle and store-transition flocks. Native HTTP and WebSocket entrypoints release their API locks too, so hooks can call the Daemon. Competing lifecycle operations receive a conflict. Before creating or publishing the replacement runtime, AoE reacquires locks and revalidates the reservation and current session.
 
-`before_session` runs each time a **host** (non-sandboxed) session is launched, before the agent starts, and applies its `KEY=VALUE` lines to the agent's own environment. Same stdout contract as `before_start`: other lines are ignored, stdout is never logged, and a non-zero exit aborts the launch. It re-runs on every host launch, including restart and a view switch that respawns the agent, and nothing is persisted between launches, so a short-lived value is refreshed rather than replayed.
+`before_session` runs before every host agent launch, including restart and a view switch that respawns it. It uses the same stdout and failure contract as `before_start`, and persists no values between launches.
 
-Minted pairs are applied **after** the static `environment` list, so a freshly minted value wins over a same-keyed config entry. Both views honor that: the structured view appends the pairs to the agent process's environment, and the terminal view passes them through `tmux new-session -e` while dropping any same-keyed `environment` entry, which would otherwise shadow them via the shell-assignment prefix.
+Minted pairs override the static `environment` list in both views. Structured view uses process environment; terminal view uses `tmux new-session -e` and drops conflicting shell-assignment prefixes.
 
-On secrecy, the terminal view is better than the static `environment` list but not airtight: a static entry becomes a shell-assignment prefix on the pane command and is therefore visible in `ps` for the pane's whole life, whereas a minted value rides `tmux new-session -e` instead, so it never enters the pane command's argv. That value is still not private, though: `tmux` stores it in the session's own environment for as long as the session exists, and any client with access to the tmux server can read it back with `tmux show-environment -t <session>`, so it is only as secret as access to that tmux server. For a value that must stay out of both argv and the tmux session environment, use a sandboxed session and `before_start`, which passes values to `docker` through the process environment.
+A minted terminal value stays out of the pane command's argv, unlike static `environment` entries. It remains readable through `tmux show-environment` by any client of that server. For values that must stay out of both argv and tmux environment, use a sandboxed session with `before_start`.
 
-The canonical use case is resolving *which* identity a session runs as at spawn time rather than pinning it in config: an account or provider switcher prints the config dir and endpoint for the account currently selected, refreshing a rotated token in the same step.
-
-```toml
-[host_hooks]
-before_session = ['my-account-switcher env --profile "$AOE_PROFILE"']
-```
-
-```text
-CLAUDE_CONFIG_DIR=/Users/me/.claude-accounts/profiles/work
-ANTHROPIC_BASE_URL=http://127.0.0.1:8317
-```
+For example, an account switcher can print `CLAUDE_CONFIG_DIR=/absolute/account/path` and an endpoint for the account selected at launch.
 
 Scope note: `before_session` applies to the **agent** launch, matching the static `environment` list. A plain tool session (the extra shell terminal in a session) is not an agent launch and does not run it.
 
 The command's environment carries:
 
-- **Lifecycle vars:** `AOE_SESSION_ID`, `AOE_SESSION_TITLE`, `AOE_PROJECT_PATH`, `AOE_PROFILE`, `AOE_TOOL`, `AOE_GROUP_PATH`, `AOE_SESSION_BRANCH` (worktree sessions only), and `AOE_REPO_SLUG` (the `owner/repo` of the project's `origin` remote, when it parses; useful for minting a repo-scoped credential without parsing the path yourself). In the structured view `before_session` receives the subset available at that spawn site: `AOE_SESSION_ID`, `AOE_PROFILE`, `AOE_TOOL`, and `AOE_PROJECT_PATH`.
-- **The session's sandbox environment** (`before_start` only), so a per-session value reaches the hook. Set `TEST_VAR=foo` in the session's sandbox env (the new-session dialog's env list accepts `KEY=VALUE`), and the hook reads `$TEST_VAR`; a different session can set a different value. This is the per-session input channel (the host process env, e.g. `TEST_VAR=foo aoe add ...`, only varies per CLI invocation, so in the long-running TUI it would otherwise be fixed for every session). This env is resolved from the per-session list (or profile/global `sandbox.environment`) but **not** from a repo's `.agent-of-empires/config.toml`, keeping the same host/repo trust boundary as `host_hooks` itself.
-
-The canonical use case is per-session, repo-scoped, short-lived credentials: mint a one-hour, single-repo token on the host (where the broad credential lives) and inject only the narrow token, so the minting tool and host credential never enter the container.
+- **Lifecycle variables:** `AOE_SESSION_ID`, `AOE_SESSION_TITLE`, `AOE_PROJECT_PATH`, `AOE_PROFILE`, `AOE_TOOL`, `AOE_GROUP_PATH`, `AOE_SESSION_BRANCH` for worktrees, and `AOE_REPO_SLUG` when the origin remote parses as `owner/repo`. Structured `before_session` receives the available subset: ID, profile, tool and project path.
+- **Sandbox input** (`before_start` only): the session's environment, or its effective profile/global `sandbox.environment`. Set per-session values in the new-session dialog. Repo config cannot supply this host-hook input.
 
 `host_hooks` is **global/profile only**: it is never honored from a repo's `.agent-of-empires/config.toml`, because a checked-out repository must not be able to run host commands. Declare it in your global or profile `config.toml`.
 
@@ -555,12 +477,12 @@ vt_live = true
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `status_bar` | `"auto"` | Paints aoe's themed status bar (session title, branch, sandbox, detach hint) on its own sessions. `"auto"` steps aside whenever you have a tmux config at all, because the bar is a whole theme rather than one option and a half-merge of yours with aoe's would please nobody; `"enabled"` always paints it; `"disabled"` never does. Not painting it reverts aoe's session-scoped `status*` overrides so your own config governs, so `"disabled"` means "stop styling the bar", not "hide it". |
-| `mouse` | `"auto"` | Sets tmux `mouse` on aoe's sessions, which is what turns a wheel scroll (or the Web dashboard's touch scroll) into tmux copy-mode scrollback. `"auto"` leaves the option untouched when your own tmux config sets `mouse`, so your `set -g mouse ...` governs, and enables it otherwise (including when your tmux config exists but never mentions `mouse`, since tmux's own default is off). `"enabled"` always turns it on; `"disabled"` always turns it off, for aoe's sessions only. |
-| `clipboard` | `"auto"` | Forwards OSC 52 clipboard escape sequences from the wrapped agent (Claude Code, OpenCode, Codex, etc.) to your terminal or Web dashboard. Without this, "select to copy" inside the agent silently fails. Sets `set-clipboard on` and `allow-passthrough on` for the aoe session (the attached path), and in live-send aoe extracts OSC 52 from either the VT stream or a terminal snapshot's raw observer before pushing it to the native or browser clipboard. `"auto"` steps aside only when your own tmux config sets one of those two options, the same per-option rule as `mouse`; `"enabled"` always applies them; `"disabled"` never does. Live-send forwarding is on for `"auto"` and `"enabled"` (your tmux config cannot affect aoe's in-process transport, so `"auto"` does not defer to it here); `"disabled"` turns it off. |
+| `status_bar` | `"auto"` | Paint AoE's themed status bar on its sessions. `"auto"` defers whenever you have a tmux config; `"enabled"` always paints it. `"disabled"` reverts AoE's session-scoped `status*` overrides so your config governs, rather than hiding the bar. |
+| `mouse` | `"auto"` | Enable copy-mode scrolling on AoE sessions. `"auto"` defers only when your tmux config sets `mouse`, and enables it otherwise; `"enabled"` always enables it and `"disabled"` disables it. |
+| `clipboard` | `"auto"` | Forward OSC 52 clipboard writes to your terminal or dashboard using `set-clipboard on` and `allow-passthrough on`. `"auto"` defers to each option in your tmux config; `"enabled"` always sets them. Live-send forwarding stays on for both modes regardless of tmux config. `"disabled"` turns forwarding off. |
 
 Detection for the per-option modes (`mouse`, `clipboard`) reads `~/.tmux.conf`, `$XDG_CONFIG_HOME/tmux/tmux.conf`, and `~/.config/tmux/tmux.conf`, looking for a `set` / `setw` of the option. It is deliberately conservative: an option reached via `source-file`, wrapped in `if-shell`, guarded by a false `%if`, or set from inside a key binding (`bind m set -g mouse`) is not detected, and aoe applies its own value. Set the mode to `"disabled"` if you keep yours in one of those places. `/etc/tmux.conf` is not consulted; it is not your file.
-| `socket_name` | unset | Run aoe's sessions on a private tmux server with this socket name (passed as `tmux -L <name>`), so your own `tmux ls` and hand-managed sessions stay separate from aoe's. Leave unset to share the default tmux server (the current behavior). Must be a bare name, not a path; a value with a `/` or `\` is ignored. Takes effect on the next aoe start. Global/profile only. |
+| `socket_name` | unset | Private tmux server name (`tmux -L <name>`), separating AoE from hand-managed sessions. Leave unset to share the default server. Bare names only; `/` or `\` is ignored. Applied at the next AoE start. Global/profile only. |
 | `vt_live` | `true` | Render agent previews and the web dashboard's agent terminal from a persistent VT channel: `tmux pipe-pane` streams the pane into an in-process terminal grid, and on tmux 3.8 or newer keystrokes go back over the same socket (older tmux keeps `send-keys`). The paired host and container shells and every fallback keep tmux's rendered `capture-pane` snapshots to avoid prompt-paint races; there a raw observer retains OSC 52 clipboard forwarding without affecting rendering. A split window is composited from `capture-pane` snapshots, with the TUI preview keeping pane 0 on its VT grid. Disabling this setting puts every surface on the slower `capture-pane` / `send-keys` path. Applies in place on the next TUI capture cycle. |
 
 ## systemd
@@ -662,7 +584,7 @@ See [Tool Sessions](tool-sessions.md) for the full reference, hotkey rules, and 
 
 ## Profiles
 
-Profiles provide separate workspaces with their own sessions and groups. Each profile can override any of the settings above. Press `P` in the TUI to choose from the last applied daemon profile list. Reopen the picker to see changes synchronized after it opened. If the selected profile disappears, its filter stays selected; choose `all` to display the remaining profiles.
+Profiles have separate sessions, groups, and overrides of profile-overridable settings. Press `P` in the TUI to choose from the last applied Daemon profile list. Reopen it to see later changes. A removed profile stays selected until you choose another filter; choose `all` to see remaining profiles.
 
 ```bash
 aoe                 # Uses "default" profile

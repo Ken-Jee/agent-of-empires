@@ -34,6 +34,8 @@ native and dashboard failures consistently. Settings > Logging exposes server,
 migration and process areas; clearing one override restores inheritance without
 clearing other targets.
 
+Filter changes saved in Settings > Logging apply to the TUI, running daemon and structured runners in the same app namespace. Sink and rotation changes require restart. No-op and unrelated saves preserve temporary runtime filters.
+
 Debug builds are isolated from installed release state:
 
 | Resource | Release and `dev-release` | Debug |

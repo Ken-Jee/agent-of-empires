@@ -55,23 +55,6 @@ pub(crate) fn resolve_client_ip(
     socket_ip
 }
 
-fn is_local_trusted(
-    client_ip: IpAddr,
-    headers: &axum::http::HeaderMap,
-    behind_ingress: bool,
-) -> bool {
-    !behind_ingress
-        && client_ip.is_loopback()
-        && ![
-            "cf-connecting-ip",
-            "x-forwarded-for",
-            "forwarded",
-            "x-real-ip",
-        ]
-        .iter()
-        .any(|header| headers.contains_key(*header))
-}
-
 /// Build a Set-Cookie header value with optional Secure flag for HTTPS tunnels.
 fn build_cookie(token: &str, secure: bool, max_age_secs: u64) -> String {
     let mut cookie = format!(
@@ -179,7 +162,12 @@ fn normalize_path(path: &str) -> &str {
 /// Whether a path is served to programs, which get a JSON `401` rather than a redirect to the
 /// login page when unauthenticated.
 fn is_machine_endpoint(path: &str) -> bool {
-    path.starts_with("/api/") || path.contains("/ws") || path == "/mcp" || path.starts_with("/mcp/")
+    let path = path.trim_end_matches('/');
+    path.starts_with("/api/")
+        || path.contains("/ws")
+        || (path.starts_with("/sessions/") && path.ends_with("/live-ws"))
+        || path == "/mcp"
+        || path.starts_with("/mcp/")
 }
 
 /// Whether a request path is exempt from the passphrase session + device-binding check.
@@ -205,74 +193,6 @@ fn is_login_session_exempt(path: &str) -> bool {
 /// for a session-authenticated request.
 fn should_refresh_session_cookie(path: &str) -> bool {
     !is_login_session_exempt(path)
-}
-
-/// Decision for the post-token branch of `auth_middleware`.
-#[derive(Debug, PartialEq, Eq)]
-enum PostTokenAuthAction {
-    /// Pass the request through to the next layer.
-    Bypass,
-    /// Return a `login_required` response so the SPA pops the
-    /// passphrase prompt (or redirects to `/login` for HTML).
-    RequireLogin,
-}
-
-/// Resolve the post-token branch decision.
-fn post_token_auth_action(
-    login_enabled: bool,
-    login_exempt: bool,
-    loopback_trusted: bool,
-) -> PostTokenAuthAction {
-    if !login_enabled || login_exempt {
-        return PostTokenAuthAction::Bypass;
-    }
-    if loopback_trusted {
-        PostTokenAuthAction::Bypass
-    } else {
-        PostTokenAuthAction::RequireLogin
-    }
-}
-
-/// Decision for the entry of `run_passphrase_wall`.
-#[derive(Debug, PartialEq, Eq)]
-enum PassphraseWallEntryAction {
-    /// Path is in the login-bootstrap allow-list.
-    BypassExempt,
-    /// Caller is on loopback and no external ingress fronts the daemon.
-    BypassLoopback,
-    /// Run the full session + device-binding + elevation flow.
-    Continue,
-}
-
-/// Resolve the entry decision for `run_passphrase_wall`.
-fn passphrase_wall_entry_action(path: &str, loopback_trusted: bool) -> PassphraseWallEntryAction {
-    if is_login_session_exempt(path) {
-        return PassphraseWallEntryAction::BypassExempt;
-    }
-    if loopback_trusted {
-        return PassphraseWallEntryAction::BypassLoopback;
-    }
-    PassphraseWallEntryAction::Continue
-}
-
-/// Emit the passphrase-only loopback-bypass event.
-fn log_loopback_bypass_passphrase(client_ip: IpAddr, path: &str) {
-    tracing::debug!(
-        target: "auth.passphrase",
-        ip = %client_ip,
-        path = %path,
-        "loopback bypass: skipping passphrase factor in passphrase-only mode"
-    );
-}
-
-/// Emit the token-mode loopback-bypass event.
-fn log_loopback_bypass_token(client_ip: IpAddr, path: &str) {
-    tracing::debug!(
-        target: "auth",
-        ip = %client_ip,
-        path = %path,
-        "loopback bypass: valid token + loopback peer; skipping passphrase factor"
-    );
 }
 
 /// Whether a request path + method needs an elevated login session (step-up auth, 15-minute
@@ -370,33 +290,21 @@ pub struct AuthenticatedTokenHash(pub [u8; 32]);
 #[derive(Clone, Debug)]
 pub struct AuthenticatedSession(pub String);
 
-/// Request extension marking a request whose resolved client IP is loopback (see
-/// `is_local_trusted`).
-#[derive(Clone, Copy, Debug)]
-pub struct LoopbackTrusted;
-
-/// Request extension carrying the authorization grounded in the accepted
-/// connection, independent of browser credentials. `LoopbackTrusted` answers
-/// "is this the same host"; this answers "is this the same *process*", which
-/// is what a Unix-socket peer proves and a loopback TCP bearer client does
-/// not. Handlers that gate a secret-bearing capability read this one.
+/// Kernel-authenticated owner authority from the Unix listener.
 #[derive(Clone, Copy, Debug)]
 pub enum LocalAuthorization {
     /// The peer on the daemon's Unix socket, with its uid from the kernel.
     UnixOwner(u32),
-    /// Same host, different identity: any process that can open a loopback
-    /// socket, including a browser client holding a bearer token.
-    TcpLoopback,
 }
 
 /// Pure elevation decision, extracted so the matrix is unit-testable without standing up
 /// `AppState`.
 fn elevation_verdict(
     login_enabled: bool,
-    loopback_trusted: bool,
+    local_owner: bool,
     session_elevated: Option<bool>,
 ) -> bool {
-    if !login_enabled || loopback_trusted {
+    if !login_enabled || local_owner {
         return true;
     }
     session_elevated.unwrap_or(false)
@@ -406,7 +314,7 @@ fn elevation_verdict(
 pub(crate) async fn handler_elevated(
     state: &AppState,
     session: Option<&AuthenticatedSession>,
-    loopback_trusted: bool,
+    local_owner: bool,
 ) -> bool {
     let session_elevated = match session {
         Some(AuthenticatedSession(id)) => Some(state.login_manager.is_elevated(id).await),
@@ -414,7 +322,7 @@ pub(crate) async fn handler_elevated(
     };
     elevation_verdict(
         state.login_manager.is_enabled(),
-        loopback_trusted,
+        local_owner,
         session_elevated,
     )
 }
@@ -478,19 +386,13 @@ async fn run_passphrase_wall(
     state: &AppState,
     request: Request,
     client_ip: IpAddr,
-    loopback_trusted: bool,
     next: Next,
 ) -> Response {
     let path = request.uri().path().to_string();
     let method = request.method().clone();
 
-    match passphrase_wall_entry_action(&path, loopback_trusted) {
-        PassphraseWallEntryAction::BypassExempt => return next.run(request).await,
-        PassphraseWallEntryAction::BypassLoopback => {
-            log_loopback_bypass_passphrase(client_ip, &path);
-            return next.run(request).await;
-        }
-        PassphraseWallEntryAction::Continue => {}
+    if is_login_session_exempt(&path) {
+        return next.run(request).await;
     }
 
     let session_id = super::login::extract_login_session(&request);
@@ -593,10 +495,6 @@ pub async fn auth_middleware(
     };
     let client_ip = resolve_client_ip(addr, request.headers(), state.behind_tunnel);
 
-    let loopback_trusted = is_local_trusted(client_ip, request.headers(), state.behind_tunnel);
-    if loopback_trusted {
-        request.extensions_mut().insert(LoopbackTrusted);
-    }
     if let Some(uid) = peer_uid {
         // The socket's owner is identified by the kernel, not by anything the
         // caller can present, so it needs none of the credential branches and
@@ -605,10 +503,6 @@ pub async fn auth_middleware(
             .extensions_mut()
             .insert(LocalAuthorization::UnixOwner(uid));
         return next.run(request).await;
-    } else if loopback_trusted {
-        request
-            .extensions_mut()
-            .insert(LocalAuthorization::TcpLoopback);
     }
 
     // Trace structured view ws specifically so we can see whether the browser ever reached
@@ -646,7 +540,7 @@ pub async fn auth_middleware(
             request
                 .extensions_mut()
                 .insert(AuthenticatedTokenHash([0u8; 32]));
-            return run_passphrase_wall(&state, request, client_ip, loopback_trusted, next).await;
+            return run_passphrase_wall(&state, request, client_ip, next).await;
         }
         NO_AUTH_LOGGED.call_once(|| {
             tracing::info!(
@@ -798,42 +692,34 @@ pub async fn auth_middleware(
         matches!(source, TokenSource::QueryParam | TokenSource::Bearer) || needs_upgrade;
 
     let login_exempt = is_login_session_exempt(&path);
-    match post_token_auth_action(login_enabled, login_exempt, loopback_trusted) {
-        PostTokenAuthAction::Bypass => {
-            if login_enabled && !login_exempt && loopback_trusted {
-                log_loopback_bypass_token(client_ip, &path);
+    if login_enabled && !login_exempt {
+        tracing::warn!(
+            target: "auth",
+            ip = %client_ip,
+            path = %path,
+            had_session_cookie = presented_session_id.is_some(),
+            had_device_binding = presented_binding.is_some(),
+            "valid token but no session on non-login-exempt path; returning login_required"
+        );
+        if is_machine_endpoint(&path) {
+            return (
+                StatusCode::UNAUTHORIZED,
+                axum::Json(serde_json::json!({
+                    "error": "login_required",
+                    "message": "Passphrase login required"
+                })),
+            )
+                .into_response();
+        } else {
+            let mut response = axum::response::Redirect::temporary("/login").into_response();
+            if should_attach_token {
+                attach_token_headers(&mut response, &state).await;
             }
-        }
-        PostTokenAuthAction::RequireLogin => {
-            tracing::warn!(
-                target: "auth",
-                ip = %client_ip,
-                path = %path,
-                had_session_cookie = presented_session_id.is_some(),
-                had_device_binding = presented_binding.is_some(),
-                "valid token but no session on non-login-exempt path; returning login_required"
-            );
-            if is_machine_endpoint(&path) {
-                return (
-                    StatusCode::UNAUTHORIZED,
-                    axum::Json(serde_json::json!({
-                        "error": "login_required",
-                        "message": "Passphrase login required"
-                    })),
-                )
-                    .into_response();
-            } else {
-                let mut response = axum::response::Redirect::temporary("/login").into_response();
-                if should_attach_token {
-                    attach_token_headers(&mut response, &state).await;
-                }
-                return response;
-            }
+            return response;
         }
     }
 
-    // Bootstrap path (login enabled + /login, /api/login, etc.), token-only mode, or
-    // loopback bypass per the match above.
+    // Bootstrap routes and token-only mode have no passphrase session requirement.
     let mut response = next.run(request).await;
     if should_attach_token {
         attach_token_headers(&mut response, &state).await;
@@ -871,11 +757,7 @@ async fn handle_session_authenticated(
     let path = request.uri().path().to_string();
     let method = request.method().clone();
 
-    // Loopback callers skip the step-up gate even with a session.
-    if requires_elevation(&method, &path)
-        && request.extensions().get::<LoopbackTrusted>().is_none()
-        && !state.login_manager.is_elevated(&session_id).await
-    {
+    if requires_elevation(&method, &path) && !state.login_manager.is_elevated(&session_id).await {
         tracing::info!(
             target: "auth.passphrase",
             ip = %client_ip,
@@ -913,36 +795,6 @@ async fn handle_session_authenticated(
 mod tests {
     use super::*;
 
-    // Records (level, target) for every event so the loopback-bypass
-    // helpers' log level is assertable without standing up the full
-    // axum middleware (AppState is too heavy to build in a unit test).
-    #[derive(Clone, Default)]
-    struct LevelCapture(std::sync::Arc<std::sync::Mutex<Vec<(tracing::Level, String)>>>);
-
-    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for LevelCapture {
-        fn on_event(
-            &self,
-            event: &tracing::Event<'_>,
-            _ctx: tracing_subscriber::layer::Context<'_, S>,
-        ) {
-            let meta = event.metadata();
-            self.0
-                .lock()
-                .unwrap()
-                .push((*meta.level(), meta.target().to_string()));
-        }
-    }
-
-    fn capture_events(f: impl FnOnce()) -> Vec<(tracing::Level, String)> {
-        use tracing_subscriber::layer::SubscriberExt;
-        let capture = LevelCapture::default();
-        let events = capture.0.clone();
-        let subscriber = tracing_subscriber::registry::Registry::default().with(capture);
-        tracing::subscriber::with_default(subscriber, f);
-        let recorded = events.lock().unwrap();
-        recorded.clone()
-    }
-
     fn build_request_with_headers(headers: Vec<(&'static str, &'static str)>) -> Request {
         let mut builder = Request::builder().uri("/api/sessions");
         for (name, value) in headers {
@@ -953,21 +805,6 @@ mod tests {
 
     fn ip(s: &str) -> IpAddr {
         s.parse().unwrap()
-    }
-
-    /// #1647: a loopback bypass is routine, so it must not be louder than debug.
-    #[test]
-    fn loopback_bypass_logs_at_debug() {
-        let at = ip("127.0.0.1");
-        let debug = |target: &str| vec![(tracing::Level::DEBUG, target.to_string())];
-        assert_eq!(
-            capture_events(|| log_loopback_bypass_passphrase(at, "/api/sessions")),
-            debug("auth.passphrase")
-        );
-        assert_eq!(
-            capture_events(|| log_loopback_bypass_token(at, "/api/sessions")),
-            debug("auth")
-        );
     }
 
     #[test]
@@ -1023,141 +860,131 @@ mod tests {
             ip("192.168.1.100"),
             "a remote peer cannot forge its own origin"
         );
-
-        for local in ["127.0.0.1", "::1"] {
-            assert!(
-                is_local_trusted(ip(local), &axum::http::HeaderMap::new(), false),
-                "{local}"
-            );
-        }
-        for remote in ["192.168.1.50", "100.64.0.5", "203.0.113.10"] {
-            assert!(
-                !is_local_trusted(ip(remote), &axum::http::HeaderMap::new(), false),
-                "{remote}"
-            );
-        }
     }
 
-    /// Full matrix of the handler-side elevation decision.
     #[test]
-    fn elevation_verdict_matrix() {
-        // (login_enabled, loopback, session elevated, expected)
-        let cases = [
-            // Login disabled: elevation does not exist as a concept.
+    fn elevation_requires_owner_authority_or_an_elevated_session() {
+        for (enabled, owner, elevated, expected) in [
             (false, false, None, true),
-            (false, true, None, true),
-            // Loopback is trusted whatever the session says.
             (true, true, None, true),
             (true, true, Some(false), true),
-            (true, true, Some(true), true),
-            // Remote with login enabled: only an elevated session passes.
             (true, false, None, false),
             (true, false, Some(false), false),
             (true, false, Some(true), true),
-        ];
-        for (enabled, loopback, elevated, want) in cases {
-            assert_eq!(
-                elevation_verdict(enabled, loopback, elevated),
-                want,
-                "enabled={enabled} loopback={loopback} elevated={elevated:?}"
-            );
+        ] {
+            assert_eq!(elevation_verdict(enabled, owner, elevated), expected);
         }
     }
 
-    #[test]
-    fn post_token_auth_action_matrix() {
-        use PostTokenAuthAction::*;
-        // (login_enabled, login_exempt, client ip, expected)
-        let cases = [
-            (false, false, "127.0.0.1", Bypass),
-            (false, false, "100.64.0.5", Bypass),
-            (true, true, "127.0.0.1", Bypass),
-            (true, true, "100.64.0.5", Bypass),
-            (true, false, "127.0.0.1", Bypass),
-            (true, false, "::1", Bypass),
-            (true, false, "100.64.0.5", RequireLogin),
-        ];
-        for (enabled, exempt, client, want) in cases {
-            assert_eq!(
-                post_token_auth_action(
-                    enabled,
-                    exempt,
-                    is_local_trusted(ip(client), &axum::http::HeaderMap::new(), false)
-                ),
-                want,
-                "enabled={enabled} exempt={exempt} ip={client}"
-            );
-        }
-        assert_eq!(
-            post_token_auth_action(
-                true,
-                false,
-                is_local_trusted(ip("127.0.0.1"), &axum::http::HeaderMap::new(), true)
-            ),
-            RequireLogin,
-            "loopback behind an ingress must not bypass the login"
-        );
-    }
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn tcp_never_inherits_unix_owner_login_or_elevation_authority() {
+        use crate::server::login::LoginManager;
+        use tower::ServiceExt;
 
-    #[test]
-    fn passphrase_wall_entry_action_matrix() {
-        use PassphraseWallEntryAction::*;
-        // (path, client ip, behind_ingress, expected)
-        let cases = [
-            ("/api/sessions", "127.0.0.1", false, BypassLoopback),
-            ("/sessions/abc/acp/ws", "127.0.0.1", false, BypassLoopback),
-            ("/api/settings", "::1", false, BypassLoopback),
-            ("/api/sessions", "100.64.0.5", false, Continue),
-            ("/sessions/abc/acp/ws", "100.64.0.5", false, Continue),
-            ("/login", "100.64.0.5", false, BypassExempt),
-            ("/api/login", "100.64.0.5", false, BypassExempt),
-            ("/assets/index.css", "127.0.0.1", false, BypassExempt),
-            ("/api/sessions", "127.0.0.1", true, Continue),
-            ("/sessions/abc/acp/ws", "::1", true, Continue),
-            ("/api/login", "127.0.0.1", true, BypassExempt),
-        ];
-        for (path, client, ingress, want) in cases {
-            assert_eq!(
-                passphrase_wall_entry_action(
-                    path,
-                    is_local_trusted(ip(client), &axum::http::HeaderMap::new(), ingress)
-                ),
-                want,
-                "path={path} ip={client} ingress={ingress}"
-            );
-        }
-    }
-
-    #[test]
-    fn forwarding_metadata_never_grants_direct_loopback_authorization() {
-        for client in ["127.0.0.1", "::1"] {
-            for header in [
-                "cf-connecting-ip",
-                "x-forwarded-for",
-                "forwarded",
-                "x-real-ip",
-            ] {
-                for value in ["", "invalid", "203.0.113.5"] {
-                    let mut headers = axum::http::HeaderMap::new();
-                    headers.insert(
-                        axum::http::HeaderName::from_static(header),
-                        value.parse().unwrap(),
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(home.path());
+        for token in [None, Some("test-token")] {
+            for ingress in [false, true] {
+                let state =
+                    crate::server::test_support::build_test_app_state_with_policy_configured(
+                        Vec::new(),
+                        vec!["localhost".into()],
+                        Vec::new(),
+                        token.map(str::to_string),
+                        |state| {
+                            state.login_manager = Arc::new(LoginManager::new(Some("passphrase")));
+                            state.behind_tunnel = ingress;
+                        },
                     );
-                    for ingress in [false, true] {
-                        let trusted = is_local_trusted(ip(client), &headers, ingress);
-                        assert!(!trusted, "{client} {header}={value:?} ingress={ingress}");
+                let app = crate::server::test_support::build_router_for_test(state);
+                for forwarded in [
+                    None,
+                    Some(("x-forwarded-for", "203.0.113.5")),
+                    Some(("forwarded", "invalid")),
+                    Some(("x-real-ip", "")),
+                    Some(("cf-connecting-ip", "127.0.0.1")),
+                ] {
+                    for address in ["127.0.0.1:1234", "[::1]:1234"] {
+                        let mut request = Request::builder()
+                            .uri("/api/sessions")
+                            .header("host", "localhost");
+                        if let Some(token) = token {
+                            request = request.header("authorization", format!("Bearer {token}"));
+                        }
+                        if let Some((name, value)) = forwarded {
+                            request = request.header(name, value);
+                        }
+                        let mut request = request.body(axum::body::Body::empty()).unwrap();
+                        request.extensions_mut().insert(ConnectInfo(
+                            super::super::peer::ConnectionPeer::Tcp(address.parse().unwrap()),
+                        ));
                         assert_eq!(
-                            passphrase_wall_entry_action("/api/sessions", trusted),
-                            PassphraseWallEntryAction::Continue
+                            app.clone().oneshot(request).await.unwrap().status(),
+                            StatusCode::UNAUTHORIZED,
+                            "{address} ingress={ingress} forwarded={forwarded:?}"
                         );
-                        assert_eq!(
-                            post_token_auth_action(true, false, trusted),
-                            PostTokenAuthAction::RequireLogin
-                        );
-                        assert!(!elevation_verdict(true, trusted, None));
                     }
                 }
+                let mut request = Request::builder()
+                    .uri("/api/about")
+                    .header("host", "localhost")
+                    .body(axum::body::Body::empty())
+                    .unwrap();
+                request.extensions_mut().insert(ConnectInfo(
+                    super::super::peer::ConnectionPeer::UnixOwner {
+                        uid: crate::process::effective_uid(),
+                    },
+                ));
+                assert_eq!(app.oneshot(request).await.unwrap().status(), StatusCode::OK);
             }
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn live_terminal_routes_require_machine_credentials() {
+        use tower::ServiceExt;
+
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(home.path());
+        for suffix in ["live-ws", "terminal/live-ws", "container-terminal/live-ws"] {
+            let state = crate::server::test_support::build_test_app_state_with_policy_configured(
+                Vec::new(),
+                vec!["localhost".into()],
+                Vec::new(),
+                Some("test-token".into()),
+                |_| {},
+            );
+            let app = crate::server::test_support::build_router_for_test(state);
+            for trailing in ["", "/"] {
+                for authorization in [None, Some("Bearer wrong-token")] {
+                    let mut request = Request::builder()
+                        .uri(format!("/sessions/missing/{suffix}{trailing}"))
+                        .header("host", "localhost");
+                    if let Some(authorization) = authorization {
+                        request = request.header("authorization", authorization);
+                    }
+                    let response = app
+                        .clone()
+                        .oneshot(request.body(axum::body::Body::empty()).unwrap())
+                        .await
+                        .unwrap();
+                    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+                }
+            }
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/about")
+                        .header("host", "localhost")
+                        .header("authorization", "Bearer test-token")
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
         }
     }
 

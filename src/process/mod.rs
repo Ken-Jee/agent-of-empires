@@ -22,6 +22,17 @@ mod linux;
 mod macos;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod unix;
+pub(crate) fn validate_recovery_file(file: &std::fs::File) -> anyhow::Result<()> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        unix::validate_recovery_file(file)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = file;
+        anyhow::bail!("Ownership recovery is unavailable on this platform")
+    }
+}
 
 #[cfg(target_os = "linux")]
 use linux as platform;
@@ -787,7 +798,9 @@ pub(crate) fn prime_processes(
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
+)]
 pub struct ProcessBirthIdentity {
     pub boot_id: String,
     pub start_id: String,

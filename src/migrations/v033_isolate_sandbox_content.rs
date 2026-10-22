@@ -5606,6 +5606,7 @@ mod tests {
         .unwrap();
         let original_identity = identity(&legacy).unwrap();
         let mut row = serde_json::to_value(&instance).unwrap();
+        row["terminal_handoff"] = serde_json::Value::Null;
         row["sandbox_store_generation"] = serde_json::json!(1);
         row["sandbox_info"] = serde_json::json!({"enabled": true, "image": "img", "container_name": "aoe-sandbox-fixture"});
         let registry = serde_json::to_vec(&vec![row]).unwrap();

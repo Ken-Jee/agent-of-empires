@@ -11,17 +11,6 @@ const TITLE: &str = "ResumeFallbackE2E";
 const FAKE_AGENT: &str = "claude";
 const STALE_SID: &str = "11111111-1111-4111-8111-111111111111";
 
-fn sessions_path(h: &TuiTestHarness) -> PathBuf {
-    crate::harness::app_dir_in(h.home_path()).join("profiles/default/sessions.json")
-}
-
-fn read_sessions(h: &TuiTestHarness) -> Value {
-    let path = sessions_path(h);
-    let content = fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("failed to read {}: {}", path.display(), e));
-    serde_json::from_str(&content).expect("invalid sessions JSON")
-}
-
 fn session_by_title<'a>(sessions: &'a Value, title: &str) -> &'a Value {
     sessions
         .as_array()
@@ -33,8 +22,8 @@ fn patch_session<F>(h: &TuiTestHarness, title: &str, patch: F)
 where
     F: FnOnce(&mut Map<String, Value>),
 {
-    let path = sessions_path(h);
-    let mut sessions = read_sessions(h);
+    let path = h.sessions_path();
+    let mut sessions = h.read_sessions();
     let row = sessions
         .as_array_mut()
         .and_then(|arr| arr.iter_mut().find(|s| s["title"].as_str() == Some(title)))

@@ -1455,11 +1455,115 @@ fn publish_canonical_snapshot(
 
 #[test]
 #[serial]
+fn canonical_peer_addition_preserves_live_send_and_drafts_when_active_row_is_hidden() {
+    let mut env = create_test_env_empty();
+    let active = local_row(&mut env, "active-live", "/tmp/active-live");
+    let active_id = active.id.clone();
+    seed_profile("test", std::slice::from_ref(&active));
+    let _native_driver = env.view.session_feed.terminal_driver_for_test();
+    publish_canonical_snapshot(
+        &mut env,
+        vec![canonical_row(&active, serde_json::json!({}))],
+        vec![],
+        1,
+    );
+    let native_lease = env.view.session_feed.native_lease_for_test();
+    assert!(native_lease.is_valid());
+    env.view.select_session_by_id(&active_id);
+    let tmux_name = crate::tmux::Session::resolve_name(&active_id, "active-live");
+    env.view.live_send = Some(live_send_state(&active_id, "active-live", &tmux_name));
+    env.view.pending_paste = Some("queued paste".into());
+    env.view.preview_capture_target = Some(tmux_name.clone());
+    env.view.live_send_last_resize = Some((100, 30));
+    env.view.trashed_section_collapsed = true;
+    env.view.search_active = true;
+    env.view.search_query = Input::new("peer-added".into());
+
+    let mut hidden = active.clone();
+    hidden.trash();
+    let mut peer = Instance::new("peer-added", "/tmp/peer-added");
+    peer.source_profile = "test".into();
+    seed_profile("test", &[hidden.clone(), peer.clone()]);
+    publish_canonical_snapshot(
+        &mut env,
+        vec![
+            canonical_row(&hidden, serde_json::json!({})),
+            canonical_row(&peer, serde_json::json!({})),
+        ],
+        vec![],
+        2,
+    );
+
+    let view = &env.view;
+    assert!(
+        native_lease.is_valid(),
+        "unchanged native authority remains live"
+    );
+    assert!(view
+        .get_instance(&active_id)
+        .is_some_and(Instance::is_trashed));
+    assert!(
+        !view
+            .flat_items
+            .iter()
+            .any(|item| matches!(item, Item::Session { id, .. } if id == &active_id)),
+        "precondition: the active row moved under the collapsed trash shelf"
+    );
+    assert_eq!(view.selected_session.as_deref(), Some(active_id.as_str()));
+    assert_eq!(view.pending_paste.as_deref(), Some("queued paste"));
+    assert_eq!(
+        view.preview_capture_target.as_deref(),
+        Some(tmux_name.as_str())
+    );
+    assert_eq!(view.live_send_last_resize, Some((100, 30)));
+    assert_eq!(
+        view.displayed_pane_tmux_name().as_deref(),
+        Some(tmux_name.as_str()),
+        "preview capture must stay pinned to the live-send pane"
+    );
+    let peer_index = view
+        .flat_items
+        .iter()
+        .position(|item| matches!(item, Item::Session { id, .. } if id == &peer.id))
+        .expect("peer row remains visible");
+    assert!(view.search_matches.contains(&peer_index));
+    assert!(
+        !view.is_sidebar_item_selected(&view.flat_items[peer_index], peer_index),
+        "cursor fallback must not visibly retarget selection during live-send"
+    );
+    let live = view.live_send.as_ref().expect("live-send remains active");
+    assert_eq!(
+        (
+            live.session_id.as_str(),
+            live.title.as_str(),
+            live.tmux_name.as_str()
+        ),
+        (active_id.as_str(), "active-live", tmux_name.as_str())
+    );
+    assert_eq!(
+        live.target,
+        crate::tui::home::live_send::LiveSendTarget::Agent
+    );
+}
+
+#[test]
+#[serial]
 fn canonical_revision_reloads_renames_moves_and_view_changes() {
     let mut env = create_test_env_empty();
     let instance = local_row(&mut env, "alpha", "/tmp/repo");
     let id = instance.id.clone();
     seed_profile("test", &env.view.cloned_instances());
+    let _native_driver = env.view.session_feed.terminal_driver_for_test();
+    publish_canonical_snapshot(
+        &mut env,
+        vec![canonical_row(&instance, serde_json::json!({}))],
+        vec![],
+        1,
+    );
+    env.view.select_session_by_id(&id);
+    let tmux_name = crate::tmux::Session::resolve_name(&id, &instance.title);
+    env.view.live_send = Some(live_send_state(&id, &instance.title, &tmux_name));
+    env.view.pending_paste = Some("rename draft".into());
 
     let mut renamed = instance.clone();
     renamed.title = "renamed".into();
@@ -1483,7 +1587,7 @@ fn canonical_revision_reloads_renames_moves_and_view_changes() {
         .expect("publish the canonical row on disk");
 
     let row = canonical_row(&renamed, serde_json::json!({}));
-    publish_canonical_snapshot(&mut env, vec![row], vec![], 1);
+    publish_canonical_snapshot(&mut env, vec![row], vec![], 2);
 
     let applied = env.view.get_instance(&id).expect("row survives");
     assert_eq!(applied.title, "renamed");
@@ -1501,6 +1605,15 @@ fn canonical_revision_reloads_renames_moves_and_view_changes() {
             .map(|worktree| worktree.branch.as_str()),
         Some("feature")
     );
+    assert!(env.view.session_feed.native_interaction_available());
+    assert!(
+        env.view.live_send.is_none(),
+        "canonical rename revokes the stale live target"
+    );
+    assert!(!env.view.is_live_send_capturing());
+    assert!(env.view.info_dialog.is_some());
+    assert_eq!(env.view.selected_session.as_deref(), Some(id.as_str()));
+    assert_eq!(env.view.pending_paste.as_deref(), Some("rename draft"));
 }
 
 #[test]
@@ -1510,6 +1623,20 @@ fn canonical_revision_drops_a_row_the_daemon_removed() {
     let kept = local_row(&mut env, "kept", "/tmp/kept");
     let removed = local_row(&mut env, "removed", "/tmp/removed");
     seed_profile("test", &env.view.cloned_instances());
+    let _native_driver = env.view.session_feed.terminal_driver_for_test();
+    publish_canonical_snapshot(
+        &mut env,
+        vec![
+            canonical_row(&kept, serde_json::json!({})),
+            canonical_row(&removed, serde_json::json!({})),
+        ],
+        vec![],
+        1,
+    );
+    env.view.select_session_by_id(&removed.id);
+    let tmux_name = crate::tmux::Session::resolve_name(&removed.id, &removed.title);
+    env.view.live_send = Some(live_send_state(&removed.id, &removed.title, &tmux_name));
+    env.view.pending_paste = Some("removal draft".into());
     Storage::new_unwatched("test")
         .unwrap()
         .update(|rows, _| {
@@ -1522,7 +1649,7 @@ fn canonical_revision_drops_a_row_the_daemon_removed() {
         &mut env,
         vec![canonical_row(&kept, serde_json::json!({}))],
         vec![],
-        1,
+        2,
     );
 
     assert!(env.view.get_instance(&kept.id).is_some());
@@ -1530,6 +1657,15 @@ fn canonical_revision_drops_a_row_the_daemon_removed() {
         env.view.get_instance(&removed.id).is_none(),
         "a row absent from the canonical revision must not linger"
     );
+    assert!(env.view.session_feed.native_interaction_available());
+    assert!(
+        env.view.live_send.is_none(),
+        "canonical removal revokes the stale live target"
+    );
+    assert!(!env.view.is_live_send_capturing());
+    assert!(env.view.info_dialog.is_some());
+    assert_eq!(env.view.selected_session.as_deref(), Some(kept.id.as_str()));
+    assert_eq!(env.view.pending_paste.as_deref(), Some("removal draft"));
 }
 
 #[test]
@@ -1640,9 +1776,11 @@ fn failed_snapshot_reload_retries_without_publication_and_acknowledges_order_onl
         assert_eq!(env.view.session_feed.next_revision_for_test(), 2);
         assert!(!env.view.session_feed.can_submit(&instance.id));
         assert_eq!(env.view.observed_workspace_ordering, before_order);
+        assert!(env.view.reload_failure_state.has_any_failure());
+        env.view.try_present_reload_failure_dialog();
         assert_eq!(
             env.view.info_dialog.as_ref().map(InfoDialog::title),
-            Some("Runtime state not applied")
+            Some("Reload Failed")
         );
         env.view.info_dialog = None;
         assert!(
@@ -1727,14 +1865,17 @@ fn a_newer_snapshot_supersedes_a_failed_reload_and_unavailable_discards_its_retr
             );
             assert_eq!(env.view.session_feed.next_revision_for_test(), 2);
         } else {
+            std::fs::write(&sessions_path, valid).unwrap();
+            assert!(env
+                .view
+                .session_feed_reload_retry_at
+                .is_some_and(|deadline| deadline > std::time::Instant::now()));
             publish_canonical_snapshot(
                 &mut env,
                 vec![canonical_row(&durable, serde_json::json!({}))],
                 vec![],
                 3,
             );
-            std::fs::write(&sessions_path, valid).unwrap();
-            env.view.session_feed_reload_retry_at = Some(std::time::Instant::now());
             env.view.apply_session_feed();
             assert_eq!(env.view.get_instance(&instance.id).unwrap().title, "latest");
             assert_eq!(env.view.session_feed.next_revision_for_test(), 4);
@@ -1766,11 +1907,11 @@ fn legacy_stop_confirmation_retains_the_original_exact_row_and_pane() {
     let pane = PaneObservation {
         state: PanePresence::Unknown,
         tmux_session: Some("captured-tool".into()),
-        legacy_tool: Some(LegacyToolIdentity {
+        legacy_tool: Some(observed_legacy_tool(LegacyToolIdentity {
             session_id: "$42".into(),
             pane_id: "%42".into(),
-            pane_pid: 4242,
-        }),
+            pane_pid: Some(4242),
+        })),
     };
     let row = canonical_row(
         &instance,
@@ -1784,18 +1925,22 @@ fn legacy_stop_confirmation_retains_the_original_exact_row_and_pane() {
     let captured = env.view.pending_stop_auxiliary.as_ref().unwrap().1.clone();
     assert_eq!(
         captured.adoption.as_ref().unwrap().identity,
-        pane.legacy_tool.unwrap()
+        pane.legacy_tool.as_ref().unwrap().identity
+    );
+    assert_eq!(
+        captured.adoption.as_ref().unwrap().server,
+        pane.legacy_tool.as_ref().unwrap().server
     );
     assert_eq!(captured.adoption.as_ref().unwrap().profile, "test");
     assert_eq!(captured.adoption.as_ref().unwrap().lifecycle_generation, 7);
     let replacement = PaneObservation {
         state: PanePresence::Unknown,
         tmux_session: Some("replacement-tool".into()),
-        legacy_tool: Some(LegacyToolIdentity {
+        legacy_tool: Some(observed_legacy_tool(LegacyToolIdentity {
             session_id: "$43".into(),
             pane_id: "%43".into(),
-            pane_pid: 4343,
-        }),
+            pane_pid: Some(4343),
+        })),
     };
     let row = canonical_row(
         &instance,
@@ -1831,15 +1976,16 @@ fn legacy_attach_live_send_and_send_require_confirmation_and_keep_its_capture() 
             let pane = PaneObservation {
                 state: PanePresence::Unknown,
                 tmux_session: Some("captured-tool".into()),
-                legacy_tool: Some(LegacyToolIdentity {
+                legacy_tool: Some(observed_legacy_tool(LegacyToolIdentity {
                     session_id: "$42".into(),
                     pane_id: "%42".into(),
-                    pane_pid: 4242,
-                }),
+                    pane_pid: Some(4242),
+                })),
             };
             let expected = crate::session::LegacyToolAdoption {
                 tmux_session: "captured-tool".into(),
-                identity: pane.legacy_tool.clone().unwrap(),
+                identity: pane.legacy_tool.as_ref().unwrap().identity.clone(),
+                server: pane.legacy_tool.as_ref().unwrap().server.clone(),
                 profile: "test".into(),
                 lifecycle_generation: 7,
             };
@@ -1881,11 +2027,11 @@ fn legacy_attach_live_send_and_send_require_confirmation_and_keep_its_capture() 
             let replacement = PaneObservation {
                 state: PanePresence::Unknown,
                 tmux_session: Some("replacement-tool".into()),
-                legacy_tool: Some(LegacyToolIdentity {
+                legacy_tool: Some(observed_legacy_tool(LegacyToolIdentity {
                     session_id: "$43".into(),
                     pane_id: "%43".into(),
-                    pane_pid: 4343,
-                }),
+                    pane_pid: Some(4343),
+                })),
             };
             let row = canonical_row(
                 &instance,
@@ -2087,9 +2233,9 @@ fn recovery_only_stop_never_adopts_current_legacy_replacement() {
                     pane: PaneObservation {
                         state: PanePresence::Unknown,
                         tmux_session: Some("current-legacy-replacement".into()),
-                        legacy_tool: Some(LegacyToolIdentity {
-                            session_id: "$42".into(), pane_id: "%42".into(), pane_pid: 4242,
-                        }),
+                        legacy_tool: Some(observed_legacy_tool(LegacyToolIdentity {
+                            session_id: "$42".into(), pane_id: "%42".into(), pane_pid: Some(4242),
+                        })),
                     },
                 }],
             }),
@@ -2129,5 +2275,890 @@ fn recovery_only_stop_never_adopts_current_legacy_replacement() {
         };
         assert_eq!(sent.target, target);
         assert!(sent.adoption.is_none());
+    }
+}
+
+#[test]
+#[serial]
+fn disk_ahead_reload_keeps_complete_model_and_newer_frame_applies_without_waiting() {
+    let mut env = create_test_env_empty();
+    let kept = local_row(&mut env, "kept", "/tmp/kept");
+    let removed = local_row(&mut env, "removed", "/tmp/removed");
+    seed_profile("test", &env.view.cloned_instances());
+    let _transport = env.view.session_feed.command_driver_for_test();
+    publish_canonical_snapshot(
+        &mut env,
+        vec![
+            canonical_row(&kept, serde_json::json!({})),
+            canonical_row(&removed, serde_json::json!({})),
+        ],
+        vec![],
+        1,
+    );
+    let before = serde_json::to_value(env.view.cloned_instances()).unwrap();
+    env.view.info_dialog = Some(InfoDialog::new("Draft Help", "keep this modal"));
+    env.view.pending_paste = Some("draft must survive".into());
+    Storage::new_unwatched("test")
+        .unwrap()
+        .update(|rows, _| {
+            rows.retain(|row| row.id != removed.id);
+            Ok(())
+        })
+        .unwrap();
+    env.view
+        .reload_storage_only()
+        .expect("routine disk-ahead reload is recoverable");
+    assert_eq!(
+        serde_json::to_value(env.view.cloned_instances()).unwrap(),
+        before
+    );
+    assert_eq!(env.view.info_dialog.as_ref().unwrap().title(), "Draft Help");
+    assert_eq!(
+        env.view.pending_paste.as_deref(),
+        Some("draft must survive")
+    );
+    assert_eq!(
+        env.view
+            .session_feed
+            .applied_snapshot()
+            .unwrap()
+            .cursor
+            .revision,
+        1
+    );
+    assert!(!env.view.try_present_reload_failure_dialog());
+    assert!(env
+        .view
+        .session_feed_reload_retry_at
+        .is_some_and(|deadline| deadline > std::time::Instant::now()));
+    publish_canonical_snapshot(
+        &mut env,
+        vec![canonical_row(&kept, serde_json::json!({}))],
+        vec![],
+        2,
+    );
+    assert!(env.view.get_instance(&removed.id).is_none());
+    assert_eq!(
+        env.view
+            .session_feed
+            .applied_snapshot()
+            .unwrap()
+            .cursor
+            .revision,
+        2
+    );
+    assert_eq!(env.view.info_dialog.as_ref().unwrap().title(), "Draft Help");
+    assert_eq!(
+        env.view.pending_paste.as_deref(),
+        Some("draft must survive")
+    );
+    assert!(
+        !env.view.apply_session_feed(),
+        "complete cursor is acknowledged once"
+    );
+}
+
+#[test]
+#[serial]
+fn persistent_metadata_lag_latches_across_revisions_without_focus_theft() {
+    let mut env = create_test_env_empty();
+    let row = local_row(&mut env, "row", "/tmp/repo");
+    seed_profile("test", &env.view.cloned_instances());
+    let _transport = env.view.session_feed.command_driver_for_test();
+    publish_canonical_snapshot(
+        &mut env,
+        vec![canonical_row(&row, serde_json::json!({}))],
+        vec![],
+        1,
+    );
+    seed_profile("test", &[]);
+    env.view.reload_storage_only().unwrap();
+    let first = env.view.canonical_metadata_lag.as_mut().unwrap();
+    first.first_seen = std::time::Instant::now() - HomeView::CANONICAL_RELOAD_RETRY_INTERVAL;
+    let first_seen = first.first_seen;
+    env.view.info_dialog = Some(InfoDialog::new("Other", "draft"));
+    publish_canonical_snapshot(
+        &mut env,
+        vec![canonical_row(&row, serde_json::json!({}))],
+        vec![],
+        2,
+    );
+    assert_eq!(
+        env.view.canonical_metadata_lag.as_ref().unwrap().first_seen,
+        first_seen
+    );
+    assert_eq!(
+        env.view
+            .session_feed
+            .applied_snapshot()
+            .unwrap()
+            .cursor
+            .revision,
+        1
+    );
+    assert!(!env.view.try_present_reload_failure_dialog());
+    assert_eq!(env.view.info_dialog.as_ref().unwrap().title(), "Other");
+    env.view.info_dialog = None;
+    assert!(env.view.try_present_reload_failure_dialog());
+    env.view.info_dialog = None;
+    env.view.session_feed_reload_retry_at = Some(std::time::Instant::now());
+    env.view.apply_session_feed();
+    assert!(
+        !env.view.try_present_reload_failure_dialog(),
+        "same failure burst stays acknowledged"
+    );
+}
+
+#[test]
+#[serial]
+fn snooze_refusal_preserves_target_duration_and_requires_explicit_resubmit() {
+    use crate::tui::dialogs::test_render::{draw, find};
+    for mouse in [false, true] {
+        let mut env = create_test_env_with_sessions(2);
+        let original = env.view.instance_at(0).id.clone();
+        let other = env.view.instance_at(1).id.clone();
+        let mut respond = env.view.session_feed.command_driver_for_test();
+        env.view.select_session_by_id(&original);
+        env.view
+            .session_feed
+            .submit(original.clone(), crate::daemon::SessionMutation::Stop)
+            .unwrap();
+        env.view.toggle_snooze_at_cursor().unwrap();
+        let bytes = payload_bytes("test");
+        if mouse {
+            let buffer = draw(110, 40, |frame, theme| {
+                env.view
+                    .render(frame, frame.area(), theme, None, None, None)
+            });
+            let (column, row) = find(&buffer, "2 hours");
+            assert!(env.view.handle_dialog_click(column, row));
+        } else {
+            env.view.handle_key(key(KeyCode::Char('2')), None);
+        }
+        assert_eq!(
+            env.view.pending_snooze_session.as_deref(),
+            Some(original.as_str())
+        );
+        assert!(env.view.snooze_duration_dialog.is_some());
+        assert_eq!(payload_bytes("test"), bytes);
+        let buffer = draw(110, 40, |frame, theme| {
+            env.view
+                .render(frame, frame.area(), theme, None, None, None)
+        });
+        find(&buffer, "Snooze Not Changed");
+        let (submitted, _) = respond(Err("held operation rejected".into())).unwrap();
+        assert_eq!(submitted, original);
+        env.view.apply_session_feed();
+        env.view.select_session_by_id(&other);
+        let buffer = draw(110, 40, |frame, theme| {
+            env.view
+                .render(frame, frame.area(), theme, None, None, None)
+        });
+        find(&buffer, "Runtime change");
+        if mouse {
+            let (column, row) = find(&buffer, "[OK]");
+            assert!(env.view.handle_dialog_click(column, row));
+        } else {
+            env.view.handle_key(key(KeyCode::Enter), None);
+        }
+        assert!(
+            env.view.info_dialog.is_none(),
+            "visible held-command error was acknowledged through actual input"
+        );
+        assert!(env.view.snooze_duration_dialog.is_some());
+        let buffer = draw(110, 40, |frame, theme| {
+            env.view
+                .render(frame, frame.area(), theme, None, None, None)
+        });
+        find(&buffer, "Snooze Not Changed");
+        if mouse {
+            let (column, row) = find(&buffer, "[OK]");
+            assert!(env.view.handle_dialog_click(column, row));
+        } else {
+            env.view.handle_key(key(KeyCode::Enter), None);
+        }
+        assert!(
+            env.view.snooze_duration_dialog.is_some(),
+            "acknowledging refusal retains duration and target"
+        );
+        assert!(respond(Err("must not submit".into())).is_none());
+        env.view.handle_key(key(KeyCode::Enter), None);
+        let (submitted, mutation) = respond(Err("test completion".into())).unwrap();
+        assert_eq!(submitted, original);
+        assert!(
+            matches!(mutation, crate::daemon::SessionMutation::Snooze(body) if body.minutes == Some(120))
+        );
+        assert!(env.view.snooze_duration_dialog.is_none());
+    }
+}
+
+fn diff_admission_fixture() -> (TestEnv, String, tempfile::TempDir) {
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instance_at(0).id.clone();
+    let temporary = tempfile::tempdir().unwrap();
+    let repository = git2::Repository::init(temporary.path()).unwrap();
+    repository.set_head("refs/heads/main").unwrap();
+    std::fs::write(temporary.path().join("draft.txt"), "base\n").unwrap();
+    let mut index = repository.index().unwrap();
+    index.add_path(std::path::Path::new("draft.txt")).unwrap();
+    let tree_id = index.write_tree().unwrap();
+    let tree = repository.find_tree(tree_id).unwrap();
+    let signature = git2::Signature::now("Test", "test@example.invalid").unwrap();
+    let commit = repository
+        .commit(Some("HEAD"), &signature, &signature, "base", &tree, &[])
+        .unwrap();
+    repository
+        .branch("review", &repository.find_commit(commit).unwrap(), false)
+        .unwrap();
+    std::fs::write(temporary.path().join("draft.txt"), "changed\n").unwrap();
+    index.add_path(std::path::Path::new("draft.txt")).unwrap();
+    let changed_tree = repository.find_tree(index.write_tree().unwrap()).unwrap();
+    let parent = repository.find_commit(commit).unwrap();
+    repository
+        .commit(
+            Some("HEAD"),
+            &signature,
+            &signature,
+            "main-only change",
+            &changed_tree,
+            &[&parent],
+        )
+        .unwrap();
+    std::fs::write(
+        temporary.path().join("draft.txt"),
+        "unsaved comparison draft\n",
+    )
+    .unwrap();
+    let rows = env
+        .view
+        .cloned_instances()
+        .iter()
+        .map(|row| canonical_row(row, serde_json::json!({})))
+        .collect();
+    publish_canonical_snapshot(&mut env, rows, vec![], 1);
+    env.view.diff_view = Some(
+        crate::tui::diff::DiffView::new_for_session(
+            temporary.path().to_owned(),
+            Some(id.clone()),
+            "test".into(),
+            Some("main".into()),
+            None,
+        )
+        .unwrap(),
+    );
+    assert!(env
+        .view
+        .diff_view
+        .as_mut()
+        .unwrap()
+        .get_current_diff()
+        .unwrap()
+        .hunks
+        .iter()
+        .flat_map(|hunk| &hunk.lines)
+        .any(|line| line.old_line_num.is_some() && line.content.trim() == "changed"));
+    (env, id, temporary)
+}
+
+#[test]
+#[serial]
+fn diff_keyboard_and_mouse_refusal_are_visible_dismissible_and_keep_comparison() {
+    use crate::tui::dialogs::test_render::{draw, find};
+    for mouse in [false, true] {
+        let (mut env, id, _repo) = diff_admission_fixture();
+        let mut respond = env.view.session_feed.command_driver_for_test();
+        env.view
+            .session_feed
+            .submit(id.clone(), crate::daemon::SessionMutation::Stop)
+            .unwrap();
+        let bytes = payload_bytes("test");
+        env.view.handle_key(key(KeyCode::Char('b')), None);
+        let target = env
+            .view
+            .diff_view
+            .as_ref()
+            .unwrap()
+            .branch_select
+            .as_ref()
+            .unwrap()
+            .branches
+            .iter()
+            .position(|branch| branch == "review")
+            .unwrap();
+        if mouse {
+            draw(120, 40, |frame, theme| {
+                env.view
+                    .render(frame, frame.area(), theme, None, None, None)
+            });
+            let rect = env
+                .view
+                .diff_view
+                .as_ref()
+                .unwrap()
+                .branch_mouse
+                .rows
+                .iter()
+                .find(|(index, _)| *index == target)
+                .unwrap()
+                .1;
+            assert!(env.view.handle_dialog_click(rect.x, rect.y));
+        } else {
+            for _ in 0..target {
+                env.view.handle_key(key(KeyCode::Down), None);
+            }
+            env.view.handle_key(key(KeyCode::Enter), None);
+        }
+        let diff = env.view.diff_view.as_ref().unwrap();
+        assert_eq!(diff.base_branch, "review");
+        assert!(diff.base_unsaved);
+        assert!(env
+            .view
+            .diff_view
+            .as_mut()
+            .unwrap()
+            .get_current_diff()
+            .unwrap()
+            .hunks
+            .iter()
+            .flat_map(|hunk| &hunk.lines)
+            .any(|line| line.old_line_num.is_some() && line.content.trim() == "base"));
+        let buffer = draw(120, 40, |frame, theme| {
+            env.view
+                .render(frame, frame.area(), theme, None, None, None)
+        });
+        find(&buffer, "Diff Base Not Saved");
+        env.view.handle_key(key(KeyCode::Enter), None);
+        assert!(env
+            .view
+            .diff_view
+            .as_ref()
+            .unwrap()
+            .warning_dialog
+            .is_none());
+        let buffer = draw(120, 40, |frame, theme| {
+            env.view
+                .render(frame, frame.area(), theme, None, None, None)
+        });
+        find(&buffer, "[not saved]");
+        assert_eq!(payload_bytes("test"), bytes);
+        assert!(respond(Err("original pending stop".into())).is_some());
+        assert!(respond(Err("must not have submitted diff".into())).is_none());
+    }
+}
+
+#[test]
+#[serial]
+fn diff_save_uses_its_own_receipt_and_surfaces_rejection_or_unknown_in_takeover() {
+    use crate::tui::dialogs::test_render::{draw, find};
+    for outcome in ["saved", "rejected", "unknown"] {
+        let (mut env, id, _repo) = diff_admission_fixture();
+        let mut respond = env.view.session_feed.command_driver_for_test();
+        env.view
+            .diff_view
+            .as_mut()
+            .unwrap()
+            .select_branch("review".into());
+        env.view.drain_pending_diff_override();
+        assert!(env.view.diff_view.as_ref().unwrap().base_save.is_some());
+        env.view.handle_key(key(KeyCode::Char('b')), None);
+        assert!(env.view.diff_view.as_ref().unwrap().branch_select.is_some());
+        if outcome == "unknown" {
+            drop(respond);
+            env.view.apply_session_feed();
+        } else if outcome == "rejected" {
+            let (_, mutation) = respond(Err("policy changed".into())).unwrap();
+            assert!(matches!(
+                mutation,
+                crate::daemon::SessionMutation::DiffBase(_)
+            ));
+            env.view.apply_session_feed();
+        } else {
+            respond(Ok(crate::daemon::RuntimeCursor {
+                epoch: "test".into(),
+                revision: 2,
+            }))
+            .unwrap();
+            env.view.apply_session_feed();
+            assert!(
+                env.view.diff_view.as_ref().unwrap().base_save.is_some(),
+                "receipt alone is insufficient"
+            );
+            Storage::new_unwatched("test")
+                .unwrap()
+                .update(|rows, _| {
+                    rows.iter_mut()
+                        .find(|row| row.id == id)
+                        .unwrap()
+                        .base_branch_override = Some("review".into());
+                    Ok(())
+                })
+                .unwrap();
+            let row = canonical_row(
+                env.view.get_instance(&id).unwrap(),
+                serde_json::json!({"base_branch_override":"review"}),
+            );
+            publish_canonical_snapshot(&mut env, vec![row], vec![], 2);
+        }
+        let diff = env.view.diff_view.as_ref().unwrap();
+        assert_eq!(diff.base_branch, "review");
+        assert!(diff.base_save.is_none());
+        assert_eq!(diff.base_unsaved, outcome != "saved");
+        let buffer = draw(120, 40, |frame, theme| {
+            env.view
+                .render(frame, frame.area(), theme, None, None, None)
+        });
+        if outcome != "saved" {
+            find(&buffer, "Diff Base Not Saved");
+            if outcome == "unknown" {
+                let (column, row) = find(&buffer, "[OK]");
+                assert!(env.view.handle_dialog_click(column, row));
+            } else {
+                env.view.handle_key(key(KeyCode::Enter), None);
+            }
+            assert!(env
+                .view
+                .diff_view
+                .as_ref()
+                .unwrap()
+                .warning_dialog
+                .is_none());
+            assert!(
+                env.view.diff_view.as_ref().unwrap().branch_select.is_some(),
+                "warning dismissal retains reopened picker"
+            );
+            assert_eq!(env.view.diff_view.as_ref().unwrap().base_branch, "review");
+        }
+        if outcome == "unknown" {
+            assert!(env
+                .view
+                .pending_indeterminate_queue
+                .iter()
+                .any(|(target, _)| target == &id));
+        }
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn degraded_stream_revokes_grants_and_project_writes_while_owner_http_is_held() {
+    use crate::server::auth::LocalAuthorization;
+    use crate::tui::dialogs::{
+        test_render::{draw, find},
+        ProjectsDialog,
+    };
+    use axum::{extract::Extension, routing::get, Router};
+    let mut env = create_test_env_with_sessions(1);
+    let tmux_socket = tokio::task::spawn_blocking(crate::tmux::native_socket_locator)
+        .await
+        .unwrap();
+    let app = crate::session::get_app_dir().unwrap();
+    let repo = app.join("admission-project");
+    git2::Repository::init(&repo).unwrap();
+    crate::session::projects::add(
+        "test",
+        crate::session::ProjectScope::Global,
+        crate::session::Project::new(
+            "seed",
+            repo.to_string_lossy(),
+            crate::session::ProjectScope::Global,
+        ),
+        false,
+    )
+    .unwrap();
+    let original = native_state(&["test"]).await;
+    let mut owned = Arc::try_unwrap(original)
+        .ok()
+        .expect("fixture has one strong state owner");
+    let work = owned.runtime.work.clone();
+    owned.runtime = crate::server::runtime::NativeRuntime::new(
+        app.to_string_lossy().into_owned(),
+        tmux_socket
+            .as_deref()
+            .and_then(std::path::Path::to_str)
+            .map(str::to_owned),
+        work,
+    );
+    let state = Arc::new(owned);
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let router = Router::new()
+        .route("/api/runtime/ws", get(crate::server::runtime::runtime_ws))
+        .route(
+            "/api/runtime",
+            get({
+                let entered = entered.clone();
+                let release = release.clone();
+                let hits = hits.clone();
+                move || {
+                    let entered = entered.clone();
+                    let release = release.clone();
+                    let hits = hits.clone();
+                    async move {
+                        hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        entered.notify_one();
+                        release.notified().await;
+                        StatusCode::SERVICE_UNAVAILABLE
+                    }
+                }
+            }),
+        )
+        .layer(Extension(LocalAuthorization::UnixOwner(
+            nix::unistd::geteuid().as_raw(),
+        )))
+        .with_state(state.clone());
+    let socket = app.join("daemon/api.sock");
+    let server = crate::server::test_support::serve_owner_router_for_test(&socket, router).await;
+    let endpoint = crate::acp::client::DaemonEndpoint::local_unix(socket.clone());
+    let connection = crate::daemon::RuntimeConnection::connect(&endpoint, Some("test"))
+        .await
+        .unwrap();
+    let client = crate::daemon::DaemonClient::new_unix(socket).unwrap();
+    env.view
+        .session_feed
+        .connect_prepared("test".into(), Some((connection, client.clone())));
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            env.view.apply_session_feed();
+            if env.view.session_feed.current_snapshot_applied() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let native_lease = env.view.session_feed.native_lease_for_test();
+    assert_eq!(
+        native_lease.is_valid(),
+        tmux_socket.is_some(),
+        "native authority is exercised when the actual tmux locator is available"
+    );
+    let held_get = tokio::spawn(async move { client.runtime_info().await });
+    tokio::time::timeout(std::time::Duration::from_secs(2), entered.notified())
+        .await
+        .expect("control owner HTTP request reaches the held endpoint");
+    *state.canonical_health.write().await = crate::daemon::RuntimeHealth::Degraded {
+        code: crate::daemon::ReloadFailureCode::ProfileData,
+        profiles: vec!["test".into()],
+    };
+    let degraded = state
+        .runtime
+        .publish(&state)
+        .await
+        .unwrap()
+        .value
+        .cursor
+        .clone();
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            env.view.apply_session_feed();
+            if env.view.session_feed.receipt_applied(&degraded) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("received degraded state is not held behind owner HTTP");
+    assert!(!held_get.is_finished());
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert!(!env.view.session_feed.mutations_available());
+    assert!(!env.view.session_feed.native_interaction_available());
+    assert!(
+        !native_lease.is_valid(),
+        "queued native dispatch observes the exact revoked grant"
+    );
+    let groups = app.join("profiles/test/groups.json");
+    let profile_projects = app.join("profiles/test/projects.json");
+    std::fs::write(&groups, "[]").unwrap();
+    std::fs::write(&profile_projects, "[]").unwrap();
+    std::fs::write(&groups, "{ SECRET_SOURCE_A").unwrap();
+    let failure = crate::server::reload::load_all_profiles(&state.file_watch)
+        .err()
+        .unwrap();
+    *state.canonical_diagnostics.write().unwrap() = failure.owner_diagnostics();
+    *state.canonical_health.write().await = failure.health;
+    let first_source_cursor = state
+        .runtime
+        .publish(&state)
+        .await
+        .unwrap()
+        .value
+        .cursor
+        .clone();
+    assert_eq!(first_source_cursor, degraded);
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            env.view.apply_session_feed();
+            if env
+                .view
+                .runtime_diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.path == groups.to_string_lossy())
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("owner diagnostics reach Home without a new canonical revision or HTTP result");
+    assert!(env.view.try_present_reload_failure_dialog());
+    assert!(env
+        .view
+        .info_dialog
+        .as_ref()
+        .unwrap()
+        .message()
+        .contains(groups.to_str().unwrap()));
+    std::fs::write(&profile_projects, "{ SECRET_SOURCE_B").unwrap();
+    std::fs::write(&groups, "[]").unwrap();
+    let failure = crate::server::reload::load_all_profiles(&state.file_watch)
+        .err()
+        .unwrap();
+    *state.canonical_diagnostics.write().unwrap() = failure.owner_diagnostics();
+    *state.canonical_health.write().await = failure.health;
+    assert_eq!(
+        state.runtime.publish(&state).await.unwrap().value.cursor,
+        degraded
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            env.view.apply_session_feed();
+            if env
+                .view
+                .runtime_diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.path == profile_projects.to_string_lossy())
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("same-cursor diagnostic-only source switch updates Home");
+    assert!(env.view.try_present_reload_failure_dialog());
+    let body = env.view.info_dialog.as_ref().unwrap().message();
+    assert!(body.contains(profile_projects.to_str().unwrap()));
+    assert!(!body.contains(groups.to_str().unwrap()));
+    assert!(!body.contains("SECRET_SOURCE_A") && !body.contains("SECRET_SOURCE_B"));
+    env.view.handle_key(key(KeyCode::Enter), None);
+    std::fs::write(&profile_projects, "[]").unwrap();
+    // Repair alone does not restore permission before a fresh healthy daemon frame.
+    let registry = app.join("projects.json");
+    let before = std::fs::read(&registry).unwrap();
+    env.view.projects_dialog = Some(ProjectsDialog::new("test"));
+    env.view.handle_key(key(KeyCode::Char('d')), None);
+    assert_eq!(std::fs::read(&registry).unwrap(), before);
+    env.view.projects_dialog = Some(ProjectsDialog::new_adding("test"));
+    for character in repo.to_string_lossy().chars() {
+        env.view.handle_key(key(KeyCode::Char(character)), None);
+    }
+    env.view.handle_key(key(KeyCode::Enter), None);
+    assert_eq!(std::fs::read(&registry).unwrap(), before);
+    let buffer = draw(120, 42, |frame, theme| {
+        env.view
+            .render(frame, frame.area(), theme, None, None, None)
+    });
+    find(&buffer, "The runtime is read-only");
+    find(&buffer, "admission-project");
+    release.notify_one();
+    assert!(held_get.await.unwrap().is_err());
+    state.shutdown.cancel();
+    drop(env);
+    server.abort();
+    let _ = server.await;
+}
+
+#[test]
+#[serial]
+fn projects_home_dispatch_reads_current_policy_for_keyboard_mouse_and_auto_add() {
+    use crate::tui::dialogs::test_render::{draw, find};
+    for policy in ["read-only", "cityhall", "disconnected"] {
+        for mouse in [false, true] {
+            for automatic in [false, true] {
+                for remove in [false, true] {
+                    if automatic && remove {
+                        continue;
+                    }
+                    let mut env = create_test_env_empty();
+                    env.view.strict_hotkeys = false;
+                    let repo = crate::session::get_app_dir()
+                        .unwrap()
+                        .join("home-policy-project");
+                    git2::Repository::init(&repo).unwrap();
+                    if remove {
+                        crate::session::projects::add(
+                            "test",
+                            crate::session::ProjectScope::Global,
+                            crate::session::Project::new(
+                                "seed",
+                                repo.to_string_lossy(),
+                                crate::session::ProjectScope::Global,
+                            ),
+                            false,
+                        )
+                        .unwrap();
+                    }
+                    let _transport = env.view.session_feed.command_driver_for_test();
+                    publish_canonical_snapshot(&mut env, vec![], vec![], 1);
+                    if automatic {
+                        env.view.open_project_session_picker();
+                    } else {
+                        env.view.handle_key(key(KeyCode::Char('p')), None);
+                        if !remove {
+                            env.view.handle_key(key(KeyCode::Char('a')), None);
+                        }
+                    }
+                    assert!(env.view.projects_dialog.is_some());
+                    if !remove {
+                        for character in repo.to_string_lossy().chars() {
+                            env.view.handle_key(key(KeyCode::Char(character)), None);
+                        }
+                        env.view.handle_key(key(KeyCode::Tab), None);
+                        for character in "retained-base".chars() {
+                            env.view.handle_key(key(KeyCode::Char(character)), None);
+                        }
+                    }
+                    let before = draw(120, 42, |frame, theme| {
+                        env.view
+                            .render(frame, frame.area(), theme, None, None, None)
+                    });
+                    let gesture = find(&before, if remove { "d remove" } else { "Enter save" });
+                    let registry = crate::session::get_app_dir().unwrap().join("projects.json");
+                    let bytes = std::fs::read(&registry).ok();
+                    match policy {
+                        "cityhall" => env.view.session_feed.set_cityhall_for_test(true),
+                        "read-only" => env
+                            .view
+                            .session_feed
+                            .set_mutation_permission_for_test(false),
+                        "disconnected" => {
+                            env.view
+                                .session_feed
+                                .publish_for_test(SessionFeedResult::Unavailable(
+                                    "controlled policy transition".into(),
+                                ));
+                            env.view.apply_session_feed();
+                        }
+                        _ => unreachable!(),
+                    }
+                    assert!(env.view.project_write_block().is_some());
+                    if mouse {
+                        assert!(env.view.handle_dialog_click(gesture.0, gesture.1));
+                    } else {
+                        env.view.handle_key(
+                            key(if remove {
+                                KeyCode::Char('d')
+                            } else {
+                                KeyCode::Enter
+                            }),
+                            None,
+                        );
+                    }
+                    assert_eq!(
+                        std::fs::read(&registry).ok(),
+                        bytes,
+                        "{policy} mouse={mouse} automatic={automatic} remove={remove}"
+                    );
+                    assert!(env.view.projects_dialog.is_some());
+                    if policy != "disconnected" {
+                        let buffer = draw(120, 42, |frame, theme| {
+                            env.view
+                                .render(frame, frame.area(), theme, None, None, None)
+                        });
+                        find(
+                            &buffer,
+                            if policy == "cityhall" {
+                                "The attached runtime serves"
+                            } else {
+                                "The runtime is read-only"
+                            },
+                        );
+                        if !remove {
+                            find(&buffer, "retained-base");
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+#[serial]
+fn retained_serve_takeover_owns_keyboard_and_mouse_without_consuming_other_drafts() {
+    use crate::tui::dialogs::test_render::{draw, find};
+    for mouse in [false, true] {
+        let (mut env, _id, _repo) = diff_admission_fixture();
+        let retained_diff = env.view.diff_view.take();
+        let _transport = env.view.session_feed.command_driver_for_test();
+        env.view.strict_hotkeys = false;
+        env.view.handle_key(key(KeyCode::Char('n')), None);
+        assert!(env.view.new_dialog.is_some());
+        for character in "retained-serve-form".chars() {
+            env.view.handle_key(key(KeyCode::Char(character)), None);
+        }
+        let form = draw(120, 42, |frame, theme| {
+            env.view
+                .new_dialog
+                .as_mut()
+                .unwrap()
+                .render(frame, frame.area(), theme)
+        });
+        find(&form, "retained-serve-form");
+        env.view.diff_view = retained_diff;
+        env.view.pending_paste = Some("retained-serve-paste".into());
+        env.view.serve_view = Some(crate::tui::dialogs::ServeView::new());
+        let foreground = draw(120, 42, |frame, theme| {
+            env.view
+                .render(frame, frame.area(), theme, None, None, None)
+        });
+        let close = find(&foreground, "[Esc] cancel");
+        if mouse {
+            assert!(env.view.handle_dialog_click(close.0, close.1));
+        } else {
+            env.view.handle_key(key(KeyCode::Esc), None);
+        }
+        assert!(
+            env.view.serve_view.is_none(),
+            "the painted Serve surface owns its dismissal"
+        );
+        assert!(env.view.diff_view.is_some());
+        assert_eq!(env.view.diff_view.as_ref().unwrap().base_branch, "main");
+        assert!(
+            env.view.new_dialog.is_some(),
+            "hidden new-session form did not consume Serve dismissal"
+        );
+        assert_eq!(
+            env.view.pending_paste.as_deref(),
+            Some("retained-serve-paste")
+        );
+        let form = draw(120, 42, |frame, theme| {
+            env.view
+                .new_dialog
+                .as_mut()
+                .unwrap()
+                .render(frame, frame.area(), theme)
+        });
+        find(&form, "retained-serve-form");
+    }
+}
+
+fn observed_legacy_tool(
+    identity: crate::session::LegacyToolIdentity,
+) -> crate::session::LegacyToolObservation {
+    crate::session::LegacyToolObservation {
+        identity,
+        server: std::sync::Arc::new(crate::session::TmuxServerIdentity {
+            socket: "/fixture-tmux.sock".into(),
+            pid: 4242,
+            birth: crate::process::ProcessBirthIdentity {
+                boot_id: "fixture-boot".into(),
+                start_id: "fixture-server".into(),
+            },
+        }),
     }
 }

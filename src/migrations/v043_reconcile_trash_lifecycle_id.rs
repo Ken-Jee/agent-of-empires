@@ -57,7 +57,7 @@ pub fn run() -> Result<()> {
             true
         })?;
         if changed > 0 {
-            info!("v043: reconciled trash identity for {changed} failed purge(s)");
+            info!(target: "migrations.v043", changed, "reconciled trash identity for failed purges");
         }
     }
     Ok(())

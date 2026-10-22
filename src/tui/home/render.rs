@@ -31,14 +31,10 @@ fn session_offset(created_at: &DateTime<Utc>) -> usize {
     created_at.timestamp_millis() as usize
 }
 
-/// Build the list-pane title.
-///
-/// `prefix` is the leading label ("aoe", "Terminals", "Tool: <name>").
-/// `profile` is `Some(name)` only when a real filter is active; when `None`,
-/// the `[<profile>]` segment is omitted so the default all-profiles state
-/// stays uncluttered.
-/// Group and sort state hang off the prefix as `· project` / `· <sort label>`
-/// segments, each dropped when it matches the default.
+/// Build the list-pane title. `prefix` is the leading label ("aoe", "Terminals",
+/// "Tool: <name>"); `profile` is `Some(name)` only when a real filter is active, so the
+/// default all-profiles state drops the `[<profile>]` segment. Group and sort state hang
+/// off the prefix as `· project` / `· <sort label>`, each dropped when it is the default.
 fn compose_list_title(
     prefix: &str,
     profile: Option<&str>,
@@ -104,10 +100,8 @@ fn sidebar_areas(
     }
 }
 
-/// Extra rows captured beyond the visible window so moderate scrolls don't
-/// force a fresh capture on every wheel tick. Cache invalidation uses the same
-/// reserve to decide when the captured window can no longer cover the
-/// requested scroll.
+/// Extra rows captured beyond the visible window so moderate scrolls don't force a fresh
+/// capture on every wheel tick. Cache invalidation uses the same reserve.
 const CAPTURE_BUFFER: u16 = 20;
 
 /// Rows the compact system-health strip occupies.
@@ -131,22 +125,19 @@ fn live_resize_retry_due(
     }
 }
 
-/// Window captured while the user is off the live edge (reading scrollback):
-/// the full scrollback in one shot, rather than a window that tracks the offset
-/// and re-anchors to the advancing live edge on every capture. Matches tmux's
-/// default `history-limit` and the VT grid's `SCROLLBACK_LINES`, so the frozen
-/// snapshot spans the whole history a live pane could have accumulated.
+/// Window captured while the user is off the live edge: the full scrollback in one shot,
+/// rather than a window that re-anchors to the advancing live edge on every capture.
+/// Matches tmux's default `history-limit` and the VT grid's `SCROLLBACK_LINES`.
 const READING_CAPTURE_LINES: u16 = 2000;
 
 /// Map a tmux pane cursor onto the preview's output rect for live-send.
 ///
-/// `cursor.x`/`y` are pane relative. On a composite, add the pane origin
-/// carried by [`crate::tmux::PaneCursor::composite_pane0`]. Vertically the
-/// renderer also bottom-anchors captures that overflow `output`, so the row
-/// formula is `output.y + min(line_count, visible_rows) - pane_height + top +
-/// cursor.y`; a short capture instead anchors at the top. This keeps the
-/// cursor on the same text row for both the status-row offset (#3515) and the
-/// shorter-pane case (#2742). A hidden or out-of-bounds cursor yields `None`.
+/// `cursor.x`/`y` are pane relative; on a composite, add the pane origin from
+/// [`crate::tmux::PaneCursor::composite_pane0`]. The renderer bottom-anchors captures that
+/// overflow `output`, so the row is `output.y + min(line_count, visible_rows) -
+/// pane_height + top + cursor.y`, while a short capture anchors at the top. That keeps the
+/// cursor on the same text row for the status-row offset (#3515) and the shorter-pane case
+/// (#2742). A hidden or out-of-bounds cursor yields `None`.
 pub(super) fn map_live_preview_cursor(
     output: Rect,
     visible_rows: usize,
@@ -238,9 +229,8 @@ pub(super) fn split_preview_rects(inner: Rect) -> Option<SplitRects> {
     })
 }
 
-/// Number of pane lines to capture for the preview, accounting for the user's
-/// scrollback offset. A small buffer is added so moderate scrolls don't force a
-/// fresh capture on every wheel tick.
+/// Pane lines to capture for the preview, accounting for the scrollback offset plus a
+/// buffer so moderate scrolls don't force a fresh capture on every wheel tick.
 fn capture_lines_for(height: u16, scroll_offset: u16) -> usize {
     // Off the live edge: capture the whole scrollback once so the snapshot stays put. A
     // window that grew per notch was re-anchored to the advancing live edge on every
@@ -259,14 +249,10 @@ fn capture_lines_for(height: u16, scroll_offset: u16) -> usize {
     (height as usize).saturating_add(CAPTURE_BUFFER as usize)
 }
 
-/// Whether the preview holds its captured snapshot instead of following live
-/// output. True when the user is reading scrollback (scrolled off the live
-/// edge, `scroll_offset > 0`) or has a text selection in flight (an active drag
-/// or a finalized highlight, `has_selection`). In both cases applying the
-/// worker's bottom-anchored live frames would shift the content out from under
-/// the user: the read position gets yanked toward the tail as output streams,
-/// or the drag anchors slide off their text. Frozen, wheel-scroll stays smooth
-/// and a drag-select tracks exactly the cells under the pointer.
+/// Whether the preview holds its snapshot instead of following live output: true while
+/// the user reads scrollback (`scroll_offset > 0`) or has a selection in flight
+/// (`has_selection`). Applying the worker's bottom-anchored frames then would yank the
+/// read position toward the tail or slide the drag anchors off their text.
 fn preview_frozen(scroll_offset: u16, has_selection: bool) -> bool {
     scroll_offset > 0 || has_selection
 }
@@ -307,9 +293,8 @@ pub(super) fn passive_resize_invalidates_live_geometry(
     live_target == Some(&live_send::LiveSendTarget::Agent)
         && selected_session == Some(completed_session)
 }
-/// Decide whether the cached capture window still covers the requested scroll.
-/// Returns true when the cache must be re-captured because the visible window
-/// (plus BUFFER headroom) would run past the end of the captured content.
+/// Whether the cached capture window still covers the requested scroll: true when the
+/// visible window plus BUFFER headroom would run past the end of the captured content.
 fn scroll_exceeds_cache(cache_captured_lines: usize, height: u16, scroll_offset: u16) -> bool {
     let needed = (height as usize)
         .saturating_add(scroll_offset as usize)
@@ -317,10 +302,9 @@ fn scroll_exceeds_cache(cache_captured_lines: usize, height: u16, scroll_offset:
     needed > cache_captured_lines
 }
 
-/// Whether a capture handed back every line the pane holds, so re-capturing
-/// could not grow it. `capture_lines_for` asks for `height + CAPTURE_BUFFER`
-/// (plus the reading depth when scrolled); a result shorter than that has hit
-/// the end of the pane's content and can never satisfy the BUFFER headroom.
+/// Whether a capture handed back every line the pane holds, so re-capturing could not
+/// grow it: `capture_lines_for` asks for `height + CAPTURE_BUFFER` (plus reading depth),
+/// and a shorter result has hit the end of the content.
 fn capture_is_exhausted(cache_captured_lines: usize, requested_lines: usize) -> bool {
     cache_captured_lines > 0 && cache_captured_lines < requested_lines
 }
@@ -338,8 +322,8 @@ pub(super) enum PassiveResizeStep {
     Fire,
 }
 
-/// Debounce for the passive preview sync: resize only once the same geometry
-/// has been wanted on two consecutive refreshes.
+/// Debounce for the passive preview sync: resize only once the same geometry has been
+/// wanted on two consecutive refreshes.
 ///
 /// The `EnterLiveSend` / `SendMessage` handlers each draw exactly one frame
 /// with a transient "Reviving session..." toast before doing the slow work.
@@ -416,12 +400,10 @@ fn passive_synced_contradicted(
 /// territory (M3 from the multi-AI review) when tmux history is shorter than
 /// `MAX_PREVIEW_SCROLL`.
 ///
-/// `visible_height` is the rendered output-body height the caller already
-/// computed (`PreviewLayout::compute(..).output.height`, shared via
-/// `preview_visible_rows`), NOT the raw pane height. Re-deriving it here with a
-/// fixed `- 1` would over-count the max offset by a row whenever the inner
-/// banner is hidden, leaving a phantom offset that stalls live-follow one row
-/// early.
+/// `visible_height` is the rendered output-body height the caller already computed
+/// (`preview_visible_rows`), NOT the raw pane height: re-deriving it with a fixed `- 1`
+/// over-counts the max offset by a row whenever the inner banner is hidden, stalling
+/// live-follow one row early.
 fn clamp_scroll_to_capture(
     scroll_offset: u16,
     captured_lines: usize,
@@ -469,11 +451,9 @@ fn spinner_idle_fresh(
         .current_frame()
 }
 
-/// Pick the structured view row icon for a session instance. Centralizes the
-/// archive/snooze override that kills the live spinner for sunk rows so the
-/// list reads as parked instead of "still alive." Exposed at crate visibility
-/// so tests can pin the override behavior without going through the full
-/// render pipeline.
+/// Structured view row icon for a session. Centralizes the archive/snooze override that
+/// kills the live spinner for sunk rows so the list reads as parked. Crate-visible so
+/// tests can pin the override without the full render pipeline.
 pub(crate) fn agent_row_icon(inst: &crate::session::Instance) -> &'static str {
     // A dormant (idle-reaped, resumable) structured worker gets its own glyph, taking
     // precedence over the raw status but yielding to the sink override below. See #2250.
@@ -515,11 +495,9 @@ struct RowSeed {
 enum SunkRow {
     /// Agent status, including canonical Error and Deleting on sunk rows.
     AgentStatus(&'static str),
-    /// Terminal / Tool: one muted glyph, unconditionally. These seeds describe
-    /// pane liveness and carry no error affordance, so letting a delete-op
-    /// status punch through would paint a bright animated "the terminal is
-    /// alive" row inside a shelf whose whole premise is that the row is put
-    /// away, while signalling nothing about the failure.
+    /// Terminal / Tool: one muted glyph, unconditionally. These seeds describe pane
+    /// liveness and carry no error affordance, so a delete-op status punching through
+    /// would paint a bright "alive" row inside a shelf and still signal nothing.
     Pane,
 }
 
@@ -672,10 +650,9 @@ pub(crate) struct RowTag {
 const BRANCH_TAG_WIDTH: usize = 12;
 
 impl RowTag {
-    /// The bracketed tag, right-padded to `max_width` terminal cells. Padding
-    /// is measured by display width, not `char` count, so a wide glyph
-    /// (`界`, two cells) or a combining mark (zero cells) in the content still
-    /// yields a bracket span of exactly `max_width + 2` cells.
+    /// The bracketed tag, right-padded to `max_width` terminal cells. Padding is measured
+    /// by display width, so a wide glyph (`界`) or a combining mark still yields a bracket
+    /// span of exactly `max_width + 2` cells.
     pub fn rendered(&self) -> String {
         // Cap first, then pad, both in painted cells: a `UnicodeWidthStr` pad overflows
         // the contract for scripts it scores below what ratatui spends. Grapheme-aligned,
@@ -686,12 +663,9 @@ impl RowTag {
     }
 }
 
-/// Compute the per-row tag for a given instance + mode, or `None` when the
-/// row should not render a tag in this context.
-///
-/// `Auto` only renders in all-profiles view (no `active_profile`). Other
-/// modes always render when their content is available (e.g. `Branch`
-/// returns `None` for sessions without branch metadata).
+/// The per-row tag for an instance and mode, or `None` when this context renders none.
+/// `Auto` only renders in all-profiles view; other modes render whenever their content
+/// exists (`Branch` yields `None` without branch metadata).
 pub(crate) fn compute_row_tag(
     inst: &crate::session::Instance,
     mode: RowTagMode,
@@ -784,8 +758,7 @@ fn branch_tag_content(branch: &str, max_width: usize) -> Option<String> {
     }
 }
 
-/// Compact display code for a profile name, used by the per-row profile tag
-/// in all-profiles view where the full name is too wide.
+/// Compact display code for a profile name, for the per-row tag in all-profiles view.
 ///
 /// Hyphen/underscore-delimited names keep a short lead segment (at most
 /// three grapheme clusters) whole and append the first cluster of each
@@ -824,9 +797,8 @@ pub(crate) fn profile_short_code(profile: &str) -> String {
     prefix_within_width(&code.to_lowercase(), MAX_CELLS).to_string()
 }
 
-/// Format a timestamp as a compact relative age (e.g. `3m`, `2h`, `4d`, `2mo`).
-/// Returns an empty string for `None` so callers can unconditionally substitute
-/// the result without guarding for absence.
+/// Format a timestamp as a compact relative age (`3m`, `2h`, `4d`, `2mo`), empty for
+/// `None` so callers can substitute unconditionally.
 fn format_relative_age(ts: Option<DateTime<Utc>>) -> String {
     let Some(ts) = ts else {
         return String::new();
@@ -855,11 +827,9 @@ fn format_relative_age(ts: Option<DateTime<Utc>>) -> String {
     format!("{}mo", months)
 }
 
-/// Format a remaining snooze duration as a compact countdown string that
-/// fits in the `LAST_ACTIVITY_SLOT` (e.g. `23m`, `1h`, `5d`). Falls back
-/// to `<1m` for sub-minute remainders so the user sees "about to wake"
-/// rather than an empty slot. Picker tops out at 1 week; validator cap
-/// is 30 days, so the day branch handles up to ~30d.
+/// Format a remaining snooze as a compact countdown that fits `LAST_ACTIVITY_SLOT` (`23m`,
+/// `1h`, `5d`), falling back to `<1m` so a sub-minute remainder reads as "about to wake".
+/// The validator caps at 30 days, which the day branch covers.
 fn format_snooze_remaining(delta: chrono::Duration) -> String {
     let secs = delta.num_seconds();
     if secs < 60 {
@@ -881,10 +851,8 @@ fn format_snooze_remaining(delta: chrono::Duration) -> String {
 /// one of left padding.
 const LAST_ACTIVITY_SLOT: usize = 6;
 
-/// Trailing gap between the activity slot (or terminal-mode badge) and the
-/// pane's right border. One cell looks consistent with the breathing room
-/// other ratatui widgets leave around the rounded border without burning
-/// horizontal budget on narrow panes.
+/// Trailing gap between the activity slot (or terminal-mode badge) and the pane's right
+/// border, one cell, matching the breathing room other widgets leave around the border.
 const LAST_ACTIVITY_RIGHT_MARGIN: usize = 1;
 
 const SELECTED_ROW_CONTRAST_RATIO: f32 = 3.0;
@@ -900,7 +868,7 @@ fn selected_row_style(style: Style, theme: &Theme) -> Style {
     }
 }
 
-/// Decide where the right-aligned activity column lives on a session row.
+/// Where the right-aligned activity column lives on a session row.
 ///
 /// `prefix_width` is the display width of the spans already pushed, `list_width` the inner
 /// width of the list pane, `slot_width` 0 when the age is empty, `badge_width` 0 when no
@@ -988,6 +956,13 @@ impl HomeView {
             .unwrap_or_else(|e| e.into_inner())
             .clear();
 
+        // Serve view takes over the whole screen
+        if let Some(ref serve) = self.serve_view {
+            self.divider_col = None;
+            self.main_area_width = 0;
+            serve.render(frame, area, theme);
+            return;
+        }
         if self.sidebar_source != crate::tui::session_feed::SidebarSource::Daemon {
             self.list_inner_area = Rect::default();
             self.shelf_inner_area = Rect::default();
@@ -1054,14 +1029,6 @@ impl HomeView {
             self.main_area_width = 0;
 
             diff.render(frame, area, theme);
-            return;
-        }
-
-        // Serve view takes over the whole screen
-        if let Some(ref serve) = self.serve_view {
-            self.divider_col = None;
-            self.main_area_width = 0;
-            serve.render(frame, area, theme);
             return;
         }
 
@@ -1230,9 +1197,11 @@ impl HomeView {
             };
         }
 
+        render_dialogs!(new_dialog);
+        if self.snooze_duration_dialog.is_none() {
+            render_dialogs!(confirm_dialog);
+        }
         render_dialogs!(
-            new_dialog,
-            confirm_dialog,
             unified_delete_dialog,
             group_delete_options_dialog,
             rename_dialog,
@@ -1246,8 +1215,15 @@ impl HomeView {
             changelog_dialog,
             telemetry_consent_dialog,
             tips_dialog,
-            info_dialog,
-            snooze_duration_dialog,
+        );
+        if self.snooze_duration_dialog.is_none() {
+            render_dialogs!(info_dialog);
+        }
+        render_dialogs!(snooze_duration_dialog);
+        if self.snooze_duration_dialog.is_some() {
+            render_dialogs!(info_dialog, confirm_dialog);
+        }
+        render_dialogs!(
             profile_picker_dialog,
             group_picker_dialog,
             sort_picker_dialog,
@@ -1261,9 +1237,6 @@ impl HomeView {
             send_message_dialog,
             permission_response_dialog,
             update_confirm_dialog,
-            // context_menu renders last so its small popup sits on top of
-            // any underlying dialog (e.g. an info dialog opened by a
-            // gated rename/delete attempt).
             context_menu,
         );
     }

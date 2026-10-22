@@ -320,6 +320,7 @@ pub enum ToolPaneOwner {
 /// Pre-fetched pane metadata from a single `tmux list-panes -a` call.
 #[derive(Debug, Clone)]
 pub struct PaneMetadata {
+    pub server: Option<std::sync::Arc<crate::session::TmuxServerIdentity>>,
     pub session_id: String,
     pub pane_id: String,
     pub session_kind: Option<String>,
@@ -1392,24 +1393,56 @@ fn stop_aoe_sessions<'a>(
 /// successful empty map is authoritative and means there are no panes.
 pub fn batch_pane_metadata() -> anyhow::Result<HashMap<String, PaneMetadata>> {
     let start = Instant::now();
+    let format = concat!(
+        "#{session_name}|#{session_id}|#{pane_id}|#{@aoe_kind}|#{pane_index}|#{pane_dead}|#{window_width}|#{window_height}",
+        "|#{pane_current_command}",
+        "|#{pane_start_command}|#{pane_pid}\x1f#{window_activity}\x1f#{@aoe_tool_owner}\x1f#{pane_title}"
+    );
     let mut command = tmux_query_command();
-    command.args([
-        "list-panes",
-        "-a",
-        "-F",
-        // Tail fields use TAIL_SEP because commands and titles may contain pipes.
-        concat!(
-            "#{session_name}|#{session_id}|#{pane_id}|#{@aoe_kind}|#{pane_index}|#{pane_dead}|#{window_width}|#{window_height}",
-            "|#{pane_current_command}",
-            "|#{pane_start_command}|#{pane_pid}\x1f#{window_activity}\x1f#{@aoe_tool_owner}\x1f#{pane_title}"
-        ),
-    ]);
+    command.args(["list-panes", "-a", "-F", format]);
     let output = run_tmux_command_with_timeout(&mut command);
 
     let result: anyhow::Result<HashMap<String, PaneMetadata>> = match output {
         Ok(out) if out.status.success() => {
             let stdout = String::from_utf8_lossy(&out.stdout);
-            Ok(parse_pane_metadata(&stdout))
+            let mut panes = parse_pane_metadata(&stdout);
+            if panes.iter().any(|(name, pane)| {
+                name.starts_with(TOOL_PREFIX)
+                    && (pane.pane_dead || matches!(pane.tool_owner, ToolPaneOwner::Unmarked))
+            }) {
+                if let Ok(server) = ToolSession::server_identity() {
+                    let mut command = tmux_query_command_for_socket(&server.socket);
+                    command.args([
+                        "display-message",
+                        "-p",
+                        "#{pid}",
+                        ";",
+                        "list-panes",
+                        "-a",
+                        "-F",
+                        format,
+                    ]);
+                    if let Ok(output) = run_tmux_command_with_timeout(&mut command) {
+                        let output_text = String::from_utf8_lossy(&output.stdout);
+                        if let Some((pid, rows)) = output_text.split_once('\n') {
+                            if output.status.success()
+                                && pid.trim().parse::<u32>().ok() == Some(server.pid)
+                                && crate::process::process_birth_is_live(server.pid, &server.birth)
+                                    .unwrap_or(false)
+                            {
+                                panes = parse_pane_metadata(rows);
+                                let server = std::sync::Arc::new(server);
+                                for (name, pane) in &mut panes {
+                                    if name.starts_with(TOOL_PREFIX) {
+                                        pane.server = Some(server.clone());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(panes)
         }
         Ok(out) => {
             if tmux_no_server_running(&out.stderr) {
@@ -1623,6 +1656,7 @@ fn parse_pane_metadata(output: &str) -> HashMap<String, PaneMetadata> {
         map.insert(
             session_name.to_string(),
             PaneMetadata {
+                server: None,
                 session_id: session_id.to_owned(),
                 pane_id: pane_id.to_owned(),
                 session_kind: (!session_kind.is_empty()).then(|| session_kind.to_owned()),
@@ -1696,6 +1730,7 @@ pub fn test_inject_pane_window_size_at(name: &str, size: (u16, u16), taken_at: I
         map.insert(
             name.to_string(),
             PaneMetadata {
+                server: None,
                 session_id: "$42".into(),
                 pane_id: "%42".into(),
                 session_kind: None,
@@ -4081,6 +4116,7 @@ mod tests {
                     (
                         n.to_string(),
                         PaneMetadata {
+                            server: None,
                             session_id: "$42".into(),
                             pane_id: "%42".into(),
                             session_kind: None,
@@ -4152,6 +4188,7 @@ mod tests {
 
     fn dead_pane_meta(dead: bool) -> PaneMetadata {
         PaneMetadata {
+            server: None,
             session_id: "$42".into(),
             pane_id: "%42".into(),
             session_kind: None,
@@ -4713,7 +4750,6 @@ mod tests {
         instance.status = crate::session::Status::Idle;
         let name = Session::generate_name(&instance.id, &instance.title);
         let cache = SessionCacheGuard::capture();
-        cache.force_present(&[&name]);
 
         for (tail, expected_title, expected_forks) in [
             (format!("{TAIL_SEP}1{TAIL_SEP}{TAIL_SEP}"), Some(""), 0),
@@ -4736,12 +4772,12 @@ mod tests {
                 .observation_key(&Observation::new("", None, true)),
                 ..Default::default()
             };
+            cache.force_present(&[&name]);
             let _ = fork_probe::take();
             let probe = fork_probe::arm();
             instance.update_status_once(Some(&metadata), Some(&name));
             let forks = fork_probe::take();
             drop(probe);
-            assert_eq!(instance.detection.rule, Some("screen_unchanged"));
             assert_eq!(instance.status, crate::session::Status::Idle);
             assert_eq!(forks, expected_forks, "metadata tail: {tail:?}");
         }

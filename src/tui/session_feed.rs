@@ -107,7 +107,7 @@ impl CommandReply {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) enum CommandFailure {
     Rejected(String),
     Unknown(String),
@@ -259,11 +259,16 @@ struct PendingCommand {
     marks_unread: bool,
     is_engagement: bool,
     deferred_native: Option<Box<DeferredNativePreparation>>,
+    diff_save: Option<tokio::sync::oneshot::Sender<Result<RuntimeCursor, CommandFailure>>>,
 }
 
 impl PendingCommand {
     fn fail(&mut self, id: &str, failure: CommandFailure, errors: &mut Vec<SessionCommandError>) {
         let unknown = matches!(&failure, CommandFailure::Unknown(_));
+        let diff_failure = self.diff_save.take();
+        if let Some(result) = diff_failure {
+            let _ = result.send(Err(failure.clone()));
+        }
         let message = failure.message();
         if let Some(deferred) = self.deferred_native.take() {
             deferred.reject(&message);
@@ -583,6 +588,8 @@ pub struct SessionFeed {
     /// overwrite an unapplied canonical snapshot.
     progress: tokio::sync::watch::Sender<Option<Vec<CreationProgress>>>,
     progress_receiver: tokio::sync::watch::Receiver<Option<Vec<CreationProgress>>>,
+    diagnostics: tokio::sync::watch::Sender<Vec<crate::daemon::OwnerLoadDiagnostic>>,
+    diagnostics_receiver: tokio::sync::watch::Receiver<Vec<crate::daemon::OwnerLoadDiagnostic>>,
     quit_control: tokio::sync::watch::Sender<Option<QuitCancellationHandle>>,
     task: Option<tokio::task::JoinHandle<()>>,
     grant: Arc<AtomicU64>,
@@ -611,6 +618,7 @@ impl SessionFeed {
         let (sender, receiver) = tokio::sync::watch::channel(None);
         let (progress, progress_receiver) = tokio::sync::watch::channel(None);
         let (quit_control, _) = tokio::sync::watch::channel(None);
+        let (diagnostics, diagnostics_receiver) = tokio::sync::watch::channel(Vec::new());
         Self {
             sender,
             receiver,
@@ -618,6 +626,8 @@ impl SessionFeed {
             progress_receiver,
             quit_control,
             task: None,
+            diagnostics,
+            diagnostics_receiver,
             grant: Arc::new(AtomicU64::new(0)),
             native_grant: Arc::new(AtomicU64::new(0)),
             cityhall: Arc::new(AtomicBool::new(false)),
@@ -635,6 +645,24 @@ impl SessionFeed {
     }
 
     pub fn connect(&mut self, profile: String) {
+        self.connect_prepared(profile, None);
+    }
+
+    pub(crate) fn suspend_for_dashboard(&mut self) {
+        set_grant(&self.grant, false);
+        set_grant(&self.native_grant, false);
+        self.quit_control.send_replace(None);
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+        self.commands = None;
+    }
+
+    pub(crate) fn connect_prepared(
+        &mut self,
+        profile: String,
+        prepared: Option<(RuntimeConnection, crate::daemon::DaemonClient)>,
+    ) {
         set_grant(&self.grant, false);
         set_grant(&self.native_grant, false);
         self.quit_control.send_replace(None);
@@ -658,19 +686,28 @@ impl SessionFeed {
         self.progress_receiver = progress_receiver;
         let sender = self.sender.clone();
         let quit_control = self.quit_control.clone();
+        let diagnostics = self.diagnostics.clone();
         self.task = Some(tokio::spawn(async move {
             let result: anyhow::Result<()> = async {
-                let endpoint =
-                    crate::acp::client::daemon_manager::ensure_native_daemon(&profile).await?;
-                let mut connection = RuntimeConnection::connect(
-                    &endpoint,
-                    (!profile.is_empty()).then_some(profile.as_str()),
-                )
-                .await?;
-                let client = crate::acp::client::HttpClient::new(endpoint)?
-                    .daemon_client()
-                    .await?;
+                let (mut connection, client) = match prepared {
+                    Some(prepared) => prepared,
+                    None => {
+                        let endpoint =
+                            crate::acp::client::daemon_manager::ensure_native_daemon(&profile)
+                                .await?;
+                        let connection = RuntimeConnection::connect(
+                            &endpoint,
+                            (!profile.is_empty()).then_some(profile.as_str()),
+                        )
+                        .await?;
+                        let client = crate::acp::client::HttpClient::new(endpoint)?
+                            .daemon_client()
+                            .await?;
+                        (connection, client)
+                    }
+                };
                 let epoch = connection.info().epoch.clone();
+                diagnostics.send_replace(connection.info().owner_diagnostics.clone());
                 cityhall.store(connection.info().cityhall_mode, Ordering::SeqCst);
                 set_grant(&grant, connection.mutations_allowed());
                 set_grant(&native_grant, connection.native_interaction_allowed());
@@ -690,6 +727,9 @@ impl SessionFeed {
                                 set_grant(&grant, connection.mutations_allowed());
                                 set_grant(&native_grant, connection.native_interaction_allowed());
                                 sender.send_replace(Some(SessionFeedResult::Snapshot(snapshot)));
+                            }
+                            Ok(RuntimeEvent::OwnerDiagnostics(current)) => {
+                                diagnostics.send_replace(current);
                             }
                             Ok(RuntimeEvent::Progress(progresses)) => {
                                 progress.send_replace(Some(progresses));
@@ -725,6 +765,28 @@ impl SessionFeed {
                 sender.send_replace(Some(SessionFeedResult::Unavailable(error.to_string())));
             }
         }));
+    }
+    pub(crate) fn take_diagnostics(&mut self) -> Option<Vec<crate::daemon::OwnerLoadDiagnostic>> {
+        self.diagnostics_receiver
+            .has_changed()
+            .unwrap_or(false)
+            .then(|| self.diagnostics_receiver.borrow_and_update().clone())
+    }
+
+    pub(crate) fn latest_snapshot(&self) -> Option<Arc<RuntimeSnapshot>> {
+        match self.receiver.borrow().as_ref() {
+            Some(SessionFeedResult::Snapshot(snapshot)) => Some(snapshot.clone()),
+            _ => None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn native_lease_for_test(&self) -> NativeLease {
+        NativeLease {
+            grant: self.native_grant.clone(),
+            generation: self.native_grant.load(Ordering::SeqCst),
+            cancelled: Arc::new(AtomicBool::new(false)),
+        }
     }
 
     pub(crate) fn mutations_available(&self) -> bool {
@@ -907,6 +969,29 @@ impl SessionFeed {
 
     pub(crate) fn submit(&mut self, id: String, mutation: SessionMutation) -> anyhow::Result<()> {
         self.enqueue(id, SessionRequest::Mutation(mutation), None, None)
+    }
+    pub(crate) fn submit_diff_base(
+        &mut self,
+        id: String,
+        base_branch: Option<String>,
+    ) -> anyhow::Result<tokio::sync::oneshot::Receiver<Result<RuntimeCursor, CommandFailure>>> {
+        self.enqueue(
+            id.clone(),
+            SessionRequest::Mutation(SessionMutation::DiffBase(
+                crate::daemon::UpdateDiffBaseBody {
+                    base_branch,
+                    repo: None,
+                },
+            )),
+            None,
+            None,
+        )?;
+        let (result, receiver) = tokio::sync::oneshot::channel();
+        self.pending
+            .get_mut(&id)
+            .expect("admitted diff command")
+            .diff_save = Some(result);
+        Ok(receiver)
     }
 
     /// Admit the selection before sending any member, then pump as receipts settle.
@@ -1440,6 +1525,7 @@ impl SessionFeed {
                 marks_unread,
                 is_engagement,
                 deferred_native: None,
+                diff_save: None,
             },
         );
         Ok(())
@@ -1633,6 +1719,9 @@ impl SessionFeed {
                         }
                     }
                     if let Some(reply) = pending.reply.take() {
+                        if let Some(result) = pending.diff_save.take() {
+                            let _ = result.send(Ok(reply.cursor().clone()));
+                        }
                         let outcome = match reply {
                             CommandReply::Trash(receipt) => Some(SessionCommandOutcome::Trashed(receipt)),
                             CommandReply::Purge(receipt) => Some(SessionCommandOutcome::Purged(receipt)),

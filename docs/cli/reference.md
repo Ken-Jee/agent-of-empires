@@ -178,7 +178,7 @@ Run without arguments to launch the TUI dashboard.
 * `acp` — Manage the ACP structured-view workers (doctor, ps, logs, prompt, approve, ...)
 * `uninstall` — Uninstall Agent of Empires
 * `update` — Update aoe to the latest release
-* `migrate` — Run pending data migrations now, showing progress. A sandboxed session moves its own agent store when it starts; use this to move every eligible store at once instead. Trashed and archived sessions are skipped; each moves when it is started, or restore or unarchive it and run this again. Refuses while the aoe serve daemon runs; stop it with `aoe serve --stop` first
+* `migrate` — Run pending migrations or restore complete original lifecycle authority. Stop the daemon with `aoe serve --stop` first. By default, also move eligible sandbox stores and retry deferred ownership recovery
 * `completion` — Generate shell completions
 
 ###### **Options:**
@@ -2088,9 +2088,15 @@ Update aoe to the latest release
 
 ## `aoe migrate`
 
-Run pending data migrations now, showing progress. A sandboxed session moves its own agent store when it starts; use this to move every eligible store at once instead. Trashed and archived sessions are skipped; each moves when it is started, or restore or unarchive it and run this again. Refuses while the aoe serve daemon runs; stop it with `aoe serve --stop` first
+Run pending migrations or restore complete original lifecycle authority. Stop the daemon with `aoe serve --stop` first. By default, also move eligible sandbox stores and retry deferred ownership recovery
 
-**Usage:** `aoe migrate`
+**Usage:** `aoe migrate [OPTIONS]`
+
+###### **Options:**
+
+* `--restore-purge-journal <FILE>` — Restore a complete original purge journal from a consistent application backup
+* `--restore-tool-journal <FILE>` — Restore complete original tool retirement receipts from a consistent application backup
+* `--confirm-complete-original-authority` — Attest that FILE contains all original authority, not a stale or partial copy
 
 
 

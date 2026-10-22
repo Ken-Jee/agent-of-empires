@@ -223,7 +223,14 @@ impl Instance {
         let metadata = panes.get(session.session_name());
         if let Some(metadata) = metadata.filter(|pane| pane.pane_dead) {
             let identity = tmux::ToolSession::legacy_identity(metadata)?;
-            session.kill_verified(&self.id, tool_name, &identity)?;
+            session.kill_verified(
+                &self.id,
+                tool_name,
+                &identity,
+                adoption
+                    .map(|adoption| adoption.server.as_ref())
+                    .or(metadata.server.as_deref()),
+            )?;
         }
         let created = metadata.is_none_or(|pane| pane.pane_dead);
         if created {
@@ -405,7 +412,7 @@ impl Instance {
         let generation =
             self.acquire_lifecycle_reservation(store, LifecycleOperation::Launch, None)?;
         let result = (|| {
-            let container = self.ensure_container_with_hook_in(
+            let (container, _) = self.ensure_container_with_hook_in(
                 store,
                 &tokio_util::sync::CancellationToken::new(),
                 |instance, config| {

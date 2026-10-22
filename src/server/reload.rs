@@ -341,8 +341,18 @@ pub(crate) struct ReloadFailure {
     #[source]
     pub(super) source: anyhow::Error,
 }
+impl ReloadFailure {
+    pub(crate) fn owner_diagnostics(&self) -> Vec<crate::daemon::OwnerLoadDiagnostic> {
+        self.source.downcast_ref::<crate::session::LoadSource>().map(|source| {
+            vec![crate::daemon::OwnerLoadDiagnostic {
+                path: crate::session::safe_load_label(&source.0.to_string_lossy()),
+                message: "Repair the unreadable or invalid file; a fresh runtime snapshot restores access.".to_owned(),
+            }]
+        }).unwrap_or_default()
+    }
+}
 
-pub(super) fn load_all_profiles(
+pub(crate) fn load_all_profiles(
     file_watch: &Arc<FileWatchService>,
 ) -> Result<LoadedProfiles, ReloadFailure> {
     use crate::daemon::{ProfileSnapshot, ProjectResponse, ReloadFailureCode, RuntimeHealth};
@@ -386,7 +396,12 @@ pub(super) fn load_all_profiles(
     let mut raw_tool_names = std::collections::HashMap::new();
     for profile in profiles {
         let (mut instances, groups, details, identity) = (|| {
-            let storage = Storage::open(&profile, file_watch.clone())?;
+            let storage = Storage::open(&profile, file_watch.clone()).map_err(|error| {
+                match crate::session::get_profile_dir_path(&profile) {
+                    Ok(directory) => error.context(crate::session::LoadSource(directory)),
+                    Err(_) => error,
+                }
+            })?;
             let (instances, groups) = storage.load_complete_with_groups()?;
             let (device, inode) = storage.bound_profile_identity()?;
             let details = load_profile_details(&profile)?;
@@ -1074,13 +1089,18 @@ pub(super) async fn reload_state_instances_from_disk(
         instances: mut fresh,
         mut cache,
     } = loaded;
-    let (mut metadata, native_health) = match metadata {
-        Ok(metadata) => (metadata, crate::daemon::RuntimeHealth::Healthy),
+    let (mut metadata, native_health, native_diagnostics) = match metadata {
+        Ok(metadata) => (metadata, crate::daemon::RuntimeHealth::Healthy, Vec::new()),
         Err(error) => {
             tracing::warn!(target: "server.file_watch", %error, "native reload remains unavailable; accepting independent CLI components");
             live_worker_records.clear();
             passive.clear();
-            (state.canonical_metadata.read().await.clone(), error.health)
+            let diagnostics = error.owner_diagnostics();
+            (
+                state.canonical_metadata.read().await.clone(),
+                error.health,
+                diagnostics,
+            )
         }
     };
     // Keep suppression stable across the reload decision.
@@ -1186,6 +1206,10 @@ pub(super) async fn reload_state_instances_from_disk(
             crate::daemon::RuntimeHealth::Degraded { .. }
         ) {
             *state.canonical_health.write().await = native_health;
+            *state
+                .canonical_diagnostics
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = native_diagnostics;
         }
         state.runtime.request_publish();
         return Vec::new();
@@ -1204,7 +1228,12 @@ pub(super) async fn reload_state_instances_from_disk(
         .await
         {
             tracing::warn!(target: "server.file_watch", error = ?error, "retaining last complete state after repair failure");
+            let diagnostics = error.owner_diagnostics();
             *state.canonical_health.write().await = error.health;
+            *state
+                .canonical_diagnostics
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = diagnostics;
             state.runtime.request_publish();
             return Vec::new();
         }
@@ -1218,7 +1247,12 @@ pub(super) async fn reload_state_instances_from_disk(
         )
         .await
         {
+            let diagnostics = error.owner_diagnostics();
             *state.canonical_health.write().await = error.health;
+            *state
+                .canonical_diagnostics
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = diagnostics;
             state.runtime.request_publish();
             return Vec::new();
         }
@@ -1236,6 +1270,10 @@ pub(super) async fn reload_state_instances_from_disk(
     drop(current);
     *state.canonical_metadata.write().await = metadata;
     *state.canonical_health.write().await = native_health;
+    *state
+        .canonical_diagnostics
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = native_diagnostics;
     state.runtime.request_publish();
     for change in &changes {
         let _ = state.status_tx.send(change.clone());
@@ -2675,6 +2713,7 @@ mod tests {
             let metadata = std::collections::HashMap::from([(
                 session_name.clone(),
                 crate::tmux::PaneMetadata {
+                    server: None,
                     session_id: "$42".into(),
                     pane_id: "%42".into(),
                     session_kind: None,
@@ -2749,6 +2788,7 @@ mod tests {
         let metadata = std::collections::HashMap::from([(
             session_name,
             crate::tmux::PaneMetadata {
+                server: None,
                 session_id: "$42".into(),
                 pane_id: "%42".into(),
                 session_kind: None,
@@ -2851,6 +2891,7 @@ mod tests {
         let metadata = std::collections::HashMap::from([(
             session_name,
             crate::tmux::PaneMetadata {
+                server: None,
                 session_id: "$42".into(),
                 pane_id: "%42".into(),
                 session_kind: None,
@@ -3468,6 +3509,7 @@ mod tests {
         let metadata = std::collections::HashMap::from([(
             name,
             crate::tmux::PaneMetadata {
+                server: None,
                 session_id: "$42".into(),
                 pane_id: "%42".into(),
                 session_kind: None,

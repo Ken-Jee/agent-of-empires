@@ -77,7 +77,7 @@ interface Props {
   onDeleteSession?: (sessionIds: string[]) => void;
   /** Receives every session id of the trashed workspace. */
   onRestoreSession?: (sessionIds: string[]) => void;
-  onEmptyTrash?: () => void;
+  onEmptyTrash?: (workspaces: Workspace[]) => void;
   onStopSession?: (sessionId: string) => void;
   onStartSession?: (sessionId: string) => void;
   onSwitchView?: (sessionId: string, toStructured: boolean) => void;
@@ -383,7 +383,7 @@ export function WorkspaceSidebar(props: Props) {
               onOpen={selection.handleRowActivate}
               onRestore={(ids) => props.onRestoreSession?.(ids)}
               onDelete={(ids) => props.onDeleteSession?.(ids)}
-              onEmptyTrash={() => props.onEmptyTrash?.()}
+              onEmptyTrash={(workspaces) => props.onEmptyTrash?.(workspaces)}
             />
           )}
           <button

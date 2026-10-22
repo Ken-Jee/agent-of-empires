@@ -12,25 +12,60 @@ use anyhow::{Context, Result};
 const LOCK_WAIT: Duration = Duration::from_secs(10);
 
 pub fn run() -> Result<()> {
-    reconcile(None)
+    let transaction = crate::daemon::lifecycle::Transaction::acquire_blocking_for(LOCK_WAIT)?;
+    run_with_exclusion(&transaction, None)
 }
 
 pub(super) fn run_with_transaction(
     transaction: &crate::daemon::lifecycle::Transaction,
 ) -> Result<()> {
-    reconcile(Some(transaction))
+    run_with_exclusion(transaction, None)
 }
 
-fn reconcile(transaction: Option<&crate::daemon::lifecycle::Transaction>) -> Result<()> {
+pub(super) fn run_with_exclusion(
+    transaction: &crate::daemon::lifecycle::Transaction,
+    serve: Option<&crate::cli::serve::ServeLock>,
+) -> Result<()> {
     let root = crate::session::AnchoredDir::open(&crate::session::get_app_dir()?)?;
-    if records_are_migrated(&root)? {
-        return Ok(());
-    }
-    if transaction.is_some() {
+    let malformed = malformed_records(&root)?;
+    if malformed.is_empty() {
+        let _state = crate::cli::serve::lock_serve_state()?;
         return migrate_records(&root);
     }
-    let _transaction = crate::daemon::lifecycle::Transaction::acquire_blocking_for(LOCK_WAIT)?;
-    migrate_records(&root)
+    crate::cli::serve::with_inactive_serve_state(transaction, serve, |_| {
+        // Revalidate both slots before preserving or removing either one.
+        let malformed = malformed_records(&root)?;
+        for (name, bytes) in malformed {
+            let file = root.bind_file(name.as_ref())?;
+            file.require_writable_existing()?;
+            let quarantine = file.quarantine_recovery_bytes(&bytes)?;
+            file.remove()?;
+            file.sync_parent()?;
+            tracing::warn!(record = name, path = %quarantine.display(), "Preserved malformed inactive launch state; start a fresh daemon explicitly");
+        }
+        migrate_records(&root)
+    })
+}
+
+fn malformed_records(root: &crate::session::AnchoredDir) -> Result<Vec<(&'static str, Vec<u8>)>> {
+    let mut malformed = Vec::new();
+    for name in ["serve.launch", "serve.rollback.launch"] {
+        let file = root.bind_file(name.as_ref())?;
+        let Some(bytes) = file
+            .read_recovery_bytes()
+            .with_context(|| format!("Reading {name}"))?
+        else {
+            continue;
+        };
+        let parsed = serde_json::from_slice::<serde_json::Value>(&bytes);
+        match parsed {
+            Ok(serde_json::Value::Object(object)) => {
+                validate_record_schema(&object).with_context(|| format!("Validating {name}"))?;
+            }
+            Ok(_) | Err(_) => malformed.push((name, bytes)),
+        }
+    }
+    Ok(malformed)
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -39,11 +74,12 @@ struct UnsupportedLaunchSchema(Option<u64>);
 
 fn validate_record_schema(object: &serde_json::Map<String, serde_json::Value>) -> Result<()> {
     let schema = object.get("schema").and_then(serde_json::Value::as_u64);
+    let supported = u64::from(crate::cli::serve::SERVE_LAUNCH_SCHEMA);
     anyhow::ensure!(
-        matches!(schema, Some(1..=4)),
+        schema.is_some_and(|schema| (1..=supported).contains(&schema)),
         UnsupportedLaunchSchema(schema)
     );
-    if schema == Some(u64::from(crate::cli::serve::SERVE_LAUNCH_SCHEMA)) {
+    if schema == Some(supported) {
         anyhow::ensure!(
             is_migrated(object),
             "Invalid current daemon passphrase policy"
@@ -206,18 +242,98 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn malformed_launch_does_not_advance_the_schema() -> anyhow::Result<()> {
+    fn inactive_malformed_launch_is_preserved_and_peer_secrets_survive() -> anyhow::Result<()> {
+        for torn in ["serve.launch", "serve.rollback.launch"] {
+            let temp = tempfile::tempdir()?;
+            let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
+            let app = crate::session::get_app_dir()?;
+            let valid = serde_json::json!({"schema":crate::cli::serve::SERVE_LAUNCH_SCHEMA,"pid":42,"instance_id":"retained","auth_mode":"token","has_passphrase":true});
+            let peer = if torn == "serve.launch" {
+                "serve.rollback.launch"
+            } else {
+                "serve.launch"
+            };
+            let peer_bytes = serde_json::to_vec(&valid)?;
+            let corrupt = [b'{', b'"', 0xff];
+            std::fs::write(app.join(torn), corrupt)?;
+            std::fs::write(app.join(peer), &peer_bytes)?;
+            std::fs::write(app.join("serve.passphrase"), b"secret")?;
+            std::fs::write(app.join("serve.rollback.passphrase"), b"rollback-secret")?;
+            run()?;
+            assert!(!app.join(torn).try_exists()?);
+            assert_eq!(std::fs::read(app.join(peer))?, peer_bytes);
+            assert_eq!(std::fs::read(app.join("serve.passphrase"))?, b"secret");
+            assert_eq!(
+                std::fs::read(app.join("serve.rollback.passphrase"))?,
+                b"rollback-secret"
+            );
+            let quarantines: Vec<_> = std::fs::read_dir(&app)?
+                .collect::<std::io::Result<Vec<_>>>()?
+                .into_iter()
+                .filter(|entry| {
+                    entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(&format!("{torn}.quarantine-"))
+                })
+                .collect();
+            assert_eq!(quarantines.len(), 1);
+            assert_eq!(std::fs::read(quarantines[0].path())?, corrupt);
+            run()?;
+            assert_eq!(std::fs::read(quarantines[0].path())?, corrupt);
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn ambiguous_daemon_or_future_peer_prevents_any_quarantine() -> anyhow::Result<()> {
+        for future_peer in [false, true] {
+            let temp = tempfile::tempdir()?;
+            let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
+            let app = crate::session::get_app_dir()?;
+            std::fs::write(app.join("serve.launch"), b"{")?;
+            std::fs::write(app.join("serve.passphrase"), b"retained-secret")?;
+            if future_peer {
+                std::fs::write(
+                    app.join("serve.rollback.launch"),
+                    br#"{"schema":18446744073709551615}"#,
+                )?;
+            } else {
+                // A torn PID is not absence proof, even when lifetime locks are free.
+                std::fs::write(app.join("serve.pid"), b"not-a-pid")?;
+            }
+            assert!(run().is_err());
+            assert_eq!(std::fs::read(app.join("serve.launch"))?, b"{");
+            assert_eq!(
+                std::fs::read(app.join("serve.passphrase"))?,
+                b"retained-secret"
+            );
+            assert!(!std::fs::read_dir(&app)?
+                .collect::<std::io::Result<Vec<_>>>()?
+                .iter()
+                .any(|entry| entry.file_name().to_string_lossy().contains(".quarantine-")));
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn occupied_legacy_lifetime_refuses_malformed_launch_recovery() -> anyhow::Result<()> {
         let temp = tempfile::tempdir()?;
-        let _guard = crate::session::test_support::isolate_app_dir_at(temp.path());
-        let root = crate::session::get_app_dir()?;
-        std::fs::write(root.join(".schema_version"), "39")?;
-        std::fs::write(root.join("serve.launch"), "not JSON")?;
-        assert!(crate::migrations::run_migrations().is_err());
-        assert_eq!(std::fs::read_to_string(root.join(".schema_version"))?, "43");
-        assert_eq!(
-            std::fs::read_to_string(root.join("serve.launch"))?,
-            "not JSON"
-        );
+        let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let app = crate::session::get_app_dir()?;
+        std::fs::write(app.join("serve.launch"), b"{")?;
+        let held = crate::cli::serve::try_lock_serve()?.unwrap();
+        assert!(run().is_err());
+        assert_eq!(std::fs::read(app.join("serve.launch"))?, b"{");
+        assert!(!std::fs::read_dir(&app)?
+            .collect::<std::io::Result<Vec<_>>>()?
+            .iter()
+            .any(|entry| entry.file_name().to_string_lossy().contains(".quarantine-")));
+        drop(held);
+        run()?;
+        assert!(!app.join("serve.launch").try_exists()?);
         Ok(())
     }
 
@@ -411,7 +527,7 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn malformed_policy_never_advertises_the_published_marker_or_clobbers_a_commit(
+    fn inactive_malformed_policy_quarantines_original_bytes_without_clobbering_commits(
     ) -> anyhow::Result<()> {
         for version in [34, 43] {
             let temp = tempfile::tempdir()?;
@@ -428,24 +544,49 @@ mod tests {
             if version == 34 {
                 let step = crate::migrations::MIGRATIONS
                     .iter()
-                    .find(|step| step.version == 35)
+                    .find(|(version, ..)| *version == 35)
                     .unwrap();
-                (step.run)()?;
+                (step.2)()?;
                 assert_eq!(
                     fs::read_to_string(app.join("serve.rollback.launch"))?,
                     "not JSON"
                 );
             }
-            assert!(crate::migrations::run_migrations().is_err());
-            assert_eq!(fs::read_to_string(app.join(".schema_version"))?, "43");
+            crate::migrations::run_migrations()?;
+            assert_eq!(
+                crate::migrations::get_current_version(),
+                crate::migrations::CURRENT_VERSION
+            );
             assert_eq!(fs::read_to_string(app.join("serve.launch"))?, committed);
             assert_eq!(
                 fs::read_to_string(app.join("serve.rollback.passphrase"))?,
                 "committed credential bytes"
             );
+            assert!(!app.join("serve.rollback.launch").try_exists()?);
+            let quarantines = || -> anyhow::Result<Vec<std::path::PathBuf>> {
+                Ok(fs::read_dir(&app)?
+                    .collect::<std::io::Result<Vec<_>>>()?
+                    .into_iter()
+                    .filter(|entry| {
+                        entry
+                            .file_name()
+                            .to_string_lossy()
+                            .starts_with("serve.rollback.launch.quarantine-")
+                    })
+                    .map(|entry| entry.path())
+                    .collect())
+            };
+            let preserved = quarantines()?;
+            assert_eq!(preserved.len(), 1);
+            assert_eq!(fs::read(&preserved[0])?, b"not JSON");
+            run()?;
+            crate::migrations::run_migrations()?;
+            assert_eq!(quarantines()?, preserved);
+            assert_eq!(fs::read(&preserved[0])?, b"not JSON");
+            assert_eq!(fs::read_to_string(app.join("serve.launch"))?, committed);
             assert_eq!(
-                fs::read_to_string(app.join("serve.rollback.launch"))?,
-                "not JSON"
+                fs::read(app.join("serve.rollback.passphrase"))?,
+                b"committed credential bytes"
             );
         }
         Ok(())

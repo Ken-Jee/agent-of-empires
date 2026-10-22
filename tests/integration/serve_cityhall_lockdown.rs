@@ -1,15 +1,6 @@
-//! Route-level coverage for CityHall client mode (#7).
-//!
-//! Drives the real `build_router` stack through `tower::ServiceExt::oneshot`
-//! (no socket bind) against a test `AppState` with `cityhall_mode = true`, and
-//! asserts that every sensitive route the locked-down client hides in the UI is
-//! actually closed server-side: the handler returns 403 with the canonical
-//! `{"error":"cityhall_mode"}` body before doing any work. Reachability is
-//! enforced by the default-deny `cityhall_gate` middleware; the runtime
-//! counterpart of the build-time `every_mutating_route_is_cityhall_classified`
-//! audit in `src/server/access.rs`. Loopback + a null token clears the
-//! DNS-rebinding gate and auth, so the only 403 source under test is the
-//! CityHall boundary (asserted via the body).
+//! CityHall boundaries through the real router and an isolated AppState.
+//! Blocked routes return the canonical CityHall body before handler effects.
+//! Positive controls verify that allowlisted requests reach their handlers.
 
 use agent_of_empires::server::test_support::{
     build_router_for_test, build_test_app_state_cityhall,
@@ -336,10 +327,7 @@ async fn delete_workspace_all_structured_is_not_cityhall_blocked() {
     );
 }
 
-// Positive boundary check: an ALLOW-listed mutating route stays reachable in
-// CityHall (the `cityhall_gate` lets it through to the handler), so an
-// accidental deletion of its allow entry is caught by a direct assertion, not
-// only the classification audit.
+// Verify allowlisted writes reach their handler as well as checking denied routes.
 #[tokio::test]
 #[serial_test::parallel]
 async fn allowlisted_route_stays_reachable() {

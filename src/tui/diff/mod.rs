@@ -102,6 +102,15 @@ pub struct DiffView {
 
     /// Staged for HomeView to submit through the runtime after keyboard or mouse input.
     pub(crate) pending_override: Option<(String, Option<String>)>,
+    pub(crate) saved_base_branch: String,
+    pub(crate) base_save_epoch: Option<String>,
+    pub(crate) base_save_branch: Option<String>,
+    pub(crate) base_save: Option<
+        tokio::sync::oneshot::Receiver<
+            Result<crate::daemon::RuntimeCursor, crate::tui::session_feed::CommandFailure>,
+        >,
+    >,
+    pub(crate) base_unsaved: bool,
 
     /// Inner rect of the file-list panel, captured during `render`.
     /// Lets a click on a file row select it and a hover highlight it
@@ -170,7 +179,7 @@ impl DiffView {
             repo_path,
             session_id,
             profile,
-            base_branch,
+            base_branch: base_branch.clone(),
             files: Vec::new(),
             selected_file: 0,
             diff_cache: HashMap::new(),
@@ -189,6 +198,11 @@ impl DiffView {
             file_list_width: config.app_state.diff_file_list_width.unwrap_or(35),
             warning_dialog,
             pending_override: None,
+            saved_base_branch: base_branch,
+            base_save_epoch: None,
+            base_save_branch: None,
+            base_save: None,
+            base_unsaved: false,
             file_list_inner: ratatui::layout::Rect::default(),
             file_list_scroll_offset: 0,
         };
@@ -346,6 +360,7 @@ impl DiffView {
     /// comparison. Persistence failures only surface as a soft error
     /// message; the in-memory switch still applies. See #970.
     pub fn select_branch(&mut self, branch: String) {
+        self.base_unsaved = self.session_id.is_some();
         self.base_branch = branch;
         self.branch_select = None;
         self.warning_dialog = check_merge_base_status(&self.repo_path, &self.base_branch)
@@ -370,6 +385,55 @@ impl DiffView {
     /// Consume the staged override exactly once for runtime submission.
     pub fn take_pending_override(&mut self) -> Option<(String, Option<String>)> {
         self.pending_override.take()
+    }
+    pub(crate) fn base_not_saved(&mut self, message: &str) {
+        self.base_unsaved = true;
+        self.warning_dialog = Some(InfoDialog::sized_to_fit(
+            "Diff Base Not Saved",
+            &format!("{message}\n\nComparison remains an unsaved draft. Choose the branch again to save after resolving the refusal."),
+        ));
+    }
+
+    pub(crate) fn poll_base_save(
+        &mut self,
+        epoch: Option<&str>,
+        canonical_base: Option<&str>,
+    ) -> bool {
+        let Some(receiver) = &mut self.base_save else {
+            return false;
+        };
+        let result = match receiver.try_recv() {
+            Ok(result) => result,
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => return false,
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed) => Err(
+                crate::tui::session_feed::CommandFailure::Unknown("Save interrupted; outcome unknown. Resolve the row quarantine before submitting again.".into()),
+            ),
+        };
+        self.base_save = None;
+        match result {
+            Ok(cursor)
+                if self.base_save_epoch.as_deref() == Some(cursor.epoch.as_str())
+                    && epoch == Some(cursor.epoch.as_str()) =>
+            {
+                if let Some(branch) = self.base_save_branch.take() {
+                    self.saved_base_branch = branch;
+                }
+                self.base_unsaved = self.base_branch != self.saved_base_branch
+                    || canonical_base != Some(self.saved_base_branch.as_str());
+            }
+            Ok(_) => {
+                self.base_not_saved("Runtime epoch changed; save confirmation cannot be used.")
+            }
+            Err(crate::tui::session_feed::CommandFailure::Rejected(message)) => {
+                self.base_not_saved(&message)
+            }
+            Err(crate::tui::session_feed::CommandFailure::Unknown(message)) => {
+                self.base_not_saved(&format!("Outcome unknown: {message}"))
+            }
+        }
+        self.base_save_epoch = None;
+        self.base_save_branch = None;
+        true
     }
 
     pub fn next_file(&mut self) {
@@ -509,6 +573,11 @@ impl DiffView {
             file_list_width: 35,
             warning_dialog: None,
             pending_override: None,
+            saved_base_branch: "main".to_string(),
+            base_save_epoch: None,
+            base_save_branch: None,
+            base_save: None,
+            base_unsaved: false,
             file_list_inner: ratatui::layout::Rect::default(),
             file_list_scroll_offset: 0,
         }

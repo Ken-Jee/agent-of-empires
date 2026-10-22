@@ -147,64 +147,11 @@ pub(super) fn migrate_journal(root: &crate::session::AnchoredDir, app: &Path) ->
     let Some(raw) = file.read()? else {
         return Ok(());
     };
-    let mut journal: Value = serde_json::from_str(&raw)?;
-    anyhow::ensure!(
-        journal["version"] == 2 || journal["version"] == 3,
-        "Unsupported pending purge ownership version"
-    );
-    let legacy = journal["version"] == 2;
-    let owners = journal["owners"]
-        .as_array_mut()
-        .context("invalid pending purge ownership")?;
-    let mut changed = legacy;
-    for owner in owners {
-        let runner = owner["runner"]
-            .as_object_mut()
-            .context("invalid captured runner")?;
-        match runner.get("state").and_then(Value::as_str) {
-            Some("captured" | "uncaptured") => {
-                if runner.get("state").and_then(Value::as_str) == Some("uncaptured")
-                    && !runner.contains_key("producer_id")
-                {
-                    runner.insert("producer_id".into(), Value::Null);
-                    changed = true;
-                }
-                if legacy {
-                    if !runner.contains_key("prime") {
-                        runner.insert("prime".into(), json!({"state": "unresolved"}));
-                        changed = true;
-                    }
-                    if runner.get("state").and_then(Value::as_str) == Some("captured")
-                        && !runner.contains_key("birth_fingerprint")
-                    {
-                        runner.insert("birth_fingerprint".into(), Value::Null);
-                        changed = true;
-                    }
-                }
-                if let Some(scopes) = runner.get("scopes") {
-                    serde_json::from_value::<Vec<crate::process::worker_registry::ScopeOwnership>>(
-                        scopes.clone(),
-                    )?;
-                } else {
-                    anyhow::ensure!(legacy, "Current purge capture is missing scope ownership");
-                    runner.insert("scopes".into(), json!([{"state": "unresolved"}]));
-                    changed = true;
-                }
-            }
-            Some("cancelled_before_birth") => {
-                anyhow::ensure!(
-                    !legacy,
-                    "Legacy purge capture cannot attest completed construction"
-                );
-            }
-            Some("unresolved") => {}
-            _ => anyhow::bail!("invalid captured runner state"),
-        }
-    }
-    journal["version"] = json!(3);
-    let encoded = serde_json::to_vec(&journal)?;
-    crate::session::purge_owners::validate_journal_for_migration(std::str::from_utf8(&encoded)?)?;
-    if changed {
+    let encoded = crate::session::purge_owners::upcast_journal(
+        &raw,
+        crate::session::purge_owners::JournalInput::Migration,
+    )?;
+    if encoded.as_ref() != raw.as_bytes() {
         crate::session::backup_before_migration(
             &app.join(crate::session::purge_owners::FILE_NAME),
         )?;

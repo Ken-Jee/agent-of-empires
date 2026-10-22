@@ -739,11 +739,7 @@ pub async fn create_session(
     let default_profile = state.served_profile().to_string();
 
     if state.cityhall_mode {
-        // CityHall sessions are server-derived and locked down: they span every
-        // configured project, always render in structured view, and must run an
-        // ACP-capable agent. Every client-supplied field that could escape the
-        // mode (path/repos/view/scratch plus the spawn/branch fields reset
-        // below) is neutralized so a crafted request cannot escape it. See #7.
+        // CityHall derives execution and outbound effects from operator policy.
         if body
             .fork_session_id
             .as_deref()
@@ -764,11 +760,7 @@ pub async fn create_session(
             );
         }
         body.scratch = false;
-        // Reset every client-controllable spawn / branch field. Deriving
-        // path/repos/view is not enough: `command_override` is load-bearing,
-        // since the ACP supervisor validates the registry-default binary but
-        // then adopts the client's `argv[0]` unchecked, so a shell command on a
-        // registry ACP tool would pass the gate below and spawn anything (#7).
+        body.callback_url = None;
         body.command_override = String::new();
         body.extra_args = String::new();
         body.extra_env = Vec::new();
@@ -779,13 +771,10 @@ pub async fn create_session(
         body.base_branch = None;
         body.sandbox = false;
         body.sandbox_image = None;
-        // Do not let the client approve the repo's `on_create` host hooks: that
-        // would run operator-repo commands from a locked-down user (#7).
+        // Hook approval remains operator-owned.
         body.trust_hooks = None;
         body.trust_review = None;
-        // The "primary" repo is the first entry in merged registry order; the
-        // rest ride along as workspace repos. The pick only affects labeling.
-        // Non-empty is checked above, so `next()` is Some.
+        // Registry order selects the primary project.
         let mut paths = projects.into_iter().map(|p| p.path);
         body.path = paths.next().unwrap();
         body.extra_repo_paths = paths.collect();

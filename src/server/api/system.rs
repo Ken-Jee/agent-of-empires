@@ -3300,7 +3300,7 @@ mod tests {
                     }),
                     headers,
                     None,
-                    Some(axum::Extension(LocalAuthorization::TcpLoopback)),
+                    None,
                     Ok(Json(json!({"systemd": {"slice": slice}}))),
                 )
                 .await
@@ -3326,7 +3326,7 @@ mod tests {
                 }),
                 HeaderMap::new(),
                 None,
-                Some(axum::Extension(LocalAuthorization::TcpLoopback)),
+                None,
                 Ok(Json(json!({"systemd": {"slice": "unstamped.slice"}}))),
             )
             .await

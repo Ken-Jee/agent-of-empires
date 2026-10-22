@@ -23,6 +23,38 @@ impl HomeView {
         self.pending_namespace_intent = Some(intent);
         Ok(())
     }
+    pub(super) fn set_group_collapsed(
+        &mut self,
+        group: crate::daemon::GroupLocation,
+        collapsed: bool,
+        intent: NamespaceIntent,
+    ) -> anyhow::Result<()> {
+        if let Err(error) = self.ensure_namespace_idle() {
+            if matches!(&intent, NamespaceIntent::Reveal { .. }) {
+                self.retained_reveal = Some(intent);
+                self.offer_retained_reveal();
+            }
+            return Err(error);
+        }
+        let result =
+            self.session_feed
+                .submit_namespace(crate::daemon::NamespaceMutation::CollapseGroup(
+                    crate::daemon::CollapseGroupBody { group, collapsed },
+                ));
+        match result {
+            Ok(()) => {
+                self.pending_namespace_intent = Some(intent);
+                Ok(())
+            }
+            Err(error) => {
+                if matches!(&intent, NamespaceIntent::Reveal { .. }) {
+                    self.retained_reveal = Some(intent);
+                    self.offer_retained_reveal();
+                }
+                Err(error)
+            }
+        }
+    }
 
     pub(super) fn canonical_group_location(
         &self,

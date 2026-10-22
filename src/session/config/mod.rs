@@ -3609,18 +3609,27 @@ impl Config {
     /// Read config.toml without the obsolete inline app_state table.
     fn load_raw_table() -> Result<toml::Table> {
         let path = config_path()?;
-        let mut table: toml::Table = match read_optional_config(&path)? {
-            Some(content) => toml::from_str(&content)?,
-            None => toml::Table::new(),
-        };
-        // state.toml is authoritative even if an older peer writes inline state.
-        table.remove("app_state");
-        Ok(table)
+        let result = (|| {
+            let mut table: toml::Table = match read_optional_config(&path)? {
+                Some(content) => toml::from_str(&content)?,
+                None => toml::Table::new(),
+            };
+            // state.toml is authoritative even if an older peer writes inline state.
+            table.remove("app_state");
+            Ok(table)
+        })();
+        result.map_err(|error: anyhow::Error| error.context(crate::session::LoadSource(path)))
     }
 
     pub fn load() -> Result<Self> {
         let table = Self::load_raw_table()?;
-        let mut config: Config = table.try_into()?;
+        let mut config: Config = table.try_into().map_err(|error: toml::de::Error| {
+            let error = anyhow::Error::new(error);
+            match config_path() {
+                Ok(path) => error.context(crate::session::LoadSource(path)),
+                Err(_) => error,
+            }
+        })?;
         config.app_state = AppStateConfig::load()?;
         Ok(config)
     }
@@ -3732,11 +3741,14 @@ impl AppStateConfig {
     /// `[app_state]` table). A missing file deserializes to defaults.
     pub fn load() -> Result<Self> {
         let path = state_path()?;
-        let table: toml::Table = match read_optional_config(&path)? {
-            Some(content) => toml::from_str(&content)?,
-            None => toml::Table::new(),
-        };
-        Ok(table.try_into()?)
+        let result = (|| {
+            let table: toml::Table = match read_optional_config(&path)? {
+                Some(content) => toml::from_str(&content)?,
+                None => toml::Table::new(),
+            };
+            Ok(table.try_into()?)
+        })();
+        result.map_err(|error: anyhow::Error| error.context(crate::session::LoadSource(path)))
     }
 }
 

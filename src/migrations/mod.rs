@@ -1,15 +1,10 @@
-//! Data migrations for handling breaking changes across versions.
-//!
-//! Each migration is a one-time transformation that runs when upgrading from
-//! an older version. Migrations run in increasing version order.
-//!
-//! To add a new migration:
-//! 1. Create a new module `vNNN_description.rs`
-//! 2. Implement the migration function
-//! 3. Add it to the `MIGRATIONS` array below
+//! One-time transformations of persisted data, run in order on upgrade. See
+//! `docs/development/adding-a-migration.md` to add one.
 
 mod config_file;
+mod legacy_scope_recovery;
 pub mod progress;
+pub(crate) mod recovery;
 mod sessions_file;
 mod store_fs;
 #[cfg(test)]
@@ -61,6 +56,7 @@ mod v044_reconcile_serve_passphrase_policy;
 mod v045_runner_scope_ownership;
 mod v046_reconcile_runtime_lineages;
 mod v047_tool_retirements;
+mod v048_terminal_handoffs;
 
 /// Fixtures shared by migrations that rewrite agent hook files.
 #[cfg(test)]
@@ -101,251 +97,173 @@ use anyhow::Result;
 use std::fs;
 use tracing::{debug, info};
 
-const CURRENT_VERSION: u32 = 47;
+const CURRENT_VERSION: u32 = 48;
 const VERSION_FILE: &str = ".schema_version";
 
-struct Migration {
-    version: u32,
-    name: &'static str,
-    run: fn() -> Result<()>,
-}
+/// Version, log name, and the one-time transformation to run.
+type Migration = (u32, &'static str, fn() -> Result<()>);
 
 const MIGRATIONS: &[Migration] = &[
-    Migration {
-        version: 1,
-        name: "xdg_linux",
-        run: v001_xdg_linux::run,
-    },
-    Migration {
-        version: 2,
-        name: "seed_sandbox_from_volumes",
-        run: v002_seed_sandbox_from_volumes::run,
-    },
-    Migration {
-        version: 3,
-        name: "yolo_mode_config",
-        run: v003_yolo_mode_config::run,
-    },
-    Migration {
-        version: 4,
-        name: "unified_environment",
-        run: v004_unified_environment::run,
-    },
-    Migration {
-        version: 5,
-        name: "acp_defaults",
-        run: v005_cockpit_defaults::run,
-    },
-    Migration {
-        version: 6,
-        name: "unlimited_cockpit_history",
-        run: v006_unlimited_cockpit_history::run,
-    },
-    Migration {
-        version: 7,
-        name: "serve_log_to_legacy",
-        run: v007_serve_log_to_legacy::run,
-    },
-    Migration {
-        version: 8,
-        name: "lock_in_default_profile",
-        run: v008_lock_in_default_profile::run,
-    },
-    Migration {
-        version: 9,
-        name: "update_check_mode",
-        run: v009_update_check_mode::run,
-    },
-    Migration {
-        version: 10,
-        name: "drop_legacy_live_send_exit_chord",
-        run: v010_drop_legacy_live_send_exit_chord::run,
-    },
-    Migration {
-        version: 11,
-        name: "relocate_sandbox_image",
-        run: v011_relocate_sandbox_image::run,
-    },
-    Migration {
-        version: 12,
-        name: "acp_rename",
-        run: v012_acp_rename::run,
-    },
-    Migration {
-        version: 13,
-        name: "strip_profile_theme",
-        run: v013_strip_profile_theme::run,
-    },
-    Migration {
-        version: 14,
-        name: "rename_default_theme",
-        run: v014_rename_default_theme::run,
-    },
-    Migration {
-        version: 15,
-        name: "rewrite_hook_strings",
-        run: v015_rewrite_hook_strings::run,
-    },
-    Migration {
-        version: 16,
-        name: "clear_archived_tmux_gone_error",
-        run: v016_clear_archived_tmux_gone_error::run,
-    },
-    Migration {
-        version: 17,
-        name: "rewrite_hook_strings_for_per_user_base",
-        run: v017_rewrite_hook_strings_for_per_user_base::run,
-    },
-    Migration {
-        version: 18,
-        name: "strip_codex_config_toml_hooks",
-        run: v018_strip_codex_config_toml_hooks::run,
-    },
-    Migration {
-        version: 19,
-        name: "move_acp_defaults_to_acp",
-        run: v019_move_acp_defaults_to_acp::run,
-    },
-    Migration {
-        version: 20,
-        name: "move_tui_branch_suffix_to_row_tag",
-        run: v020_move_tui_branch_suffix_to_row_tag::run,
-    },
-    Migration {
-        version: 21,
-        name: "split_app_state_to_state_toml",
-        run: v021_split_app_state_to_state_toml::run,
-    },
-    Migration {
-        version: 22,
-        name: "prune_tuning_settings",
-        run: v022_prune_tuning_settings::run,
-    },
-    Migration {
-        version: 23,
-        name: "clear_structured_container_error",
-        run: v023_clear_structured_container_error::run,
-    },
-    Migration {
-        version: 24,
-        name: "backfill_detect_as",
-        run: v024_backfill_detect_as::run,
-    },
-    Migration {
-        version: 25,
-        name: "reenable_confirm_delete",
-        run: v025_reenable_confirm_delete::run,
-    },
-    Migration {
-        version: 26,
-        name: "repoint_acp_default_agent",
-        run: v026_repoint_acp_default_agent::run,
-    },
-    Migration {
-        version: 27,
-        name: "isolate_sandbox_stores",
-        run: v027_isolate_sandbox_stores::run,
-    },
-    Migration {
-        version: 28,
-        name: "clear_archived_live_status",
-        run: v028_clear_archived_live_status::run,
-    },
-    Migration {
-        version: 29,
-        name: "fold_pending_initial_turn",
-        run: v029_fold_pending_initial_turn::run,
-    },
-    Migration {
-        version: 30,
-        name: "global_only_profile_settings",
-        run: v030_global_only_profile_settings::run,
-    },
-    Migration {
-        version: 31,
-        name: "conversation_provenance",
-        run: v031_conversation_provenance::run,
-    },
-    Migration {
-        version: 32,
-        name: "bound_capture_exclusions",
-        run: v032_bound_capture_exclusions::run,
-    },
-    Migration {
-        version: 33,
-        name: "isolate_sandbox_content",
-        run: v033_isolate_sandbox_content::run,
-    },
-    Migration {
-        version: 34,
-        name: "trash_retention_minutes",
-        run: v034_trash_retention_minutes::run,
-    },
-    Migration {
-        version: 35,
-        name: "custom_sort_order",
-        run: v035_custom_sort_order::run,
-    },
-    Migration {
-        version: 36,
-        name: "session_creation_count",
-        run: v036_session_creation_count::run,
-    },
-    Migration {
-        version: 37,
-        name: "trash_lifecycle_id",
-        run: v037_trash_lifecycle_id::run,
-    },
-    Migration {
-        version: 38,
-        name: "prime_native_runtime",
-        run: v038_prime_native_runtime::run,
-    },
-    Migration {
-        version: 39,
-        name: "prime_control_path",
-        run: v039_prime_control_path::run,
-    },
-    Migration {
-        version: 40,
-        name: "worker_ownership",
-        run: v040_worker_ownership::run,
-    },
-    Migration {
-        version: 41,
-        name: "pending_purge_owners",
-        run: v041_pending_purge_owners::run,
-    },
-    Migration {
-        version: 42,
-        name: "reconcile_session_creation_count",
-        run: v042_reconcile_session_creation_count::run,
-    },
-    Migration {
-        version: 43,
-        name: "reconcile_trash_lifecycle_id",
-        run: v043_reconcile_trash_lifecycle_id::run,
-    },
-    Migration {
-        version: 44,
-        name: "reconcile_serve_passphrase_policy",
-        run: v044_reconcile_serve_passphrase_policy::run,
-    },
-    Migration {
-        version: 45,
-        name: "runner_scope_ownership",
-        run: v045_runner_scope_ownership::run,
-    },
-    Migration {
-        version: 46,
-        name: "reconcile_runtime_lineages",
-        run: v046_reconcile_runtime_lineages::run,
-    },
-    Migration {
-        version: 47,
-        name: "tool_retirements",
-        run: v047_tool_retirements::run,
-    },
+    (1, "xdg_linux", v001_xdg_linux::run),
+    (
+        2,
+        "seed_sandbox_from_volumes",
+        v002_seed_sandbox_from_volumes::run,
+    ),
+    (3, "yolo_mode_config", v003_yolo_mode_config::run),
+    (4, "unified_environment", v004_unified_environment::run),
+    (5, "acp_defaults", v005_cockpit_defaults::run),
+    (
+        6,
+        "unlimited_cockpit_history",
+        v006_unlimited_cockpit_history::run,
+    ),
+    (7, "serve_log_to_legacy", v007_serve_log_to_legacy::run),
+    (
+        8,
+        "lock_in_default_profile",
+        v008_lock_in_default_profile::run,
+    ),
+    (9, "update_check_mode", v009_update_check_mode::run),
+    (
+        10,
+        "drop_legacy_live_send_exit_chord",
+        v010_drop_legacy_live_send_exit_chord::run,
+    ),
+    (
+        11,
+        "relocate_sandbox_image",
+        v011_relocate_sandbox_image::run,
+    ),
+    (12, "acp_rename", v012_acp_rename::run),
+    (13, "strip_profile_theme", v013_strip_profile_theme::run),
+    (14, "rename_default_theme", v014_rename_default_theme::run),
+    (15, "rewrite_hook_strings", v015_rewrite_hook_strings::run),
+    (
+        16,
+        "clear_archived_tmux_gone_error",
+        v016_clear_archived_tmux_gone_error::run,
+    ),
+    (
+        17,
+        "rewrite_hook_strings_for_per_user_base",
+        v017_rewrite_hook_strings_for_per_user_base::run,
+    ),
+    (
+        18,
+        "strip_codex_config_toml_hooks",
+        v018_strip_codex_config_toml_hooks::run,
+    ),
+    (
+        19,
+        "move_acp_defaults_to_acp",
+        v019_move_acp_defaults_to_acp::run,
+    ),
+    (
+        20,
+        "move_tui_branch_suffix_to_row_tag",
+        v020_move_tui_branch_suffix_to_row_tag::run,
+    ),
+    (
+        21,
+        "split_app_state_to_state_toml",
+        v021_split_app_state_to_state_toml::run,
+    ),
+    (22, "prune_tuning_settings", v022_prune_tuning_settings::run),
+    (
+        23,
+        "clear_structured_container_error",
+        v023_clear_structured_container_error::run,
+    ),
+    (24, "backfill_detect_as", v024_backfill_detect_as::run),
+    (
+        25,
+        "reenable_confirm_delete",
+        v025_reenable_confirm_delete::run,
+    ),
+    (
+        26,
+        "repoint_acp_default_agent",
+        v026_repoint_acp_default_agent::run,
+    ),
+    (
+        27,
+        "isolate_sandbox_stores",
+        v027_isolate_sandbox_stores::run,
+    ),
+    (
+        28,
+        "clear_archived_live_status",
+        v028_clear_archived_live_status::run,
+    ),
+    (
+        29,
+        "fold_pending_initial_turn",
+        v029_fold_pending_initial_turn::run,
+    ),
+    (
+        30,
+        "global_only_profile_settings",
+        v030_global_only_profile_settings::run,
+    ),
+    (
+        31,
+        "conversation_provenance",
+        v031_conversation_provenance::run,
+    ),
+    (
+        32,
+        "bound_capture_exclusions",
+        v032_bound_capture_exclusions::run,
+    ),
+    (
+        33,
+        "isolate_sandbox_content",
+        v033_isolate_sandbox_content::run,
+    ),
+    (
+        34,
+        "trash_retention_minutes",
+        v034_trash_retention_minutes::run,
+    ),
+    (35, "custom_sort_order", v035_custom_sort_order::run),
+    (
+        36,
+        "session_creation_count",
+        v036_session_creation_count::run,
+    ),
+    (37, "trash_lifecycle_id", v037_trash_lifecycle_id::run),
+    (38, "prime_native_runtime", v038_prime_native_runtime::run),
+    (39, "prime_control_path", v039_prime_control_path::run),
+    (40, "worker_ownership", v040_worker_ownership::run),
+    (41, "pending_purge_owners", v041_pending_purge_owners::run),
+    (
+        42,
+        "reconcile_session_creation_count",
+        v042_reconcile_session_creation_count::run,
+    ),
+    (
+        43,
+        "reconcile_trash_lifecycle_id",
+        v043_reconcile_trash_lifecycle_id::run,
+    ),
+    (
+        44,
+        "reconcile_serve_passphrase_policy",
+        v044_reconcile_serve_passphrase_policy::run,
+    ),
+    (
+        45,
+        "runner_scope_ownership",
+        v045_runner_scope_ownership::run,
+    ),
+    (
+        46,
+        "reconcile_runtime_lineages",
+        v046_reconcile_runtime_lineages::run,
+    ),
+    (47, "tool_retirements", v047_tool_retirements::run),
+    (48, "terminal_handoffs", v048_terminal_handoffs::run),
 ];
 
 /// The data-schema version this build targets, i.e. the version every install
@@ -361,21 +279,20 @@ pub fn has_pending_migrations() -> bool {
     get_current_version() < CURRENT_VERSION
 }
 
-/// Refuse to run against a schema this build does not own: either pending
-/// migrations, or a version from a newer build.
-///
-/// This is the check the detached daemon child makes instead of migrating.
-/// Its parent `aoe serve` ran the migrations and still holds the daemon
-/// lifecycle transaction, so migrating here would both race the parent on
-/// `.schema_version` and wait on the lock the parent is about to hand over.
-/// Verifying is the fail-closed alternative.
-pub fn assert_schema_current() -> Result<()> {
+/// Check compatibility before changing or stopping a managed daemon.
+pub(crate) fn ensure_schema_supported() -> Result<u32> {
     let current = get_current_version();
     if current > CURRENT_VERSION {
         anyhow::bail!(
             "data schema version {current} is newer than this build supports ({CURRENT_VERSION}); refusing to downgrade"
         );
     }
+    Ok(current)
+}
+
+/// The detached daemon child must observe its parent's completed migration.
+pub fn assert_schema_current() -> Result<()> {
+    let current = ensure_schema_supported()?;
     anyhow::ensure!(
         current == CURRENT_VERSION,
         "data schema version {current} is behind this build ({CURRENT_VERSION}); \
@@ -425,13 +342,13 @@ pub fn run_migrations() -> Result<()> {
 /// [`run_migrations_announced`] for `aoe migrate`. This path only advances the
 /// schema version and reports the migrations it actually runs.
 pub fn run_migrations_with(reporter: Option<progress::Reporter>) -> Result<()> {
-    run_migrations_inner(reporter, false, None)
+    run_migrations_inner(reporter, false, None, None)
 }
 
 /// [`run_migrations_with`] for an explicit `aoe migrate`: a pending sandbox
 /// store move also narrates what is still pending and why.
 pub fn run_migrations_announced(reporter: Option<progress::Reporter>) -> Result<()> {
-    run_migrations_inner(reporter, true, None)
+    run_migrations_inner(reporter, true, None, None)
 }
 
 pub(crate) fn reconcile_serve_launch_under_transaction(
@@ -440,86 +357,95 @@ pub(crate) fn reconcile_serve_launch_under_transaction(
     v044_reconcile_serve_passphrase_policy::run_with_transaction(transaction)
 }
 
-pub(crate) fn run_migrations_under_transaction(
+pub(crate) fn run_migrations_under_exclusion(
     reporter: Option<progress::Reporter>,
     announce: bool,
     transaction: &crate::daemon::lifecycle::Transaction,
+    serve: &crate::cli::serve::ServeLock,
 ) -> Result<()> {
-    run_migrations_inner(reporter, announce, Some(transaction))
+    run_migrations_inner(reporter, announce, Some(transaction), Some(serve))
 }
 
 fn run_migrations_inner(
     reporter: Option<progress::Reporter>,
     announce: bool,
     transaction: Option<&crate::daemon::lifecycle::Transaction>,
+    serve: Option<&crate::cli::serve::ServeLock>,
 ) -> Result<()> {
     let _installed = progress::install(reporter);
     let _announced = progress::install_announced(announce);
-    // `announce` is the explicit `aoe migrate`, and the two reconciliations
-    // below read it under their own names, so state the conversion once here
-    // instead of letting one bool read as "narrate" in one call and "move"
-    // in the next: v027's `explicit_migrate` takes it as narrated-and-bulk
-    // (`defer = !explicit_migrate`), v033's `move_stores` takes it as
-    // migrate-rather-than-notify. Both mean the same thing on this path, which
-    // is why the same value is right for each.
-    let explicit_migrate = announce;
-    let move_stores = announce;
     let current = get_current_version();
     debug!("Current schema version: {}", current);
-
     if current > CURRENT_VERSION {
-        anyhow::bail!(
-            "data schema version {current} is newer than this build supports ({CURRENT_VERSION}); refusing to downgrade"
-        );
+        anyhow::bail!("data schema version {current} is newer than this build supports ({CURRENT_VERSION}); refusing to downgrade");
     }
     if current == CURRENT_VERSION {
-        v027_isolate_sandbox_stores::reconcile_pending(explicit_migrate)?;
-        v033_isolate_sandbox_content::reconcile_pending(move_stores)?;
-        if announce {
-            v046_reconcile_runtime_lineages::run()?;
-        }
-        return Ok(());
-    }
-
-    let pending: Vec<&Migration> = MIGRATIONS
-        .iter()
-        .filter(|migration| migration.version > current)
-        .collect();
-    for (index, migration) in pending.iter().enumerate() {
-        let start = std::time::Instant::now();
-        info!(
-            target: "migrations",
-            version = migration.version,
-            name = migration.name,
-            "running migration"
-        );
-        progress::report(progress::Event::Started {
-            version: migration.version,
-            name: migration.name,
-            position: index + 1,
-            total: pending.len(),
-        });
-        match (migration.version, transaction) {
-            (44, Some(transaction)) => {
-                v044_reconcile_serve_passphrase_policy::run_with_transaction(transaction)?
+        v027_isolate_sandbox_stores::reconcile_pending(announce)?;
+        v033_isolate_sandbox_content::reconcile_pending(announce)?;
+    } else {
+        let pending: Vec<&Migration> = MIGRATIONS
+            .iter()
+            .filter(|(version, ..)| *version > current)
+            .collect();
+        for (index, (version, name, run)) in pending.iter().enumerate() {
+            let start = std::time::Instant::now();
+            info!(target: "migrations", version, name, "running migration");
+            progress::report(progress::Event::Started {
+                version: *version,
+                name,
+                position: index + 1,
+                total: pending.len(),
+            });
+            match (*version, transaction) {
+                (44, Some(transaction)) => {
+                    v044_reconcile_serve_passphrase_policy::run_with_exclusion(transaction, serve)?
+                }
+                _ => run()?,
             }
-            _ => (migration.run)()?,
+            set_version(*version)?;
+            progress::report(progress::Event::Finished {
+                version: *version,
+                elapsed: start.elapsed(),
+            });
+            info!(target: "migrations", version, name, duration_ms = start.elapsed().as_millis() as u64, "migration completed");
         }
-        set_version(migration.version)?;
-        progress::report(progress::Event::Finished {
-            version: migration.version,
-            elapsed: start.elapsed(),
-        });
-        info!(
-            target: "migrations",
-            version = migration.version,
-            name = migration.name,
-            duration_ms = start.elapsed().as_millis() as u64,
-            "migration completed"
-        );
     }
-
+    if announce {
+        run_explicit_recovery(transaction, serve)?;
+    }
     Ok(())
+}
+
+fn run_explicit_recovery(
+    transaction: Option<&crate::daemon::lifecycle::Transaction>,
+    serve: Option<&crate::cli::serve::ServeLock>,
+) -> Result<()> {
+    let owned_transaction;
+    let transaction = match transaction {
+        Some(transaction) => transaction,
+        None => {
+            owned_transaction = crate::daemon::lifecycle::Transaction::acquire_blocking_for(
+                std::time::Duration::from_secs(10),
+            )?;
+            &owned_transaction
+        }
+    };
+    let owned_serve;
+    let serve = match serve {
+        Some(serve) => serve,
+        None => {
+            owned_serve = crate::cli::serve::try_lock_serve()?.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Daemon or migration owns serve.lock; explicit scope recovery refused"
+                )
+            })?;
+            &owned_serve
+        }
+    };
+    crate::cli::serve::with_inactive_serve_state(transaction, Some(serve), |_| {
+        recovery::reconcile_repaired_components()
+    })?;
+    legacy_scope_recovery::run_under_exclusion(transaction, serve)
 }
 
 /// Get the schema version from the selected app directory.
@@ -547,14 +473,9 @@ mod tests {
     #[test]
     fn test_migrations_are_sequential() {
         let mut prev = 0;
-        for m in MIGRATIONS {
-            assert!(
-                m.version > prev,
-                "Migration {} should be > {}",
-                m.version,
-                prev
-            );
-            prev = m.version;
+        for (version, ..) in MIGRATIONS {
+            assert!(*version > prev, "Migration {version} should be > {prev}");
+            prev = *version;
         }
     }
 
@@ -774,12 +695,14 @@ mod tests {
         fs::create_dir_all(&app).unwrap();
         fs::create_dir_all(home.join(".gemini/sandbox/history")).unwrap();
         fs::write(home.join(".gemini/sandbox/history/id.json"), b"legacy").unwrap();
-        let row = serde_json::json!({
-            "id": "one",
-            "title": "One",
-            "tool": "gemini",
-            "project_path": temp.path().join("project"),
-            "sandbox_info": {"enabled": true},
+        let mut instance =
+            crate::session::Instance::new("One", temp.path().join("project").to_str().unwrap());
+        instance.id = "one".into();
+        instance.tool = "gemini".into();
+        instance.sandbox_store_generation = 1;
+        let mut row = serde_json::to_value(instance).unwrap();
+        row["sandbox_info"] = serde_json::json!({
+            "enabled":true, "image":"fixture", "container_name":"aoe-sandbox-fixture",
         });
         fs::write(
             app.join("sessions.json"),
@@ -834,5 +757,80 @@ mod tests {
         serde_json::json!(u64::from(
             crate::session::config::container_config::CURRENT_SANDBOX_STORE_GENERATION
         ))
+    }
+    #[test]
+    #[serial_test::serial]
+    fn ordinary_current_schema_startup_never_runs_scope_authority_recovery() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let _home = crate::session::test_support::isolate_app_dir_at(home.path());
+        let app = crate::session::get_app_dir()?;
+        crate::session::purge_owners::initialize(&app)?;
+        crate::tmux::tool_retirement::initialize(&app)?;
+        let store = crate::session::Storage::new_unwatched("default")?;
+        let mut row = crate::session::Instance::new("old", "/tmp/repo");
+        row.view = crate::session::View::Terminal;
+        row.terminal_scopes = None;
+        store.update(|rows, _| {
+            rows.push(row.clone());
+            Ok(())
+        })?;
+        let workers = crate::process::worker_registry::workers_dir()?;
+        std::fs::write(workers.join("quarantined.json"), b"{")?;
+        set_version(CURRENT_VERSION)?;
+        let before = std::fs::read(store.sessions_path())?;
+        let transaction = crate::daemon::lifecycle::Transaction::acquire_blocking_for(
+            std::time::Duration::from_secs(1),
+        )?;
+        let serve = crate::cli::serve::try_lock_serve()?.unwrap();
+        run_migrations_under_exclusion(None, false, &transaction, &serve)?;
+        assert_eq!(std::fs::read(store.sessions_path())?, before);
+        assert_eq!(std::fs::read(workers.join("quarantined.json"))?, b"{");
+        assert_eq!(get_current_version(), CURRENT_VERSION);
+        assert!(run_migrations_under_exclusion(None, true, &transaction, &serve).is_err());
+        assert_eq!(std::fs::read(store.sessions_path())?, before);
+        Ok(())
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn explicit_recovery_runs_after_current_and_just_completed_migrations() -> Result<()> {
+        for version in [CURRENT_VERSION, CURRENT_VERSION - 1] {
+            let home = tempfile::tempdir()?;
+            let _home = crate::session::test_support::isolate_app_dir_at(home.path());
+            let app = crate::session::get_app_dir()?;
+            crate::session::purge_owners::initialize(&app)?;
+            crate::tmux::tool_retirement::initialize(&app)?;
+            let store = crate::session::Storage::new_unwatched("default")?;
+            let mut row = crate::session::Instance::new("old", "/tmp/repo");
+            row.view = crate::session::View::Terminal;
+            row.terminal_scopes = None;
+            store.update(|rows, _| {
+                rows.push(row.clone());
+                Ok(())
+            })?;
+            let mut persisted: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(store.sessions_path())?)?;
+            persisted[0]["terminal_handoff"] = serde_json::Value::Null;
+            std::fs::write(
+                store.sessions_path(),
+                serde_json::to_vec_pretty(&persisted)?,
+            )?;
+            set_version(version)?;
+            let before = std::fs::read(store.sessions_path())?;
+            let journal_path = app.join(crate::session::purge_owners::FILE_NAME);
+            let journal_before = std::fs::read(&journal_path)?;
+            let transaction = crate::daemon::lifecycle::Transaction::acquire_blocking_for(
+                std::time::Duration::from_secs(1),
+            )?;
+            let serve = crate::cli::serve::try_lock_serve()?.unwrap();
+            let unavailable = legacy_scope_recovery::test_support::deny_inventory();
+            assert!(run_migrations_under_exclusion(None, true, &transaction, &serve).is_err());
+            assert_eq!(unavailable.attempts(), 1);
+            assert_eq!(get_current_version(), CURRENT_VERSION);
+            assert_eq!(std::fs::read(store.sessions_path())?, before);
+            assert_eq!(std::fs::read(journal_path)?, journal_before);
+            assert!(crate::session::migration_backups(store.sessions_path())?.is_empty());
+        }
+        Ok(())
     }
 }

@@ -1122,7 +1122,8 @@ async fn handle_live_ws_inner(
                     // Keep the size-owner lock alive while we hold it, and
                     // notice promptly if another client took over (then we
                     // demote ourselves to a read-only viewer).
-                    if capture_settings.is_owner.load(Ordering::Relaxed)
+                    if !read_only
+                        && capture_settings.is_owner.load(Ordering::Relaxed)
                         && last_heartbeat.elapsed() >= SIZE_OWNER_HEARTBEAT
                     {
                         last_heartbeat = std::time::Instant::now();
@@ -1141,7 +1142,8 @@ async fn handle_live_ws_inner(
                         }
                     }
                     // Auto-reclaim.
-                    else if !capture_settings.is_owner.load(Ordering::Relaxed)
+                    else if !read_only
+                        && !capture_settings.is_owner.load(Ordering::Relaxed)
                         && capture_settings.fast.load(Ordering::Relaxed)
                         && last_reclaim.elapsed() >= SIZE_OWNER_HEARTBEAT
                     {
@@ -1185,7 +1187,7 @@ async fn handle_live_ws_inner(
                         }
                     }
                     // Only the owner drives the window size.
-                    if capture_settings.is_owner.load(Ordering::Relaxed) {
+                    if !read_only && capture_settings.is_owner.load(Ordering::Relaxed) {
                         if let Some(c) = cursor.as_ref() {
                             let want_cols =
                                 capture_settings.screen_cols.load(Ordering::Relaxed) as u16;
@@ -1579,6 +1581,10 @@ async fn handle_live_ws_inner(
                                 if settings.window_lines.load(Ordering::Relaxed) < floor {
                                     settings.window_lines.store(floor, Ordering::Relaxed);
                                 }
+                                if read_only {
+                                    nudge.notify_one();
+                                    continue;
+                                }
                                 // Claim the cross-process size-owner lock; only
                                 // the owner resizes the shared window. A
                                 // non-owner keeps rendering best-effort at the
@@ -1627,6 +1633,12 @@ async fn handle_live_ws_inner(
                                 }
                             }
                             LiveClientMessage::ClaimIfVacant => {
+                                if read_only {
+                                    let _ = out_tx
+                                        .send(Message::Text(size_owner_json(false).into()))
+                                        .await;
+                                    continue;
+                                }
                                 // A keyboard-open mobile pane intentionally postpones its
                                 // first resize so it never sends keyboard-shrunk rows to
                                 // tmux.
@@ -1645,6 +1657,12 @@ async fn handle_live_ws_inner(
                                 nudge.notify_one();
                             }
                             LiveClientMessage::Claim => {
+                                if read_only {
+                                    let _ = out_tx
+                                        .send(Message::Text(size_owner_json(false).into()))
+                                        .await;
+                                    continue;
+                                }
                                 // Explicit take-over.
                                 let name = tmux_name.clone();
                                 let who = owner_id.clone();

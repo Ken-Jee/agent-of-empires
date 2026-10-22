@@ -43,6 +43,7 @@ pub(super) fn repair_startup_profile_ownership(
                     .as_ref()
                     .is_some_and(|reservation| {
                         reservation.op != crate::session::LifecycleOperation::Purge
+                            && row.terminal_handoff.is_none()
                     })
                     && !row.has_fresh_lifecycle_reservation(now)
             })
@@ -64,6 +65,7 @@ pub(super) fn repair_startup_profile_ownership(
                         .as_ref()
                         .is_some_and(|reservation| {
                             reservation.op != crate::session::LifecycleOperation::Purge
+                                && row.terminal_handoff.is_none()
                         })
                     {
                         row.clear_expired_lifecycle_reservation(

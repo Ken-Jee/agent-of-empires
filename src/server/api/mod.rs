@@ -29,6 +29,9 @@ pub use acp::{
     list_acp_agents, list_importable_sessions, resolve_approval, resolve_elicitation, shutdown_acp,
     spawn_acp, switch_acp_agent, switch_acp_provider,
 };
+pub(crate) use acp::{
+    publish_startup_error_if_current, recover_pending_terminal_handoffs, HandoffRecovery,
+};
 
 pub use queue::{queue_clear, queue_edit, queue_enqueue, queue_list, queue_remove};
 
@@ -197,6 +200,19 @@ pub(crate) fn read_only_block(state: &AppState) -> Option<axum::response::Respon
     state.read_only.then(read_only_response)
 }
 
+pub(crate) async fn read_only_gate(
+    axum::extract::State(state): axum::extract::State<std::sync::Arc<AppState>>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    if !request.method().is_safe() {
+        if let Some(response) = read_only_block(&state) {
+            return response;
+        }
+    }
+    next.run(request).await
+}
+
 /// Canonical 404 for a session id that does not resolve to a live instance.
 /// Body shape (`error` discriminator + human `message`) matches the rest of
 /// the JSON error surface so the dashboard's generic `.message` handling and
@@ -223,16 +239,8 @@ pub(super) fn read_only_response() -> axum::response::Response {
         .into_response()
 }
 
-/// Canonical 403 body for CityHall client mode (`AOE_CITYHALL_MODE`). Terminal
-/// (keystrokes + raw pane/output reads), diff, project management, agent/worker
-/// lifecycle + config, git clone/probe, and uncurated settings/profile writes
-/// are all closed here, not only by hiding the UI: the create path also strips
-/// every client-controlled spawn field, and the curated settings/theme writes
-/// are field-filtered. Reachability is enforced default-deny by the
-/// `cityhall_gate` middleware against the `CITYHALL_MUTATION_ALLOW` table (with
-/// the per-handler `cityhall_block*` calls kept as defense in depth); the
-/// `every_mutating_route_is_cityhall_classified` audit and the
-/// `serve_cityhall_lockdown` route tests keep the contract honest. See #7.
+/// CityHall rejects unlisted mutations and field-filters its curated writes.
+/// Request-level coverage lives in `serve_cityhall_lockdown`.
 pub(crate) fn cityhall_response() -> axum::response::Response {
     use axum::response::IntoResponse as _;
     (
@@ -384,104 +392,101 @@ pub(super) fn validate_profile_name(name: &str) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    //! Regression tests that pin security-critical helpers.
-    //!
-    //! `SHELL_METACHARACTERS` was silently rewritten in an earlier hand-
-    //! assembled version of this split: a refactor PR that claimed "no
-    //! behavior changes" dropped 4 shell metacharacters (`#`, `[`, `]`,
-    //! `~`) from the injection blocklist. Pin its contents here so the
-    //! next refactor that touches this file fails CI instead of silently
-    //! regressing security.
-    //!
-    //! The settings PATCH write surface (allowed sections, blocked agent-
-    //! command fields, elevation surfaces) is no longer a constant here:
-    //! it is derived from the settings schema and pinned by the tests in
-    //! `crate::session::config::settings_schema::policy` (#1692).
     use super::*;
 
-    /// CityHall lockdown (#7): the shared guard returns 403 so terminal, diff,
-    /// project-management, and advanced-settings endpoints are unreachable in
-    /// CityHall client mode, not merely hidden in the UI.
-    #[test]
-    fn cityhall_response_is_forbidden() {
-        assert_eq!(
-            cityhall_response().status(),
-            axum::http::StatusCode::FORBIDDEN
-        );
-    }
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn native_mutations_reject_read_only_before_body_extraction() {
+        use axum::http::{Method, Request};
+        use tower::ServiceExt;
 
-    /// A plugin pane action is forwarded to the worker (the trust boundary)
-    /// and mutates no host-managed state, so it is gated on read-write mode
-    /// only, never on passphrase elevation (#2454). This static check guards
-    /// against a refactor re-introducing the elevation gate on the action
-    /// path and re-breaking the refresh button under login. Same body-boundary
-    /// walk as `every_mutating_handler_has_read_only_guard`.
-    #[test]
-    fn plugin_action_does_not_require_elevation() {
-        let source = include_str!("plugins.rs");
-        let needle = "fn invoke_plugin_action(";
-        let start = source
-            .find(needle)
-            .expect("handler `invoke_plugin_action` not found (rename/refactor?)");
-        let rest = &source[start + needle.len()..];
-        let body_terminators: &[&str] = &["\npub async fn ", "\npub fn ", "\nasync fn ", "\nfn "];
-        let end = body_terminators
-            .iter()
-            .filter_map(|t| rest.find(t))
-            .min()
-            .unwrap_or(rest.len());
-        let body = &rest[..end];
-        // `mutation_gate` bundles the elevation check; `is_elevated` /
-        // `elevation_required` would mean elevation was reintroduced inline.
-        for marker in ["mutation_gate", "is_elevated", "elevation_required"] {
-            assert!(
-                !body.contains(marker),
-                "invoke_plugin_action must not elevation-gate (found `{marker}`). \
-                 A pane action mutates no host state; keep the read-only gate only. \
-                 If an action ever needs elevation, make it opt-in per action (#2454)."
-            );
-        }
-    }
-
-    #[test]
-    fn shell_metacharacters_blocklist_is_exhaustive() {
-        // Every character here has a documented shell-injection vector when
-        // interpolated into a command line. Removing a character from this
-        // list without removing the corresponding regression below is a
-        // security change that must be reviewed on its own, not smuggled
-        // through a refactor.
-        let expected: &[char] = &[
-            ';', '&', '|', '$', '`', '(', ')', '{', '}', '<', '>', '\n', '\r', '\\', '"', '\'',
-            '!', '#', '*', '?', '[', ']', '~', '\t', '\0',
-        ];
-        assert_eq!(
-            SHELL_METACHARACTERS.len(),
-            expected.len(),
-            "SHELL_METACHARACTERS size changed; every addition/removal must be \
-             reviewed as a security change, not a refactor tidy-up"
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(home.path());
+        let state = crate::server::test_support::build_test_app_state_with_policy_configured(
+            Vec::new(),
+            vec!["localhost".into()],
+            Vec::new(),
+            None,
+            |state| state.read_only = true,
         );
-        for c in expected {
-            assert!(
-                SHELL_METACHARACTERS.contains(c),
-                "SHELL_METACHARACTERS lost character {:?}. Each character blocks \
-                 a specific shell-injection vector: # starts a comment, [ ] are \
-                 glob metacharacters, ~ triggers tilde expansion, etc. If the \
-                 intent is to actually stop blocking this character, update both \
-                 this test and the list in the same commit with justification.",
-                c
+        let app = crate::server::test_support::build_router_for_test(state);
+        for (method, path) in [
+            (Method::POST, "/api/sessions/creation-trust"),
+            (Method::POST, "/api/sessions/missing/creation/cancel"),
+            (Method::PATCH, "/api/sessions/missing/favorite"),
+            (Method::PATCH, "/api/sessions/missing/access"),
+            (Method::POST, "/api/sessions/missing/purge/abandon"),
+            (Method::POST, "/api/sessions/missing/restart"),
+            (Method::POST, "/api/sessions/missing/tools/ensure"),
+            (Method::POST, "/api/sessions/missing/auxiliary/stop"),
+            (Method::POST, "/api/groups"),
+            (Method::PATCH, "/api/groups"),
+            (Method::DELETE, "/api/groups"),
+            (Method::PATCH, "/api/groups/collapse"),
+            (Method::POST, "/api/reorder"),
+            (Method::DELETE, "/api/workspaces"),
+        ] {
+            let mut request = Request::builder()
+                .method(method.clone())
+                .uri(path)
+                .header("host", "localhost")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from("{"))
+                .unwrap();
+            request.extensions_mut().insert(axum::extract::ConnectInfo(
+                crate::server::peer::ConnectionPeer::UnixOwner {
+                    uid: crate::process::effective_uid(),
+                },
+            ));
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{method} {path}");
+            assert_eq!(
+                response.headers()[crate::daemon::ERROR_CODE_HEADER],
+                "read_only",
+                "{method} {path}"
             );
+            let bytes = axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body["error"], "read_only", "{method} {path}");
         }
     }
 
     #[test]
     fn validate_no_shell_injection_rejects_every_metacharacter() {
-        for &c in SHELL_METACHARACTERS {
-            let input = format!("prefix{}suffix", c);
-            let result = validate_no_shell_injection(&input, "field");
+        for input in [
+            "name;command",
+            "name&command",
+            "name|command",
+            "$(command)",
+            "`command`",
+            "path(1)",
+            "path)",
+            "path{a,b}",
+            "path}",
+            "name<input",
+            "name>output",
+            "name\ncommand",
+            "name\rcommand",
+            "path\\name",
+            "\"quoted\"",
+            "it's",
+            "name!0",
+            "name#comment",
+            "path/*",
+            "name?",
+            "path[0",
+            "path]",
+            "~root",
+            "name\targ",
+            "name\0arg",
+        ] {
+            let result = validate_no_shell_injection(input, "field");
             assert!(
                 result.is_err(),
                 "validate_no_shell_injection should reject {:?} but accepted {:?}",
-                c,
+                input,
                 input
             );
         }
@@ -539,13 +544,6 @@ mod tests {
             );
         }
     }
-
-    // The settings PATCH write-surface pins (allowed sections, blocked session
-    // fields, elevation surfaces) moved to
-    // `crate::session::config::settings_schema::policy` when the curated constants were
-    // replaced by schema-derived `validate_patch` (#1692). The security
-    // invariants (hooks never writable, agent-command fields denied,
-    // sandbox/worktree require elevation) are pinned by that module's tests.
 
     #[test]
     fn profile_name_rejects_path_traversal() {

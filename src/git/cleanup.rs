@@ -410,18 +410,13 @@ pub fn is_permission_error(error: &str) -> bool {
         || lower.contains("access is denied")
 }
 
-/// Delete worktree contents from inside the sandbox container without ever
-/// starting its managed entrypoint.
-///
-/// The outcome distinguishes an absent container from a present stopped or
-/// uncleanable one. Callers that intend to destroy the container must fail
-/// closed on [`SandboxCleanup::Blocked`], rather than losing the only mounted
-/// view of the worktree and then removing its bind mount.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Preclean without starting the managed entrypoint.
+/// Blocked cleanup retains the container until host worktree removal succeeds.
+#[derive(Debug)]
 pub enum SandboxCleanup {
     Cleaned,
     Absent,
-    Blocked,
+    Blocked(String),
 }
 
 pub fn cleanup_sandbox_worktree(instance: &Instance) -> SandboxCleanup {
@@ -436,7 +431,10 @@ pub fn cleanup_sandbox_worktree(instance: &Instance) -> SandboxCleanup {
                 error = %e,
                 "container existence probe failed during worktree cleanup; retaining worktree"
             );
-            return SandboxCleanup::Blocked;
+            return SandboxCleanup::Blocked(format!(
+                "Cannot inspect {:?} container {} for worktree cleanup at {}: {e}. AoE did not restart the sandbox.",
+                container.runtime().kind, container.name, instance.project_path,
+            ));
         }
     }
     match container.probe_running() {
@@ -447,7 +445,10 @@ pub fn cleanup_sandbox_worktree(instance: &Instance) -> SandboxCleanup {
                 session = %instance.id,
                 "container is stopped; retaining worktree because in-container cleanup is impossible"
             );
-            return SandboxCleanup::Blocked;
+            return SandboxCleanup::Blocked(format!(
+                "{:?} container {} is stopped. AoE retained it and worktree {} without restarting the sandbox. Repair ownership or remove host-unwritable files with elevated host permissions, then retry purge.",
+                container.runtime().kind, container.name, instance.project_path,
+            ));
         }
         crate::containers::Probe::Unknown(e) => {
             tracing::warn!(
@@ -456,13 +457,22 @@ pub fn cleanup_sandbox_worktree(instance: &Instance) -> SandboxCleanup {
                 error = %e,
                 "container running-state probe failed during worktree cleanup; retaining worktree"
             );
-            return SandboxCleanup::Blocked;
+            return SandboxCleanup::Blocked(format!(
+                "Cannot prove the running state of {:?} container {} for worktree cleanup at {}: {e}. AoE did not restart the sandbox.",
+                container.runtime().kind, container.name, instance.project_path,
+            ));
         }
     }
     match container.exec(&["find", ".", "-mindepth", "1", "-delete"]) {
         Ok(output) if output.status.success() => SandboxCleanup::Cleaned,
-        Ok(_) => SandboxCleanup::Blocked,
-        Err(_) => SandboxCleanup::Blocked,
+        Ok(output) => SandboxCleanup::Blocked(format!(
+            "Worktree preclean in {:?} container {} at {} exited with {}. AoE did not remove the container or restart the sandbox.",
+            container.runtime().kind, container.name, instance.project_path, output.status,
+        )),
+        Err(error) => SandboxCleanup::Blocked(format!(
+            "Worktree preclean in {:?} container {} at {} failed: {error}. AoE did not remove the container or restart the sandbox.",
+            container.runtime().kind, container.name, instance.project_path,
+        )),
     }
 }
 
@@ -515,6 +525,7 @@ pub(crate) fn remove_managed_worktree(
                         instance,
                         allow_container_removal,
                         allow_root_cleanup,
+                        &mut errors,
                     )
                 {
                     worktree_removed = true;
@@ -570,6 +581,7 @@ pub(crate) fn remove_managed_worktree(
                                 instance,
                                 allow_container_removal,
                                 allow_root_cleanup,
+                                &mut errors,
                             ) {
                                 worktree_removed = true;
                             } else {
@@ -594,6 +606,7 @@ pub(crate) fn remove_managed_worktree(
                         instance,
                         allow_container_removal,
                         allow_root_cleanup,
+                        &mut errors,
                     )
                 {
                     worktree_removed = true;
@@ -646,6 +659,7 @@ fn try_sandbox_dir_cleanup(
     instance: &Instance,
     allow_container_removal: bool,
     allow_root_cleanup: bool,
+    errors: &mut Vec<String>,
 ) -> bool {
     if !instance.is_sandboxed() {
         return false;
@@ -658,7 +672,10 @@ fn try_sandbox_dir_cleanup(
     match cleanup_sandbox_worktree(instance) {
         crate::git::cleanup::SandboxCleanup::Cleaned => {}
         crate::git::cleanup::SandboxCleanup::Absent => {}
-        crate::git::cleanup::SandboxCleanup::Blocked => return false,
+        crate::git::cleanup::SandboxCleanup::Blocked(reason) => {
+            errors.push(reason);
+            return false;
+        }
     }
 
     let container = DockerContainer::from_session_id(&instance.id);

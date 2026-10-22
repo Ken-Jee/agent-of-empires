@@ -3167,7 +3167,20 @@ mod tests {
         fs::create_dir_all(&app).unwrap();
         fs::create_dir_all(home.join(".gemini/sandbox/history")).unwrap();
         fs::write(home.join(".gemini/sandbox/history/id.json"), b"legacy").unwrap();
-        fs::write(app.join("sessions.json"), format!("[{}]", row("one"))).unwrap();
+        let mut instance =
+            crate::session::Instance::new("one", temp.path().join("project").to_str().unwrap());
+        instance.id = "one".into();
+        instance.tool = "gemini".into();
+        instance.sandbox_store_generation = 1;
+        let mut fixture = serde_json::to_value(instance).unwrap();
+        fixture["sandbox_info"] = serde_json::json!({
+            "enabled":true, "image":"fixture", "container_name":"aoe-sandbox-fixture",
+        });
+        fs::write(
+            app.join("sessions.json"),
+            serde_json::to_vec(&vec![fixture]).unwrap(),
+        )
+        .unwrap();
         fs::write(app.join(".schema_version"), b"26").unwrap();
 
         assert!(!defer_requested_by(None));

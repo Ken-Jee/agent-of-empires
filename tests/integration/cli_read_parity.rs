@@ -166,7 +166,6 @@ impl Fixture {
         for name in ["default", "zeta"] {
             std::fs::create_dir_all(app_dir.join("profiles").join(name)).expect("extra profile");
         }
-        // Disable network-dependent update notices and keep the default profile explicit.
         std::fs::write(
             app_dir.join("config.toml"),
             format!("default_profile = \"{PROFILE}\"\n\n[updates]\nupdate_check_mode = \"off\"\n"),
@@ -857,6 +856,11 @@ async fn compare_transports_with(
     not_witnessed: &[&[&str]],
     compare: impl Fn(&[String], &Run, &Run),
 ) -> Vec<Run> {
+    // Normalize caller-prepared data before caching or comparing either transport.
+    tokio::task::spawn_blocking(agent_of_empires::migrations::run_migrations)
+        .await
+        .expect("the fixture migration task joins")
+        .expect("migrate the fixture before publishing its read cache");
     let xdg_base = fixture.path().join(".config");
     let state = build_test_app_state_with_policy(
         daemon_instances(),

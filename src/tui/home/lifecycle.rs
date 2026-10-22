@@ -9,53 +9,23 @@ impl HomeView {
         available_tools: AvailableTools,
         file_watch: std::sync::Arc<crate::file_watch::FileWatchService>,
     ) -> anyhow::Result<Self> {
-        use crate::session::list_profiles;
+        let storages = HashMap::new();
+        let all_instances = Vec::new();
+        let group_trees = HashMap::new();
+        let legacy_duplicate_reports = Vec::new();
 
-        let mut storages = HashMap::new();
-        let mut all_instances = Vec::new();
-        let mut group_trees = HashMap::new();
-        let mut profile_loads: Vec<(String, Vec<Instance>, Vec<Group>)> = Vec::new();
-
-        let profile_names = match &active_profile {
-            Some(name) => vec![name.clone()],
-            None => list_profiles()?.into_iter().collect(),
-        };
-
-        for profile_name in &profile_names {
-            let storage = Storage::open(profile_name, file_watch.clone())?;
-            let (mut instances, groups) = storage.load_complete_with_groups()?;
-            for inst in &mut instances {
-                inst.source_profile = profile_name.clone();
-            }
-            profile_loads.push((profile_name.clone(), instances, groups));
-            storages.insert(profile_name.clone(), storage);
-        }
-
-        let legacy_duplicate_reports = {
-            let loads_view: Vec<(&str, &[Instance])> = profile_loads
-                .iter()
-                .map(|(name, rows, _)| (name.as_str(), rows.as_slice()))
-                .collect();
-            let storages_view: Vec<(&str, &Storage)> = storages
-                .iter()
-                .map(|(name, storage)| (name.as_str(), storage))
-                .collect();
-            let reports = crate::session::duplicate_reports(&loads_view, &storages_view);
-            log_legacy_duplicates_once(&reports);
-            reports
-        };
-        for (profile_name, instances, groups) in &profile_loads {
-            let tree = GroupTree::new_with_groups(instances, groups);
-            group_trees.insert(profile_name.clone(), tree);
-            all_instances.extend(instances.iter().cloned());
-        }
-
-        // In unified mode there is no single active profile, so config is
-        // resolved from the user's default profile.
-        let config_profile = active_profile
-            .clone()
-            .unwrap_or_else(crate::session::config::resolve_default_profile);
-        let resolved = resolve_config_or_warn(&config_profile);
+        let user_config = load_config().ok().flatten();
+        let config_profile = active_profile.clone().or_else(|| {
+            user_config
+                .as_ref()
+                .map(|config| config.default_profile.clone())
+                .filter(|profile| !profile.is_empty())
+                .or_else(|| crate::session::list_profiles().ok()?.into_iter().next())
+        });
+        let resolved = config_profile
+            .as_deref()
+            .map(resolve_config_or_warn)
+            .unwrap_or_else(crate::session::Config::load_or_warn);
         let default_terminal_mode = match resolved.sandbox.default_terminal_mode {
             DefaultTerminalMode::Host => TerminalMode::Host,
             DefaultTerminalMode::Container => TerminalMode::Container,
@@ -69,7 +39,6 @@ impl HomeView {
         crate::session::set_unread_enabled(resolved.session.unread_indicator);
         crate::session::set_favorites_first(resolved.session.favorites_first);
         crate::session::set_preview_link_prefixes(&resolved.session.preview_link_prefixes);
-        let user_config = load_config().ok().flatten();
         let sort_order = user_config
             .as_ref()
             .and_then(|c| c.app_state.sort_order)
@@ -114,6 +83,11 @@ impl HomeView {
                 .map(|ordering| ordering.order)
                 .unwrap_or_default(),
             session_feed_reload_retry_at: None,
+            session_feed_failed_cursor: None,
+            canonical_metadata_lag: None,
+            pending_created_attach: None,
+            retained_reveal: None,
+            runtime_diagnostics: Vec::new(),
             group_trees,
             legacy_duplicate_reports,
             flat_items: Vec::new(),
@@ -195,6 +169,7 @@ impl HomeView {
             skills_manager_dialog: None,
             command_palette: None,
             serve_view: None,
+            pending_dashboard_launch: None,
             update_confirm_dialog: None,
             telemetry_consent_dialog: None,
             tips_dialog: None,
@@ -413,6 +388,7 @@ impl HomeView {
         file_watch: std::sync::Arc<crate::file_watch::FileWatchService>,
     ) -> anyhow::Result<Self> {
         let mut view = Self::new(active_profile, available_tools, file_watch)?;
+        view.load_storage_projection()?;
         let default_profile = view
             .active_profile
             .clone()
@@ -445,9 +421,30 @@ impl HomeView {
     }
 
     pub(in crate::tui) fn reload_storage_only(&mut self) -> anyhow::Result<()> {
+        self.apply_session_feed();
         if let Some(snapshot) = self.session_feed.applied_snapshot() {
-            self.apply_canonical_projection(&snapshot, true)?;
-            self.refresh_projection_presentation();
+            if self
+                .session_feed_failed_cursor
+                .as_ref()
+                .is_some_and(|failed| {
+                    failed.epoch == snapshot.cursor.epoch
+                        && failed.revision > snapshot.cursor.revision
+                })
+            {
+                return Ok(());
+            }
+            match self.apply_canonical_projection(&snapshot, true) {
+                Ok(()) => {
+                    self.session_feed_reload_retry_at = None;
+                    self.session_feed_failed_cursor = None;
+                    self.canonical_metadata_lag = None;
+                    self.reload_failure_state.record_canonical(&Ok(()));
+                    self.refresh_projection_presentation();
+                }
+                Err(error) => self.record_canonical_projection_failure(&snapshot.cursor, &error),
+            }
+            Ok(())
+        } else if self.sidebar_source == crate::tui::session_feed::SidebarSource::Daemon {
             Ok(())
         } else {
             self.load_storage_projection()
@@ -456,123 +453,89 @@ impl HomeView {
 
     /// Load a read-only preview before an acknowledged runtime frame exists.
     pub(super) fn load_storage_projection(&mut self) -> anyhow::Result<()> {
-        use crate::session::list_profiles;
-
-        let mut all_instances = Vec::new();
-
-        let current_profiles = match list_profiles() {
-            Ok(profiles) => profiles,
-            Err(error) => {
-                tracing::warn!(
-                    target: "tui.file_watch",
-                    error = %error,
-                    "list_profiles failed during reload_storage_only; reusing loaded storages for watcher rewires"
+        let current_profiles = crate::session::list_profiles()?;
+        let scope: Vec<_> = current_profiles
+            .iter()
+            .filter(|name| {
+                self.active_profile
+                    .as_ref()
+                    .is_none_or(|active| active == *name)
+            })
+            .cloned()
+            .collect();
+        let mut opened = HashMap::new();
+        for profile in &scope {
+            if !self.storages.contains_key(profile) {
+                opened.insert(
+                    profile.clone(),
+                    Storage::open(profile, self.file_watch.clone())?,
                 );
-                let mut keys: Vec<String> = self.storages.keys().cloned().collect();
-                keys.sort();
-                keys
             }
-        };
-
-        // Watch all profile configs, but only loaded profile data.
-        self.rewire_config_subscriptions(&current_profiles);
-        if self.active_profile.is_some() {
-            let mut active_only: Vec<String> = self.storages.keys().cloned().collect();
-            active_only.sort();
-            self.rewire_disk_subscriptions(&active_only);
-        } else {
-            self.rewire_disk_subscriptions(&current_profiles);
         }
-
-        // Storage rebuild is unified mode only: single-profile mode keeps the scope set at
-        // startup, with only the active profile in memory.
-        if self
-            .active_profile
-            .as_ref()
-            .is_some_and(|profile| !current_profiles.contains(profile))
-        {
-            self.storages.clear();
-        }
-        if self.active_profile.is_none() {
-            for name in &current_profiles {
-                if !self.storages.contains_key(name) {
-                    self.storages
-                        .insert(name.clone(), Storage::open(name, self.file_watch.clone())?);
+        let mut loads = Vec::new();
+        for profile in &scope {
+            let storage = self
+                .storages
+                .get(profile)
+                .or_else(|| opened.get(profile))
+                .expect("profile store staged");
+            let (mut rows, groups) = storage.load_complete_with_groups()?;
+            for row in &mut rows {
+                row.source_profile.clone_from(profile);
+                if let Some(previous) = self.instances.get(&row.id) {
+                    row.merge_runtime_from_reload(previous);
                 }
             }
-            self.storages.retain(|k, _| current_profiles.contains(k));
+            loads.push((profile.clone(), rows, groups));
         }
-
-        // Read-only diagnostic collection; repairs are daemon-owned.
-        type ProfileLoads = Vec<(String, Vec<Instance>, Vec<Group>)>;
-        let collect_loads = |storages: &HashMap<String, Storage>,
-                             prev: &indexmap::IndexMap<String, Instance>|
-         -> anyhow::Result<ProfileLoads> {
-            let mut loads = Vec::new();
-            for (profile_name, storage) in storages {
-                let (mut instances, groups) = storage.load_complete_with_groups()?;
-                for inst in &mut instances {
-                    inst.source_profile = profile_name.clone();
-                    if let Some(previous) = prev.get(&inst.id) {
-                        // Field-ownership rules (generation-governed vs
-                        // runtime-only) live on merge_runtime_from_reload.
-                        inst.merge_runtime_from_reload(previous);
-                    }
-                }
-                loads.push((profile_name.clone(), instances, groups));
-            }
-            Ok(loads)
-        };
-        let loads = collect_loads(&self.storages, &self.instances)?;
-        let loads_view: Vec<(&str, &[Instance])> = loads
+        let load_refs: Vec<_> = loads
             .iter()
             .map(|(name, rows, _)| (name.as_str(), rows.as_slice()))
             .collect();
-        let storages_view: Vec<(&str, &Storage)> = self
-            .storages
+        let stores: Vec<_> = scope
             .iter()
-            .map(|(name, storage)| (name.as_str(), storage))
+            .map(|profile| {
+                (
+                    profile.as_str(),
+                    self.storages
+                        .get(profile)
+                        .or_else(|| opened.get(profile))
+                        .unwrap(),
+                )
+            })
             .collect();
-        let reports = crate::session::duplicate_reports(&loads_view, &storages_view);
-        log_legacy_duplicates_once(&reports);
-        self.legacy_duplicate_reports = reports;
-
-        for (profile_name, instances, groups) in &loads {
-            let new_tree = GroupTree::new_with_groups(instances, groups);
-            self.group_trees.insert(profile_name.clone(), new_tree);
-            all_instances.extend(instances.iter().cloned());
+        let reports = crate::session::duplicate_reports(&load_refs, &stores);
+        let mut trees = HashMap::new();
+        let mut rows = Vec::new();
+        for (profile, instances, groups) in loads {
+            trees.insert(profile, GroupTree::new_with_groups(&instances, &groups));
+            rows.extend(instances);
         }
-
-        // Remove trees for profiles that no longer exist
-        let storage_keys: Vec<String> = self.storages.keys().cloned().collect();
-        self.group_trees.retain(|k, _| storage_keys.contains(k));
-
-        // Preserve the display-only placeholder across a canonical row reload.
-        let creating_stub_snapshot: Option<Instance> = self
+        let mut next = Self::build_instances_map(rows);
+        if let Some(stub) = self
             .creating_stub_id
             .as_ref()
-            .and_then(|id| self.instances.get(id).cloned());
-
-        self.instances = Self::build_instances_map(all_instances);
-
-        if let Some(stub) = creating_stub_snapshot {
-            self.instances.entry(stub.id.clone()).or_insert(stub);
+            .and_then(|id| self.instances.get(id))
+        {
+            next.insert(stub.id.clone(), stub.clone());
         }
-        // The creation in flight is displayed by its placeholder alone; its own
-        // reservation row stays out of the model until the daemon commits.
         if let Some(id) = self
             .pending_creation
             .as_ref()
             .filter(|pending| pending.confirmation.is_none())
             .and_then(|pending| pending.daemon_id.as_deref())
         {
-            self.instances.shift_remove(id);
+            next.shift_remove(id);
         }
-
-        // Refresh the project registry so project view's empty pinned headers
-        // and pin indicators reflect the current on-disk registry.
+        self.instances = next;
+        self.group_trees = trees;
+        self.storages.extend(opened);
+        self.storages.retain(|profile, _| scope.contains(profile));
+        log_legacy_duplicates_once(&reports);
+        self.legacy_duplicate_reports = reports;
+        self.rewire_config_subscriptions(&current_profiles);
+        self.rewire_disk_subscriptions(&scope);
         self.refresh_registered_projects();
-
         self.refresh_projection_presentation();
         Ok(())
     }
@@ -682,6 +645,12 @@ impl HomeView {
     ///   unrelated dialog occupies the slot. While live or another dialog is
     ///   open, the ack latch stays armed so a later tick can present it.
     pub(in crate::tui) fn try_present_reload_failure_dialog(&mut self) -> bool {
+        let info = self.info_dialog.take();
+        let occupied = self.has_non_live_send_overlay();
+        self.info_dialog = info;
+        if occupied {
+            return false;
+        }
         if self.live_send.is_some() || !self.reload_failure_state.has_any_failure() {
             return false;
         }

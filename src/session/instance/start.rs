@@ -144,18 +144,7 @@ impl Instance {
         let profile = self.effective_profile();
         let storage = crate::session::storage::Storage::new(&profile, self.resolve_file_watch())
             .context("failed to open lifecycle lock storage")?;
-        self.start_with_size_opts_in(size, skip_on_launch, &storage, false)
-    }
-
-    /// Native mutations use the same launch path with their canonical store.
-    pub(crate) fn start_in(&mut self, storage: &dyn crate::session::SessionStore) -> Result<()> {
-        crate::session::validate_instance_id(&self.id)
-            .context("refusing to launch: AOE_INSTANCE_ID failed validation")?;
-        if self.is_structured() {
-            return Ok(());
-        }
-        self.start_with_size_opts_in(None, false, storage, true)
-            .map(|_| ())
+        self.start_with_size_opts_in(size, skip_on_launch, &storage, false, None)
     }
 
     fn start_with_size_opts_in(
@@ -164,6 +153,7 @@ impl Instance {
         skip_on_launch: bool,
         storage: &dyn crate::session::SessionStore,
         require_tracked_row: bool,
+        mut handoff: Option<(TerminalHandoffKey, bool)>,
     ) -> Result<LaunchSidOutcome> {
         storage.check_available()?;
 
@@ -176,6 +166,12 @@ impl Instance {
         if require_tracked_row {
             self.reconcile_from_store(storage)?;
         }
+        if handoff.is_none() && self.terminal_handoff.is_some() {
+            return Err(LifecycleReservationError::Busy(LifecycleOperation::Launch).into());
+        }
+        if let Some((key, _)) = handoff {
+            self.validate_terminal_handoff(storage, key)?;
+        }
         if self.is_structured() {
             return Ok(LaunchSidOutcome::Skipped);
         }
@@ -187,7 +183,19 @@ impl Instance {
         let session = self.tmux_session()?;
         let corpse_pane = if session.exists_live() {
             if !session.is_pane_dead() {
+                if let Some((key, _)) = handoff {
+                    self.complete_terminal_handoff_live_in(storage, key)?;
+                }
                 return Ok(LaunchSidOutcome::Skipped);
+            }
+            if let Some((key, _)) = handoff {
+                if let Some(launch) = self
+                    .validate_terminal_handoff(storage, key)?
+                    .launch
+                    .as_ref()
+                {
+                    Self::ensure_terminal_handoff_pane_matches(session.name(), key, launch)?;
+                }
             }
             true
         } else {
@@ -202,11 +210,29 @@ impl Instance {
             }
             self.ensure_startable()?;
         }
-        let generation = self.acquire_lifecycle_reservation(
-            storage,
-            LifecycleOperation::Launch,
-            Some(Status::Starting),
-        )?;
+        if let Some((key, allow_retry)) = handoff {
+            anyhow::ensure!(allow_retry || !self.validate_terminal_handoff(storage, key)?.launch_started,
+                "previous terminal launch did not remain live; retry disable explicitly after correcting its error");
+            self.prepare_terminal_handoff_retry_in(storage, key)?;
+            self.validate_terminal_handoff_target(storage, key)?;
+        }
+        let generation = if let Some((key, allow_retry)) = handoff {
+            let generation = self.acquire_terminal_handoff_launch_reservation(storage, key)?;
+            handoff = Some((
+                TerminalHandoffKey {
+                    id: key.id,
+                    generation,
+                },
+                allow_retry,
+            ));
+            generation
+        } else {
+            self.acquire_lifecycle_reservation(
+                storage,
+                LifecycleOperation::Launch,
+                Some(Status::Starting),
+            )?
+        };
 
         // Hooks may invoke aoe; retain the token, not the flocks, across them.
         drop(lifecycle_lock);
@@ -214,6 +240,9 @@ impl Instance {
         let hook_result = self.run_pre_launch_hooks(skip_on_launch, storage, None);
         let (_title_lock, _lifecycle_lock) =
             self.reacquire_launch_locks_after_hooks(storage, generation, hook_result)?;
+        if let Some((key, _)) = handoff {
+            self.validate_terminal_handoff_target(storage, key)?;
+        }
         self.reconcile_sidecar_into_disk_in(storage)?;
         let expected = self.apply_fresh_launch_intent_in(storage);
 
@@ -240,12 +269,381 @@ impl Instance {
             Ok(outcome)
         })();
         if let Err(error) = result {
-            self.fail_reserved_launch(storage, generation, &error, true);
+            self.fail_reserved_launch(storage, generation, &error, handoff.is_none());
             return Err(error);
         }
         result
     }
 
+    pub(crate) fn start_terminal_handoff_in(
+        &mut self,
+        storage: &dyn crate::session::SessionStore,
+        key: TerminalHandoffKey,
+        driver: &crate::session::TerminalHandoffDriver,
+        allow_retry: bool,
+    ) -> Result<()> {
+        crate::session::validate_instance_id(&self.id)?;
+        anyhow::ensure!(
+            driver.session_id() == self.id.as_str(),
+            LifecycleReservationError::Superseded
+        );
+        self.start_with_size_opts_in(None, false, storage, true, Some((key, allow_retry)))
+            .map(|_| ())
+    }
+
+    fn validate_terminal_handoff(
+        &self,
+        storage: &dyn crate::session::SessionStore,
+        key: TerminalHandoffKey,
+    ) -> Result<&TerminalHandoffIntent> {
+        let intent = self
+            .terminal_handoff
+            .as_ref()
+            .ok_or(LifecycleReservationError::Superseded)?;
+        anyhow::ensure!(
+            self.view == View::Terminal
+                && self.lifecycle_generation == key.generation
+                && intent.id == key.id
+                && intent.generation == key.generation
+                && intent.target_generation <= key.generation
+                && intent.stage == TerminalHandoffStage::TerminalLaunchOwed
+                && intent.profile == storage.storage().profile()
+                && intent.profile_identity == storage.storage().bound_profile_identity()?,
+            LifecycleReservationError::Superseded
+        );
+        anyhow::ensure!(
+            intent.final_event_seq.is_some(),
+            "terminal handoff has no completed original retirement"
+        );
+        intent.ensure_original_stopped(&self.id)?;
+        Ok(intent)
+    }
+
+    fn normalized_handoff_launch_state(&self, launch: &TerminalHandoffLaunch) -> ConversationState {
+        let mut desired = launch.launched.clone();
+        if matches!(
+            desired.intent,
+            ResumeIntent::Cleared | ResumeIntent::Fork { .. }
+        ) || (matches!(desired.intent, ResumeIntent::Use(_))
+            && self.launch_has_session_publisher())
+        {
+            desired.intent = ResumeIntent::Default;
+            desired.resume_binding = None;
+        }
+        desired
+    }
+
+    fn prepare_terminal_handoff_retry_in(
+        &mut self,
+        storage: &dyn crate::session::SessionStore,
+        key: TerminalHandoffKey,
+    ) -> Result<()> {
+        let intent = self.validate_terminal_handoff(storage, key)?.clone();
+        let Some(launch) = intent.launch else {
+            if matches!(intent.context, TerminalHandoffContext::Keep { .. }) {
+                anyhow::ensure!(
+                    matches!(self.resume_intent, ResumeIntent::Use(_))
+                        && !self.force_fresh_next_launch,
+                    "kept handoff requires its explicit native resume target"
+                );
+            }
+            return Ok(());
+        };
+        if launch.generation < intent.target_generation {
+            let target = intent
+                .terminal
+                .as_ref()
+                .ok_or(LifecycleReservationError::Superseded)?;
+            anyhow::ensure!(target.matches(self), LifecycleReservationError::Superseded);
+            return Ok(());
+        }
+        let normalized = self.normalized_handoff_launch_state(&launch);
+        let current_execution = launch.launched.active.is_some()
+            && self.runs(&launch.launched.tool, launch.launched.active.as_ref());
+        anyhow::ensure!(
+            launch.prior.matches(self)
+                || launch.launched.matches(self)
+                || normalized.matches(self)
+                || current_execution,
+            LifecycleReservationError::Superseded
+        );
+        let observed = if current_execution {
+            self.agent_session_id
+                .as_ref()
+                .zip(self.agent_session_binding.as_ref())
+                .filter(|(sid, binding)| {
+                    binding.session_id.as_str() == sid.as_str()
+                        && binding.is_known()
+                        && binding
+                            .execution
+                            .as_ref()
+                            .zip(self.active_execution.as_ref())
+                            .is_some_and(|(binding, active)| {
+                                Self::execution_identity_matches(binding, &active.binding)
+                            })
+                })
+                .map(|(sid, binding)| {
+                    let mut state = self.conversation_state();
+                    state.intent = ResumeIntent::Use(sid.clone());
+                    state.resume_binding = Some(binding.clone());
+                    state
+                })
+        } else {
+            None
+        };
+        let mut target = match (observed, intent.context) {
+            (Some(observed), _) => observed,
+
+            (None, TerminalHandoffContext::Keep { .. }) => intent
+                .terminal
+                .ok_or_else(|| anyhow::anyhow!("kept handoff has no native target"))?,
+            (None, TerminalHandoffContext::Discard) => {
+                let ambiguous = "terminal launch outcome has no proven exact native target; use aoe session set-session-id SESSION ID --store /absolute/store, or aoe session set-session-id SESSION \"\" to explicitly authorize a fresh terminal launch";
+                let sid = launch.launched.session_id.as_ref().context(ambiguous)?;
+                let binding = launch
+                    .launched
+                    .binding
+                    .as_ref()
+                    .filter(|binding| {
+                        binding.session_id.as_str() == sid.as_str()
+                            && binding.is_known()
+                            && binding
+                                .execution
+                                .as_ref()
+                                .zip(launch.launched.active.as_ref())
+                                .is_some_and(|(binding, active)| {
+                                    Self::execution_identity_matches(binding, &active.binding)
+                                })
+                    })
+                    .context(ambiguous)?;
+                let mut exact = launch.launched.clone();
+                exact.intent = ResumeIntent::Use(sid.clone());
+                exact.resume_binding = Some(binding.clone());
+                exact
+            }
+        };
+        target.active = self.active_execution.clone();
+        let profile = storage.storage().profile().to_owned();
+        let identity = storage.storage().bound_profile_identity()?;
+        storage.update(|rows, _| {
+            let row = rows
+                .iter_mut()
+                .find(|row| row.id == self.id)
+                .ok_or(LifecycleReservationError::Superseded)?;
+            let pending = row
+                .terminal_handoff
+                .as_ref()
+                .ok_or(LifecycleReservationError::Superseded)?;
+            anyhow::ensure!(
+                row.lifecycle_generation == key.generation
+                    && pending.id == key.id
+                    && pending.generation == key.generation
+                    && pending.profile == profile
+                    && pending.profile_identity == identity
+                    && pending.stage == TerminalHandoffStage::TerminalLaunchOwed
+                    && (launch.prior.matches(row)
+                        || launch.launched.matches(row)
+                        || normalized.matches(row)
+                        || (current_execution
+                            && row.runs(&self.tool, self.active_execution.as_ref())
+                            && self.conversation_state().matches(row))),
+                LifecycleReservationError::Superseded
+            );
+            row.adopt_conversation_state(target.clone());
+            row.terminal_handoff
+                .as_mut()
+                .expect("validated handoff")
+                .terminal = Some(target.clone());
+            Ok(())
+        })?;
+        self.adopt_conversation_state(target);
+        Ok(())
+    }
+
+    fn acquire_terminal_handoff_launch_reservation(
+        &mut self,
+        storage: &dyn crate::session::SessionStore,
+        key: TerminalHandoffKey,
+    ) -> Result<u64> {
+        self.validate_terminal_handoff(storage, key)?;
+        let id = self.id.clone();
+        let profile = storage.storage().profile().to_owned();
+        let identity = storage.storage().bound_profile_identity()?;
+        let mut candidate = None;
+        let result = storage.update(|rows, _| {
+            let row = rows
+                .iter_mut()
+                .find(|row| row.id == id)
+                .ok_or(LifecycleReservationError::Superseded)?;
+            let pending = row
+                .terminal_handoff
+                .as_ref()
+                .ok_or(LifecycleReservationError::Superseded)?;
+            anyhow::ensure!(
+                row.lifecycle_generation == key.generation
+                    && pending.id == key.id
+                    && pending.generation == key.generation
+                    && pending.profile == profile
+                    && pending.profile_identity == identity
+                    && pending.stage == TerminalHandoffStage::TerminalLaunchOwed,
+                LifecycleReservationError::Superseded
+            );
+            row.ensure_startable()?;
+            let generation = row
+                .lifecycle_generation
+                .checked_add(1)
+                .ok_or(LifecycleReservationError::GenerationOverflow)?;
+            row.lifecycle_generation = generation;
+            row.lifecycle_reservation = Some(LifecycleReservation {
+                op: LifecycleOperation::Launch,
+                generation,
+                at: Utc::now(),
+            });
+            row.status = Status::Starting;
+            row.idle_entered_at = None;
+            let pending = row.terminal_handoff.as_mut().expect("validated handoff");
+            pending.generation = generation;
+            pending.launch_started = true;
+            candidate = Some(generation);
+            Ok(())
+        });
+        let landed = match &result {
+            Ok(()) => true,
+            Err(error) if error.is::<crate::session::SessionCommitApplied>() => true,
+            Err(_) => {
+                crate::migrations::ensure_schema_supported().is_ok()
+                    && candidate.is_some_and(|generation| {
+                        storage
+                            .storage()
+                            .load_complete_with_groups()
+                            .is_ok_and(|(rows, _)| {
+                                rows.iter().any(|row| {
+                                    row.id == id
+                                        && row.lifecycle_reservation_is_owned(
+                                            LifecycleOperation::Launch,
+                                            generation,
+                                        )
+                                        && row.terminal_handoff.as_ref().is_some_and(|pending| {
+                                            pending.id == key.id
+                                                && pending.generation == generation
+                                                && pending.profile == profile
+                                                && pending.profile_identity == identity
+                                        })
+                                })
+                            })
+                    })
+            }
+        };
+        if landed {
+            self.lifecycle_generation =
+                candidate.ok_or_else(|| anyhow::anyhow!("launch mutation not invoked"))?;
+        }
+        result?;
+        self.reconcile_from_store(storage)?;
+        Ok(self.lifecycle_generation)
+    }
+
+    pub(crate) fn ensure_terminal_handoff_pane_matches(
+        session_name: &str,
+        key: TerminalHandoffKey,
+        launch: &TerminalHandoffLaunch,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            launch.generation <= key.generation,
+            LifecycleReservationError::Superseded
+        );
+        let id = key.id.to_string();
+        let generation = launch.generation.to_string();
+        anyhow::ensure!(
+            crate::tmux::env::get_env(session_name, crate::tmux::env::AOE_TERMINAL_HANDOFF_ID_KEY)
+                .as_deref()
+                == Some(id.as_str())
+                && crate::tmux::env::get_env(
+                    session_name,
+                    crate::tmux::env::AOE_TERMINAL_HANDOFF_GENERATION_KEY
+                )
+                .as_deref()
+                    == Some(generation.as_str()),
+            "pane does not match the original terminal handoff attempt; replacement retained"
+        );
+        if let Some(metadata) = launch.omp_capture_metadata.as_ref() {
+            anyhow::ensure!(
+                crate::tmux::env::get_env(session_name, crate::tmux::env::AOE_OMP_LAUNCH_ID_KEY)
+                    .as_deref()
+                    == Some(metadata.launch_id.as_str()),
+                "pane has different OMP launch identity"
+            );
+        }
+        Ok(())
+    }
+
+    fn complete_terminal_handoff_live_in(
+        &mut self,
+        storage: &dyn crate::session::SessionStore,
+        key: TerminalHandoffKey,
+    ) -> Result<()> {
+        let intent = self.validate_terminal_handoff(storage, key)?;
+        let Some(launch) = intent.launch.clone() else {
+            return Ok(());
+        };
+        anyhow::ensure!(launch.generation >= intent.target_generation,
+        "previous handoff pane is live but does not apply the explicitly selected target; pane retained");
+        let session = self.tmux_session()?;
+        Self::ensure_terminal_handoff_pane_matches(session.name(), key, &launch)?;
+        let normalized = self.normalized_handoff_launch_state(&launch);
+        if launch.prior.matches(self) || launch.launched.matches(self) {
+            self.adopt_conversation_state(launch.launched.clone());
+            self.capture_started_at = launch.capture_started_at;
+            self.finalize_launch_with_store(
+                session.name(),
+                storage,
+                &launch.prior,
+                launch.omp_capture_metadata,
+                launch.confirm_desired_conversation,
+            )?;
+        } else {
+            anyhow::ensure!(
+                normalized.matches(self)
+                    || (launch.launched.active.is_some()
+                        && self.runs(&launch.launched.tool, launch.launched.active.as_ref())),
+                LifecycleReservationError::Superseded
+            );
+            self.capture_started_at = launch.capture_started_at;
+            self.maybe_start_poller_since_in(CaptureStorage::Scoped(storage))?;
+        }
+        if self.lifecycle_reservation_is_owned(LifecycleOperation::Launch, key.generation) {
+            self.commit_lifecycle_launch(storage, key.generation, false)?;
+        }
+        Ok(())
+    }
+
+    fn validate_terminal_handoff_target(
+        &self,
+        storage: &dyn crate::session::SessionStore,
+        key: TerminalHandoffKey,
+    ) -> Result<()> {
+        let intent = self.validate_terminal_handoff(storage, key)?;
+        let target = intent
+            .terminal
+            .as_ref()
+            .ok_or(LifecycleReservationError::Superseded)?;
+        anyhow::ensure!(
+            target.tool == self.tool,
+            LifecycleReservationError::Superseded
+        );
+        if matches!(intent.context, TerminalHandoffContext::Keep { .. })
+            || matches!(&target.intent, ResumeIntent::Use(_))
+        {
+            anyhow::ensure!(
+                matches!(&self.resume_intent, ResumeIntent::Use(id)
+                if matches!(&target.intent, ResumeIntent::Use(target_id) if target_id == id))
+                    && self.resume_binding == target.resume_binding
+                    && !self.force_fresh_next_launch,
+                "exact terminal handoff target changed; set an explicit native target to recover"
+            );
+        }
+        Ok(())
+    }
     pub(super) fn apply_fresh_launch_intent_in(
         &mut self,
         _storage: &dyn crate::session::SessionStore,
@@ -302,6 +700,13 @@ impl Instance {
         mut prepared: PreparedLaunch,
     ) -> Result<LaunchSidOutcome> {
         let profile = storage.storage().profile();
+        let handoff_key = self
+            .terminal_handoff
+            .as_ref()
+            .map(|intent| TerminalHandoffKey {
+                id: intent.id,
+                generation: self.lifecycle_generation,
+            });
         let session = self.tmux_session()?;
         if session.exists_live() {
             anyhow::bail!(
@@ -345,7 +750,7 @@ impl Instance {
 
         self.clear_pane_identity_sidecar();
 
-        let mut omp_capture_metadata = if let Some(plan) = prepared.omp_capture_plan {
+        let mut omp_capture_metadata = if let Some(plan) = prepared.omp_capture_plan.take() {
             let launched_at_ms = SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
                 .context("system clock predates UNIX_EPOCH during OMP launch")
@@ -396,6 +801,33 @@ impl Instance {
             );
         }
         self.capture_started_at = Some(SystemTime::now());
+        let handoff_launch = if let Some(key) = handoff_key {
+            self.validate_terminal_handoff(storage, key)?;
+            anyhow::ensure!(
+                omp_capture_metadata.is_none() || omp_generation_published,
+                "handoff OMP launch generation was not durably published"
+            );
+            self.apply_prepared_launch_state(&mut prepared, omp_capture_metadata.as_ref());
+            prepared.launch_env.pane.push(tmux::PaneEnvMutation::set(
+                crate::tmux::env::AOE_TERMINAL_HANDOFF_ID_KEY.to_owned(),
+                key.id.to_string(),
+            ));
+            prepared.launch_env.pane.push(tmux::PaneEnvMutation::set(
+                crate::tmux::env::AOE_TERMINAL_HANDOFF_GENERATION_KEY.to_owned(),
+                key.generation.to_string(),
+            ));
+            Some(TerminalHandoffLaunch {
+                generation: key.generation,
+                prior: prepared.expected_conversation.clone(),
+                launched: self.conversation_state(),
+                capture_started_at: self.capture_started_at,
+                omp_capture_metadata: omp_capture_metadata.clone(),
+                confirm_desired_conversation: canonicalized
+                    || prepared.require_conversation_publication,
+            })
+        } else {
+            None
+        };
         let scope = crate::process::systemd::scope_prefix_for(&self.id, profile);
         let generation = self.lifecycle_generation;
         self.terminal_scopes = Some(storage.update(|rows, _| {
@@ -407,6 +839,13 @@ impl Instance {
                 row.lifecycle_reservation_is_owned(LifecycleOperation::Launch, generation),
                 LifecycleReservationError::Superseded
             );
+            if let Some(key) = handoff_key {
+                row.validate_terminal_handoff(storage, key)?;
+                row.terminal_handoff
+                    .as_mut()
+                    .expect("validated handoff")
+                    .launch = handoff_launch;
+            }
             let scopes = row.terminal_scopes.get_or_insert_with(|| {
                 vec![crate::process::worker_registry::ScopeOwnership::Unresolved]
             });
@@ -447,6 +886,33 @@ impl Instance {
             }
         }
 
+        if handoff_key.is_none() {
+            self.apply_prepared_launch_state(&mut prepared, omp_capture_metadata.as_ref());
+        }
+        #[cfg(test)]
+        test_support::observe(self, test_support::FinalizePhase::Before);
+
+        self.finalize_launch_with_store(
+            session.name(),
+            storage,
+            &prepared.expected_conversation,
+            omp_capture_metadata,
+            canonicalized || prepared.require_conversation_publication,
+        )?;
+
+        #[cfg(test)]
+        test_support::observe(self, test_support::FinalizePhase::After);
+        Ok(match launch_sid {
+            Some(sid) => LaunchSidOutcome::Existing { sid },
+            None => LaunchSidOutcome::Fresh { pinned_prior_sid },
+        })
+    }
+
+    fn apply_prepared_launch_state(
+        &mut self,
+        prepared: &mut PreparedLaunch,
+        omp_capture_metadata: Option<&OmpCaptureMetadata>,
+    ) {
         if let Some(canonical) = prepared.canonical_conversation.take() {
             self.adopt_conversation_state(canonical);
         }
@@ -457,7 +923,7 @@ impl Instance {
                 binding: execution.binding.clone(),
                 capture: execution
                     .capture
-                    .or_else(|| omp_capture_metadata.clone().map(CaptureContext::Omp)),
+                    .or_else(|| omp_capture_metadata.cloned().map(CaptureContext::Omp)),
                 container: execution.inputs.container,
             });
 
@@ -526,25 +992,7 @@ impl Instance {
                 }
             }
         }
-        #[cfg(test)]
-        test_support::observe(self, test_support::FinalizePhase::Before);
-
-        self.finalize_launch_with_store(
-            session.name(),
-            storage,
-            &prepared.expected_conversation,
-            omp_capture_metadata,
-            canonicalized || prepared.require_conversation_publication,
-        )?;
-
-        #[cfg(test)]
-        test_support::observe(self, test_support::FinalizePhase::After);
-        Ok(match launch_sid {
-            Some(sid) => LaunchSidOutcome::Existing { sid },
-            None => LaunchSidOutcome::Fresh { pinned_prior_sid },
-        })
     }
-
     /// Name both stores when a recorded one outranks what a new session would
     /// use. Reported at the launch, not in the resolver, because a restart
     /// resolves twice and only the launch is one event.
@@ -1178,7 +1626,8 @@ else:
                 &row.source_profile,
                 Some(row.id.clone()),
             )?;
-            row.start_in(&native)
+            row.start_with_size_opts_in(None, false, &native, true, None)
+                .map(|_| ())
         })
         .await?;
         let error = result.unwrap_err();

@@ -26,6 +26,8 @@ Each entry carries a status letter: `A` added, `M` modified, `D` deleted, `R` re
 
 The diff refreshes automatically after you save and exit the editor.
 
+Base changes save through the Daemon for the original session and profile. The TUI shows pending or rejected saves instead of writing local session storage. A stale selection, unavailable runtime, or read-only policy refuses the save. Reconnect and select the base again to retry; changes are not replayed automatically.
+
 ## In the web dashboard
 
 The changed-files list has two layouts, toggled in its header: **flat** lists every path, **tree** nests them under collapsible directories with per-directory file counts and `+`/`-` stats. Arrow keys move the selection, left and right expand or collapse a directory, and Enter or Space opens a file. Per-repo collapse state persists to your web settings. Right-click a file or folder for **Copy relative path**. On a file, **Open file** opens its current working-tree copy in a new browser tab. It is disabled for deleted files.

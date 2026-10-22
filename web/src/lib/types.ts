@@ -17,6 +17,7 @@ export interface SessionResponse {
   status: SessionStatus;
   /** Worker auto-stopped for inactivity (resumable), unlike a deliberate Stop. */
   dormant: boolean;
+  lifecycle_generation: number;
   yolo_mode: boolean;
   created_at: string;
   last_accessed_at: string | null;
@@ -48,6 +49,7 @@ export interface SessionResponse {
   /** Null once the snooze expires, so any non-null value is an active snooze. */
   snoozed_until?: string | null;
   trashed_at?: string | null;
+  trash_lifecycle_id?: string | null;
   /** Needs attention (unreviewed finished turn or manual flag). */
   unread?: boolean;
   has_managed_worktree: boolean;

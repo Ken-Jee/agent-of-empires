@@ -20,30 +20,17 @@ use crate::session::{get_update_settings, update_app_state, Config};
 use crate::tmux::AvailableTools;
 use crate::update::{check_for_update, UpdateInfo};
 
-/// Minimum elapsed time between considering periodic update re-checks.
-/// The main loop runs at ~20Hz; gating on this gap keeps the per-iteration
-/// `get_update_settings()` config read off the hot path while still
-/// re-evaluating well under the daily re-check interval.
+/// Gap between periodic update re-check evaluations, keeping the config read off the ~20Hz loop.
 const UPDATE_CHECK_THROTTLE_GAP: Duration = Duration::from_secs(60);
 
-/// How often a long-running TUI re-checks for updates, matching the
-/// `check_for_update` cache TTL (`update::UPDATE_CHECK_INTERVAL_HOURS`).
 const PERIODIC_RECHECK_INTERVAL: Duration =
     Duration::from_secs(crate::update::UPDATE_CHECK_INTERVAL_HOURS * 3600);
 
-/// Inter-key timeout for the paste-burst detector. After any printable Char
-/// or Enter, the event loop polls for the next event with this timeout; if
-/// another burst-candidate arrives before the deadline, it joins the burst.
-/// Mosh strips bracketed-paste markers, so dictation from iOS clients lands
-/// as a tightly-packed stream of individual key events; 5ms is comfortably
-/// wider than a Mosh paste's inter-key gap and well under any human typing
-/// rhythm, so it discriminates between paste and typing without making
-/// single-key shortcuts feel laggy.
+/// Inter-key gap under which printable keys join a paste burst. Mosh strips
+/// bracketed-paste markers, so pastes arrive as a tight stream of key events.
 const PASTE_BURST_INTER_KEY_MS: u64 = 5;
 
-/// Minimum length (in burst-candidate events) for an accumulated burst to be
-/// routed through `handle_paste`. Shorter accumulations are replayed as
-/// individual key events so genuine typing isn't mistaken for a paste.
+/// Shorter bursts are replayed as individual keys so typing isn't mistaken for a paste.
 const PASTE_BURST_MIN_LEN: usize = 3;
 
 /// Process-local session-create trend counter for the TUI surface, mirroring the
@@ -57,18 +44,12 @@ const PASTE_BURST_MIN_LEN: usize = 3;
 /// or dropped. A no-op for opted-out installs (no snapshot is ever sent).
 static TUI_SESSION_CREATES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
-/// Point-in-time read of the create counter, so a snapshot can later be cleared
-/// by exactly the value it reported.
 fn reported_session_creates() -> u32 {
     TUI_SESSION_CREATES.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// Decrement the create counter by exactly `reported` after a confirmed send,
-/// mirroring serve's `decrement_reported_count`. Subtracting the reported amount
-/// rather than zeroing preserves any create that landed between the snapshot
-/// build and the confirmed send. A no-op when nothing was reported or the send
-/// was not confirmed (`Deduped`/`Failed` retain the count for the next snapshot).
-/// The subtraction saturates rather than underflow-wrapping the `AtomicU32`.
+/// Subtract exactly what a confirmed snapshot reported, so creates that landed
+/// during the send roll into the next snapshot.
 fn clear_reported_session_creates(reported: u32, outcome: crate::telemetry::SendOutcome) {
     if reported == 0 || outcome != crate::telemetry::SendOutcome::Sent {
         return;
@@ -116,8 +97,6 @@ impl UpdateStatus {
     }
 }
 
-/// The terminal backend the TUI runs on: crossterm plus OSC 8 re-emission for
-/// the cells the renderer marked as hyperlinks.
 pub type TuiBackend = crate::tui::hyperlink::HyperlinkBackend<std::io::Stdout>;
 
 pub struct App {
@@ -130,14 +109,8 @@ pub struct App {
     force_update_check: bool,
     should_quit: bool,
     theme: Theme,
-    /// Identity of the currently applied `theme` (global theme name +
-    /// palette-downsample mode). `set_theme` compares against this so a
-    /// re-apply with the same identity is a no-op. The config-file watcher
-    /// re-dispatches the theme on EVERY `config.toml` save (it can't tell
-    /// what changed), and a needless `set_theme` there sets `needs_redraw`,
-    /// forcing a full-screen `clear_terminal` that flickers. Guarding here
-    /// keeps any config save (collapse persistence, list resize, `i`,
-    /// settings) from clearing the screen when the theme is unchanged.
+    /// Guards `set_theme`: the config watcher re-dispatches the theme on every
+    /// save, and a needless apply forces a flickering full clear.
     theme_name: String,
     theme_palette_mode: bool,
     needs_redraw: bool,
@@ -145,50 +118,26 @@ pub struct App {
     update_rx: Option<tokio::sync::oneshot::Receiver<anyhow::Result<UpdateInfo>>>,
     update_status: Option<UpdateStatus>,
     update_status_rx: Option<tokio::sync::oneshot::Receiver<anyhow::Result<()>>>,
-    /// Latest version the user dismissed via Ctrl+x. Persisted to
-    /// `app_state.dismissed_update_version` so the snooze survives
-    /// `aoe` restarts (per #1140). The banner stays hidden while the
-    /// fetched latest_version equals this value, and returns
-    /// automatically when a newer release ships.
+    /// Snoozed via Ctrl+x until a newer release ships.
     dismissed_update_version: Option<String>,
-    /// A newer sandbox image detected in its registry, surfaced as the
-    /// lowest-priority bottom banner (below app-update and transient status).
-    /// `None` until the background check finds a drift the user hasn't snoozed.
     image_update: Option<ImageUpdate>,
     image_update_rx: Option<tokio::sync::oneshot::Receiver<anyhow::Result<Option<ImageUpdate>>>>,
-    /// In-flight `docker pull` of the sandbox image, kicked off when the user
-    /// accepts the banner's confirm. Result promotes into a transient toast.
     image_pull_rx: Option<tokio::sync::oneshot::Receiver<anyhow::Result<()>>>,
-    /// Registry digest the user dismissed via Ctrl+x on the image banner.
-    /// Persisted to `app_state.dismissed_image_digest`; the banner stays hidden
-    /// while the registry still resolves to this digest.
+    /// Snoozed via Ctrl+x while the registry still resolves to this digest.
     dismissed_image_digest: Option<String>,
     /// Held in an Option so `with_raw_mode_disabled` can drop it before
     /// spawning child processes. Crossterm's EventStream runs a background
     /// reader thread on stdin; if it's alive when tmux attach-session starts,
     /// the two compete for stdin and tmux fails to initialize its client.
     event_stream: Option<EventStream>,
-    /// Tracks whether we currently have xterm mouse-tracking enabled. The TUI
-    /// turns it off while a copy-friendly surface is open (`HomeView::
-    /// wants_text_selection`) so users can drag-select natively, then turns
-    /// it back on when the surface dismisses. Default true to match the
-    /// startup `EnableMouseCapture` in `tui::run`.
+    /// Whether xterm mouse tracking is engaged right now.
     mouse_captured: bool,
-    /// Whether the resolved config permits xterm mouse tracking (the
-    /// `session.mouse_capture` field plus the `AOE_MOUSE_CAPTURE` backstop).
-    /// This is permission, not live state: `mouse_captured` tracks whether
-    /// tracking is actually engaged right now. Refreshed from disk on the
-    /// periodic reload so toggling Settings > Interaction > Mouse Capture takes
-    /// effect without a restart. When false, `sync_mouse_capture` keeps xterm
-    /// tracking off entirely.
+    /// Whether config permits mouse tracking at all.
     mouse_capture_allowed: bool,
     /// Last OSC 0 host-tab title written. Dedups unchanged selections and
     /// is invalidated after `tmux attach` so the dashboard title is restored.
     host_title: super::host_title::HostTitleTracker,
-    /// True when running under Mosh (`MOSH_CONNECTION` set). Mosh mangles
-    /// xterm mouse-tracking escapes, so `tui::run` skips the startup
-    /// `EnableMouseCapture` and `sync_mouse_capture` must not re-enable
-    /// tracking mid-session either.
+    /// Mosh mangles mouse-tracking escapes, so capture is never enabled under it.
     mosh_active: bool,
     /// Set by `Action::OpenStructuredView` so the async main loop can pick it
     /// up and enter the acp view (which needs `event_stream` access
@@ -199,22 +148,26 @@ pub struct App {
     pending_view_switch: Option<String>,
 
     pending_smart_rename: Option<String>,
+    dashboard_stop_requested: bool,
+    dashboard_stop: Option<tokio::sync::oneshot::Receiver<Result<(), String>>>,
+    dashboard_launch: Option<
+        tokio::sync::oneshot::Receiver<
+            Result<
+                (
+                    crate::daemon::RuntimeConnection,
+                    crate::daemon::DaemonClient,
+                ),
+                String,
+            >,
+        >,
+    >,
     /// Debounce for structured preview-on-select, so fast navigation doesn't
     /// connect a WebSocket per keystroke.
     preview_mount_pending: Option<(String, std::time::Instant)>,
-    /// Version of the install currently being attempted (auto or manual).
-    /// Set when the install task is spawned; transferred to
-    /// `last_installed_version_in_session` on confirmed success in
-    /// `poll_update_status`. Cleared on failure so the user can retry.
+    /// Cleared on failure so the user can retry.
     pending_install_version: Option<String>,
-    /// Version we successfully installed this session. The running binary's
-    /// compile-time `CARGO_PKG_VERSION` stays at the old value until
-    /// restart, so without this guard every periodic re-check (#1471) would
-    /// surface the same release again: as an auto-install loop in auto
-    /// mode, and as a re-appearing banner in notify mode. A genuinely newer
-    /// release clears the guard automatically because the version string
-    /// differs. Single-process scope; on restart the new binary's
-    /// `CARGO_PKG_VERSION` makes the underlying check return "no update".
+    /// The running binary keeps its old version until restart, so this stops
+    /// periodic re-checks from re-offering a release we already installed.
     last_installed_version_in_session: Option<String>,
 }
 
@@ -320,14 +273,8 @@ impl App {
     fn set_status(&mut self, text: impl Into<String>) {
         self.update_status = Some(UpdateStatus::transient(text.into()));
     }
-    /// Is this key event a candidate for paste-burst accumulation?
-    /// Printable ASCII Char or Enter, with no modifiers (or shift only).
-    /// Burst detection ignores Ctrl/Alt-modified chords because those
-    /// are genuine intentional shortcuts and never come from a paste-burst.
-    /// Enter is included so embedded CR/LF inside a Mosh-stripped paste
-    /// (voice/dictation often inserts sentence-break newlines) gets
-    /// captured into the burst as \n instead of breaking it in two and
-    /// firing Submit/select on the deferred Enter.
+    /// Printable ASCII or Enter with no modifier other than Shift. Enter is
+    /// included so newlines inside a Mosh-stripped paste stay in the burst.
     fn is_burst_candidate(key: &KeyEvent) -> bool {
         let mods = key.modifiers;
         let mods_ok = mods.is_empty() || mods == KeyModifiers::SHIFT;
@@ -341,8 +288,6 @@ impl App {
         }
     }
 
-    /// Translate a burst-candidate key event back to its text byte for the
-    /// accumulated burst string. Char yields the char; Enter yields '\n'.
     fn burst_char_for(key: &KeyEvent) -> Option<char> {
         match key.code {
             KeyCode::Char(c) => Some(c),
@@ -351,12 +296,8 @@ impl App {
         }
     }
 
-    /// Holding a key produces a stream of Press events on terminals that do not
-    /// report key-event types, or an initial Press followed by Repeat events on
-    /// terminals that do. That stream has the same timing as Mosh's paste
-    /// fallback, but it is navigation, not pasted text. Keep it on the normal
-    /// input path so held `j`/`k` continue scrolling the session list instead of
-    /// opening the message composer.
+    /// A held key repeats the same event with paste-like timing; keep that on
+    /// the normal input path so held `j`/`k` still scroll.
     fn is_auto_repeat_burst(keys: &[KeyEvent]) -> bool {
         let Some(first) = keys.first() else {
             return false;
@@ -366,31 +307,8 @@ impl App {
             .all(|key| key.code == first.code && key.modifiers == first.modifiers)
     }
 
-    /// Peel a trailing Enter off a paste burst so plain-Enter Submit
-    /// semantics survive when the user types or dictates fast enough to
-    /// pump everything through the burst path.
-    ///
-    /// Without this peel, an "hi<Enter>" with sub-5ms key gaps
-    /// (fast typing, clipboard paste with trailing newline, VoiceInk
-    /// dictation that punctuates with a return) lands as a single
-    /// burst `[h, i, Enter]` whose string is `"hi\n"`. The current
-    /// code forwards that whole string through `handle_paste`, which
-    /// inserts `\n` as a literal newline in the textarea, so the
-    /// `Enter` never reaches the dialog's Submit branch and the
-    /// message never sends.
-    ///
-    /// The fix preserves embedded `\n` (mid-burst sentence breaks from
-    /// Mosh-stripped voice paste; the original reason Enter was added
-    /// to `is_burst_candidate`) and only peels the trailing Enter,
-    /// which is intent-to-submit, not data.
-    ///
-    /// Returns `(paste_text, trailing_enter)`:
-    ///   * `paste_text`: the string to forward to `handle_paste` with
-    ///     any trailing `\n` removed.
-    ///   * `trailing_enter`: `Some(KeyEvent)` to replay via
-    ///     `handle_key` after `handle_paste` runs, so the dialog's
-    ///     plain-Enter Submit branch fires; `None` if the burst did
-    ///     not end on Enter.
+    /// Peel a trailing Enter off a burst so it is replayed as Submit rather
+    /// than inserted as a literal newline. Embedded newlines stay in the paste.
     fn split_trailing_enter(
         burst_str: &str,
         burst_keys: &[KeyEvent],
@@ -407,9 +325,6 @@ impl App {
         }
     }
 
-    /// The per-frame hyperlink map the renderer fills, for the terminal backend
-    /// to re-emit as OSC 8. Handed out after construction so `run` can build the
-    /// backend around the same map the `HomeView` writes into.
     pub fn hyperlink_cells(&self) -> crate::tui::hyperlink::SharedHyperlinks {
         self.home.hyperlink_cells.clone()
     }
@@ -479,6 +394,9 @@ impl App {
             preview_mount_pending: None,
             pending_view_switch: None,
             pending_smart_rename: None,
+            dashboard_launch: None,
+            dashboard_stop_requested: false,
+            dashboard_stop: None,
             pending_install_version: None,
             last_installed_version_in_session: None,
         };
@@ -927,7 +845,8 @@ impl App {
             tokio::select! {
                 event = self.event_stream.as_mut().expect("event_stream missing").next() => {
                     self.home.apply_session_feed();
-                    if self.home.sidebar_source != crate::tui::session_feed::SidebarSource::Daemon {
+                    if self.home.sidebar_source != crate::tui::session_feed::SidebarSource::Daemon
+                        && self.home.serve_view.is_none() {
                         match event {
                             Some(Ok(Event::Key(key)))
                                 if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
@@ -1747,6 +1666,8 @@ impl App {
             }
 
             needs_full_refresh |= self.home.apply_session_feed();
+            needs_full_refresh |= self.poll_dashboard_launch();
+            needs_full_refresh |= self.poll_dashboard_stop();
             let had_native_error = self.home.info_dialog.is_some();
             if let Some(ready) = self.home.take_native_attachment() {
                 use crate::tui::home::panes::PaneIntent;
@@ -1792,7 +1713,11 @@ impl App {
                 needs_full_refresh = true;
             }
 
-            if let Some(session_id) = self.home.apply_creation_results() {
+            let created_attach = self
+                .home
+                .apply_creation_results()
+                .or_else(|| self.home.take_created_attach());
+            if let Some(session_id) = created_attach {
                 self.dispatch_new_session_attach(&session_id, terminal)?;
                 // A structured session routes the post-create attach into
                 // `pending_structured_view_open`; drain it here (this tick
@@ -3116,12 +3041,145 @@ impl App {
         true
     }
 
+    fn start_dashboard_launch(&mut self) {
+        let Some(request) = self.home.pending_dashboard_launch.take() else {
+            return;
+        };
+        if self.dashboard_stop_requested || self.dashboard_stop.is_some() {
+            if let Some(serve) = &mut self.home.serve_view {
+                serve.begin_stop();
+            }
+            return;
+        }
+        if self.dashboard_launch.is_some() {
+            return;
+        }
+        let profile = self
+            .home
+            .active_profile
+            .clone()
+            .or_else(|| {
+                self.home
+                    .session_feed
+                    .applied_snapshot()
+                    .map(|snapshot| snapshot.contents.default_profile.clone())
+            })
+            .unwrap_or_default();
+        let epoch = self.home.session_feed.applied_epoch().map(str::to_owned);
+        self.home.session_feed.suspend_for_dashboard();
+        self.home
+            .set_sidebar_source(crate::tui::session_feed::SidebarSource::Connecting, None);
+        let (result, receiver) = tokio::sync::oneshot::channel();
+        self.dashboard_launch = Some(receiver);
+        tokio::spawn(async move {
+            let _ = result.send(request.run(profile, epoch).await);
+        });
+    }
+
+    fn poll_dashboard_launch(&mut self) -> bool {
+        let Some(receiver) = &mut self.dashboard_launch else {
+            return false;
+        };
+        let result = match receiver.try_recv() {
+            Ok(result) => result,
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => return false,
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed) => Err("Dashboard startup was interrupted; no reconnect or mutation was replayed. Use aoe serve --status, then reconnect explicitly.".to_owned()),
+        };
+        self.dashboard_launch = None;
+        match result {
+            Ok(prepared) if self.dashboard_stop_requested => {
+                drop(prepared);
+            }
+            Ok(prepared) => {
+                if let Some(serve) = &mut self.home.serve_view {
+                    serve.finish_launch(Ok(()));
+                }
+                self.home.session_feed.connect_prepared(
+                    self.home.active_profile.clone().unwrap_or_default(),
+                    Some(prepared),
+                );
+            }
+            Err(_) if self.dashboard_stop_requested => {}
+            Err(message) => {
+                if let Some(serve) = &mut self.home.serve_view {
+                    serve.finish_launch(Err(message.clone()));
+                }
+                self.home.set_sidebar_source(
+                    crate::tui::session_feed::SidebarSource::Disconnected,
+                    Some(&message),
+                );
+            }
+        }
+        self.start_dashboard_stop_if_ready();
+        true
+    }
+
+    fn request_dashboard_stop(&mut self) {
+        if self.dashboard_stop_requested || self.dashboard_stop.is_some() {
+            return;
+        }
+        self.dashboard_stop_requested = true;
+        if let Some(serve) = &mut self.home.serve_view {
+            serve.begin_stop();
+        }
+        self.home.session_feed.suspend_for_dashboard();
+        self.home
+            .set_sidebar_source(crate::tui::session_feed::SidebarSource::Connecting, None);
+        self.start_dashboard_stop_if_ready();
+    }
+
+    fn start_dashboard_stop_if_ready(&mut self) {
+        if !self.dashboard_stop_requested
+            || self.dashboard_launch.is_some()
+            || self.dashboard_stop.is_some()
+        {
+            return;
+        }
+        let (result, receiver) = tokio::sync::oneshot::channel();
+        self.dashboard_stop = Some(receiver);
+        tokio::spawn(async move {
+            let stopped = crate::cli::serve::stop_daemon().await.map_err(|error| {
+                tracing::warn!(target: "tui.home", %error, "dashboard stop failed");
+                "Stop did not complete. Inspect `aoe serve --status` before reconnecting or retrying.".to_owned()
+            });
+            let _ = result.send(stopped);
+        });
+    }
+
+    fn poll_dashboard_stop(&mut self) -> bool {
+        let Some(receiver) = &mut self.dashboard_stop else {
+            return false;
+        };
+        let result = match receiver.try_recv() {
+            Ok(result) => result,
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => return false,
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed) => Err(
+                "Stop was interrupted; inspect `aoe serve --status` before another action."
+                    .to_owned(),
+            ),
+        };
+        self.dashboard_stop = None;
+        self.dashboard_stop_requested = false;
+        if let Some(serve) = &mut self.home.serve_view {
+            serve.finish_stop(result.clone());
+        }
+        let message = result.err().unwrap_or_else(|| {
+            "Daemon stopped by this TUI. Reconnect explicitly to start a local runtime.".to_owned()
+        });
+        self.home.set_sidebar_source(
+            crate::tui::session_feed::SidebarSource::Disconnected,
+            Some(&message),
+        );
+        true
+    }
     fn execute_action(
         &mut self,
         action: Action,
         terminal: &mut Terminal<TuiBackend>,
     ) -> Result<()> {
         match action {
+            Action::StartDashboard => self.start_dashboard_launch(),
+            Action::StopDashboard => self.request_dashboard_stop(),
             Action::Quit => self.should_quit = true,
             Action::RecheckAgents => self.spawn_tool_detection(true),
             Action::AttachSession(id) => {
@@ -3394,8 +3452,10 @@ impl App {
 
         self.needs_redraw = true;
         crate::tmux::refresh_session_cache();
-        self.home.reload()?;
         self.home.apply_session_feed();
+        let result = self.home.reload();
+        self.home.reload_failure_state.record_storage(&result);
+        self.home.try_present_reload_failure_dialog();
         self.home.clear_unread_on_view(session_id);
         self.home.stamp_last_accessed(session_id);
         // In Attention sort, jump cursor to the top-attention row instead of
@@ -3658,6 +3718,8 @@ fn wait_for_background_tool(session_id: &str, tool_name: &str, mut child: std::p
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Action {
+    StartDashboard,
+    StopDashboard,
     Quit,
     RecheckAgents,
     AttachSession(String),
@@ -4901,5 +4963,85 @@ mod tests {
         let (paste, enter) = App::split_trailing_enter("hi\n\n", &burst_keys);
         assert_eq!(paste, "hi\n");
         assert!(enter.is_some());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn dashboard_stop_waits_for_owned_launch_settlement_without_reconnect() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        crate::session::get_profile_dir("test").unwrap();
+        let mut app = App::new(
+            "test",
+            AvailableTools::with_tools(&[]),
+            true,
+            false,
+            crate::file_watch::FileWatchService::noop(),
+        )
+        .unwrap();
+        app.home.serve_view = Some(crate::tui::dialogs::ServeView::new());
+        app.home.pending_paste = Some("retained stop draft".into());
+        let transaction = crate::daemon::lifecycle::Transaction::acquire()
+            .await
+            .unwrap();
+        let (settle_launch, owned_launch) = tokio::sync::oneshot::channel();
+        app.dashboard_launch = Some(owned_launch);
+        app.request_dashboard_stop();
+        assert!(app.dashboard_stop_requested);
+        assert!(
+            app.dashboard_stop.is_none(),
+            "Stop cannot acquire lifecycle while owned launch remains unsettled"
+        );
+        assert!(!app.poll_dashboard_launch());
+        assert_eq!(
+            app.home.pending_paste.as_deref(),
+            Some("retained stop draft")
+        );
+        assert!(app
+            .home
+            .handle_key(KeyEvent::from(KeyCode::Esc), None)
+            .is_none());
+        assert!(
+            app.home.serve_view.is_none(),
+            "input remains usable during deferred Stop"
+        );
+        app.home.serve_view = Some(crate::tui::dialogs::ServeView::new());
+        assert!(matches!(
+            app.home.handle_key(KeyEvent::from(KeyCode::Enter), None),
+            Some(Action::StartDashboard)
+        ));
+        app.start_dashboard_launch();
+        assert!(
+            app.dashboard_launch.is_some(),
+            "only the original owned launch remains"
+        );
+        assert!(app.dashboard_stop.is_none());
+        assert!(
+            app.home.pending_dashboard_launch.is_none(),
+            "a start attempted during Stop is refused, not replayed later"
+        );
+        assert!(app
+            .home
+            .handle_key(KeyEvent::from(KeyCode::Esc), None)
+            .is_none());
+        drop(transaction);
+        assert!(settle_launch
+            .send(Err("controlled failed startup".into()))
+            .is_ok());
+        assert!(app.poll_dashboard_launch());
+        assert!(app.dashboard_stop.is_some());
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while app.dashboard_stop.is_some() {
+                app.poll_dashboard_stop();
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("asynchronous stop settles after launch release");
+        assert!(!app.dashboard_stop_requested);
+        assert!(!app.home.session_feed.mutations_available());
+        assert_eq!(
+            app.home.pending_paste.as_deref(),
+            Some("retained stop draft")
+        );
     }
 }

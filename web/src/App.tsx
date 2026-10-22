@@ -63,7 +63,6 @@ import { PluginSessionMenu } from "./components/plugin/PluginSessionMenu";
 import { TOUR_ANCHORS, tourAnchor } from "./lib/tourSteps";
 import {
   deleteWorkspaceSessions,
-  type Notifier,
   restoreSessions,
   trashedWorkspaceRestoreIds,
   trashSessions,
@@ -163,7 +162,7 @@ import { ThemeIntro } from "./components/onboarding/ThemeIntro";
 import type { TourScope } from "./lib/tourSteps";
 import { SessionWizard } from "./components/session-wizard/SessionWizard";
 import type { WizardPrefill } from "./components/session-wizard/SessionWizard";
-import type { ProjectInfo, RepoGroup, SessionResponse } from "./lib/types";
+import type { ProjectInfo, RepoGroup, SessionResponse, Workspace } from "./lib/types";
 import { Dashboard } from "./components/Dashboard";
 import { LoginPage } from "./components/LoginPage";
 import { TokenEntryPage } from "./components/TokenEntryPage";
@@ -394,6 +393,7 @@ function AppContent({
     loaded: sessionsLoaded,
     injectSession,
     setSessionStatus,
+    clearDeletingStatus,
     applySession,
     applySessionMutation,
     observedById,
@@ -1113,7 +1113,7 @@ function AppContent({
   }, [navigate]);
 
   const [wizardPrefill, setWizardPrefill] = useState<WizardPrefill | undefined>(undefined);
-  const [deletingSessionIds, setDeletingSessionIds] = useState<string[] | null>(null);
+  const [deletingSessions, setDeletingSessions] = useState<SessionResponse[]>([]);
   const [stoppingSessionId, setStoppingSessionId] = useState<string | null>(null);
   const [switchViewTarget, setSwitchViewTarget] = useState<{ sessionId: string; toStructured: boolean } | null>(null);
   // `serverAbout === null` conflates "not fetched yet" with "fetch failed", so
@@ -1192,15 +1192,6 @@ function AppContent({
     void setTelemetryConsent(enabled);
   }, []);
 
-  // Ids, not a workspace id: a sidebar group slice covers only some of its workspace's sessions.
-  const deletingSessions = useMemo(
-    () =>
-      (deletingSessionIds ?? []).flatMap((id) => {
-        const session = sessions.find((s) => s.id === id);
-        return session ? [session] : [];
-      }),
-    [deletingSessionIds, sessions],
-  );
   const liveDeletingSessions = deletingSessions.filter((session) => !session.trashed_at);
   const deletingSession = deletingSessions[0] ?? null;
   const deletingDefaultToTrash = liveDeletingSessions.some((session) => session.cleanup_defaults.delete_to_trash);
@@ -1217,20 +1208,25 @@ function AppContent({
   const deletingBranchName =
     deletingSessions.find((session) => session.branch)?.branch ?? deletingSession?.branch ?? null;
 
-  const handleDeleteSession = useCallback((sessionIds: string[]) => {
-    setDeletingSessionIds(sessionIds);
-  }, []);
+  const handleDeleteSession = useCallback(
+    (sessionIds: string[]) => {
+      setDeletingSessions(
+        sessionIds.flatMap((id) => {
+          const session = sessions.find((session) => session.id === id);
+          return session ? [session] : [];
+        }),
+      );
+    },
+    [sessions],
+  );
 
   const handleConfirmDelete = async (options: DeleteSessionOptions) => {
     if (deletingSessions.length === 0) return;
-    // Close the dialog immediately; the loop, ordering, and toast logic live
-    // in deleteWorkspaceSessions so they are unit-testable without the bundle.
-    setDeletingSessionIds(null);
+    setDeletingSessions([]);
     await deleteWorkspaceSessions(deletingSessions, options, activeSessionId, {
       setStatus: setSessionStatus,
-      // Drop a deleted session's local-only state (#1358 acp cache + draft,
-      // #1842 diff comments). Cross-tab / cross-device deletes fall to the
-      // startup sweep.
+      clearDeleting: clearDeletingStatus,
+      // Clear local state only after the daemon confirms deletion.
       purgeLocal: (id) => {
         clearAcpCache(id);
         clearDraft(id);
@@ -1241,60 +1237,52 @@ function AppContent({
     });
   };
 
-  // Empty Trash (#3167): purge every trashed workspace in one action, mirroring
-  // the TUI's `empty_trash_all`. Reuses the atomic per-workspace delete loop, so
-  // partial failures stay consistent (each call flags only its own failed ids).
-  // Per-workspace toasts are suppressed for one summary; force_delete matches
-  // the TUI so a dirty worktree cannot block a bulk purge.
-  // Rows stay in `trashedWorkspaces` (as Deleting) until the next /api/sessions
-  // poll drops them, so the Trash panel and its Empty Trash button are still
-  // clickable while this loop runs. Without the guard a second confirm starts a
-  // concurrent loop that re-issues a DELETE for every workspace and fires a
-  // second summary toast.
+  // Keep shared-repository cleanup sequential.
   const emptyingTrashRef = useRef(false);
-  const handleEmptyTrash = useCallback(async () => {
-    if (trashedWorkspaces.length === 0 || emptyingTrashRef.current) return;
-    emptyingTrashRef.current = true;
-    let anyFailed = false;
-    const notify: Notifier = {
-      error: () => {
-        anyFailed = true;
-      },
-      info: () => {},
-    };
-    // Purge one workspace at a time, matching the CLI's sequential
-    // `for inst in &trashed` loop (src/cli/session.rs) and the TUI's single
-    // shared deletion poller. Running teardowns in series keeps the summary
-    // toast trivially ordered and stops N git worktree removals from racing on
-    // one source repo, the same sequential-await idiom trashActions.ts uses.
-    try {
-      for (const ws of trashedWorkspaces) {
-        await deleteWorkspaceSessions(
-          ws.sessions,
-          {
-            ...workspaceCleanupDefaults(ws.sessions),
-            force_delete: true,
-          },
-          activeSessionId,
-          {
-            setStatus: setSessionStatus,
-            purgeLocal: (id) => {
-              clearAcpCache(id);
-              clearDraft(id);
-              clearStoredComments(id);
+  const handleEmptyTrash = useCallback(
+    async (confirmed: Workspace[]) => {
+      if (confirmed.length === 0 || emptyingTrashRef.current) return;
+      emptyingTrashRef.current = true;
+      let anyFailed = false;
+      let anyKept = false;
+      try {
+        for (const ws of confirmed) {
+          const result = await deleteWorkspaceSessions(
+            ws.sessions,
+            {
+              ...workspaceCleanupDefaults(ws.sessions),
+              force_delete: true,
+              expected_trash: true,
             },
-            navigateHome: leaveActiveSession,
-            notify,
-          },
-        );
+            activeSessionId,
+            {
+              setStatus: setSessionStatus,
+              clearDeleting: clearDeletingStatus,
+              purgeLocal: (id) => {
+                clearAcpCache(id);
+                clearDraft(id);
+                clearStoredComments(id);
+              },
+              navigateHome: leaveActiveSession,
+              notify: null,
+            },
+          );
+          anyFailed ||= !result.ok || (result.failed?.length ?? 0) > 0;
+          anyKept ||= (result.kept?.length ?? 0) > 0;
+        }
+      } finally {
+        emptyingTrashRef.current = false;
       }
-    } finally {
-      emptyingTrashRef.current = false;
-    }
-    toastBus.handler?.[anyFailed ? "error" : "info"](
-      anyFailed ? "Some trashed sessions could not be deleted" : "Emptied trash",
-    );
-  }, [trashedWorkspaces, activeSessionId, setSessionStatus, leaveActiveSession]);
+      toastBus.handler?.[anyFailed ? "error" : "info"](
+        anyFailed
+          ? "Some trashed sessions could not be deleted"
+          : anyKept
+            ? "Some selected sessions changed and were not deleted"
+            : "Emptied trash",
+      );
+    },
+    [activeSessionId, setSessionStatus, clearDeletingStatus, leaveActiveSession],
+  );
 
   // Move-to-trash path (#2489): the safe default. Unlike permanent delete it
   // deliberately KEEPS the per-session acp cache, draft, and stored comments
@@ -1305,7 +1293,7 @@ function AppContent({
     if (ids.length === 0) return;
     const wasActive = activeSessionId != null && ids.includes(activeSessionId);
 
-    setDeletingSessionIds(null);
+    setDeletingSessions([]);
     for (const id of ids) setSessionStatus(id, "Stopped");
     if (wasActive) {
       leaveActiveSession();
@@ -1794,8 +1782,8 @@ function AppContent({
         // abort. Cancel/stop must stay behind an explicit gesture
         // (the assistant-ui Stop button in the composer).
         onEscape: () => {
-          if (deletingSessionIds) {
-            setDeletingSessionIds(null);
+          if (deletingSessions.length > 0) {
+            setDeletingSessions([]);
             return;
           }
           if (stoppingSessionId) {
@@ -1828,7 +1816,7 @@ function AppContent({
         toggleDiff,
         toggleRightDock,
         showPalette,
-        deletingSessionIds,
+        deletingSessions,
         stoppingSessionId,
         showSettings,
         handleCloseSettings,
@@ -1955,6 +1943,7 @@ function AppContent({
       }
       return (
         <PairedShellPane
+          readOnly={!!serverAbout?.read_only}
           session={activeSession ?? null}
           sessionId={activeSessionId}
           terminalIndex={isTerminalTabId(id) ? terminalIndexOf(id) : 0}
@@ -2007,6 +1996,7 @@ function AppContent({
                     />
                   ) : (
                     <TerminalSessionStack
+                      readOnly={!!serverAbout?.read_only}
                       activeSessionId={activeSessionId!}
                       sessions={sessions.filter((session) => session.view !== "structured")}
                       persistent={webSettings.persistentTerminals}
@@ -2207,6 +2197,7 @@ function AppContent({
     if (singlePane) {
       return (
         <MobileMainPane
+          readOnly={!!serverAbout?.read_only}
           view={rightPanelView}
           pluginPanes={pluginPanes}
           onBackToAgent={() => handlePickView("agent")}
@@ -2629,7 +2620,7 @@ function AppContent({
               worktreeSharedWith={deletingWorktreeSharedWith}
               onConfirm={handleConfirmDelete}
               onTrash={handleConfirmTrash}
-              onCancel={() => setDeletingSessionIds(null)}
+              onCancel={() => setDeletingSessions([])}
             />
           )}
 

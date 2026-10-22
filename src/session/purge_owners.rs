@@ -17,9 +17,9 @@ use crate::acp::runner_lifecycle::PrimeOwnership;
 
 pub(crate) const FILE_NAME: &str = "pending-purge-owners.json";
 
-#[derive(Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "state", rename_all = "snake_case")]
-enum RunnerCapture {
+pub(crate) enum RunnerCapture {
     CancelledBeforeBirth {
         producer_epoch: u64,
         producer_id: uuid::Uuid,
@@ -45,7 +45,7 @@ enum RunnerCapture {
 }
 
 impl RunnerCapture {
-    fn ensure_stopped(&self, session_id: Option<&str>) -> Result<()> {
+    pub(crate) fn ensure_stopped(&self, session_id: Option<&str>) -> Result<()> {
         self.ensure_stopped_with(
             session_id,
             crate::process::worker_registry::load_strict,
@@ -148,6 +148,276 @@ impl RunnerCapture {
         };
         anyhow::bail!("Runner ownership unresolved; purge resources retained: {error}")
     }
+
+    pub(crate) fn bind_retirement(
+        &mut self,
+        target: &crate::acp::supervisor::RetirementTarget,
+    ) -> Result<()> {
+        if let RunnerCapture::Unresolved { error } = &*self {
+            anyhow::bail!("Runner ownership unresolved; purge resources retained: {error}");
+        }
+        let (identity, ownership) = if target.identity.is_some() {
+            (target.identity, target.prime.clone())
+        } else {
+            target
+                .lease
+                .as_ref()
+                .map(crate::acp::runner_lifecycle::Lease::constructed_ownership)
+                .unwrap_or_else(|| (None, target.prime.clone()))
+        };
+        let mut scopes = target.scopes.clone();
+        if let Some(lease) = &target.lease {
+            for scope in lease.scopes() {
+                if !scopes.contains(&scope) {
+                    scopes.push(scope);
+                }
+            }
+        }
+        *self = match (&*self, identity) {
+            (
+                RunnerCapture::Captured {
+                    pid,
+                    generation,
+                    scopes: old,
+                    birth_fingerprint,
+                    prime,
+                },
+                Some(identity),
+            ) => {
+                anyhow::ensure!(
+                    *pid == identity.pid
+                        && *generation == identity.generation
+                        && *birth_fingerprint == identity.birth_fingerprint
+                        && *prime == ownership,
+                    "Captured runner was replaced before purge commit"
+                );
+                for scope in old {
+                    if !scopes.contains(scope) {
+                        scopes.push(scope.clone());
+                    }
+                }
+                RunnerCapture::Captured {
+                    pid: *pid,
+                    generation: *generation,
+                    birth_fingerprint: *birth_fingerprint,
+                    prime: prime.clone(),
+                    scopes,
+                }
+            }
+            (RunnerCapture::Captured { .. }, None) => {
+                anyhow::bail!("Captured runner identity disappeared before purge commit")
+            }
+            (_, Some(identity)) => RunnerCapture::Captured {
+                pid: identity.pid,
+                generation: identity.generation,
+                birth_fingerprint: identity.birth_fingerprint,
+                prime: ownership,
+                scopes,
+            },
+            (_, None) => RunnerCapture::Uncaptured {
+                scopes,
+                prime: ownership,
+                producer_epoch: target
+                    .lease
+                    .as_ref()
+                    .map(crate::acp::runner_lifecycle::Lease::epoch),
+                producer_id: target
+                    .lease
+                    .as_ref()
+                    .map(crate::acp::runner_lifecycle::Lease::producer_id),
+            },
+        };
+        Ok(())
+    }
+
+    pub(crate) fn ensure_retirement_target(
+        &self,
+        target: &mut crate::acp::supervisor::RetirementTarget,
+    ) -> Result<()> {
+        let (observed, observed_prime) = if target.identity.is_some() {
+            (target.identity, target.prime.clone())
+        } else {
+            target
+                .lease
+                .as_ref()
+                .map(crate::acp::runner_lifecycle::Lease::constructed_ownership)
+                .unwrap_or_else(|| (None, target.prime.clone()))
+        };
+        let scopes = match self {
+            RunnerCapture::CancelledBeforeBirth {
+                producer_epoch,
+                producer_id,
+                scopes,
+            } => {
+                anyhow::ensure!(
+                    observed.is_none(),
+                    "A runner appeared after completed producer capture"
+                );
+                if let Some(lease) = &target.lease {
+                    anyhow::ensure!(
+                        lease.epoch() == *producer_epoch
+                            && lease.producer_id() == *producer_id
+                            && lease.was_cancelled_before_birth()
+                            && observed_prime == PrimeOwnership::NotPrime,
+                        "A replacement producer appeared after completed capture"
+                    );
+                }
+                target.identity = None;
+                target.prime = PrimeOwnership::NotPrime;
+                scopes
+            }
+            RunnerCapture::Captured {
+                pid,
+                generation,
+                scopes,
+                birth_fingerprint,
+                prime,
+            } => {
+                anyhow::ensure!(
+                    birth_fingerprint.is_some()
+                        && *generation != 0
+                        && *prime != PrimeOwnership::Unresolved,
+                    "Captured runner authority remains unresolved; purge resources retained"
+                );
+                if let Some(identity) = observed {
+                    anyhow::ensure!(
+                        identity.pid == *pid
+                            && identity.generation == *generation
+                            && identity.birth_fingerprint == *birth_fingerprint
+                            && observed_prime == *prime,
+                        "Captured runner was replaced before retirement; purge resources retained"
+                    );
+                } else {
+                    anyhow::ensure!(
+                        target.lease.is_none(),
+                        "A replacement producer appeared before recovery; purge resources retained"
+                    );
+                }
+                target.identity = Some(crate::acp::runner_lifecycle::RunnerIdentity {
+                    pid: *pid,
+                    generation: *generation,
+                    birth_fingerprint: *birth_fingerprint,
+                });
+                target.prime = prime.clone();
+                scopes
+            }
+            RunnerCapture::Uncaptured {
+                scopes,
+                producer_epoch,
+                producer_id,
+                prime,
+            } => {
+                anyhow::ensure!(
+                    observed.is_none_or(|identity| Some(identity.generation) == *producer_epoch)
+                        && target
+                            .lease
+                            .as_ref()
+                            .is_none_or(|lease| Some(lease.epoch()) == *producer_epoch
+                                && Some(lease.producer_id()) == *producer_id),
+                    "Uncaptured runner was replaced before retirement; purge resources retained"
+                );
+                let live_producer = producer_epoch.is_some()
+                    && target.lease.as_ref().is_some_and(|lease| {
+                        Some(lease.epoch()) == *producer_epoch
+                            && Some(lease.producer_id()) == *producer_id
+                    });
+                anyhow::ensure!(
+                    producer_epoch.is_none() || live_producer,
+                    "Captured producer lifetime remains unresolved; purge resources retained"
+                );
+                anyhow::ensure!(
+                    (*prime != PrimeOwnership::Unresolved && (observed.is_none() || observed_prime == *prime))
+                        || (*prime == PrimeOwnership::Unresolved && live_producer),
+                    "Captured native ownership changed or remains unresolved; purge resources retained"
+                );
+                target.prime = if live_producer && *prime == PrimeOwnership::Unresolved {
+                    observed_prime
+                } else {
+                    prime.clone()
+                };
+                target.identity = observed;
+                scopes
+            }
+            RunnerCapture::Unresolved { error } => {
+                anyhow::bail!("Runner ownership unresolved; purge resources retained: {error}")
+            }
+        };
+        for scope in scopes {
+            anyhow::ensure!(
+                *scope != crate::process::worker_registry::ScopeOwnership::Unresolved,
+                "Captured scope ownership unresolved; purge resources retained"
+            );
+            if !target.scopes.contains(scope) {
+                target.scopes.push(scope.clone());
+            }
+        }
+        target.journalled = true;
+        Ok(())
+    }
+
+    pub(crate) fn completed(
+        &self,
+        target: &crate::acp::supervisor::RetirementTarget,
+    ) -> Result<Self> {
+        let RunnerCapture::Uncaptured {
+            producer_epoch: Some(epoch),
+            producer_id: Some(producer_id),
+            scopes,
+            ..
+        } = self
+        else {
+            return Ok(self.clone());
+        };
+        let lease = target
+            .lease
+            .as_ref()
+            .filter(|lease| lease.epoch() == *epoch && lease.producer_id() == *producer_id)
+            .context(
+                "The captured live producer is no longer available; purge resources retained",
+            )?;
+        let (identity, prime) = lease.constructed_ownership();
+        anyhow::ensure!(
+            prime != PrimeOwnership::Unresolved,
+            "Completed producer native ownership is unresolved"
+        );
+        let mut scopes = scopes.clone();
+        for scope in target.scopes.iter().cloned().chain(lease.scopes()) {
+            anyhow::ensure!(
+                scope != crate::process::worker_registry::ScopeOwnership::Unresolved,
+                "Completed producer scope ownership is unresolved"
+            );
+            if !scopes.contains(&scope) {
+                scopes.push(scope);
+            }
+        }
+        let runner = match identity {
+            Some(identity) => {
+                anyhow::ensure!(
+                    identity.generation == *epoch && identity.birth_fingerprint.is_some(),
+                    "Completed producer runner incarnation is unattested"
+                );
+                RunnerCapture::Captured {
+                    pid: identity.pid,
+                    generation: identity.generation,
+                    birth_fingerprint: identity.birth_fingerprint,
+                    prime,
+                    scopes,
+                }
+            }
+            None => {
+                anyhow::ensure!(
+                    lease.was_cancelled_before_birth() && prime == PrimeOwnership::NotPrime,
+                    "A missing runner does not prove that its producer built no child"
+                );
+                RunnerCapture::CancelledBeforeBirth {
+                    producer_epoch: *epoch,
+                    producer_id: *producer_id,
+                    scopes,
+                }
+            }
+        };
+        Ok(runner)
+    }
 }
 
 fn peer_pid_for(session_id: &str) -> Result<Option<u32>> {
@@ -165,7 +435,7 @@ fn peer_pid_for(session_id: &str) -> Result<Option<u32>> {
     Ok(peer_pid)
 }
 
-fn capture_runner(session_id: &str) -> RunnerCapture {
+pub(crate) fn capture_runner(session_id: &str) -> RunnerCapture {
     match crate::process::worker_registry::load_strict(session_id) {
         Ok(Some(record)) if record.pid > 0 && i32::try_from(record.pid).is_ok() => {
             RunnerCapture::Captured {
@@ -407,11 +677,265 @@ pub(crate) struct PurgeCapture {
     session_id: String,
 }
 
-pub(crate) fn validate_journal_for_migration(content: &str) -> Result<()> {
-    decode(Some(content))?;
-    Ok(())
+pub(crate) enum JournalInput {
+    Migration,
+    CompleteBackup,
 }
 
+pub(crate) fn upcast_journal(
+    content: &str,
+    input: JournalInput,
+) -> Result<std::borrow::Cow<'_, [u8]>> {
+    let mut value: serde_json::Value =
+        serde_json::from_str(content).context("Reading pending purge ownership backup")?;
+    match value.get("version").and_then(serde_json::Value::as_u64) {
+        Some(3) => {
+            if matches!(input, JournalInput::CompleteBackup) {
+                let owners = value
+                    .get("owners")
+                    .and_then(serde_json::Value::as_array)
+                    .context("Invalid pending purge ownership backup")?;
+                anyhow::ensure!(
+                    owners.iter().all(|owner| owner.get("request").is_some()
+                        && owner.get("additional_protection").is_some()),
+                    "Incomplete purge backup omits frozen cleanup request or protection"
+                );
+            }
+            decode(Some(content))?;
+            return Ok(std::borrow::Cow::Borrowed(content.as_bytes()));
+        }
+        Some(2) => {}
+        _ => anyhow::bail!("Unsupported pending purge ownership version"),
+    }
+    let owners = value["owners"]
+        .as_array_mut()
+        .context("Invalid pending purge ownership backup")?;
+    for owner in owners {
+        let owner = owner
+            .as_object_mut()
+            .context("Invalid pending purge owner")?;
+        for field in ["request", "additional_protection"] {
+            if !owner.contains_key(field) {
+                owner.insert(field.to_owned(), serde_json::Value::Null);
+            }
+        }
+        let runner = owner
+            .get_mut("runner")
+            .and_then(serde_json::Value::as_object_mut)
+            .context("Invalid captured runner")?;
+        match runner.get("state").and_then(serde_json::Value::as_str) {
+            Some("captured" | "uncaptured") => {
+                let captured =
+                    runner.get("state").and_then(serde_json::Value::as_str) == Some("captured");
+                if !captured {
+                    runner
+                        .entry("producer_id")
+                        .or_insert(serde_json::Value::Null);
+                }
+                runner
+                    .entry("prime")
+                    .or_insert_with(|| serde_json::json!({"state":"unresolved"}));
+                if captured {
+                    runner
+                        .entry("birth_fingerprint")
+                        .or_insert(serde_json::Value::Null);
+                }
+                runner
+                    .entry("scopes")
+                    .or_insert_with(|| serde_json::json!([{"state":"unresolved"}]));
+            }
+            Some("unresolved") => {}
+            Some("cancelled_before_birth") => {
+                anyhow::bail!("Legacy purge capture cannot attest completed construction")
+            }
+            _ => anyhow::bail!("Invalid captured runner state"),
+        }
+    }
+    value["version"] = serde_json::json!(3);
+    let bytes = serde_json::to_vec(&value)?;
+    decode(Some(std::str::from_utf8(&bytes)?))?;
+    Ok(std::borrow::Cow::Owned(bytes))
+}
+
+pub(crate) fn restore_from_complete_backup(
+    source: &Path,
+    _transaction: &crate::daemon::lifecycle::Transaction,
+    _serve: &crate::cli::serve::ServeLock,
+) -> Result<()> {
+    let parent = source.parent().context("Backup needs a parent directory")?;
+    let parent = if parent.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        parent
+    };
+    let source = AnchoredDir::open(parent)?
+        .bind_file(source.file_name().context("Backup needs a file name")?)?;
+    let original = source
+        .read_recovery_bytes()?
+        .context("Purge backup is missing")?;
+    let encoded = upcast_journal(
+        std::str::from_utf8(&original)?,
+        JournalInput::CompleteBackup,
+    )?;
+    let app = super::get_app_dir()?;
+    let _identity = super::acquire_recovery_identity_lock()?;
+    let _profiles = crate::migrations::recovery::profile_locks()?;
+    let file = super::LockedDataFile::lock_recovery(open(&app)?)?;
+    if let Some(bytes) = file.read_recovery_bytes()? {
+        if let Ok(text) = std::str::from_utf8(&bytes) {
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(text) {
+                let version = value.get("version").and_then(serde_json::Value::as_u64);
+                anyhow::ensure!(
+                    matches!(version, Some(2 | 3)),
+                    "Unsupported destination purge journal version; refusing replacement"
+                );
+            }
+            anyhow::ensure!(
+                upcast_journal(text, JournalInput::CompleteBackup).is_err(),
+                "Destination purge journal is healthy; refusing replacement"
+            );
+        }
+        file.require_writable_existing()?;
+        let quarantine = file.quarantine_recovery_bytes(&bytes)?;
+        tracing::warn!(path = %quarantine.display(), "Preserved corrupt purge ownership evidence");
+    }
+    file.replace_and_sync(&encoded)
+}
+
+pub(crate) struct ScopeRecoveryInventory {
+    raw: String,
+    pub(crate) owners: Vec<(String, String)>,
+}
+
+pub(crate) fn scope_recovery_inventory() -> Result<ScopeRecoveryInventory> {
+    let app = super::get_app_dir()?;
+    let raw = open(&app)?.read()?.context("Pending purge ownership is missing; restore complete original authority before explicit scope recovery")?;
+    let journal = decode(Some(&raw))?;
+    let owners = journal
+        .owners
+        .into_iter()
+        .map(|owner| (owner.profile, owner.session_id))
+        .collect();
+    Ok(ScopeRecoveryInventory { raw, owners })
+}
+
+pub(crate) struct ScopeRecoveryPlan {
+    file: super::LockedDataFile,
+    raw: String,
+    encoded: Option<Vec<u8>>,
+    path: std::path::PathBuf,
+}
+
+impl ScopeRecoveryPlan {
+    pub(crate) fn check_current(&self) -> Result<()> {
+        anyhow::ensure!(
+            self.file.read()?.as_deref() == Some(self.raw.as_str()),
+            "Purge journal changed before scope recovery; retry aoe migrate"
+        );
+        if self.encoded.is_some() {
+            self.file.require_writable_existing()?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn backup(&self) -> Result<()> {
+        if self.encoded.is_some() {
+            super::backup_before_migration(&self.path)?;
+            AnchoredDir::open(self.path.parent().context("Purge journal lacks parent")?)?.sync()?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn commit(self) -> Result<()> {
+        self.check_current()?;
+        if let Some(encoded) = self.encoded {
+            self.file.replace_and_sync(&encoded)?;
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn plan_scope_recovery(inventory: ScopeRecoveryInventory) -> Result<ScopeRecoveryPlan> {
+    use crate::process::worker_registry::ScopeOwnership;
+    let app = super::get_app_dir()?;
+    let file = super::LockedDataFile::lock_recovery(open(&app)?)?;
+    anyhow::ensure!(
+        file.read()?.as_deref() == Some(inventory.raw.as_str()),
+        "Purge journal changed before scope recovery; retry aoe migrate"
+    );
+    let mut journal = decode(Some(&inventory.raw))?;
+    let mut changed = false;
+    for owner in &mut journal.owners {
+        let unfinished = matches!(
+            &owner.runner,
+            RunnerCapture::Uncaptured {
+                producer_epoch: Some(_),
+                ..
+            }
+        );
+        let scopes = match &mut owner.runner {
+            RunnerCapture::Captured { scopes, .. }
+            | RunnerCapture::Uncaptured { scopes, .. }
+            | RunnerCapture::CancelledBeforeBirth { scopes, .. } => Some(scopes),
+            RunnerCapture::Unresolved { .. } => None,
+        };
+        if let Some(scopes) = scopes {
+            if scopes.contains(&ScopeOwnership::Unresolved) {
+                anyhow::ensure!(
+                    !unfinished,
+                    "Pending owner {} still has an unfinished constructor; scope recovery refused",
+                    owner.token
+                );
+                anyhow::ensure!(crate::process::systemd::legacy_unknown_scope_absent(&owner.session_id, scopes)?,
+                    "Pending owner {} has a live unknown original scope; independently identify and retire its exact original unit before retrying aoe migrate", owner.token);
+                scopes.retain(|scope| *scope != ScopeOwnership::Unresolved);
+                changed = true;
+            }
+        }
+        if let Some(request) = &mut owner.request {
+            if !request.instance.is_structured()
+                && request
+                    .instance
+                    .terminal_scopes
+                    .as_ref()
+                    .is_none_or(|scopes| scopes.contains(&ScopeOwnership::Unresolved))
+            {
+                anyhow::ensure!(
+                    !unfinished,
+                    "Pending request {} has an unfinished constructor",
+                    owner.token
+                );
+                let retained: Vec<_> = request
+                    .instance
+                    .terminal_scopes
+                    .clone()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|scope| *scope != ScopeOwnership::Unresolved)
+                    .collect();
+                anyhow::ensure!(crate::process::systemd::legacy_unknown_scope_absent(&owner.session_id, &retained)?,
+                    "Pending request {} has a live unknown original scope; exact original-unit retirement is required", owner.token);
+                request.instance.terminal_scopes = Some(retained);
+                changed = true;
+            }
+        }
+    }
+    let encoded = if changed {
+        let encoded = serde_json::to_vec(&journal)?;
+        decode(Some(std::str::from_utf8(&encoded)?))?;
+        Some(encoded)
+    } else {
+        None
+    };
+    let plan = ScopeRecoveryPlan {
+        file,
+        raw: inventory.raw,
+        encoded,
+        path: app.join(FILE_NAME),
+    };
+    plan.check_current()?;
+    Ok(plan)
+}
 impl PurgeCapture {
     pub(crate) fn new(row: &Instance) -> Result<Self> {
         let mut runner = capture_runner(&row.id);
@@ -456,81 +980,7 @@ impl PurgeCapture {
         &mut self,
         target: &crate::acp::supervisor::RetirementTarget,
     ) -> Result<()> {
-        if let RunnerCapture::Unresolved { error } = &self.runner {
-            anyhow::bail!("Runner ownership unresolved; purge resources retained: {error}");
-        }
-        let (identity, ownership) = if target.identity.is_some() {
-            (target.identity, target.prime.clone())
-        } else {
-            target
-                .lease
-                .as_ref()
-                .map(crate::acp::runner_lifecycle::Lease::constructed_ownership)
-                .unwrap_or_else(|| (None, target.prime.clone()))
-        };
-        let mut scopes = target.scopes.clone();
-        if let Some(lease) = &target.lease {
-            for scope in lease.scopes() {
-                if !scopes.contains(&scope) {
-                    scopes.push(scope);
-                }
-            }
-        }
-        self.runner = match (&self.runner, identity) {
-            (
-                RunnerCapture::Captured {
-                    pid,
-                    generation,
-                    scopes: old,
-                    birth_fingerprint,
-                    prime,
-                },
-                Some(identity),
-            ) => {
-                anyhow::ensure!(
-                    *pid == identity.pid
-                        && *generation == identity.generation
-                        && *birth_fingerprint == identity.birth_fingerprint
-                        && *prime == ownership,
-                    "Captured runner was replaced before purge commit"
-                );
-                for scope in old {
-                    if !scopes.contains(scope) {
-                        scopes.push(scope.clone());
-                    }
-                }
-                RunnerCapture::Captured {
-                    pid: *pid,
-                    generation: *generation,
-                    birth_fingerprint: *birth_fingerprint,
-                    prime: prime.clone(),
-                    scopes,
-                }
-            }
-            (RunnerCapture::Captured { .. }, None) => {
-                anyhow::bail!("Captured runner identity disappeared before purge commit")
-            }
-            (_, Some(identity)) => RunnerCapture::Captured {
-                pid: identity.pid,
-                generation: identity.generation,
-                birth_fingerprint: identity.birth_fingerprint,
-                prime: ownership,
-                scopes,
-            },
-            (_, None) => RunnerCapture::Uncaptured {
-                scopes,
-                prime: ownership,
-                producer_epoch: target
-                    .lease
-                    .as_ref()
-                    .map(crate::acp::runner_lifecycle::Lease::epoch),
-                producer_id: target
-                    .lease
-                    .as_ref()
-                    .map(crate::acp::runner_lifecycle::Lease::producer_id),
-            },
-        };
-        Ok(())
+        self.runner.bind_retirement(target)
     }
 
     pub(crate) fn ensure_captured_runner_stopped(&self) -> Result<()> {
@@ -619,188 +1069,17 @@ impl PurgeOwner {
         &self,
         target: &mut crate::acp::supervisor::RetirementTarget,
     ) -> Result<()> {
-        let (observed, observed_prime) = if target.identity.is_some() {
-            (target.identity, target.prime.clone())
-        } else {
-            target
-                .lease
-                .as_ref()
-                .map(crate::acp::runner_lifecycle::Lease::constructed_ownership)
-                .unwrap_or_else(|| (None, target.prime.clone()))
-        };
-        let scopes = match &self.runner {
-            RunnerCapture::CancelledBeforeBirth {
-                producer_epoch,
-                producer_id,
-                scopes,
-            } => {
-                anyhow::ensure!(
-                    observed.is_none(),
-                    "A runner appeared after completed producer capture"
-                );
-                if let Some(lease) = &target.lease {
-                    anyhow::ensure!(
-                        lease.epoch() == *producer_epoch
-                            && lease.producer_id() == *producer_id
-                            && lease.was_cancelled_before_birth()
-                            && observed_prime == PrimeOwnership::NotPrime,
-                        "A replacement producer appeared after completed capture"
-                    );
-                }
-                target.identity = None;
-                target.prime = PrimeOwnership::NotPrime;
-                scopes
-            }
-            RunnerCapture::Captured {
-                pid,
-                generation,
-                scopes,
-                birth_fingerprint,
-                prime,
-            } => {
-                anyhow::ensure!(
-                    birth_fingerprint.is_some()
-                        && *generation != 0
-                        && *prime != PrimeOwnership::Unresolved,
-                    "Captured runner authority remains unresolved; purge resources retained"
-                );
-                if let Some(identity) = observed {
-                    anyhow::ensure!(
-                        identity.pid == *pid
-                            && identity.generation == *generation
-                            && identity.birth_fingerprint == *birth_fingerprint
-                            && observed_prime == *prime,
-                        "Captured runner was replaced before retirement; purge resources retained"
-                    );
-                } else {
-                    anyhow::ensure!(
-                        target.lease.is_none(),
-                        "A replacement producer appeared before recovery; purge resources retained"
-                    );
-                }
-                target.identity = Some(crate::acp::runner_lifecycle::RunnerIdentity {
-                    pid: *pid,
-                    generation: *generation,
-                    birth_fingerprint: *birth_fingerprint,
-                });
-                target.prime = prime.clone();
-                scopes
-            }
-            RunnerCapture::Uncaptured {
-                scopes,
-                producer_epoch,
-                producer_id,
-                prime,
-            } => {
-                anyhow::ensure!(
-                    observed.is_none_or(|identity| Some(identity.generation) == *producer_epoch)
-                        && target
-                            .lease
-                            .as_ref()
-                            .is_none_or(|lease| Some(lease.epoch()) == *producer_epoch
-                                && Some(lease.producer_id()) == *producer_id),
-                    "Uncaptured runner was replaced before retirement; purge resources retained"
-                );
-                let live_producer = producer_epoch.is_some()
-                    && target.lease.as_ref().is_some_and(|lease| {
-                        Some(lease.epoch()) == *producer_epoch
-                            && Some(lease.producer_id()) == *producer_id
-                    });
-                anyhow::ensure!(
-                    producer_epoch.is_none() || live_producer,
-                    "Captured producer lifetime remains unresolved; purge resources retained"
-                );
-                anyhow::ensure!(
-                    (*prime != PrimeOwnership::Unresolved && (observed.is_none() || observed_prime == *prime))
-                        || (*prime == PrimeOwnership::Unresolved && live_producer),
-                    "Captured native ownership changed or remains unresolved; purge resources retained"
-                );
-                target.prime = if live_producer && *prime == PrimeOwnership::Unresolved {
-                    observed_prime
-                } else {
-                    prime.clone()
-                };
-                target.identity = observed;
-                scopes
-            }
-            RunnerCapture::Unresolved { error } => {
-                anyhow::bail!("Runner ownership unresolved; purge resources retained: {error}")
-            }
-        };
-        for scope in scopes {
-            anyhow::ensure!(
-                *scope != crate::process::worker_registry::ScopeOwnership::Unresolved,
-                "Captured scope ownership unresolved; purge resources retained"
-            );
-            if !target.scopes.contains(scope) {
-                target.scopes.push(scope.clone());
-            }
-        }
-        target.journalled = true;
-        Ok(())
+        self.runner.ensure_retirement_target(target)
     }
 
     pub(crate) fn complete_retirement(
         &mut self,
         target: &crate::acp::supervisor::RetirementTarget,
     ) -> Result<()> {
-        let RunnerCapture::Uncaptured {
-            producer_epoch: Some(epoch),
-            producer_id: Some(producer_id),
-            scopes,
-            ..
-        } = &self.runner
-        else {
+        let runner = self.runner.completed(target)?;
+        if runner == self.runner {
             return Ok(());
-        };
-        let lease = target
-            .lease
-            .as_ref()
-            .filter(|lease| lease.epoch() == *epoch && lease.producer_id() == *producer_id)
-            .context(
-                "The captured live producer is no longer available; purge resources retained",
-            )?;
-        let (identity, prime) = lease.constructed_ownership();
-        anyhow::ensure!(
-            prime != PrimeOwnership::Unresolved,
-            "Completed producer native ownership is unresolved"
-        );
-        let mut scopes = scopes.clone();
-        for scope in target.scopes.iter().cloned().chain(lease.scopes()) {
-            anyhow::ensure!(
-                scope != crate::process::worker_registry::ScopeOwnership::Unresolved,
-                "Completed producer scope ownership is unresolved"
-            );
-            if !scopes.contains(&scope) {
-                scopes.push(scope);
-            }
         }
-        let runner = match identity {
-            Some(identity) => {
-                anyhow::ensure!(
-                    identity.generation == *epoch && identity.birth_fingerprint.is_some(),
-                    "Completed producer runner incarnation is unattested"
-                );
-                RunnerCapture::Captured {
-                    pid: identity.pid,
-                    generation: identity.generation,
-                    birth_fingerprint: identity.birth_fingerprint,
-                    prime,
-                    scopes,
-                }
-            }
-            None => {
-                anyhow::ensure!(
-                    lease.was_cancelled_before_birth() && prime == PrimeOwnership::NotPrime,
-                    "A missing runner does not prove that its producer built no child"
-                );
-                RunnerCapture::CancelledBeforeBirth {
-                    producer_epoch: *epoch,
-                    producer_id: *producer_id,
-                    scopes,
-                }
-            }
-        };
         let (lock, path) = self.file.open_sidecar()?;
         let _guard = acquire_open_storage_flock(lock, &path)?;
         let mut journal = decode(self.file.read()?.as_deref())?;
@@ -1370,6 +1649,177 @@ mod tests {
         let capture = PurgeCapture::new(&row)?;
 
         assert!(capture.ensure_captured_runner_stopped().is_err());
+        Ok(())
+    }
+    #[test]
+    #[serial_test::serial]
+    fn complete_restore_preserves_removed_row_request_and_path_protection() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let _home = crate::session::test_support::isolate_app_dir_at(home.path());
+        let app = crate::session::get_app_dir()?;
+        initialize(&app)?;
+        let store = Storage::new_unwatched("default")?;
+        let checkout = home.path().join("retained-checkout");
+        std::fs::create_dir(&checkout)?;
+        std::fs::write(checkout.join("sentinel"), b"retained")?;
+        let mut row = Instance::new("original", checkout.to_str().unwrap());
+        row.source_profile = "default".into();
+        row.view = crate::session::View::Terminal;
+        row.terminal_scopes = Some(Vec::new());
+        store.update(|rows, _| {
+            rows.push(row.clone());
+            Ok(())
+        })?;
+        let request = DeletionRequest {
+            session_id: row.id.clone(),
+            instance: row.clone(),
+            delete_worktree: false,
+            delete_branch: false,
+            delete_sandbox: false,
+            force_delete: false,
+            detach_hooks: true,
+            keep_scratch: true,
+        };
+        let owner = PurgeOwner::record_plan(
+            &store,
+            &row,
+            row.lifecycle_generation,
+            Some(&request),
+            None,
+            PurgeCapture::new(&row)?,
+        )?;
+        let token = owner.token().to_owned();
+        drop(owner);
+        store.update(|rows, _| {
+            rows.clear();
+            Ok(())
+        })?;
+        let target = app.join(FILE_NAME);
+        let original = std::fs::read(&target)?;
+        let backup = home.path().join("complete-purge-backup.json");
+        std::fs::write(&backup, &original)?;
+        std::fs::remove_file(&target)?;
+        assert!(protection(&store, None).is_err());
+        assert_eq!(std::fs::read(checkout.join("sentinel"))?, b"retained");
+        let transaction = crate::daemon::lifecycle::Transaction::acquire_blocking_for(
+            std::time::Duration::from_secs(1),
+        )?;
+        let serve = crate::cli::serve::try_lock_serve()?.unwrap();
+        let corrupt_bytes = b"retained corrupt purge evidence";
+        for corrupt in [false, true] {
+            if corrupt {
+                std::fs::write(&target, corrupt_bytes)?;
+            } else if target.exists() {
+                std::fs::remove_file(&target)?;
+            }
+            for missing in ["request", "additional_protection"] {
+                let mut incomplete: serde_json::Value = serde_json::from_slice(&original)?;
+                incomplete["owners"][0]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove(missing);
+                let incomplete_path = home.path().join("incomplete-purge-backup.json");
+                std::fs::write(&incomplete_path, serde_json::to_vec(&incomplete)?)?;
+                assert!(
+                    crate::cli::serve::with_inactive_serve_state(
+                        &transaction,
+                        Some(&serve),
+                        |serve| {
+                            restore_from_complete_backup(&incomplete_path, &transaction, serve)
+                        },
+                    )
+                    .is_err(),
+                    "missing {missing}"
+                );
+                if corrupt {
+                    assert_eq!(std::fs::read(&target)?, corrupt_bytes);
+                } else {
+                    assert!(!target.exists());
+                }
+                assert_eq!(std::fs::read(checkout.join("sentinel"))?, b"retained");
+            }
+            crate::cli::serve::with_inactive_serve_state(&transaction, Some(&serve), |serve| {
+                restore_from_complete_backup(&backup, &transaction, serve)
+            })?;
+            assert_eq!(std::fs::read(&target)?, original);
+            let plans = recovery_plans()?;
+            assert_eq!(plans.len(), 1);
+            assert_eq!(plans[0].token, token);
+            let request = plans[0].request.as_ref().unwrap();
+            assert_eq!(request.instance.project_path, row.project_path);
+            assert!(request.keep_scratch);
+            assert_eq!(protection(&store, None)?.len(), 1);
+            assert!(crate::cli::serve::with_inactive_serve_state(
+                &transaction,
+                Some(&serve),
+                |serve| { restore_from_complete_backup(&backup, &transaction, serve) }
+            )
+            .is_err());
+            assert_eq!(std::fs::read(&target)?, original);
+            assert_eq!(std::fs::read(checkout.join("sentinel"))?, b"retained");
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn historical_backup_upcast_preserves_unknown_authority_and_refuses_invalid_identity(
+    ) -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let _home = crate::session::test_support::isolate_app_dir_at(home.path());
+        let app = crate::session::get_app_dir()?;
+        initialize(&app)?;
+        let store = Storage::new_unwatched("default")?;
+        let mut row = Instance::new("legacy", home.path().to_str().unwrap());
+        row.source_profile = "default".into();
+        row.view = crate::session::View::Terminal;
+        row.terminal_scopes = Some(Vec::new());
+        let owner = PurgeOwner::record(&store, &row, PurgeCapture::new(&row)?)?;
+        let token = owner.token().to_owned();
+        drop(owner);
+        let mut old: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(app.join(FILE_NAME))?)?;
+        old["version"] = serde_json::json!(2);
+        old["owners"][0].as_object_mut().unwrap().remove("request");
+        old["owners"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("additional_protection");
+        let runner = old["owners"][0]["runner"].as_object_mut().unwrap();
+        runner.remove("prime");
+        runner.remove("scopes");
+        runner.remove("producer_id");
+        let old_json = serde_json::to_string(&old)?;
+        let converted = upcast_journal(&old_json, JournalInput::CompleteBackup)?;
+        let value: serde_json::Value = serde_json::from_slice(&converted)?;
+        assert_eq!(value["owners"][0]["token"], token);
+        assert_eq!(
+            value["owners"][0]["protection"],
+            old["owners"][0]["protection"]
+        );
+        assert_eq!(value["owners"][0]["runner"]["prime"]["state"], "unresolved");
+        assert_eq!(
+            value["owners"][0]["runner"]["scopes"],
+            serde_json::json!([{"state":"unresolved"}])
+        );
+        assert_eq!(
+            upcast_journal(
+                std::str::from_utf8(&converted)?,
+                JournalInput::CompleteBackup
+            )?,
+            converted
+        );
+        let mut future = old.clone();
+        future["version"] = serde_json::json!(u32::MAX);
+        assert!(upcast_journal(
+            &serde_json::to_string(&future)?,
+            JournalInput::CompleteBackup
+        )
+        .is_err());
+        old["owners"][0]["session_id"] = serde_json::json!("../foreign");
+        assert!(
+            upcast_journal(&serde_json::to_string(&old)?, JournalInput::CompleteBackup).is_err()
+        );
         Ok(())
     }
 }

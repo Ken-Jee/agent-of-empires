@@ -40,6 +40,7 @@ impl Instance {
             trash_lifecycle_id: None,
             pre_trash_project_path: None,
             lifecycle_reservation: None,
+            terminal_handoff: None,
             plugin_meta: std::collections::BTreeMap::new(),
             created_by_plugin: None,
             plugin_create_idempotency: None,
@@ -698,13 +699,11 @@ impl Instance {
         self.view == View::Structured
     }
 
-    /// Move a structured row to the terminal view, keeping the store an
-    /// asserted binding or the live worker proved, and refusing to move at all
-    /// when neither did: the row then keeps its view and its ACP id.
-    pub(crate) fn switch_to_terminal_keep_context(
-        &mut self,
+    /// Require an asserted or worker-proven native store before planning a terminal handoff.
+    pub(crate) fn terminal_keep_context_state(
+        &self,
         worker: Option<&ExecutionBinding>,
-    ) -> Result<()> {
+    ) -> Result<ConversationState> {
         let sid = self
             .acp_session_id
             .clone()
@@ -732,7 +731,7 @@ impl Instance {
         let binding = resolved
             .context(unresolved)?
             .ok_or_else(|| anyhow::anyhow!(unresolved))?;
-        self.adopt_conversation_state(ConversationState {
+        Ok(ConversationState {
             tool: self.tool.clone(),
             session_id: Some(sid.clone()),
             binding: Some(binding.clone()),
@@ -740,12 +739,7 @@ impl Instance {
             resume_binding: Some(binding),
             active: None,
             pi_session_path: None,
-        });
-        self.acp_session_id = None;
-        self.import_pending = None;
-        self.acp_load_session_capable = None;
-        self.view = View::Terminal;
-        Ok(())
+        })
     }
 
     pub(crate) fn selected_claude_conversation(&self) -> Option<(&str, &ExecutionBinding)> {
@@ -761,12 +755,7 @@ impl Instance {
         (execution.agent == "claude" && execution.filesystem == "host").then_some((sid, execution))
     }
 
-    /// A legacy binding carries no route marker, so the marker is derived from
-    /// the configuration as it stands right now — the same rule the launch
-    /// itself routes with, ambient `CLAUDE_CONFIG_DIR` included, since a
-    /// wrapper that exports the default store is naming it too. Deriving
-    /// rather than reading keeps a reconfigured alias observed instead of
-    /// frozen into the row.
+    /// Legacy route markers follow current launch configuration so alias changes stay visible.
     pub(crate) fn selected_claude_store_pin(
         &self,
     ) -> Option<crate::session::capture::ClaudeStorePin> {
@@ -867,12 +856,10 @@ mod tests {
     }
 
     #[test]
-    fn switch_to_terminal_keep_context_carries_asserted_native_binding() {
+    fn terminal_keep_context_state_carries_asserted_native_binding() {
         let mut inst = Instance::new("claude", "/tmp");
         inst.view = View::Structured;
         inst.acp_session_id = Some("sid-abc".to_string());
-        inst.import_pending = Some(true);
-        inst.acp_load_session_capable = Some(true);
         let binding = ConversationBinding {
             session_id: "sid-abc".into(),
             execution: Some(ExecutionBinding {
@@ -890,37 +877,24 @@ mod tests {
         inst.resume_intent = ResumeIntent::Use("sid-abc".into());
         inst.resume_binding = Some(binding.clone());
 
-        inst.switch_to_terminal_keep_context(None).unwrap();
+        let planned = inst.terminal_keep_context_state(None).unwrap();
 
-        assert_eq!(inst.view, View::Terminal);
-        assert_eq!(inst.agent_session_binding.as_ref(), Some(&binding));
-        assert_eq!(inst.resume_intent, ResumeIntent::Use("sid-abc".to_string()));
-        assert_eq!(
-            (
-                inst.acp_session_id,
-                inst.import_pending,
-                inst.acp_load_session_capable
-            ),
-            (None, None, None)
-        );
+        assert_eq!(planned.binding.as_ref(), Some(&binding));
+        assert_eq!(planned.resume_binding.as_ref(), Some(&binding));
+        assert_eq!(planned.session_id.as_deref(), Some("sid-abc"));
+        assert_eq!(planned.intent, ResumeIntent::Use("sid-abc".to_string()));
     }
 
-    /// A structured row with no asserted binding and no worker has proved no
-    /// store, so the switch is refused and names the command that would, and
-    /// the row keeps the view and the ACP id it had.
     #[test]
     #[serial_test::serial]
-    fn switch_to_terminal_keep_context_refuses_a_row_nothing_proved() {
+    fn terminal_keep_context_state_refuses_unproved_store() {
         let temp = tempfile::tempdir().unwrap();
         let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
         let mut inst = Instance::new("claude-unproved", "/tmp");
         inst.view = View::Structured;
         inst.acp_session_id = Some("sid-abc".into());
 
-        let error = inst.switch_to_terminal_keep_context(None).unwrap_err();
-        assert!(error.to_string().contains("set-session-id"));
-        assert_eq!(inst.view, View::Structured);
-        assert_eq!(inst.acp_session_id.as_deref(), Some("sid-abc"));
+        assert!(inst.terminal_keep_context_state(None).is_err());
     }
 
     /// A legacy binding carries no route marker, and the marker it would be
@@ -1296,10 +1270,11 @@ mod tests {
         inst.acp_session_id = Some("sid-abc".to_string());
 
         let worker = inst.resolve_native_execution(None).unwrap().binding;
-        inst.switch_to_terminal_keep_context(Some(&worker)).unwrap();
+        let planned = inst.terminal_keep_context_state(Some(&worker)).unwrap();
 
         assert_eq!(
-            inst.agent_session_binding
+            planned
+                .binding
                 .as_ref()
                 .and_then(|binding| binding.execution.as_ref())
                 .and_then(|execution| execution.stores.first())
@@ -1330,14 +1305,11 @@ mod tests {
         inst.view = View::Structured;
         inst.acp_session_id = Some("sid-abc".to_string());
 
-        let error = inst.switch_to_terminal_keep_context(None).unwrap_err();
-        assert!(error.to_string().contains("set-session-id"));
-        assert_eq!(inst.view, View::Structured);
-        assert_eq!(inst.acp_session_id.as_deref(), Some("sid-abc"));
+        assert!(inst.terminal_keep_context_state(None).is_err());
     }
     #[test]
     #[serial_test::serial]
-    fn handoff_reports_native_resolution_failure_without_losing_acp_session() {
+    fn handoff_refuses_unattested_native_configuration() {
         let temp = tempfile::tempdir().unwrap();
         let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
         let _claude = crate::session::test_support::install_login_shell_path_command(
@@ -1351,14 +1323,7 @@ mod tests {
         let worker = inst.resolve_native_execution(None).unwrap().binding;
         inst.extra_args = "--mcp-config /tmp/unattested.json".into();
 
-        let error = inst
-            .switch_to_terminal_keep_context(Some(&worker))
-            .unwrap_err();
-        let chain = format!("{error:#}");
-        assert!(chain.contains("set-session-id"), "{chain}");
-        assert!(chain.contains("--mcp-config"), "{chain}");
-        assert_eq!(inst.view, View::Structured);
-        assert_eq!(inst.acp_session_id.as_deref(), Some("sid-abc"));
+        assert!(inst.terminal_keep_context_state(Some(&worker)).is_err());
     }
 
     /// #4127: the launch's route reaches both bindings a resume may persist,

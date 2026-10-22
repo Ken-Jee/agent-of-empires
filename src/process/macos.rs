@@ -1,4 +1,4 @@
-//! macOS-specific process utilities
+//! macOS-specific process utilities.
 
 pub(crate) const HAS_CODEX_MANAGED_PREFERENCES: bool = true;
 use anyhow::Context as _;
@@ -67,7 +67,6 @@ pub(super) fn throttle_child(cmd: &mut Command) {
     }
 }
 
-/// Collect `pid` and every descendant by parsing `ps -A` once and walking the map.
 pub(super) fn collect_pid_tree(pid: u32) -> Vec<u32> {
     let children_map = build_children_map();
     let mut pids = vec![pid];
@@ -75,7 +74,6 @@ pub(super) fn collect_pid_tree(pid: u32) -> Vec<u32> {
     pids
 }
 
-/// Build a map of parent PID -> list of child PIDs by parsing `ps` output once
 pub(super) fn build_children_map() -> HashMap<u32, Vec<u32>> {
     let mut children_map: HashMap<u32, Vec<u32>> = HashMap::new();
 
@@ -825,10 +823,7 @@ fn read_vm_stat() -> Option<String> {
         .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-/// Derive "available" bytes from `vm_stat`: (free + inactive) pages times the
-/// reported page size. Inactive pages are reclaimable, so this mirrors the
-/// spirit of Linux `MemAvailable`. It is an approximation, which is why macOS
-/// leans on the native pressure level for its band rather than this number.
+/// (free + inactive) pages; an approximation, so the band uses the native pressure level.
 fn parse_vm_stat_available(vm_stat: &str) -> Option<u64> {
     let page_size = parse_vm_stat_page_size(vm_stat)?;
     let free = parse_vm_stat_pages(vm_stat, "Pages free")?;
@@ -836,15 +831,12 @@ fn parse_vm_stat_available(vm_stat: &str) -> Option<u64> {
     Some((free + inactive).saturating_mul(page_size))
 }
 
-/// The page size from the `vm_stat` header: `Mach Virtual Memory Statistics:
-/// (page size of 16384 bytes)`.
 fn parse_vm_stat_page_size(vm_stat: &str) -> Option<u64> {
     let line = vm_stat.lines().next()?;
     let after = line.split("page size of").nth(1)?;
     after.split_whitespace().next()?.parse().ok()
 }
 
-/// A `vm_stat` page-count line like `Pages free:    123456.` (trailing period).
 fn parse_vm_stat_pages(vm_stat: &str, key: &str) -> Option<u64> {
     for line in vm_stat.lines() {
         let Some((name, rest)) = line.split_once(':') else {
@@ -876,7 +868,6 @@ Pages wired down:                        300000.
         assert_eq!(parse_vm_stat_page_size(VM_STAT), Some(16384));
         assert_eq!(parse_vm_stat_pages(VM_STAT, "Pages free"), Some(123456));
         assert_eq!(parse_vm_stat_pages(VM_STAT, "Pages inactive"), Some(200000));
-        // available = (free + inactive) * page_size
         assert_eq!(
             parse_vm_stat_available(VM_STAT),
             Some((123456 + 200000) * 16384)
@@ -908,10 +899,7 @@ Pages wired down:                        300000.
     }
 }
 
-/// Per-boot identity from `kern.bootsessionuuid`: a UUID fixed for the boot's
-/// lifetime. Preferred over `kern.boottime`, which is recomputed as
-/// `now - uptime` and shifts on clock steps (NTP, sleep/wake), which would
-/// silently rotate the ledger mid-boot.
+/// `kern.boottime` shifts on clock steps; the session UUID does not.
 pub(super) fn boot_id() -> Option<String> {
     let out = Command::new("sysctl")
         .args(["-n", "kern.bootsessionuuid"])
@@ -1011,10 +999,7 @@ pub(super) fn parent_and_argv0(pid: u32) -> Option<(u32, String)> {
     Some((ppid, fields.next().unwrap_or_default().to_string()))
 }
 
-/// Get the foreground process group leader for a shell PID
 pub fn get_foreground_pid(shell_pid: u32) -> Option<u32> {
-    // Use ps to get the foreground process group
-    // ps -o tpgid= -p <pid> gives us the terminal foreground process group ID
     let output = Command::new("ps")
         .args(["-o", "tpgid=", "-p", &shell_pid.to_string()])
         .output()
@@ -1033,14 +1018,10 @@ pub fn get_foreground_pid(shell_pid: u32) -> Option<u32> {
         return Some(shell_pid);
     }
 
-    // Find a process in the foreground group
     find_process_in_group(tpgid as u32).or(Some(shell_pid))
 }
 
-/// Find a process belonging to the given process group
 fn find_process_in_group(pgrp: u32) -> Option<u32> {
-    // Use ps to find processes in this group
-    // ps -o pid=,pgid= -A lists all processes with their PIDs and PGIDs
     let output = Command::new("ps")
         .args(["-o", "pid=,pgid=", "-A"])
         .output()

@@ -2805,7 +2805,7 @@ impl Instance {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ConversationState {
     pub(crate) tool: String,
     pub(crate) session_id: Option<String>,

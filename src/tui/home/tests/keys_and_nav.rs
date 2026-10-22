@@ -1069,13 +1069,71 @@ fn test_n_opens_new_dialog() {
     assert!(env.view.has_dialog());
 }
 
-#[test]
+#[tokio::test]
 #[serial]
-fn test_b_opens_project_add_flow_when_no_projects() {
+async fn test_b_opens_project_add_flow_when_no_projects() {
+    if which::which("tmux").is_err() {
+        return;
+    }
     let mut env = create_test_env_empty();
     let project_dir = env._temp.path().join("plain-project");
     std::fs::create_dir_all(&project_dir).unwrap();
     let profile = env.view.config_profile();
+    let app_dir = crate::session::get_app_dir().unwrap();
+    crate::session::purge_owners::initialize(&app_dir).unwrap();
+    crate::tmux::tool_retirement::initialize(&app_dir).unwrap();
+    let state = test_support::build_test_app_state_with_policy_configured(
+        Vec::new(),
+        vec!["localhost".into()],
+        Vec::new(),
+        None,
+        |state| {
+            state.runtime = crate::server::runtime::NativeRuntime::new(
+                app_dir.to_string_lossy().into_owned(),
+                crate::tmux::native_socket_locator()
+                    .map(|path| path.to_string_lossy().into_owned()),
+                state.runtime.work.clone(),
+            );
+        },
+    );
+    test_support::refresh_canonical_metadata_for_test(&state).await;
+    let socket = crate::session::get_app_dir()
+        .unwrap()
+        .join("daemon/api.sock");
+    let server = test_support::serve_owner_router_for_test(
+        &socket,
+        test_support::build_router_for_test(state.clone()),
+    )
+    .await;
+    let endpoint = crate::acp::client::DaemonEndpoint::local_unix(socket.clone());
+    let connection = crate::daemon::RuntimeConnection::connect(&endpoint, Some("test"))
+        .await
+        .unwrap();
+    assert!(
+        connection.mutations_allowed(),
+        "the authenticated owner runtime accepts mutations"
+    );
+    assert!(matches!(
+        connection.snapshot().contents.health,
+        crate::daemon::RuntimeHealth::Healthy
+    ));
+    let client = crate::daemon::DaemonClient::new_unix(socket).unwrap();
+    env.view
+        .session_feed
+        .connect_prepared(profile.clone(), Some((connection, client)));
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            env.view.apply_session_feed();
+            if env.view.session_feed.current_snapshot_applied() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("healthy owner runtime frame reaches Home");
+    assert!(env.view.session_feed.mutations_available());
+    assert!(env.view.project_write_block().is_none());
 
     env.view.handle_key(key(KeyCode::Char('b')), None);
     assert!(env.view.project_session_picker_dialog.is_none());
@@ -1097,6 +1155,10 @@ fn test_b_opens_project_add_flow_when_no_projects() {
         projects.iter().any(|p| p.path == canonical),
         "b empty-state add flow should register the typed path"
     );
+    state.shutdown.cancel();
+    drop(env);
+    server.abort();
+    let _ = server.await;
 }
 
 #[test]

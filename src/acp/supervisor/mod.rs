@@ -31,7 +31,7 @@ use super::runner_lifecycle::{
 use super::state::AcpSessionId;
 use crate::daemon::{AcpWorkerStart, AcpWorkerStartKind, AcpWorkerState};
 use crate::session::SandboxInfo;
-pub(crate) use teardown::RetirementTarget;
+pub(crate) use teardown::{RetirementResources, RetirementTarget};
 
 pub(crate) use agents::apply_agent_command_override;
 pub(crate) use launch::{host_spawn_environment, with_durable_launch};
@@ -171,6 +171,7 @@ pub struct Supervisor<S: BroadcastSink> {
     lifecycle: Arc<std::sync::Mutex<LifecycleTable>>,
     process_control: Arc<dyn ProcessControl>,
     launcher: Launcher,
+    native_admission_required: bool,
     /// Agents whose first spawn finished; until then spawns serialize on a
     /// per-agent lock so a lazy adapter install is not raced.
     warmed_up_agents: SharedSet,
@@ -194,11 +195,12 @@ pub struct Supervisor<S: BroadcastSink> {
     max_concurrent_workers: u32,
 }
 
-/// RAII guard over a `Starting` or `Respawning` epoch; dropping it before
-/// install abandons the epoch so a failed resume cannot pin the session.
+/// RAII guard over a `Starting` or `Respawning` epoch. A dropped attach
+/// abandons only its observation unless an explicit stop claimed the runner.
 pub(crate) struct ResumeReservation {
     lease: Lease,
     pub(crate) expected_lifecycle_generation: Option<u64>,
+    attach_record: Option<Box<crate::process::worker_registry::WorkerRecord>>,
     lifecycle: Arc<std::sync::Mutex<LifecycleTable>>,
     notify: Arc<tokio::sync::Notify>,
 }
@@ -212,18 +214,22 @@ impl ResumeReservation {
 impl Drop for ResumeReservation {
     fn drop(&mut self) {
         let mut lifecycle = lock_recover(&self.lifecycle);
-        if lifecycle.construction_is_pending(&self.lease) {
-            self.lease.cancellation().cancel();
+        if !lifecycle.construction_is_pending(&self.lease) {
+            return;
         }
-        if let Some(identity) = self.lease.spawned_runner() {
-            if lifecycle.convert_to_stopping(&self.lease) {
-                lifecycle.settle(
-                    &self.lease,
-                    super::runner_lifecycle::Settlement::Unproven(Some(identity)),
-                );
-                self.notify.notify_waiters();
-            }
-        } else if lifecycle.abandon(&self.lease) {
+        self.lease.cancellation().cancel();
+        if self.lease.retirement_runners().next().is_none() && lifecycle.abandon(&self.lease) {
+            self.notify.notify_waiters();
+            return;
+        }
+        // abandon can refuse because a producer crossed the birth gate while
+        // we inspected it. Convert that same construction instead of losing it.
+        if lifecycle.convert_to_stopping(&self.lease) {
+            let identity = self.lease.retirement_runners().next();
+            lifecycle.settle(
+                &self.lease,
+                super::runner_lifecycle::Settlement::Unproven(identity),
+            );
             self.notify.notify_waiters();
         }
     }
@@ -317,6 +323,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             ))),
             process_control: Arc::new(SystemProcessControl::default()),
             launcher: Arc::new(|config, session_id| Box::pin(AcpClient::spawn(config, session_id))),
+            native_admission_required: false,
             warmed_up_agents: Arc::default(),
             agent_warmup_locks: Arc::default(),
             worker_notify: Arc::default(),
@@ -332,6 +339,10 @@ impl<S: BroadcastSink> Supervisor<S> {
         }
     }
 
+    pub(crate) fn with_native_admission(mut self) -> Self {
+        self.native_admission_required = true;
+        self
+    }
     pub(crate) fn max_concurrent_workers(&self) -> u32 {
         self.max_concurrent_workers
     }

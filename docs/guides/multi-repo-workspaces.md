@@ -1,64 +1,37 @@
 # Multi-Repo Workspaces
 
-Run a single AoE session across several git repositories at once. Each repo gets its own worktree on a shared branch name, all rooted under one workspace directory, attached to one tmux session.
+Run one session across several git repositories. Each repo gets its own worktree on a shared branch name, all rooted under one workspace directory, attached to one tmux session. Use it when a unit of work touches more than one repo and you want one agent driving all of them.
 
-Use this when a unit of work, a feature, a bug fix, an investigation, touches more than one repo and you want one agent driving all of them, not N agents you have to mentally reconcile.
-
-## When to Use
-
-| Scenario | Multi-repo? |
-|---|---|
-| Bug spans backend and frontend repos | Yes |
-| Refactor across an OSS core and a private wrapper | Yes |
-| Feature limited to a single repo | No, regular session |
-| Investigating logs that touch many repos | Yes, agent picks the relevant ones |
-| OSS core is pinned and rarely changes | Use [`on_create` hooks](repo-config.md) instead |
+For fixed sibling repos that rarely change, an [`on_create` hook](repo-config.md) is simpler than a workspace.
 
 ## Quick Start
 
-### 1. Register your repos once
+Register repos once, then start a session:
 
 ```bash
 aoe project add /path/to/backend
 aoe project add /path/to/frontend
 aoe project add /path/to/shared-lib
-```
-
-`aoe project list` shows what is registered.
-
-### 2. Start a multi-repo session
-
-CLI:
-
-```bash
-aoe add /path/to/backend \
-  --project frontend \
-  --project shared-lib \
+aoe add /path/to/backend --project frontend --project shared-lib \
   -w feat/auth-rewrite -b
 ```
 
-TUI: open the new-session dialog (`n`), enter the worktree branch, focus the **Extra Repos** field, press `Ctrl+R`, and pick the registered projects you want to include.
+TUI: in the new-session dialog (`n`), focus **Extra Repos**, press `Ctrl+R`, and select registered projects. Web: select a primary repo and use **Extra repos**, or enter a path.
 
-Web: `+ New session`, pick a primary repo, then click registered projects in the **Extra repos** picker (or paste a path with the free-text input).
+### Per-repo base branches
 
-### 3. Give a repo its own base branch
-
-Each repo's branch is forked from `--base-branch` by default. `--repo-base <repo>=<branch>` overrides that for one repo, so a workspace can start with one repo on `develop` and others on their own epic branches:
+Each repo forks from `--base-branch` by default. Override one with `--repo-base <repo>=<branch>`:
 
 ```bash
-aoe add /path/to/backend \
-  --project frontend \
-  --project shared-lib \
-  -w feat/auth-rewrite -b \
-  --base-branch develop \
-  --repo-base frontend=epic/checkout
+aoe add /path/to/backend --project frontend \
+  -w feat/auth-rewrite -b --base-branch develop --repo-base frontend=epic/checkout
 ```
 
-`<repo>` is the repo's directory name or a path you passed to `--repo`; an unmatched name is an error rather than a silent fallback. The web wizard has the same thing as a base-branch field on each repo in the **Extra repos** picker. The base each repo was forked from is recorded, and it becomes that repo's default diff comparison ref (see [Base override](diff-view.md#base-override)); `aoe session set-base --repo <name>` changes it later, per repo.
+`<repo>` is the repo directory name or a `--repo` path; unmatched names fail rather than falling back. The web wizard exposes the same per-repo field. Each recorded base becomes its repo's diff comparison ref, changeable with `aoe session set-base --repo <name>`; see [Base override](diff-view.md#base-override).
 
-Worktree creation across the repos in a workspace runs concurrently, so wall-clock time is roughly that of the slowest single repo rather than the sum (network-bound `git fetch` and `git submodule update` dominate). If any repo's post-checkout hook fails after `git worktree add` has already checked out the branch, the workspace is still created and the hook output is surfaced as a warning. See [Post-Checkout Hooks](worktrees.md#post-checkout-hooks) for details.
+Worktree creation runs concurrently. A failed post-checkout hook leaves the completed checkout usable and surfaces a warning rather than aborting the workspace. See [Post-checkout hooks](worktrees.md#post-checkout-hooks).
 
-### 4. The agent sees one workspace
+### Workspace layout
 
 The session starts in the workspace root with all the worktrees as siblings:
 
@@ -71,22 +44,15 @@ The session starts in the workspace root with all the worktrees as siblings:
 
 The agent navigates between them like any normal multi-repo working tree. Use `cd` and standard git commands; AoE does not impose any cross-repo orchestration.
 
-### 5. Add a repo to a session that already exists
+### Adding a repo to an existing session
 
-When you get twenty minutes into a task and realize you also need another repo,
-attach it instead of recreating the session:
+Add a repository without recreating the session:
 
 ```bash
 aoe session add-project <session> frontend
 ```
 
-Web: right-click the session in the sidebar, **Add project**. TUI: same action on
-the right-click menu, or `Add project to this session` in the command palette.
-
-Attaching converts the session into a real multi-repo workspace. Afterwards it is
-indistinguishable from one created with `--project`: both repos sit side by side
-under one workspace directory, and `aoe list --json` reports both in
-`workspace_repos`. There is no second class of "attached" repo.
+Web and TUI: choose **Add project** on the session's context menu, or use the command palette. The result is the same workspace shape as `--project`, reported in `aoe list --json` as `workspace_repos`.
 
 What that means for the session depends on the shape it started in:
 
@@ -125,64 +91,26 @@ have to be removed by hand.
 
 ## The Project Registry
 
-Saved repo paths the multi-repo pickers draw from. Two scopes:
+Saved repo paths the pickers draw from, in two scopes:
 
 | Scope | File | Visibility |
 |---|---|---|
 | Global | `<app_dir>/projects.json` | Every profile |
 | Profile | `<app_dir>/profiles/{profile}/projects.json` | Only that profile |
 
-`<app_dir>` is `$XDG_CONFIG_HOME/agent-of-empires/` on Linux, `~/.agent-of-empires/` on macOS.
-
-`aoe project add <path>` defaults to global; `aoe -p <profile> project add <path>` defaults to profile. Pass `--scope global` or `--scope profile` to override.
-
-Adding a path that already exists in another scope is an error unless you pass `--allow-override`, which lets a profile entry shadow the global one (the profile entry then wins in merged views):
-
-```bash
-aoe project add /repo/foo                              # global
-aoe -p other project add /repo/foo --allow-override    # profile shadows global
-```
+See [File Locations](configuration.md#file-locations) for `<app_dir>`. `aoe project add` defaults to global, or to the selected profile with `-p <profile>`; `--scope global` or `--scope profile` overrides that choice. A path already registered in another scope is refused unless `--allow-override` lets a profile entry shadow the global one.
 
 ### Saved projects versus pinned projects
 
-A registered (saved) project is a registry entry: it shows in the Projects view and the new-session wizard's multi-select picker, whether or not it has any sessions. Pinning is a separate decision: it keeps the project's header visible in the sidebar / project view even with zero sessions. So a saved project is not forced into the sidebar, and unpinning a project does not delete it; it stays saved and only its sessionless header goes away. Removing a project (the Projects view's "Remove", or `aoe project remove`) is the one action that deletes the registry entry.
+Saved projects appear in pickers even without sessions. **Pinning** keeps a project header visible when empty; unpinning leaves the registration intact. Only **Remove** or `aoe project remove` deletes the entry.
 
-### Pinning a project from the TUI
-
-In the TUI's project view (press `g` and pick Project grouping), a project header normally disappears once its last session is gone. Press `p` on a project header, or pick "Pin project" from its right-click menu, to pin it (registering the repo in the global registry if it is not already saved). A pinned project keeps its header (marked with a `◆`) even with zero sessions, so you can launch new work under it later. Press `p` again to unpin; the project stays saved (still in the picker), and its header drops from the view once it has no sessions.
-
-### Pinning a project from the web dashboard
-
-The web sidebar's project (repository) grouping mirrors the TUI. A pinned project shows a `◆` next to its name and keeps its header even with zero sessions; its `+` New session button launches work under that repo. Open a project header's actions menu (right-click, or the menu on the header) and choose "Pin project" to pin it (registering the repo, global scope, if needed) or "Unpin project" to clear the pin while keeping the saved project. Pinned-but-empty projects sort below your active repositories. The pin is stored in the registry, so a pin made in the TUI shows up here when the dashboard regains focus, and vice versa.
+Pin from the TUI project view (`g`, Project grouping, then `p` on a header or its context menu), or the web project header's actions menu. Pinning registers an unsaved repo globally and marks it with `◆`. Empty pinned web projects sort below active repositories and retain their **New session** action. Pins live in the registry and appear on the other surface when refreshed.
 
 ## CLI Reference
 
-```bash
-# List
-aoe project list                       # merged (global + active profile)
-aoe project list --scope global        # globals only
-aoe project list --scope profile       # active profile only
-aoe project list --json                # machine-readable
+Use `aoe project list`, `aoe project add <path>` and `aoe project remove <name-or-path>` to manage registrations. See the [CLI Reference](../cli/reference.md) for scope, naming, override and JSON flags.
 
-# Add
-aoe project add /path/to/repo                          # global, name = basename
-aoe project add /path/to/repo --name shortname        # custom display name
-aoe project add /path/to/repo --scope profile         # profile-only
-aoe project add /path/to/repo --allow-override        # shadow other-scope entry
-
-# Remove
-aoe project remove backend                # by name (case-insensitive)
-aoe project remove /path/to/repo          # by canonical path
-aoe project remove backend --scope profile
-
-# Use in a session
-aoe add /path/to/primary --project name1 --project name2 -w branch -b
-aoe add /path/to/primary --repo /literal/path --project registered -w branch -b
-```
-
-`--repo` and `--project` may be mixed; the union is passed to the workspace builder. The builder rejects duplicate repo names, so the same repo via two paths is a hard error.
-
-`aoe list --json` includes a `workspace_repos` array for each session; the array is empty for single-repo sessions.
+`--repo` accepts literal paths and can be mixed with registered `--project` names. Duplicate repo names, including the same repo reached through two paths, are refused. `aoe list --json` reports `workspace_repos`, empty for single-repo sessions.
 
 ## TUI
 

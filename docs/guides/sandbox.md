@@ -1,54 +1,22 @@
-# Docker Sandbox: Quick Reference
+# Container Sandbox
 
 ## Overview
 
-Docker sandboxing runs your AI coding agents (Claude Code, OpenCode, Mistral Vibe, Hermes, Codex CLI, Gemini CLI, Antigravity CLI, Cursor CLI, Copilot CLI, Pi, Oh My Pi (OMP), Kiro CLI, Qwen Code, Kimi Code, Prime Agent) inside isolated Docker containers while maintaining access to your project files and credentials.
+A sandboxed session runs its agent in a private container with the project mounted at `/workspace`. Agent credentials are seeded into a private per-session store; containers do not share writable agent history. Claude Code shares only its credential file; see [Shared credentials](#shared-credentials).
 
-> **Linux users:** AoE also supports [Podman](podman.md) as a daemonless, rootless-friendly alternative to Docker.
->
-> **macOS users:** AoE also supports [Apple Containers](apple-containers.md) as a native alternative to Docker Desktop.
+Docker is the default. [Podman](podman.md) and [Apple Container](apple-containers.md) are alternatives.
 
-**Key Features:**
-- One container per session
-- Shared authentication across containers (no re-auth needed)
-- Automatic container lifecycle management
-- Full project access via volume mounts
-
-Agent credentials are seeded from the host config into a private per-session
-sandbox directory, so agents authenticate without re-login. Containers do not
-share a writable agent store; Claude Code's credential file is the one
-exception, see [Shared credentials](#shared-credentials).
-
-## CLI vs TUI Behavior
-
-| Feature | CLI | TUI |
-|---------|-----|-----|
-| Enable sandbox | `--sandbox` flag | Checkbox toggle |
-| Custom image | `--sandbox-image <image>` | Not supported |
-| Container cleanup | Automatic on remove | Automatic on remove |
-| Keep container | `--keep-container` flag | Not supported |
-
-## One-Liner Commands
+## Creating one
 
 ```bash
-# Create sandboxed session
 aoe add --sandbox .
-
-# Create sandboxed session with custom image
 aoe add --sandbox-image myregistry/custom:v1 .
-
-# Create and launch sandboxed session
 aoe add --sandbox -l .
-
-# Remove session (auto-cleans container)
 aoe remove <session>
-
-# Remove session but keep container
 aoe remove <session> --keep-container
 ```
 
-
-**Note:** In the TUI, the sandbox checkbox only appears when Docker is available on your system.
+In the TUI or web wizard, enable the sandbox toggle when creating a session. The TUI shows it when a container runtime is available and cannot set a per-session image.
 
 ## Default Configuration
 
@@ -68,60 +36,40 @@ environment = ["ANTHROPIC_API_KEY"]
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `enabled_by_default` | `false` | Auto-enable sandbox for new sessions. Overridable per project. |
-| `default_image` | `ghcr.io/agent-of-empires/aoe-sandbox:latest` | Docker image to use |
-| `auto_cleanup` | `true` | Remove containers when sessions are deleted |
-| `cpu_limit` | (none) | CPU limit (e.g., "4") |
-| `memory_limit` | (none) | Memory limit (e.g., "8g") |
-| `environment` | `[]` | Env vars for containers (bare KEY or KEY=VALUE, see below) |
-| `volume_ignores` | `[]` | Directory paths to exclude from the project mount via anonymous volumes. Literal paths or glob patterns expanded at create time (see below) |
-| `volume_ignores_strategy` | `"anonymous"` | How `volume_ignores` are mounted: `"anonymous"` (default) or `"named"` (required on macOS/VirtioFS, see below) |
+| `enabled_by_default` | `false` | Auto-enable the sandbox for new sessions. Overridable per project. |
+| `default_image` | `aoe-sandbox:latest` | Image to run |
+| `container_runtime` | `docker` | `docker`, `podman`, or `apple_container`. Global only; a profile or repo override is ignored |
+| `auto_cleanup` | `true` | Remove the container when the session is deleted |
+| `cpu_limit` / `memory_limit` | (none) | Per-container limits, e.g. `"4"` and `"8g"` |
+| `environment` | `[]` | Env vars for the container (`KEY` or `KEY=VALUE`, see below) |
+| `volume_ignores` | `[]` | Paths excluded from the project mount (see [Volume ignores](#volume-ignores)) |
+| `volume_ignores_strategy` | `"anonymous"` | `"anonymous"` or `"named"` (see [Volume ignores](#volume-ignores)) |
 | `extra_volumes` | `[]` | Additional volume mounts |
-| `mount_ssh` | `false` | Mount `~/.ssh/` read-only into containers |
-| `default_terminal_mode` | `"host"` | Paired terminal location: `"host"` (on host machine) or `"container"` (inside Docker) |
-| `privileged` | `false` | Run the container in privileged mode (`--privileged`) |
-| `cap_add` | `[]` | Capabilities granted on top of the runtime default (`--cap-add`) |
-| `cap_drop` | `[]` | Capabilities removed from the runtime default (`--cap-drop`) |
-| `security_opt` | `[]` | Security options (`--security-opt`, e.g. `seccomp=unconfined`) |
+| `port_mappings` | `[]` | Published ports, e.g. `"3000:3000"` |
+| `mount_ssh` | `false` | Mount `~/.ssh/` read-only |
+| `selinux_relabel` | `false` | Append `:z` to every bind mount (Docker and Podman only) |
+| `default_terminal_mode` | `"host"` | Where the paired terminal runs: `"host"` or `"container"` |
+| `privileged` | `false` | Run privileged (`--privileged`) |
+| `cap_add` / `cap_drop` | `[]` | Capabilities added or dropped |
+| `security_opt` | `[]` | Security options, e.g. `seccomp=unconfined` |
 | `extra_run_args` | `[]` | Extra arguments passed to container run, before the image |
 
 ### Run Policy
 
-Configure container privileges, capabilities, and security options:
-
-```toml
-[sandbox]
-# Privileged mode
-privileged = true
-
-# Capabilities
-cap_add = ["SYS_ADMIN"]
-cap_drop = ["NET_RAW"]
-
-# Security options
-security_opt = ["seccomp=unconfined"]
-
-# Additional arguments passed to container run
-extra_run_args = ["--device", "/dev/fuse"]
-```
-
-Docker and Podman support all run-policy options. Apple Container supports `cap_add` and `cap_drop`; `privileged` and `security_opt` are ignored with a warning. `extra_run_args` is passed through on all runtimes.
+Docker and Podman honor all run-policy options. Apple Container supports `cap_add` and `cap_drop`, but warns and ignores `privileged` and `security_opt`. `extra_run_args` is passed through on every runtime.
 
 ## Volume Mounts
 
 ### Volume Ignores: Literal Paths and Glob Patterns
 
-`volume_ignores` entries can be literal directory paths or glob patterns:
-
-- A **literal path** (e.g. `node_modules`, `target`, `src/MyApp/bin`) is resolved relative to each mounted workspace root and mounted unconditionally. It need not exist yet; the anonymous volume shadows it once the directory is created.
-- A **glob pattern** (containing `*`, `?`, `[`, or `]`, e.g. `**/bin`, `**/obj`) is expanded against the workspace filesystem when the session is created, and one ignore mount is created per matching directory.
+`volume_ignores` accepts literal paths relative to each workspace root, or glob patterns (`*`, `?`, `[` or `]`) expanded when the session is created. Literal mounts shadow paths even if they do not exist yet.
 
 ```toml
 [sandbox]
 volume_ignores = ["node_modules", "target", "**/bin", "**/obj"]
 ```
 
-> **Glob expansion is a point-in-time snapshot.** Docker needs concrete mount paths when the container starts, so a glob is expanded only against the directories that exist at create time. A `bin/` that a build creates *later*, inside the container, is **not** shadowed. Re-create the session to pick up new matches, or list the path literally if you know it ahead of time. The native TUI and the web dashboard show a one-time confirmation explaining this before creating a sandbox session whose config has a glob entry.
+A glob is a point-in-time snapshot: directories created later inside the container are not shadowed. List known paths literally or recreate the session for new matches. The TUI and web dashboard confirm this once before sandbox creation.
 
 ### Volume Ignores Strategy (macOS/VirtioFS)
 
@@ -149,159 +97,65 @@ volume_ignores_strategy = "named"
 |-----------|----------------|------|---------|
 | Project directory | `/workspace` | RW | Your code |
 | `~/.gitconfig` | `/root/.gitconfig` | RO | Git config |
-| `~/.ssh/` | `/root/.ssh/` | RO | SSH keys |
+| `~/.ssh/` (with `mount_ssh`) | `/root/.ssh/` | RO | SSH keys |
 | `~/.config/opencode/` | `/root/.config/opencode/` | RO | OpenCode config |
 | `<agent config>/sandbox-v2/<instance-id>/` | the agent's config path, e.g. `/root/.claude/` | RW | [Per-session agent store](#per-session-agent-stores) |
 | `~/.claude/sandbox-v2/.credentials.json` | `/root/.claude/.credentials.json` | RW | [Shared Claude Code credential](#shared-credentials) |
 
 ## Environment Variables
 
-Pass variables through containers by adding them to the `environment` list. Each entry can be:
-
-- **`KEY`** (bare name) passes the host env var value into the container
-- **`KEY=VALUE`** sets an explicit value
-
-Keys must match `[A-Za-z_][A-Za-z0-9_]*` (an ASCII letter or `_` first, then ASCII alphanumerics or `_`). Any other key is dropped with a warning; Docker accepts laxer keys than this, so `FOO-BAR=x` or `foo.bar=x` is accepted by the runtime but silently rejected here.
+Each `environment` entry is a bare `KEY` (pass the host value through) or `KEY=VALUE`. A value starting with `$` reads a host variable (`$$` escapes a literal `$`), so secrets can live in your shell profile rather than in `config.toml`; an unset variable is skipped. Keys must match `[A-Za-z_][A-Za-z0-9_]*`; anything else is dropped with a warning.
 
 ```toml
 [sandbox]
 environment = [
-    "ANTHROPIC_API_KEY",                # pass through from host
-    "OPENAI_API_KEY",                   # pass through from host
-    "GH_TOKEN=$AOE_GH_TOKEN",          # read AOE_GH_TOKEN from host, inject as GH_TOKEN
-    "CUSTOM_API_KEY=sk-sandbox-key",    # literal value
+    "ANTHROPIC_API_KEY",              # pass through from the host
+    "GH_TOKEN=$AOE_GH_TOKEN",         # read AOE_GH_TOKEN, inject as GH_TOKEN
+    "CUSTOM_API_KEY=sk-sandbox-key",  # literal value
 ]
 ```
 
-For `KEY=VALUE` entries, values starting with `$` read from a host env var. This lets you store secrets in your shell profile rather than in the AOE config file:
-
-```bash
-# In your .bashrc / .zshrc
-export AOE_GH_TOKEN="ghp_sandbox_scoped_token"
-```
-
-If the referenced host env var is not set, the entry is silently skipped.
-
-To use a literal value starting with `$`, double it: `$$LITERAL` is injected as `$LITERAL`.
+To mint a short-lived value on the host at launch instead, use [`host_hooks.before_start`](configuration.md#host-hooks). Host (non-sandboxed) sessions read the top-level [`environment`](configuration.md#host-environment) list instead; the two are disjoint.
 
 ## Folder Trust
 
-Claude Code, Codex, and Gemini each refuse to start in a directory they have
-not been told to trust. A container workspace is always a new directory to
-them, so AoE pre-trusts it in the agent's staged config before the session
-starts. Claude Code is trusted in every sandboxed session because its prompt
-blocks startup; Codex and Gemini are trusted only in YOLO mode, where their
-prompts guard approvals the user has already opted out of.
+Claude Code, Codex and Gemini need a trusted directory before launch. AoE pre-trusts the staged container config for Claude Code in every sandbox, and for Codex and Gemini only in YOLO mode.
 
-A repo that ships an `.mcp.json` still asks per server before any of them run.
-Trust does activate the repo's own `.claude/settings.json`, whose
-`permissions.allow` rules an untrusted workspace drops, and since the prompt is
-what holds a session before startup, a pre-trusted workspace runs that file's
-hooks unprompted.
+Trust activates the repo's `.claude/settings.json`, including hooks and permission rules; `.mcp.json` still asks per server. For host sessions, see `session.pre_trust_agent_folders` in [Configuration](configuration.md#session).
 
-AoE seeds the config it stages for the container. For a custom agent whose
-wrapper points the CLI at another directory, set that host root in
-`session.agent_config_dir`. AoE stages a private per-session child and mounts it
-at the agent's canonical container config path. Remove any
-`sandbox.extra_volumes` entry for that path because it would shadow AoE's
-managed mount; AoE warns once per container preparation when an extra-volume
-source is that directory or a child of it. Inside the sandbox the wrapper has
-to keep the config-dir variables AoE sets (`CLAUDE_CONFIG_DIR`, for example)
-rather than export its own, which points the agent at the pre-upgrade store
-and its missing folder-trust record, leaving the session on the folder-trust
-dialog. Host-only account selection stays outside the sandbox.
-
-To pre-trust worktrees for host sessions too, see `session.pre_trust_agent_folders`
-in the [configuration guide](configuration.md).
+Custom wrappers must keep the managed container config path and AoE's config-dir variables. `session.agent_config_dir` names the host root; each sandbox gets a private child. Do not shadow its managed mount with `sandbox.extra_volumes`; AoE warns about overlapping source paths during preparation. Host-only account selection stays outside the sandbox.
 
 ## Available Images
 
-AOE provides two official sandbox images:
+Two official images are available:
 
-| Image | Description |
-|-------|-------------|
-| `ghcr.io/agent-of-empires/aoe-sandbox:latest` | Base image with Claude Code, OpenCode, Mistral Vibe, Hermes, Codex CLI, Gemini CLI, Cursor CLI, Copilot CLI, Pi, Oh My Pi (OMP), Kiro CLI, Qwen Code, Kimi Code, Prime Agent, git, ripgrep, fzf |
-| `ghcr.io/agent-of-empires/aoe-dev-sandbox:latest` | Extended image with additional dev tools |
+| Image | Contents |
+|---|---|
+| `ghcr.io/agent-of-empires/aoe-sandbox:latest` | Supported agent CLIs, git, ripgrep and fzf |
+| `ghcr.io/agent-of-empires/aoe-dev-sandbox:latest` | Base image plus Rust, uv, Node.js LTS and GitHub CLI |
 
-### Dev Sandbox Tools
-
-The dev sandbox (`aoe-dev-sandbox`) includes everything in the base image plus:
-
-- **Rust** (rustup, cargo, rustc)
-- **uv** (fast Python package manager)
-- **Node.js LTS** (via nvm, with npm and npx)
-- **GitHub CLI** (gh)
-
-To use the dev sandbox:
-
-```bash
-# Per-session
-aoe add --sandbox-image ghcr.io/agent-of-empires/aoe-dev-sandbox:latest .
-
-# Or set as default in ~/.agent-of-empires/config.toml
-[sandbox]
-default_image = "ghcr.io/agent-of-empires/aoe-dev-sandbox:latest"
-```
+Use the dev image per session with `aoe add --sandbox-image ghcr.io/agent-of-empires/aoe-dev-sandbox:latest .`, or set `[sandbox] default_image`.
 
 ## Custom Docker Images
 
-The default sandbox image includes all supported agents, git, and basic development tools. For projects requiring additional dependencies beyond what the dev sandbox provides, you can extend either base image.
-
-### Step 1: Create a Dockerfile
-
-Create a `Dockerfile` in your project (or a shared location):
+Extend either image for project dependencies:
 
 ```dockerfile
 FROM ghcr.io/agent-of-empires/aoe-sandbox:latest
-
-# Example: Add Python for a data science project
-RUN apt-get update && apt-get install -y \
-    python3 \
-    python3-pip \
-    python3-venv \
+RUN apt-get update && apt-get install -y python3 python3-pip \
     && rm -rf /var/lib/apt/lists/*
-
-# Install Python packages
-RUN pip3 install --break-system-packages \
-    pandas \
-    numpy \
-    requests
 ```
 
-### Step 2: Build Your Image
+Build and select it:
 
 ```bash
-# Build locally
 docker build -t my-sandbox:latest .
-
-# Or build and push to a registry
-docker build -t ghcr.io/yourusername/my-sandbox:latest .
-docker push ghcr.io/yourusername/my-sandbox:latest
-```
-
-### Step 3: Configure AOE to Use Your Image
-
-**Option A: Set as default for all sessions**
-
-Add to `~/.agent-of-empires/config.toml`:
-
-```toml
-[sandbox]
-default_image = "my-sandbox:latest"
-# Or with registry:
-# default_image = "ghcr.io/yourusername/my-sandbox:latest"
-```
-
-**Option B: Use per-session via CLI**
-
-For a custom agent whose wrapper points the CLI at another directory, name that host root in `session.agent_config_dir` and declare its native CLI with `session.agent_execution_as`; `agent_detect_as` selects status and ACP adapter behavior, not native-store ownership. A foreign declared root without a provable native identity is opaque during sandbox seeding. See [Custom agents](configuration.md#custom-agents). AoE stages a per-session child of that root and mounts it at the agent's canonical container path. Do not add an `extra_volumes` entry for that path, which would shadow the managed mount (AoE warns when one does), and leave the config-dir variables AoE sets in place inside the container.
-
-```bash
 aoe add --sandbox-image my-sandbox:latest .
 ```
 
-> Building a custom image and using structured view? Install the agent's ACP
-> adapter in the image too, or the handshake fails.
+Alternatively set `[sandbox] default_image = "my-sandbox:latest"`; push it to a registry if another host needs it. A custom image used with structured view must include the agent's ACP adapter or the handshake fails.
+
+For a custom agent whose wrapper points the CLI at another directory, name that host root in `session.agent_config_dir` and declare its native CLI with `session.agent_execution_as`; `agent_detect_as` selects status and ACP adapter behavior, not native-store ownership. A foreign declared root without a provable native identity is opaque during sandbox seeding. See [Custom agents](configuration.md#custom-agents). AoE stages a per-session child of that root and mounts it at the agent's canonical container path. Do not add an `extra_volumes` entry for that path, which would shadow the managed mount (AoE warns when one does), and leave the config-dir variables AoE sets in place inside the container.
 
 ## Per-session agent stores
 
@@ -356,43 +210,13 @@ moved, so drop the variable or run `aoe migrate` before launching it.
 
 ### Shared credentials
 
-Claude Code rotates its refresh token every time it refreshes, and the old
-token stops working. A per-session copy of `.credentials.json` therefore logs
-out as soon as any other copy refreshes, and logging in inside one container
-would fix only that container. So every Claude Code session mounts the one
-`sandbox-v2/.credentials.json` at its config path instead of keeping a copy in
-its store, and a refresh or login in any container is seen by the rest.
+Claude Code rotates refresh tokens and invalidates the old token, so per-session credential copies would log each other out. All Claude sandboxes mount `sandbox-v2/.credentials.json`; login or refresh in one reaches all. Conversation stores remain private.
 
-A file that holds no credential is seeded at the next start or TUI refresh
-from the freshest of the Keychain entry on macOS, `~/.claude/.credentials.json`
-elsewhere, and any copy left in the session's store by an earlier layout. A
-file that holds one is never replaced by the host's again: a token copied from
-the host is the host's own refresh token, so both sides hold it until the
-first of them refreshes and logs the other out, as it did before this layout.
-From that first refresh on the sandboxes are a chain of their own, and a login
-made inside any one of them re-authenticates all of them. A copy left in a
-session's store by an earlier layout is a sandbox chain too, and is folded in
-at that session's next start when it is fresher. To seed the sandboxes from a
-new host login instead, stop them, delete `sandbox-v2/.credentials.json` and
-start one.
+When the shared file holds no credential, the next start or refresh seeds it from the freshest macOS Keychain entry, host `.credentials.json`, or earlier session-store copy. Once populated, the host never replaces it automatically; the sandboxes have their own refresh chain. Fresher sandbox credentials from an earlier layout are folded in at that session's next start.
 
-Claude Code writes the file itself, and empties `accessToken` and
-`refreshToken` in place when the credential it holds fails to authenticate.
-That reaches every sandbox at once, through the mount they share. A file whose
-tokens are both empty holds no credential, whatever expiry is left beside
-them, so it is seeded like any other at the next start or TUI refresh and the
-container that emptied it costs the rest of them nothing more than a seed.
+Claude Code empties both tokens after failed authentication, making the shared file eligible for seeding again. Simultaneous refreshes can still conflict: the losing container may empty the shared file and lose the winner's new token.
 
-Two containers that refresh at the same moment off one token stay a hazard the
-shared file cannot remove: one refresh wins, the other is refused, and the
-container that lost empties the file. The token the winner obtained goes with
-it, and the sandboxes are seeded from the host at the next start or refresh.
-
-A container created before this layout mounts only its store, so a stopped
-one is recreated at its next start, as it was for the store move, and a
-running one refuses to relaunch until it is stopped. Running `/logout` inside
-a sandbox revokes the token for every sandbox but cannot remove the mounted
-file, so the revoked token stays there until the next login.
+To seed from a new host login, stop every Claude sandbox, delete only `sandbox-v2/.credentials.json`, and start one. Older containers are recreated when stopped; a running one must be stopped before relaunch. `/logout` in any sandbox revokes all sandboxes' tokens but cannot remove the mounted file; log in again to replace the revoked credential.
 
 ### Reclaiming stores
 

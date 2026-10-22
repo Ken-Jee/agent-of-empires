@@ -124,6 +124,9 @@ pub async fn spawn_acp(
     if !instance.is_structured() {
         return not_structured_response();
     }
+    if instance.terminal_handoff.is_some() {
+        return (StatusCode::CONFLICT, "terminal handoff is pending").into_response();
+    }
     if let Err(blocked) = instance.ensure_startable() {
         return crate::server::api::start_blocked_response(blocked);
     }
@@ -133,6 +136,11 @@ pub async fn spawn_acp(
         }))).into_response();
     }
 
+    let instance =
+        match crate::server::api::sessions::resume_structured_stop(&state, instance).await {
+            Ok(instance) => instance,
+            Err(response) => return response,
+        };
     let explicit = req.agent.clone().or_else(|| instance.agent_name.clone());
     let agent = pick_agent(&state, &instance, explicit.as_deref()).await;
     let (native, exclusion) = match launch_store_for(&state, &instance, exclusion).await {
@@ -151,8 +159,7 @@ pub async fn spawn_acp(
     };
     let rate_limit_resume_resets_at = rate_limit_resume_probe(&state, &id).await;
 
-    // An explicit resume overrides a stop kept from a resume that failed
-    // before it installed; only the reconciler's fallback must honor it.
+    // Explicit resume has settled and consumed only the observed native stop.
 
     let request = SpawnRequest {
         launch_admission: Some(crate::acp::supervisor::LaunchAdmission {
@@ -225,17 +232,44 @@ pub async fn shutdown_acp(
     if let Some(resp) = cityhall_block(&state) {
         return resp;
     }
-    // Worker-stopping barrier (#3650): wait out any in-flight submission.
-    let Some(_submission) = state
-        .session_service
-        .prompt_submission_for_session(&id)
+    // Runtime-owned work retains stop admission and retirement after HTTP cancellation.
+    let work = state.runtime.work.clone();
+    match work
+        .run("server.acp.user_stop", async move {
+            let _namespace = state.profile_namespace.read().await;
+            if *state.canonical_health.read().await != crate::daemon::RuntimeHealth::Healthy {
+                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            }
+            let Some(_submission) = state
+                .session_service
+                .prompt_submission_for_session(&id)
+                .await
+            else {
+                return session_not_found();
+            };
+            let lock = state.instance_lock(&id).await;
+            let _guard = lock.lock().await;
+            let Some(instance) = find_instance(&state, &id).await else {
+                return session_not_found();
+            };
+            if !instance.is_structured() {
+                return not_structured_response();
+            }
+            match crate::server::api::sessions::stop_structured_with_commit(
+                &state,
+                instance.source_profile,
+                &id,
+            )
+            .await
+            {
+                Ok(()) => StatusCode::NO_CONTENT.into_response(),
+                Err(response) => response,
+            }
+        })
         .await
-    else {
-        return session_not_found();
-    };
-    match state.acp_supervisor.shutdown(&id).await {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(e) => supervisor_error_response("shutdown failed", &e),
+    {
+        Ok(response) => response,
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
     }
 }
 
@@ -397,6 +431,9 @@ pub async fn switch_acp_agent(
     let Some(instance) = find_instance(&state, &id).await else {
         return session_not_found();
     };
+    if instance.terminal_handoff.is_some() {
+        return (StatusCode::CONFLICT, "terminal handoff is pending").into_response();
+    }
     if let Err(blocked) = instance.ensure_startable() {
         return crate::server::api::start_blocked_response(blocked);
     }
@@ -404,6 +441,11 @@ pub async fn switch_acp_agent(
         Ok(agent) => agent,
         Err(resp) => return resp,
     };
+    let instance =
+        match crate::server::api::sessions::resume_structured_stop(&state, instance).await {
+            Ok(instance) => instance,
+            Err(response) => return response,
+        };
     let (native, exclusion) = match launch_store_for(&state, &instance, exclusion).await {
         Ok(store) => store,
         Err(response) => return response,
@@ -543,7 +585,8 @@ async fn persist_provider_switch(
                     && row.title == expected.title
                     && row.agent_provider == expected.agent_provider
                     && row.is_structured()
-                    && row.launch_is_finalized(),
+                    && row.launch_is_finalized()
+                    && row.terminal_handoff.is_none(),
                 crate::session::LifecycleReservationError::Superseded
             );
             row.ensure_startable()?;
@@ -606,6 +649,9 @@ pub async fn switch_acp_provider(
     if !instance.is_structured() {
         return not_structured_response();
     }
+    if instance.terminal_handoff.is_some() {
+        return (StatusCode::CONFLICT, "terminal handoff is pending").into_response();
+    }
     if let Err(blocked) = instance.ensure_startable() {
         return crate::server::api::start_blocked_response(blocked);
     }
@@ -616,10 +662,6 @@ pub async fn switch_acp_provider(
             "The structured session launch is not finalized",
         );
     }
-    let (native, exclusion) = match launch_store_for(&state, &instance, exclusion).await {
-        Ok(store) => store,
-        Err(response) => return response,
-    };
     let agent = pick_agent(&state, &instance, instance.agent_name.as_deref()).await;
     // The routing flags are Claude-specific; no other adapter reads them.
     if !matches!(agent.as_str(), "claude" | "claude-code") {
@@ -646,6 +688,15 @@ pub async fn switch_acp_provider(
             "the session is mid-turn; switch providers once it finishes",
         );
     }
+    let instance =
+        match crate::server::api::sessions::resume_structured_stop(&state, instance).await {
+            Ok(instance) => instance,
+            Err(response) => return response,
+        };
+    let (native, exclusion) = match launch_store_for(&state, &instance, exclusion).await {
+        Ok(store) => store,
+        Err(response) => return response,
+    };
 
     if let Err(e) = state
         .acp_supervisor
@@ -752,6 +803,572 @@ mod tests {
     use super::*;
     use crate::acp::agent_policy::AgentPolicy;
     use crate::acp::state::RateLimitInfo;
+
+    async fn durable_stop_state(row: crate::session::Instance) -> Arc<AppState> {
+        crate::server::test_support::seed_instances_on_disk_for_test("default", vec![row.clone()]);
+        let state = crate::server::test_support::build_test_app_state(vec![row]);
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+        state
+    }
+
+    async fn assert_reconstructed_stop_does_not_resume(row: crate::session::Instance) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let starts = Arc::new(AtomicUsize::new(0));
+        let calls = starts.clone();
+        let state = crate::server::test_support::build_test_app_state_with_launcher(
+            vec![row.clone()],
+            Arc::new(move |_, _| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async {
+                    Err(crate::acp::acp_client::AcpError::Spawn(
+                        "unexpected automatic launch".into(),
+                    ))
+                })
+            }),
+        );
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+        crate::server::acp_reconciler::reconcile_acp_workers(
+            &state,
+            &mut std::collections::HashSet::new(),
+            &mut crate::server::acp_reconciler::ReapCadence::default(),
+            &mut std::collections::HashMap::new(),
+            &mut std::collections::HashSet::new(),
+            &mut std::collections::HashSet::new(),
+        )
+        .await;
+        assert_eq!(starts.load(Ordering::SeqCst), 0);
+        assert!(!state.acp_supervisor.is_owned(&row.id).await);
+    }
+
+    #[cfg(unix)]
+    async fn live_stop_runner(row: &crate::session::Instance) -> tokio::process::Child {
+        let child = tokio::process::Command::new("sleep")
+            .arg("60")
+            .process_group(0)
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let record = crate::process::worker_registry::WorkerRecord::new(
+            row.id.clone(),
+            child.id().unwrap(),
+            crate::process::worker_registry::socket_path_for(&row.id).unwrap(),
+            "sleep".into(),
+            "claude".into(),
+            PathBuf::from(&row.project_path),
+            None,
+            Vec::new(),
+            Vec::new(),
+            None,
+            Some(row.source_profile.clone()),
+        )
+        .with_generation(71);
+        assert!(record.runner_identity.is_some());
+        crate::process::worker_registry::save(&record).unwrap();
+        child
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn rest_user_stop_retires_active_and_already_stopped_native_rows_durably() {
+        use crate::session::{Instance, Status, Storage, View};
+        for status in [Status::Running, Status::Stopped] {
+            let _home = crate::session::test_support::isolate_app_dir();
+            let project = tempfile::tempdir().unwrap();
+            let mut row = Instance::new("durable DELETE", project.path().to_str().unwrap());
+            row.source_profile = "default".into();
+            row.view = View::Structured;
+            row.status = status;
+            let state = durable_stop_state(row.clone()).await;
+            let mut runner = live_stop_runner(&row).await;
+            let record = crate::process::worker_registry::load_strict(&row.id)
+                .unwrap()
+                .unwrap();
+            state
+                .acp_supervisor
+                .test_install_attached(
+                    &row.id,
+                    crate::acp::runner_lifecycle::RunnerIdentity::from_record(&record),
+                )
+                .await;
+            let response = shutdown_acp(State(state.clone()), Path(row.id.clone()))
+                .await
+                .into_response();
+            assert_eq!(response.status(), StatusCode::NO_CONTENT);
+            let exit = tokio::time::timeout(std::time::Duration::from_secs(5), runner.wait())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(!exit.success());
+            assert!(crate::process::worker_registry::load(&row.id)
+                .unwrap()
+                .is_none());
+            let stopped = Storage::open_unwatched("default")
+                .unwrap()
+                .load()
+                .unwrap()
+                .remove(0);
+            assert_eq!(stopped.status, Status::Stopped);
+            assert!(stopped.is_idle_dormant());
+            assert!(stopped.lifecycle_generation > row.lifecycle_generation);
+            assert!(stopped.lifecycle_reservation.is_none());
+            assert_reconstructed_stop_does_not_resume(stopped.clone()).await;
+
+            let resumed = crate::server::api::sessions::resume_structured_stop(&state, stopped)
+                .await
+                .unwrap_or_else(|response| panic!("resume failed: {}", response.status()));
+            assert_eq!(resumed.status, Status::Idle);
+            assert!(!resumed.is_idle_dormant());
+            let admission = crate::acp::supervisor::LaunchAdmission {
+                store: Arc::new(Storage::open_unwatched("default").unwrap()),
+                generation: resumed.lifecycle_generation,
+                namespace: None,
+            };
+            let mut child = crate::acp::supervisor::with_durable_launch(
+                Some(admission),
+                row.id.clone(),
+                || {
+                    std::process::Command::new("true")
+                        .spawn()
+                        .map_err(|error| crate::acp::acp_client::AcpError::Spawn(error.to_string()))
+                },
+            )
+            .await
+            .unwrap();
+            assert!(child.wait().unwrap().success());
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn rest_user_stop_fences_prebirth_launch_before_http_cancellation() {
+        use crate::session::{Instance, LifecycleOperation, Status, Storage, View};
+        for cancel_http in [false, true] {
+            let _home = crate::session::test_support::isolate_app_dir();
+            let project = tempfile::tempdir().unwrap();
+            let mut row = Instance::new("prebirth DELETE", project.path().to_str().unwrap());
+            row.source_profile = "default".into();
+            row.view = View::Structured;
+            row.status = Status::Running;
+            let old_generation = row
+                .try_acquire_lifecycle_reservation(
+                    LifecycleOperation::Launch,
+                    Instance::LIFECYCLE_RESERVATION_TTL,
+                    Utc::now(),
+                )
+                .unwrap();
+            let state = durable_stop_state(row.clone()).await;
+            let reservation = state
+                .acp_supervisor
+                .reserve_spawn(
+                    &row.id,
+                    crate::acp::supervisor::ResumeKind::SpawnFirst,
+                    crate::process::worker_registry::ResumeAuthority::Automatic,
+                )
+                .await
+                .unwrap();
+            let mut changes = state.status_tx.subscribe();
+            let request_state = state.clone();
+            let id = row.id.clone();
+            let request = tokio::spawn(async move {
+                shutdown_acp(State(request_state), Path(id))
+                    .await
+                    .into_response()
+            });
+            let change = tokio::time::timeout(std::time::Duration::from_secs(5), changes.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(change.instance_id, row.id);
+            assert_eq!(change.new, Status::Stopped);
+            let fenced = Storage::open_unwatched("default")
+                .unwrap()
+                .load()
+                .unwrap()
+                .remove(0);
+            assert!(fenced.lifecycle_generation > old_generation);
+            assert!(fenced.lifecycle_reservation_is_owned(
+                LifecycleOperation::Stop,
+                fenced.lifecycle_generation
+            ));
+            let request = if cancel_http {
+                request.abort();
+                assert!(request.await.unwrap_err().is_cancelled());
+                None
+            } else {
+                Some(request)
+            };
+
+            let admission = crate::acp::supervisor::LaunchAdmission {
+                store: Arc::new(Storage::open_unwatched("default").unwrap()),
+                generation: old_generation,
+                namespace: None,
+            };
+            let late_birth = crate::acp::supervisor::with_durable_launch(
+                Some(admission),
+                row.id.clone(),
+                || {
+                    std::process::Command::new("true")
+                        .spawn()
+                        .map_err(|error| crate::acp::acp_client::AcpError::Spawn(error.to_string()))
+                },
+            )
+            .await;
+            assert!(matches!(
+                late_birth,
+                Err(SupervisorError::SpawnCancelled(_))
+            ));
+            drop(reservation);
+            state.acp_supervisor.retry_pending_teardowns().await;
+            if let Some(request) = request {
+                assert_eq!(request.await.unwrap().status(), StatusCode::NO_CONTENT);
+            }
+            state.runtime.work.drain().await;
+            let stopped = Storage::open_unwatched("default")
+                .unwrap()
+                .load()
+                .unwrap()
+                .remove(0);
+            assert_eq!(stopped.status, Status::Stopped);
+            assert!(stopped.is_idle_dormant());
+            assert!(stopped.lifecycle_reservation.is_none());
+            assert_reconstructed_stop_does_not_resume(stopped).await;
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn explicit_resume_cannot_consume_a_newer_native_stop() {
+        use crate::session::{Instance, Status, Storage, View};
+        let _home = crate::session::test_support::isolate_app_dir();
+        let project = tempfile::tempdir().unwrap();
+        let mut row = Instance::new("newer stop", project.path().to_str().unwrap());
+        row.source_profile = "default".into();
+        row.view = View::Structured;
+        row.status = Status::Running;
+        let state = durable_stop_state(row.clone()).await;
+        assert_eq!(
+            shutdown_acp(State(state.clone()), Path(row.id.clone()))
+                .await
+                .into_response()
+                .status(),
+            StatusCode::NO_CONTENT
+        );
+        let observed = Storage::open_unwatched("default")
+            .unwrap()
+            .load()
+            .unwrap()
+            .remove(0);
+        assert_eq!(
+            shutdown_acp(State(state.clone()), Path(row.id.clone()))
+                .await
+                .into_response()
+                .status(),
+            StatusCode::NO_CONTENT
+        );
+        let newer = Storage::open_unwatched("default")
+            .unwrap()
+            .load()
+            .unwrap()
+            .remove(0);
+        assert!(newer.lifecycle_generation > observed.lifecycle_generation);
+        let response = crate::server::api::sessions::resume_structured_stop(&state, observed)
+            .await
+            .expect_err("stale explicit resume must retain newer stop");
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let retained = Storage::open_unwatched("default")
+            .unwrap()
+            .load()
+            .unwrap()
+            .remove(0);
+        assert_eq!(retained.lifecycle_generation, newer.lifecycle_generation);
+        assert_eq!(retained.status, Status::Stopped);
+        assert!(retained.is_idle_dormant());
+        let stop_path = crate::process::worker_registry::workers_dir()
+            .unwrap()
+            .join(format!("{}.stop", row.id));
+        std::fs::write(&stop_path, b"undecodable stop intent").unwrap();
+        let response = crate::server::api::sessions::resume_structured_stop(&state, newer)
+            .await
+            .expect_err("undecodable intent cannot authorize resume");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            std::fs::read(stop_path).unwrap(),
+            b"undecodable stop intent"
+        );
+        let retained = Storage::open_unwatched("default")
+            .unwrap()
+            .load()
+            .unwrap()
+            .remove(0);
+        assert_eq!(retained.status, Status::Stopped);
+        assert!(retained.is_idle_dormant());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn rest_stop_rejects_wrong_view_missing_and_uncommitted_targets() {
+        use crate::session::{Instance, Status, Storage};
+        let _home = crate::session::test_support::isolate_app_dir();
+        let project = tempfile::tempdir().unwrap();
+        let mut row = Instance::new("terminal DELETE", project.path().to_str().unwrap());
+        row.source_profile = "default".into();
+        row.status = Status::Running;
+        let state = durable_stop_state(row.clone()).await;
+        assert_eq!(
+            shutdown_acp(State(state.clone()), Path(row.id.clone()))
+                .await
+                .into_response()
+                .status(),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            shutdown_acp(State(state.clone()), Path("missing-stop-target".into()))
+                .await
+                .into_response()
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+        let retained = Storage::open_unwatched("default")
+            .unwrap()
+            .load()
+            .unwrap()
+            .remove(0);
+        assert_eq!(retained.status, Status::Running);
+        assert_eq!(retained.lifecycle_generation, row.lifecycle_generation);
+        assert!(!retained.is_idle_dormant());
+        state.instances.write().await[0].view = crate::session::View::Structured;
+        let reservation = state
+            .acp_supervisor
+            .reserve_spawn(
+                &row.id,
+                crate::acp::supervisor::ResumeKind::SpawnFirst,
+                crate::process::worker_registry::ResumeAuthority::Automatic,
+            )
+            .await
+            .unwrap();
+        Storage::open_unwatched("default")
+            .unwrap()
+            .update(|rows, _| {
+                rows.clear();
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            shutdown_acp(State(state.clone()), Path(row.id.clone()))
+                .await
+                .into_response()
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+        assert!(!state
+            .acp_supervisor
+            .test_cancel_requested(reservation.lease()));
+        drop(reservation);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn reconstructed_internal_stopped_history_resumes_but_native_user_stop_does_not() {
+        use crate::session::{Instance, Status, Storage, View};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        for native_status in [Status::Running, Status::Idle, Status::Stopped] {
+            let _home = crate::session::test_support::isolate_app_dir();
+            let project = tempfile::tempdir().unwrap();
+            let mut row = Instance::new("reconstructed shutdown", project.path().to_str().unwrap());
+            row.source_profile = "default".into();
+            row.view = View::Structured;
+            row.status = native_status;
+            row.lifecycle_generation = 9;
+            row.tool = "claude".into();
+            row.agent_name = Some("claude".into());
+            if native_status == Status::Stopped {
+                row.mark_idle_dormant();
+            }
+            crate::server::test_support::seed_instances_on_disk_for_test(
+                "default",
+                vec![row.clone()],
+            );
+            let births = Arc::new(AtomicUsize::new(0));
+            let calls = births.clone();
+            let state = crate::server::test_support::build_test_app_state_with_launcher(
+                vec![row.clone()],
+                Arc::new(move |_, _| {
+                    let calls = calls.clone();
+                    Box::pin(async move {
+                        assert!(tokio::process::Command::new("true")
+                            .status()
+                            .await
+                            .unwrap()
+                            .success());
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        Err(crate::acp::acp_client::AcpError::Spawn(
+                            "controlled post-admission launch failure".into(),
+                        ))
+                    })
+                }),
+            );
+            crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+            state
+                .acp_event_store
+                .record(
+                    &row.id,
+                    1,
+                    &crate::acp::Event::Stopped {
+                        reason: "user_stopped".into(),
+                    },
+                )
+                .unwrap();
+            crate::server::acp_events::seed_acp_statuses(state.clone()).await;
+            assert_eq!(
+                Storage::open_unwatched("default").unwrap().load().unwrap()[0].status,
+                native_status
+            );
+            crate::server::acp_reconciler::reconcile_acp_workers(
+                &state,
+                &mut std::collections::HashSet::new(),
+                &mut crate::server::acp_reconciler::ReapCadence::default(),
+                &mut std::collections::HashMap::new(),
+                &mut std::collections::HashSet::new(),
+                &mut std::collections::HashSet::new(),
+            )
+            .await;
+            assert_eq!(
+                births.load(Ordering::SeqCst),
+                usize::from(native_status != Status::Stopped),
+                "{native_status:?}"
+            );
+            if native_status == Status::Stopped {
+                let admission = crate::acp::supervisor::LaunchAdmission {
+                    store: Arc::new(Storage::open_unwatched("default").unwrap()),
+                    generation: row.lifecycle_generation,
+                    namespace: None,
+                };
+                let rejected = crate::acp::supervisor::with_durable_launch(
+                    Some(admission),
+                    row.id.clone(),
+                    || {
+                        std::process::Command::new("true").spawn().map_err(|error| {
+                            crate::acp::acp_client::AcpError::Spawn(error.to_string())
+                        })
+                    },
+                )
+                .await;
+                assert!(matches!(rejected, Err(SupervisorError::SpawnCancelled(_))));
+                let retained = Storage::open_unwatched("default")
+                    .unwrap()
+                    .load()
+                    .unwrap()
+                    .remove(0);
+                assert_eq!(retained.status, Status::Stopped);
+                assert!(retained.is_idle_dormant());
+                assert_eq!(retained.lifecycle_generation, row.lifecycle_generation);
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn explicit_backend_and_provider_switches_resume_native_stop_before_birth() {
+        use crate::session::{Instance, LifecycleOperation, Status, Storage, View};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        for case in ["backend", "provider", "invalid_backend", "invalid_provider"] {
+            let _home = crate::session::test_support::isolate_app_dir();
+            let project = tempfile::tempdir().unwrap();
+            let mut row = Instance::new(case, project.path().to_str().unwrap());
+            row.source_profile = "default".into();
+            row.view = View::Structured;
+            row.status = Status::Stopped;
+            row.tool = "claude".into();
+            row.agent_name = Some("claude".into());
+            row.agent_provider = Some("anthropic".into());
+            row.mark_idle_dormant();
+            let observed = row
+                .try_acquire_lifecycle_reservation(
+                    LifecycleOperation::Stop,
+                    Instance::LIFECYCLE_RESERVATION_TTL,
+                    Utc::now(),
+                )
+                .unwrap();
+            crate::server::test_support::seed_instances_on_disk_for_test(
+                "default",
+                vec![row.clone()],
+            );
+            let births = Arc::new(AtomicUsize::new(0));
+            let calls = births.clone();
+            let state = crate::server::test_support::build_test_app_state_with_launcher(
+                vec![row.clone()],
+                Arc::new(move |_, _| {
+                    let calls = calls.clone();
+                    Box::pin(async move {
+                        let status = tokio::process::Command::new("true").status().await.unwrap();
+                        assert!(status.success());
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        Err(crate::acp::acp_client::AcpError::Spawn(
+                            "controlled post-admission launch failure".into(),
+                        ))
+                    })
+                }),
+            );
+            crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+            let response = if case.contains("backend") {
+                switch_acp_agent(
+                    State(state.clone()),
+                    Path(row.id.clone()),
+                    Json(SwitchAgentRequest {
+                        target: if case == "backend" {
+                            "codex".into()
+                        } else {
+                            "not-a-registered-agent".into()
+                        },
+                        model: None,
+                        reason: None,
+                    }),
+                )
+                .await
+                .into_response()
+            } else {
+                let provider = if case == "provider" {
+                    crate::session::environment::AGENT_PROVIDERS
+                        .iter()
+                        .find(|provider| **provider != "anthropic")
+                        .unwrap()
+                        .to_string()
+                } else {
+                    "not-a-provider".into()
+                };
+                switch_acp_provider(
+                    State(state.clone()),
+                    Path(row.id.clone()),
+                    Ok(Json(SwitchProviderRequest { provider })),
+                )
+                .await
+                .into_response()
+            };
+            assert!(!response.status().is_success());
+            let stored = Storage::open_unwatched("default")
+                .unwrap()
+                .load()
+                .unwrap()
+                .remove(0);
+            if case.starts_with("invalid") {
+                assert_eq!(births.load(Ordering::SeqCst), 0);
+                assert_eq!(stored.lifecycle_generation, observed);
+                assert_eq!(stored.status, Status::Stopped);
+                assert!(stored.is_idle_dormant());
+            } else {
+                assert_eq!(
+                    births.load(Ordering::SeqCst),
+                    1,
+                    "{case}: {}",
+                    response.status()
+                );
+                assert!(stored.lifecycle_generation > observed);
+                assert_ne!(stored.status, Status::Stopped);
+                assert!(!stored.is_idle_dormant());
+            }
+        }
+    }
 
     #[tokio::test]
     #[serial_test::serial]

@@ -83,7 +83,7 @@ fn run_in(app: &Path) -> Result<()> {
         let mut value: Value = match serde_json::from_slice(&bytes) {
             Ok(value) => value,
             Err(error) => {
-                tracing::warn!(path = %path.display(), %error, "v040: preserving unreadable ownership evidence");
+                tracing::warn!(target: "migrations.v040", path = %path.display(), %error, "v040: preserving unreadable ownership evidence");
                 continue;
             }
         };
@@ -127,7 +127,7 @@ fn run_in(app: &Path) -> Result<()> {
         if changed {
             crate::session::backup_before_migration(&path)?;
             crate::session::atomic_write(&path, &serde_json::to_vec_pretty(&value)?)?;
-            tracing::info!(path = %path.display(), "v040: migrated worker ownership evidence");
+            tracing::info!(target: "migrations.v040", path = %path.display(), "v040: migrated worker ownership evidence");
         }
     }
     Ok(())

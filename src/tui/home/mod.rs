@@ -105,23 +105,19 @@ pub(super) struct GroupRenameContext {
     pub(super) old_profile: String,
 }
 
-/// Destination for a response from the shared permission dialog.
 pub(super) enum PermissionResponseTarget {
     Terminal(String),
     Structured { session_id: String, nonce: String },
 }
 
-/// View mode for the home screen
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum ViewMode {
     #[default]
     Structured,
     Terminal,
-    /// Previewing a tool session (lazygit, yazi, etc.)
     Tool(String),
 }
 
-/// Terminal mode for sandboxed sessions (container vs host)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TerminalMode {
     #[default]
@@ -129,7 +125,6 @@ pub enum TerminalMode {
     Container,
 }
 
-/// Hook progress for a session being created in the background
 pub(super) struct CreatingHookProgress {
     pub(super) hook_output: Vec<String>,
     pub(super) current_hook: Option<String>,
@@ -144,7 +139,33 @@ pub(super) struct PendingArchiveCursor {
     pub(super) successor: Option<String>,
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("Native metadata for profile '{profile}', session '{id}' is not yet available")]
+pub(super) struct CanonicalMetadataLag {
+    profile: String,
+    id: String,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub(super) struct CanonicalMetadataConflict(String);
+
+pub(super) struct CanonicalMetadataLagState {
+    epoch: String,
+    profile: String,
+    id: String,
+    first_seen: std::time::Instant,
+}
 pub(super) enum NamespaceIntent {
+    Reveal {
+        epoch: String,
+        profile: String,
+        id: String,
+        generation: u64,
+        created_at: String,
+        group: String,
+        attach: bool,
+    },
     Plain,
     ProfileCreated(String),
     ProfileDeleted(String),
@@ -209,6 +230,11 @@ pub struct HomeView {
     /// appended), so this is what detects a peer's reorder.
     observed_workspace_ordering: Vec<String>,
     session_feed_reload_retry_at: Option<std::time::Instant>,
+    session_feed_failed_cursor: Option<crate::daemon::RuntimeCursor>,
+    canonical_metadata_lag: Option<CanonicalMetadataLagState>,
+    pending_created_attach: Option<(String, String, String, u64, String)>,
+    retained_reveal: Option<NamespaceIntent>,
+    runtime_diagnostics: Vec<crate::daemon::OwnerLoadDiagnostic>,
     pub(super) group_trees: HashMap<String, GroupTree>,
     /// Duplicate session ids that remain ambiguous after journal-guided
     /// reconciliation (#3459): every copy is excluded from `instances` and
@@ -216,7 +242,6 @@ pub struct HomeView {
     pub(super) legacy_duplicate_reports: Vec<crate::session::DuplicateIdReport>,
     pub(super) flat_items: Vec<Item>,
 
-    // UI state
     pub(super) cursor: usize,
     pub(super) selected_session: Option<String>,
     pub(super) selected_group: Option<String>,
@@ -257,7 +282,6 @@ pub struct HomeView {
     /// overlay falls back to this when no session row is selected so the
     /// render path never touches disk for the Enter/Tab labels.
     pub(super) profile_default_attach_mode: crate::session::AttachMode,
-    /// Collapsed state for project-mode groups (persists across rebuilds)
     pub(super) project_group_collapsed: HashMap<String, bool>,
     /// Collapsed state for org-mode groups (persists across rebuilds), same
     /// shape and lifecycle as `project_group_collapsed`.
@@ -283,7 +307,6 @@ pub struct HomeView {
     /// just a registry entry decoupled from any session.
     pub(super) registered_projects: Vec<crate::session::Project>,
 
-    // Dialogs
     pub(super) show_help: bool,
     pub(super) help_scroll: u16,
     pub(super) new_dialog: Option<NewSessionDialog>,
@@ -336,7 +359,6 @@ pub struct HomeView {
     pub(super) profile_picker_dialog: Option<ProfilePickerDialog>,
     pub(super) group_picker_dialog: Option<GroupPickerDialog>,
     pub(super) sort_picker_dialog: Option<SortPickerDialog>,
-    /// Attach-a-project picker for the selected session (#3103).
     pub(super) attach_project_dialog: Option<AttachProjectDialog>,
     pub(super) project_session_picker_dialog: Option<ProjectSessionPickerDialog>,
     pub(super) projects_dialog: Option<ProjectsDialog>,
@@ -344,6 +366,7 @@ pub struct HomeView {
     pub(super) skills_manager_dialog: Option<crate::tui::dialogs::SkillsManagerDialog>,
     pub(super) command_palette: Option<CommandPaletteDialog>,
     pub(super) serve_view: Option<ServeView>,
+    pub(super) pending_dashboard_launch: Option<super::dialogs::ServeLaunchRequest>,
     pub(super) update_confirm_dialog: Option<UpdateConfirmDialog>,
     /// One-time opt-in popup for users who finished the walkthrough before
     /// telemetry existed. Startup gating keeps it from rendering over the
@@ -370,9 +393,7 @@ pub struct HomeView {
     pub(super) tips_badge_hovered: bool,
     pub(super) send_message_dialog: Option<super::dialogs::SendMessageDialog>,
     pub(super) permission_response_dialog: Option<super::dialogs::PermissionResponseDialog>,
-    /// Destination for the response once the dialog resolves.
     pub(super) pending_permission_response: Option<PermissionResponseTarget>,
-    /// Session to receive the message from the send dialog
     pub(super) pending_send_session: Option<String>,
     /// Which pane the pending send-message dialog will target. Set
     /// alongside `pending_send_session` and read when the dialog
@@ -552,13 +573,11 @@ pub struct HomeView {
     /// an Action. Stashed here and drained by `app.rs` after the click
     /// is consumed so both paths produce the same downstream effect.
     pub(super) pending_dialog_click_action: Option<crate::tui::app::Action>,
-    // Search
     pub(super) search_active: bool,
     pub(super) search_query: Input,
     pub(super) search_matches: Vec<usize>,
     pub(super) search_match_index: usize,
 
-    // Tool availability
     pub(super) available_tools: AvailableTools,
 
     // Compact system-health strip controlled by `session.show_diagnostics_pane`.
@@ -608,20 +627,16 @@ pub struct HomeView {
     /// which would find the same container and hand the launch back again.
     store_move_bypass: Option<String>,
 
-    // Performance: background session creation (for sandbox)
     /// The creation this view submitted to the daemon and still displays. The
     /// daemon owns provisioning, hooks, and the committed row.
     pub(super) pending_creation: Option<PendingCreation>,
 
-    /// Hook progress for sessions in Creating state, keyed by stub instance ID
     pub(super) creating_hook_progress: HashMap<String, CreatingHookProgress>,
-    /// The stub instance ID for the current background creation
     pub(super) creating_stub_id: Option<String>,
 
     /// Cursor placement owed to the applied snapshot after an archive toggle.
     pub(super) pending_archive_cursor: Option<PendingArchiveCursor>,
 
-    // Performance: preview caching
     pub(super) preview_cache: PreviewCache,
     pub(super) terminal_preview_cache: PreviewCache,
     pub(super) container_terminal_preview_cache: PreviewCache,
@@ -736,12 +751,9 @@ pub struct HomeView {
     /// this-visit hint, not a durable badge.
     pub(super) manual_unread_hold: Option<String>,
 
-    // Terminal mode for sandboxed sessions (per-session, ephemeral)
     pub(super) terminal_modes: HashMap<String, TerminalMode>,
-    // Default terminal mode from config
     pub(super) default_terminal_mode: TerminalMode,
 
-    // Sound config for state transition sounds
     pub(super) sound_config: crate::sound::SoundConfig,
 
     /// Resolved decay window from `Config.theme.idle_decay_minutes`. Read
@@ -771,15 +783,11 @@ pub struct HomeView {
     pub(super) serve_probe: crate::tui::worker::Worker<(), bool>,
     pub(super) serve_probe_in_flight: bool,
 
-    // Settings view
     pub(super) settings_view: Option<SettingsView>,
-    /// Flag to indicate we're confirming settings close (unsaved changes)
     pub(super) settings_close_confirm: bool,
 
-    // Diff view
     pub(super) diff_view: Option<DiffView>,
 
-    // Resizable list column width (percentage-like units)
     pub(super) list_width: u16,
 
     /// Visible column of the list/preview divider in side-by-side mode,
@@ -878,7 +886,6 @@ pub struct HomeView {
     pub(super) opener_exits: Vec<(String, std::sync::mpsc::Receiver<std::process::ExitStatus>)>,
     pub(super) restart_cooldown_at: std::collections::HashMap<String, std::time::Instant>,
 
-    // Tool sessions config (lazygit, yazi, etc.)
     pub(super) tool_configs: HashMap<String, crate::session::config::ToolSessionConfig>,
     /// Pre-parsed and sorted view of valid tool hotkeys: (name, KeyCode, KeyModifiers).
     /// Built once at construction and on settings reload, then iterated on every

@@ -422,21 +422,6 @@ const requestCases: RequestCase[] = [
     () => api.updateSessionGroup("a/b", ""),
     { body: { group: "" }, respond: runtimeJson(session), result: { session, cursor } },
   ],
-  ...(
-    [
-      ["off", false],
-      ["all", true],
-      ["default", null],
-    ] as const
-  ).map(([preset, value]): RequestCase => [
-    "PATCH /api/sessions/s1/notifications",
-    () => api.setSessionNotifications("s1", preset, "boot"),
-    {
-      body: { notify_on_waiting: value, notify_on_idle: value, notify_on_error: value },
-      respond: runtimeJson(session),
-      result: { session, cursor },
-    },
-  ]),
   [
     "PATCH /api/sessions/s1/diff-base",
     () => api.setSessionDiffBase("s1", "develop"),
@@ -451,11 +436,6 @@ const requestCases: RequestCase[] = [
     "PATCH /api/sessions/s1/pin",
     () => api.setSessionPin("s1", false),
     { body: { pinned: false }, respond: json(session), result: session },
-  ],
-  [
-    "PATCH /api/sessions/s1/color",
-    () => api.setSessionColor("s1", null, "boot"),
-    { body: { color: null }, respond: runtimeJson(session), result: { session, cursor } },
   ],
   [
     "PATCH /api/sessions/s1/archive",
@@ -482,15 +462,6 @@ const requestCases: RequestCase[] = [
   ],
   ["PATCH /api/sessions/s1/snooze", () => api.setSessionSnooze("s1", 60), { body: { minutes: 60 } }],
   ["PATCH /api/sessions/s1/unread", () => api.setSessionUnread("s1", true), { body: { unread: true } }],
-  [
-    "DELETE /api/workspaces",
-    () => api.deleteWorkspace(["a", "b"], { delete_worktree: true }),
-    {
-      body: { session_ids: ["a", "b"], delete_worktree: true },
-      respond: json({ deleted: ["a"], failed: [{ id: "b", error: "boom" }], messages: ["m"] }),
-      result: { ok: true, messages: ["m"], deleted: ["a"], failed: [{ id: "b", error: "boom" }] },
-    },
-  ],
   [
     "POST /api/sessions/s1/projects",
     () => api.attachSessionProject("s1", "/r", { epoch: "boot" }),
@@ -915,11 +886,71 @@ it("forwards abort signals", async () => {
 it("pasteImage uploads raw base64 and returns the host path", async () => {
   fetchSpy.mockResolvedValueOnce(json({ path: "/wt/img.png" }));
   const file = new File(["hi"], "img.png", { type: "image/png" });
-  expect(await api.pasteImage("s1", file)).toBe("/wt/img.png");
+  expect(await api.pasteImage("s1", file, () => true)).toBe("/wt/img.png");
   expect(lastCall().url).toBe("/api/sessions/s1/paste-image");
   expect(bodyOf(lastCall().init)).toEqual({ mime_type: "image/png", data: btoa("hi") });
   fetchSpy.mockResolvedValueOnce(json({}));
-  expect(await api.pasteImage("s1", file)).toBeNull();
+  expect(await api.pasteImage("s1", file, () => true)).toBeNull();
+});
+
+it("drops an image upload revoked during file decoding without replaying it", async () => {
+  let finish!: () => void;
+  vi.stubGlobal(
+    "FileReader",
+    class {
+      result = "data:image/png;base64,aGk=";
+      onload: (() => void) | null = null;
+      readAsDataURL() {
+        finish = () => this.onload?.();
+      }
+    },
+  );
+  let readOnly = false;
+  const file = new File(["hi"], "img.png", { type: "image/png" });
+  const pending = api.pasteImage("s1", file, () => !readOnly);
+  readOnly = true;
+  finish();
+  expect(await pending).toBeNull();
+  expect(fetchSpy).not.toHaveBeenCalled();
+  readOnly = false;
+  expect(fetchSpy).not.toHaveBeenCalled();
+  fetchSpy.mockResolvedValueOnce(json({ path: "/wt/new.png" }));
+  const fresh = api.pasteImage("s1", file, () => !readOnly);
+  finish();
+  expect(await fresh).toBe("/wt/new.png");
+  expect(fetchSpy).toHaveBeenCalledTimes(1);
+});
+
+it("keeps a dispatched image upload result after write policy is revoked", async () => {
+  vi.stubGlobal(
+    "FileReader",
+    class {
+      result = "data:image/png;base64,aGk=";
+      onload: (() => void) | null = null;
+      readAsDataURL() {
+        this.onload?.();
+      }
+    },
+  );
+  let readOnly = false;
+  let finish!: (response: Response) => void;
+  let started!: () => void;
+  const dispatched = new Promise<void>((resolve) => {
+    started = resolve;
+  });
+  fetchSpy.mockImplementationOnce(() => {
+    started();
+    return new Promise<Response>((resolve) => {
+      finish = resolve;
+    });
+  });
+  const file = new File(["hi"], "img.png", { type: "image/png" });
+  const pending = api.pasteImage("s1", file, () => !readOnly);
+  await dispatched;
+  readOnly = true;
+  finish(json({ path: "/wt/accepted.png" }));
+  expect(await pending).toBe("/wt/accepted.png");
+  expect(fetchSpy).toHaveBeenCalledTimes(1);
 });
 
 it("fetchSoundBlob returns the file as a Blob", async () => {
@@ -1475,12 +1506,7 @@ describe("runtime snapshots and cancellation", () => {
     ["missing revision", { "aoe-runtime-epoch": "boot" }],
     ["malformed revision", { "aoe-runtime-epoch": "boot", "aoe-runtime-revision": "1.5" }],
   ])("rejects unattested session snapshots and mutation ACKs (%s)", async (_name, headers) => {
-    for (const call of [
-      () => api.fetchSessions(),
-      () => api.setSessionColor("s1", null, "boot"),
-      () => api.setSessionNotifications("s1", "default", "boot"),
-      () => api.updateSessionGroup("s1", ""),
-    ]) {
+    for (const call of [() => api.fetchSessions(), () => api.updateSessionGroup("s1", "")]) {
       fetchSpy.mockResolvedValueOnce(
         new Response(JSON.stringify(session), { headers: headers as Record<string, string> }),
       );
@@ -1488,10 +1514,51 @@ describe("runtime snapshots and cancellation", () => {
     }
   });
 
+  it.each([
+    ["missing epoch", { "aoe-runtime-revision": "1" }],
+    ["missing revision", { "aoe-runtime-epoch": "boot" }],
+    ["malformed revision", { "aoe-runtime-epoch": "boot", "aoe-runtime-revision": "1.5" }],
+    ["zero revision", { "aoe-runtime-epoch": "boot", "aoe-runtime-revision": "0" }],
+    ["another epoch", { "aoe-runtime-epoch": "successor", "aoe-runtime-revision": "1" }],
+  ])("does not claim a setting committed without its original runtime receipt (%s)", async (_name, headers) => {
+    for (const call of [
+      () => api.setSessionColor("s1", null, "boot"),
+      () => api.setSessionNotifications("s1", "default", "boot"),
+    ]) {
+      fetchSpy.mockResolvedValueOnce(
+        new Response(JSON.stringify(session), { headers: headers as Record<string, string> }),
+      );
+      expect(await call()).toEqual({ outcome: "uncertain" });
+    }
+  });
+
+  it.each([400, 401, 403, 409, 500, 503])(
+    "distinguishes setting rejection from unconfirmed writes (%s)",
+    async (status) => {
+      for (const call of [
+        () => api.setSessionColor("s1", null, "boot"),
+        () => api.setSessionNotifications("s1", "all", "boot"),
+      ]) {
+        fetchSpy.mockResolvedValueOnce(empty(status));
+        expect(await call()).toEqual({ outcome: status >= 500 ? "uncertain" : "rejected" });
+      }
+    },
+  );
+
+  it("does not attest another session or a missing canonical row", async () => {
+    for (const body of [null, {}, { ...session, id: "replacement" }]) {
+      fetchSpy.mockResolvedValueOnce(runtimeJson(body));
+      expect(await api.setSessionColor("s1", null, "boot")).toEqual({ outcome: "uncertain" });
+    }
+  });
+
   it("preserves u64 revision precision and the canonical returned fields, including optional outcome", async () => {
     const canonical = { ...session, color: "green", outcome: { acknowledged: true } };
     fetchSpy.mockResolvedValueOnce(runtimeJson(canonical));
-    expect(await api.setSessionColor("s1", null, "boot")).toEqual({ session: canonical, cursor });
+    expect(await api.setSessionColor("s1", null, "boot")).toEqual({
+      outcome: "committed",
+      mutation: { session: canonical, cursor },
+    });
     fetchSpy.mockResolvedValueOnce(runtimeJson(sessions));
     expect((await api.fetchSessions())!.cursor.revision).toBe(9007199254740993n);
   });

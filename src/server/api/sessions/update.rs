@@ -144,6 +144,13 @@ where
     .await;
     match persisted {
         Ok(Ok(result)) => Ok(result),
+        Ok(Err(error)) if error.is::<crate::session::SessionCommitApplied>() => Err(
+            super::super::api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "outcome_unconfirmed",
+                "The change committed, but runtime publication is unconfirmed. Check canonical state before retrying.",
+            ),
+        ),
         Ok(Err(error)) if error.is::<crate::session::NativeStoreUnavailable>() => {
             Err(StatusCode::SERVICE_UNAVAILABLE.into_response())
         }

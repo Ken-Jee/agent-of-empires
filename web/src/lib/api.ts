@@ -167,6 +167,10 @@ export interface SessionMutation {
   cursor: RuntimeCursor;
 }
 
+export type SessionSettingOutcome =
+  | { outcome: "committed"; mutation: SessionMutation }
+  | { outcome: Exclude<SaveOutcome, "committed"> };
+
 export interface SessionsEnvelope {
   sessions: SessionResponse[];
   workspace_ordering: string[];
@@ -185,6 +189,20 @@ async function sessionMutation(res: Response): Promise<SessionMutation | null> {
   const cursor = runtimeCursor(res);
   if (!cursor) return null;
   return { session: (await res.json()) as SessionResponse, cursor };
+}
+
+async function sessionSettingOutcome(res: Response, id: string, expectedEpoch: string): Promise<SessionSettingOutcome> {
+  if (!res.ok) return { outcome: res.status >= 500 ? "uncertain" : "rejected" };
+  const mutation = await sessionMutation(res);
+  if (
+    !mutation ||
+    mutation.session?.id !== id ||
+    mutation.cursor.epoch !== expectedEpoch ||
+    mutation.cursor.revision === 0n
+  ) {
+    return { outcome: "uncertain" };
+  }
+  return { outcome: "committed", mutation };
 }
 
 export async function fetchSessions(signal?: AbortSignal): Promise<SessionsEnvelope | null> {
@@ -321,9 +339,11 @@ function fileToBase64(file: File): Promise<string> {
  * the CLI agent (e.g. Claude Code) attaches it. Returns null on any failure.
  * See #2678.
  */
-export async function pasteImage(id: string, file: File): Promise<string | null> {
+export async function pasteImage(id: string, file: File, canUpload: () => boolean): Promise<string | null> {
   try {
+    if (!canUpload()) return null;
     const data = await fileToBase64(file);
+    if (!canUpload()) return null;
     const body = await fetchJson<Payload>(
       `/api/sessions/${id}/paste-image`,
       jsonInit("POST", { mime_type: file.type, data }),
@@ -2618,7 +2638,7 @@ export async function setSessionNotifications(
   id: string,
   preset: "off" | "default" | "all",
   expectedEpoch: string,
-): Promise<SessionMutation | null> {
+): Promise<SessionSettingOutcome> {
   const value = preset === "off" ? false : preset === "all" ? true : null;
   try {
     const res = await fetch(
@@ -2629,9 +2649,9 @@ export async function setSessionNotifications(
         { "aoe-runtime-epoch": expectedEpoch },
       ),
     );
-    return await sessionMutation(res);
+    return await sessionSettingOutcome(res, id, expectedEpoch);
   } catch {
-    return null;
+    return { outcome: "uncertain" };
   }
 }
 
@@ -2670,15 +2690,15 @@ export async function setSessionColor(
   id: string,
   color: string | null,
   expectedEpoch: string,
-): Promise<SessionMutation | null> {
+): Promise<SessionSettingOutcome> {
   try {
     const res = await fetch(
       `/api/sessions/${id}/color`,
       jsonInit("PATCH", { color }, { "aoe-runtime-epoch": expectedEpoch }),
     );
-    return await sessionMutation(res);
+    return await sessionSettingOutcome(res, id, expectedEpoch);
   } catch {
-    return null;
+    return { outcome: "uncertain" };
   }
 }
 
@@ -2785,6 +2805,12 @@ export async function setSessionUnread(id: string, unread: boolean): Promise<Ses
   }
 }
 
+export interface TrashPurgeConsent {
+  expected_trashed_at: string;
+  expected_trash_lifecycle_id: string;
+  expected_generation: number;
+}
+
 export interface DeleteSessionOptions {
   delete_worktree?: boolean;
   delete_branch?: boolean;
@@ -2794,6 +2820,8 @@ export interface DeleteSessionOptions {
    *  removing it. The session record is still deleted. No effect on
    *  non-scratch sessions. */
   keep_scratch?: boolean;
+  expected_trash?: boolean;
+  trash_consents?: Record<string, TrashPurgeConsent>;
 }
 
 export interface WorkspaceDeleteFailure {
@@ -2807,15 +2835,12 @@ export interface DeleteWorkspaceResult {
   messages?: string[];
   /** Ids the server actually deleted. */
   deleted?: string[];
+  kept?: string[];
   /** Sessions that could not be deleted, with their error. */
   failed?: WorkspaceDeleteFailure[];
 }
 
-/** Atomically delete a whole multi-session workspace in one call (#2536).
- *  `sessionIds` is the workspace's full session set in display order; the
- *  server treats `sessionIds[0]` as the worktree owner (removed last) and the
- *  rest as record-only siblings. Replaces the old per-session delete fan-out,
- *  so a mid-delete disconnect can no longer half-delete the workspace. */
+/** Delete siblings before their shared-worktree owner under the selected consent. */
 export async function deleteWorkspace(
   sessionIds: string[],
   options: DeleteSessionOptions = {},
@@ -2826,6 +2851,7 @@ export async function deleteWorkspace(
       message?: string;
       messages?: string[];
       deleted?: string[];
+      kept?: string[];
       failed?: WorkspaceDeleteFailure[];
     };
     if (!res.ok) {
@@ -2842,7 +2868,7 @@ export async function deleteWorkspace(
     if (!Array.isArray(data.deleted)) {
       return { ok: false, error: "Server did not confirm which sessions were deleted" };
     }
-    return { ok: true, messages: data.messages, deleted: data.deleted, failed: data.failed };
+    return { ok: true, messages: data.messages, deleted: data.deleted, kept: data.kept, failed: data.failed };
   } catch (e) {
     return {
       ok: false,

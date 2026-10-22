@@ -717,8 +717,8 @@ pub struct RegisterStartRequest {
     label: String,
 }
 
-/// The session enrolling a passkey. The auth middleware sets it, except on the loopback
-/// bypass, where the cookie and device binding are validated here instead.
+/// The session enrolling a passkey. The auth middleware sets it for browser login.
+/// Owner-socket callers must still present a valid session cookie and device binding.
 async fn enrolling_session(
     state: &AppState,
     session: Option<Extension<AuthenticatedSession>>,
@@ -1294,8 +1294,7 @@ mod tests {
         assert_eq!(res.status(), StatusCode::FORBIDDEN);
     }
 
-    /// On a direct loopback bind the auth wall is bypassed and sets no session extension,
-    /// so enrolment must validate the cookie and binding itself.
+    /// TCP loopback enrolment requires a bound session and passphrase elevation.
     #[tokio::test]
     async fn loopback_enrolment_validates_the_bound_session_through_the_router() {
         use tower::ServiceExt;
@@ -1315,45 +1314,82 @@ mod tests {
             .create_session(&binding, "127.0.0.1", "t")
             .await;
         let binding = URL_SAFE_NO_PAD.encode(binding);
+        let wrong_binding = URL_SAFE_NO_PAD.encode([8u8; 32]);
         let app = crate::server::test_support::build_router_for_test(state);
 
-        let send = |cookie: Option<&str>, bound: bool| {
-            let mut req = axum::http::Request::builder()
-                .method("POST")
-                .uri("/api/passkeys/register/start")
-                .header("host", "localhost")
-                .header("origin", "http://localhost")
-                .header("content-type", "application/json");
-            if let Some(cookie) = cookie {
-                req = req.header("cookie", cookie);
-            }
-            if bound {
-                req = req.header("x-aoe-device-binding", &binding);
-            }
-            let mut req = req
-                .body(axum::body::Body::from(r#"{"label":"Laptop"}"#))
-                .unwrap();
-            req.extensions_mut()
-                .insert(ConnectInfo(std::net::SocketAddr::from((
-                    [127, 0, 0, 1],
-                    5555,
-                ))));
-            app.clone().oneshot(req)
-        };
+        let send =
+            |path: &str, cookie: Option<&str>, binding: Option<&str>, body: serde_json::Value| {
+                let mut req = axum::http::Request::builder()
+                    .method("POST")
+                    .uri(path)
+                    .header("host", "localhost")
+                    .header("origin", "http://localhost")
+                    .header("content-type", "application/json");
+                if let Some(cookie) = cookie {
+                    req = req.header("cookie", cookie);
+                }
+                if let Some(binding) = binding {
+                    req = req.header("x-aoe-device-binding", binding);
+                }
+                let mut req = req.body(axum::body::Body::from(body.to_string())).unwrap();
+                req.extensions_mut()
+                    .insert(ConnectInfo(crate::server::peer::ConnectionPeer::Tcp(
+                        std::net::SocketAddr::from(([127, 0, 0, 1], 5555)),
+                    )));
+                app.clone().oneshot(req)
+            };
         let cookie = format!("aoe_session={session}");
+        let register_path = "/api/passkeys/register/start";
+        let register_body = serde_json::json!({ "label": "Laptop" });
 
-        let ok = send(Some(&cookie), true).await.unwrap();
+        let res = send(
+            register_path,
+            Some(&cookie),
+            Some(&binding),
+            register_body.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let error: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(error["error"], "elevation_required");
+
+        let res = send(
+            "/api/login/elevate",
+            Some(&cookie),
+            Some(&binding),
+            serde_json::json!({ "passphrase": "pw" }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let ok = send(
+            register_path,
+            Some(&cookie),
+            Some(&binding),
+            register_body.clone(),
+        )
+        .await
+        .unwrap();
         assert_eq!(ok.status(), StatusCode::OK);
-        for (cookie, bound) in [
-            (Some(cookie.as_str()), false),
-            (None, true),
-            (Some("aoe_session=forged"), true),
+        for (cookie, binding) in [
+            (Some(cookie.as_str()), None),
+            (Some(cookie.as_str()), Some(wrong_binding.as_str())),
+            (None, Some(binding.as_str())),
+            (Some("aoe_session=forged"), Some(binding.as_str())),
+            (None, None),
         ] {
-            let res = send(cookie, bound).await.unwrap();
+            let res = send(register_path, cookie, binding, register_body.clone())
+                .await
+                .unwrap();
             assert_eq!(
                 res.status(),
                 StatusCode::UNAUTHORIZED,
-                "{cookie:?} bound={bound}"
+                "{cookie:?} binding={binding:?}"
             );
         }
     }

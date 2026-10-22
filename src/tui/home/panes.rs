@@ -108,13 +108,14 @@ impl HomeView {
                             .tmux_session
                             .clone()
                             .ok_or_else(|| anyhow::anyhow!("Legacy pane name unavailable"))?,
-                        identity: identity.clone(),
+                        identity: identity.identity.clone(),
+                        server: identity.server.clone(),
                         profile: row.source_profile.clone(),
                         lifecycle_generation: row.lifecycle_generation,
                     };
-                    let message = format!("Adopt legacy tool '{}' for '{}'\nRow: {} / {} / generation {}\nTmux: {} ({} / {}, PID {})\nConfirm ownership of this exact unmarked pane before opening it.",
+                    let message = format!("Adopt legacy tool '{}' for '{}'\nRow: {} / {} / generation {}\nTmux: {} ({})\nConfirm ownership of this exact unmarked pane before opening it.",
                         tool_name, row.title, row.source_profile, row.id, row.lifecycle_generation,
-                        adoption.tmux_session, identity.session_id, identity.pane_id, identity.pane_pid);
+                        adoption.tmux_session, adoption.identity);
                     self.pending_legacy_tool_preparation = Some(PendingLegacyToolPreparation {
                         id: id.to_owned(),
                         pane,

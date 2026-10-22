@@ -115,9 +115,9 @@ pub(crate) enum TerminalContextResume {
     PreviousFailure,
 }
 pub use types::{
-    AuxiliaryObservation, AuxiliaryTarget, LegacyToolAdoption, LegacyToolIdentity, PaneObservation,
-    PanePresence, PluginCreateIdempotency, SandboxInfo, TerminalInfo, View, WorkspaceInfo,
-    WorkspaceRepo, WorktreeInfo,
+    AuxiliaryObservation, AuxiliaryTarget, LegacyToolAdoption, LegacyToolIdentity,
+    LegacyToolObservation, PaneObservation, PanePresence, PluginCreateIdempotency, SandboxInfo,
+    TerminalInfo, TmuxServerIdentity, View, WorkspaceInfo, WorkspaceRepo, WorktreeInfo,
 };
 pub(crate) use types::{
     PrimeAgentCapturePlan, PriorToolSession, ResumeIntent, SandboxStoreTransitionPath,
@@ -205,6 +205,165 @@ pub(crate) struct FailedPurge {
     forced: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum TerminalHandoffStage {
+    RetirementPending,
+    TerminalCommitOwed,
+    TerminalLaunchOwed,
+    ProjectionCleanupOwed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub(crate) enum TerminalHandoffContext {
+    Keep { native_store: ExecutionBinding },
+    Discard,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct TerminalHandoffLaunch {
+    pub(crate) generation: u64,
+    pub(crate) prior: ConversationState,
+    pub(crate) launched: ConversationState,
+    pub(crate) capture_started_at: Option<SystemTime>,
+    pub(crate) omp_capture_metadata: Option<OmpCaptureMetadata>,
+    pub(crate) confirm_desired_conversation: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct TerminalHandoffUnbornFence {
+    pub(crate) producer_epoch: u64,
+    pub(crate) producer_id: uuid::Uuid,
+    pub(crate) source_generation: u64,
+    pub(crate) fence_generation: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct TerminalHandoffIntent {
+    pub(crate) id: uuid::Uuid,
+    pub(crate) profile: String,
+    pub(crate) profile_identity: (u64, u64),
+    pub(crate) generation: u64,
+    pub(crate) target_generation: u64,
+    pub(crate) stage: TerminalHandoffStage,
+    pub(crate) context: TerminalHandoffContext,
+    pub(crate) source_acp_session_id: Option<String>,
+    pub(crate) source_event_seq: u64,
+    pub(crate) final_event_seq: Option<u64>,
+    pub(crate) source_conversation: ConversationState,
+    pub(crate) runner: crate::session::purge_owners::RunnerCapture,
+    pub(crate) unborn_fence: Option<TerminalHandoffUnbornFence>,
+    pub(crate) terminal: Option<ConversationState>,
+    pub(crate) launch_required: bool,
+    pub(crate) launch_started: bool,
+    pub(crate) launch: Option<TerminalHandoffLaunch>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TerminalHandoffKey {
+    pub(crate) id: uuid::Uuid,
+    pub(crate) generation: u64,
+}
+
+impl TerminalHandoffIntent {
+    pub(crate) fn validate_unborn_fence(&self) -> Result<&TerminalHandoffUnbornFence> {
+        let fence = self
+            .unborn_fence
+            .as_ref()
+            .context("unborn handoff has no durable birth fence")?;
+        anyhow::ensure!(
+            fence.source_generation.checked_add(1) == Some(fence.fence_generation)
+                && fence.fence_generation <= self.generation,
+            "unborn handoff generation fence is malformed"
+        );
+        match &self.runner {
+            crate::session::purge_owners::RunnerCapture::Uncaptured {
+                producer_epoch: Some(epoch),
+                producer_id: Some(id),
+                scopes,
+                ..
+            } if *epoch == fence.producer_epoch
+                && *id == fence.producer_id
+                && scopes.is_empty() => {}
+            _ => anyhow::bail!("unborn fence does not match its captured original producer"),
+        }
+        Ok(fence)
+    }
+
+    fn ensure_unborn_routes_absent(&self, session_id: &str) -> Result<()> {
+        self.validate_unborn_fence()?;
+        match crate::session::purge_owners::capture_runner(session_id) {
+            crate::session::purge_owners::RunnerCapture::Uncaptured {
+                producer_epoch: None, producer_id: None, scopes,
+                prime: crate::acp::runner_lifecycle::PrimeOwnership::NotPrime,
+            } if scopes.is_empty() => Ok(()),
+            _ => anyhow::bail!("a runner route appeared after the original unborn admission was fenced; replacement retained"),
+        }
+    }
+
+    pub(crate) fn ensure_retirement_target(
+        &self,
+        session_id: &str,
+        target: &mut crate::acp::supervisor::RetirementTarget,
+    ) -> Result<()> {
+        if self.unborn_fence.is_none() {
+            return self.runner.ensure_retirement_target(target);
+        }
+        let fence = self.validate_unborn_fence()?;
+        self.ensure_unborn_routes_absent(session_id)?;
+        anyhow::ensure!(
+            target.identity.is_none() && target.scopes.is_empty(),
+            "unborn handoff encountered a physical replacement"
+        );
+        if let Some(lease) = &target.lease {
+            anyhow::ensure!(
+                lease.session_id() == session_id
+                    && lease.epoch() == fence.producer_epoch
+                    && lease.producer_id() == fence.producer_id
+                    && lease.previous_runner().is_none(),
+                "unborn handoff producer was replaced"
+            );
+        } else {
+            target.prime = crate::acp::runner_lifecycle::PrimeOwnership::NotPrime;
+        }
+        target.journalled = true;
+        Ok(())
+    }
+
+    pub(crate) fn completed_runner(
+        &self,
+        session_id: &str,
+        target: &crate::acp::supervisor::RetirementTarget,
+    ) -> Result<crate::session::purge_owners::RunnerCapture> {
+        if self.unborn_fence.is_none() {
+            return self.runner.completed(target);
+        }
+        let fence = self.validate_unborn_fence()?;
+        self.ensure_unborn_routes_absent(session_id)?;
+        if let Some(lease) = &target.lease {
+            let (identity, prime) = lease.constructed_ownership();
+            anyhow::ensure!(
+                lease.session_id() == session_id
+                    && lease.epoch() == fence.producer_epoch
+                    && lease.producer_id() == fence.producer_id
+                    && lease.was_cancelled_before_birth()
+                    && identity.is_none()
+                    && prime == crate::acp::runner_lifecycle::PrimeOwnership::NotPrime,
+                "original fenced producer completion is not proven"
+            );
+        }
+        Ok(self.runner.clone())
+    }
+
+    pub(crate) fn ensure_original_stopped(&self, session_id: &str) -> Result<()> {
+        if self.unborn_fence.is_some() {
+            self.ensure_unborn_routes_absent(session_id)
+        } else {
+            self.runner.ensure_stopped(Some(session_id))
+        }
+    }
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Instance {
     pub id: String,
@@ -369,15 +528,16 @@ pub struct Instance {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pre_trash_project_path: Option<String>,
 
-    /// Durable ownership reservation for every in-flight lifecycle transition.
-    /// Acquired atomically with a new `lifecycle_generation`; only that
-    /// generation may perform the transition's irreversible phase, commit, or
-    /// release it. This is intentionally the only persisted busy signal:
-    /// `status` remains multi-writer presentation state, while the per-instance
-    /// flock is the short-lived mutex protecting the final side effects and
-    /// commit.
+    /// Current-generation lifecycle owner. Only that generation may perform
+    /// irreversible effects, commit, or release this reservation. A pending
+    /// terminal handoff retains recovery debt after its reservation releases.
+    /// Status is presentation state; the per-instance flock protects final
+    /// effects and commits.
+    /// The terminal-handoff driver additionally retains exclusion through hooks.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lifecycle_reservation: Option<LifecycleReservation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) terminal_handoff: Option<Box<TerminalHandoffIntent>>,
 
     /// Namespaced per-session plugin data, keyed by plugin id. Each plugin
     /// owns only its own slot (`plugin_meta["<id>"]`), an opaque JSON value it

@@ -313,6 +313,14 @@ pub(super) async fn spawn_runner_detached(
         cmd.arg("--stored-acp-session-id").arg(stored);
     }
     cmd.arg("--generation").arg(config.generation.to_string());
+    if let Some(admission) = config
+        .launch_lease
+        .as_ref()
+        .and_then(|lease| lease.admission())
+    {
+        cmd.arg("--lifecycle-generation")
+            .arg(admission.generation.to_string());
+    }
     if let crate::process::worker_registry::ScopeOwnership::Owned { unit } = &scope {
         cmd.arg("--systemd-scope").arg(unit);
     }
@@ -487,20 +495,24 @@ pub(super) async fn spawn_runner_detached(
         let pid = child
             .id()
             .ok_or_else(|| AcpError::Spawn("runner exited before it could be identified".into()))?;
+        // Transfer reaping before the blocking result can be dropped.
         if let Some(lease) = &lease {
-            lease.record_runner(crate::acp::runner_lifecycle::RunnerIdentity {
-                pid,
-                generation,
-                birth_fingerprint: crate::process::process_birth_identity(pid)
-                    .ok()
-                    .flatten()
-                    .map(|identity| identity.fingerprint()),
+            lease.record_spawned_child(
+                child,
+                crate::acp::runner_lifecycle::RunnerIdentity {
+                    pid,
+                    generation,
+                    birth_fingerprint: crate::process::process_birth_identity(pid)
+                        .ok()
+                        .flatten()
+                        .map(|identity| identity.fingerprint()),
+                },
+            );
+        } else {
+            tokio::spawn(async move {
+                let _ = child.wait().await;
             });
         }
-        // The producer owns reaping even if the blocking-result waiter is dropped.
-        tokio::spawn(async move {
-            let _ = child.wait().await;
-        });
         Ok(pid)
     })
     .await

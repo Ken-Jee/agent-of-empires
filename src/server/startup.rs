@@ -328,11 +328,16 @@ pub(crate) async fn start_server(
                 source,
             })
     });
-    let (canonical_metadata, canonical_health) = match metadata {
-        Ok(metadata) => (metadata, crate::daemon::RuntimeHealth::Healthy),
+    let (canonical_metadata, canonical_health, canonical_diagnostics) = match metadata {
+        Ok(metadata) => (metadata, crate::daemon::RuntimeHealth::Healthy, Vec::new()),
         Err(error) => {
             tracing::warn!(target: "server.runtime", %error, "native runtime unavailable; healthy CLI components remain readable");
-            (super::reload::CanonicalMetadata::default(), error.health)
+            let diagnostics = error.owner_diagnostics();
+            (
+                super::reload::CanonicalMetadata::default(),
+                error.health,
+                diagnostics,
+            )
         }
     };
 
@@ -454,10 +459,13 @@ pub(crate) async fn start_server(
             event_store: acp_event_store.clone(),
             control_cache: acp_control_cache.clone(),
         });
-        let supervisor = std::sync::Arc::new(crate::acp::supervisor::Supervisor::with_capacity(
-            sink,
-            config.acp.max_concurrent_workers,
-        ));
+        let supervisor = std::sync::Arc::new(
+            crate::acp::supervisor::Supervisor::with_capacity(
+                sink,
+                config.acp.max_concurrent_workers,
+            )
+            .with_native_admission(),
+        );
         // Seed the seq counter from disk so fresh publishes don't collide with restored
         // history.
         supervisor.hydrate_seqs(acp_event_store.all_session_seqs());
@@ -786,6 +794,7 @@ pub(crate) async fn start_server(
         reload_lane: tokio::sync::Mutex::new(()),
         canonical_metadata: RwLock::new(canonical_metadata),
         canonical_health: RwLock::new(canonical_health),
+        canonical_diagnostics: std::sync::RwLock::new(canonical_diagnostics),
         runtime: super::runtime::NativeRuntime::new(
             runtime_namespace,
             runtime_tmux_socket,
@@ -863,17 +872,26 @@ pub(crate) async fn start_server(
 
     // Seed acp sessions' status from the on-disk event log before any background task runs.
     seed_acp_statuses(state.clone()).await;
+    let mut pending_tool_retirements = super::pane::initial_tool_retirement_inventory(&state).await;
     let mut failed_repairs = std::collections::HashSet::new();
     if !state.read_only {
-        crate::server::api::sessions::recover_pending_purges(&state).await;
-        failed_repairs.extend(crate::server::api::reconcile_trashed_worktrees(&state).await);
-        failed_repairs.extend(crate::server::api::reconcile_worktree_paths(&state).await);
+        if pending_tool_retirements.is_some() {
+            crate::server::api::sessions::recover_pending_purges(&state).await;
+            failed_repairs.extend(crate::server::api::reconcile_trashed_worktrees(&state).await);
+            failed_repairs.extend(crate::server::api::reconcile_worktree_paths(&state).await);
+            crate::server::api::recover_pending_terminal_handoffs(
+                &state,
+                crate::server::api::HandoffRecovery::Startup,
+            )
+            .await;
+            pending_tool_retirements = super::pane::initial_tool_retirement_inventory(&state).await;
+        }
         super::startup_recovery::publish_startup_identity(&state).await;
     }
 
     // Mark recovery before status polling can observe missing recovering panes.
     let recovery_inputs = daemon_startup_recovery_mark(state.clone(), &failed_repairs).await;
-    super::pane::seed_initial_observations(&state).await?;
+    super::pane::seed_initial_observations(&state, pending_tool_retirements.as_deref()).await?;
     state.runtime.publish(&state).await?;
     {
         let runtime_state = state.clone();
@@ -1012,6 +1030,19 @@ pub(crate) async fn start_server(
     // are still logged and skipped; polling stays canonical when a watch
     // cannot be installed.
     init_disk_watch_subscriptions(state.clone()).await;
+    if let Ok(app_dir) = crate::session::get_app_dir() {
+        let file_watch = state.file_watch.clone();
+        let shutdown = state.shutdown.clone();
+        state
+            .runtime
+            .work
+            .spawn("server.log_filter_watcher", async move {
+                tokio::select! {
+                    _ = crate::logging::watch_runtime_filter(file_watch, app_dir) => {}
+                    _ = shutdown.cancelled() => {}
+                }
+            });
+    }
     {
         let consumer_state = state.clone();
         state

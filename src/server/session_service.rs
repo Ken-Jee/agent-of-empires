@@ -741,9 +741,23 @@ impl SessionService {
         let Ok(state) = self.native_state() else {
             return PromptTouch::WorkerNotReady;
         };
+        let work = state.runtime.work.clone();
+        let service = state.session_service.clone();
+        let id = id.to_owned();
+        work.run("server.prompt_touch", async move {
+            service.touch_and_wake_on_prompt_inner(&id, no_revive).await
+        })
+        .await
+        .unwrap_or(PromptTouch::WorkerNotReady)
+    }
+
+    async fn touch_and_wake_on_prompt_inner(&self, id: &str, no_revive: bool) -> PromptTouch {
+        let Ok(state) = self.native_state() else {
+            return PromptTouch::WorkerNotReady;
+        };
         let namespace = state.profile_namespace.clone().read_owned().await;
         let guard = self.instance_lock(id).await.lock_owned().await;
-        let (worker_id, profile, title, generation, provider, view) = {
+        let (worker_id, profile, title, generation, provider, view, needs_resume, was_idle_dormant) = {
             let instances = self.instances.read().await;
             let Some(row) = instances.iter().find(|row| row.id == id) else {
                 return PromptTouch::WorkerNotReady;
@@ -755,53 +769,115 @@ impl SessionService {
                 row.lifecycle_generation,
                 row.agent_provider.clone(),
                 row.view,
+                row.is_structured()
+                    && (row.status == crate::session::Status::Stopped || row.is_idle_dormant()),
+                row.is_idle_dormant(),
             )
         };
+        // Ordinary live prompts retain their single existing commit producer.
+        let (native, worker_id, profile, title, generation, provider, view, namespace, guard) =
+            if needs_resume {
+                let probe_state = state.clone();
+                let prepared = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+                    let _identity = crate::session::acquire_session_identity_lock()?;
+                    let _title = crate::session::acquire_session_title_lock(&worker_id)?;
+                    let native = super::session_store::NativeSessionStore::open(
+                        probe_state,
+                        &profile,
+                        None,
+                    )?;
+                    use crate::session::SessionStore;
+                    let _lifecycle = native
+                        .storage()
+                        .acquire_instance_lifecycle_lock(&worker_id)?;
+                    let row = native
+                        .load()?
+                        .into_iter()
+                        .find(|row| row.id == worker_id)
+                        .ok_or(crate::session::SessionGone)?;
+                    if let Some(outcome) = prompt_touch_rejection(
+                        &row,
+                        generation,
+                        &title,
+                        provider.as_deref(),
+                        view,
+                        no_revive,
+                    ) {
+                        return Ok(Err(outcome));
+                    }
+                    Ok(Ok((native, row, namespace, guard)))
+                })
+                .await;
+                let (native, expected, namespace, guard) = match prepared {
+                    Ok(Ok(Ok(prepared))) => prepared,
+                    Ok(Ok(Err(outcome))) => return outcome,
+                    Ok(Err(error)) => {
+                        tracing::warn!(target: "server.session_service", session = %id, %error,
+                    "canonical prompt wake probe failed");
+                        return PromptTouch::WorkerNotReady;
+                    }
+                    Err(error) => {
+                        tracing::warn!(target: "server.session_service", session = %id, %error,
+                    "canonical prompt wake probe worker failed");
+                        return PromptTouch::WorkerNotReady;
+                    }
+                };
+                // No lifecycle/title flock crosses late-construction retirement.
+                let expected =
+                    match crate::server::api::sessions::resume_structured_stop(&state, expected)
+                        .await
+                    {
+                        Ok(expected) => expected,
+                        Err(_) => return PromptTouch::WorkerNotReady,
+                    };
+                (
+                    Some(native),
+                    expected.id,
+                    expected.source_profile,
+                    expected.title,
+                    expected.lifecycle_generation,
+                    expected.agent_provider,
+                    expected.view,
+                    namespace,
+                    guard,
+                )
+            } else {
+                (
+                    None, worker_id, profile, title, generation, provider, view, namespace, guard,
+                )
+            };
         let result = tokio::task::spawn_blocking(move || -> anyhow::Result<PromptTouch> {
-            // A dropped request must not release exclusion before commit and adoption finish.
+            // Runtime-owned wake retains exclusion if its HTTP/plugin caller disappears.
             let _exclusion = (namespace, guard);
             let _identity = crate::session::acquire_session_identity_lock()?;
             let _title = crate::session::acquire_session_title_lock(&worker_id)?;
-            let native = super::session_store::NativeSessionStore::open(
-                state, &profile, None,
-            )?;
+            use crate::session::SessionStore;
+            let native = match native {
+                Some(native) => native,
+                None => super::session_store::NativeSessionStore::open(state, &profile, None)?,
+            };
+            let _lifecycle = native.storage().acquire_instance_lifecycle_lock(&worker_id)?;
             let store: &dyn crate::session::SessionStore = &native;
-            let _lifecycle = store.storage().acquire_instance_lifecycle_lock(&worker_id)?;
             let mut refused = None;
             let committed = store.update(|rows, _| {
                 let row = rows.iter_mut().find(|row| row.id == worker_id)
                     .ok_or(crate::session::SessionGone)?;
-                if let Err(blocked) = row.ensure_startable() {
-                    refused = Some(PromptTouch::Blocked(blocked));
-                    return Err(blocked.into());
-                }
-                anyhow::ensure!(
-                    row.lifecycle_generation == generation
-                        && row.title == title
-                        && row.agent_provider == provider
-                        && row.view == view,
-                    crate::session::LifecycleReservationError::Superseded
-                );
-                if row.is_structured() && !row.launch_is_finalized() {
-                    refused = Some(PromptTouch::WorkerNotReady);
+                if let Some(outcome) = prompt_touch_rejection(
+                    row, generation, &title, provider.as_deref(), view, no_revive,
+                ) {
+                    refused = Some(outcome);
                     anyhow::bail!(crate::session::LifecycleReservationError::Superseded);
                 }
-                let idle_dormant = row.is_idle_dormant();
+                let idle_dormant = was_idle_dormant || row.is_idle_dormant();
                 let wake = row.is_snoozed() || idle_dormant;
-                if no_revive && wake {
-                    refused = Some(PromptTouch::RevivalRefused);
-                    anyhow::bail!("prompt revival refused");
-                }
                 apply_prompt_persist_to_disk(row, wake);
                 Ok(idle_dormant)
             });
             match committed {
                 Ok(idle_dormant) => {
                     if idle_dormant {
-                        tracing::info!(
-                            target: "acp.supervisor", session = %worker_id,
-                            "waking idle-dormant structured view session on prompt; spawning a fresh worker"
-                        );
+                        tracing::info!(target: "acp.supervisor", session = %worker_id,
+                            "waking idle-dormant structured view session on prompt; spawning a fresh worker");
                     }
                     Ok(PromptTouch::Touched { idle_dormant })
                 }
@@ -860,7 +936,7 @@ impl SessionService {
                     return Err(SendTurnError::NotOwner);
                 }
             }
-            if !inst.launch_is_finalized() {
+            if inst.terminal_handoff.is_some() || !inst.launch_is_finalized() {
                 return Err(SendTurnError::WorkerNotReady);
             }
             (inst.acp_mode_id.clone(), inst.yolo_mode)
@@ -979,7 +1055,7 @@ impl SessionService {
             let instances = self.instances.read().await;
             instances
                 .iter()
-                .find(|i| i.id == id && i.launch_is_finalized())
+                .find(|i| i.id == id && i.launch_is_finalized() && i.terminal_handoff.is_none())
                 .and_then(|i| {
                     i.pending_initial_turn.clone().map(|turn| {
                         // Reconstruct the creator principal so plugin-created
@@ -1590,7 +1666,8 @@ impl SessionService {
             let Some(inst) = instances.iter().find(|i| i.id == id) else {
                 return;
             };
-            if !inst.is_structured()
+            if inst.terminal_handoff.is_some()
+                || !inst.is_structured()
                 || inst.is_archived()
                 || inst.is_snoozed()
                 || inst.is_trashed()
@@ -2320,6 +2397,36 @@ fn spec_payload_hash(spec: &StructuredSessionSpec) -> String {
         let _ = write!(out, "{byte:02x}");
     }
     out
+}
+
+fn prompt_touch_rejection(
+    row: &crate::session::Instance,
+    generation: u64,
+    title: &str,
+    provider: Option<&str>,
+    view: crate::session::View,
+    no_revive: bool,
+) -> Option<PromptTouch> {
+    if let Err(blocked) = row.ensure_startable() {
+        return Some(PromptTouch::Blocked(blocked));
+    }
+    if row.lifecycle_generation != generation
+        || row.title != title
+        || row.agent_provider.as_deref() != provider
+        || row.view != view
+        || row.terminal_handoff.is_some()
+        || (row.is_structured() && !row.launch_is_finalized())
+    {
+        return Some(PromptTouch::WorkerNotReady);
+    }
+    if no_revive
+        && (row.is_snoozed()
+            || row.is_idle_dormant()
+            || row.status == crate::session::Status::Stopped)
+    {
+        return Some(PromptTouch::RevivalRefused);
+    }
+    None
 }
 
 /// Apply an accepted prompt gesture to the authoritative row before native commit.
@@ -3743,6 +3850,131 @@ mod tests {
             .await;
 
             assert!(check(&state.instances.read().await[0]), "{name}");
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn explicit_prompt_wake_consumes_only_the_retired_native_stop_observation() {
+        use crate::session::{LifecycleOperation, Status, Storage, View};
+        for case in ["no_revive", "resume", "newer_stop"] {
+            let _home = crate::session::test_support::isolate_app_dir();
+            let project = tempfile::tempdir().unwrap();
+            let mut row = Instance::new(case, project.path().to_str().unwrap());
+            row.source_profile = "default".into();
+            row.view = View::Structured;
+            row.status = Status::Stopped;
+            row.mark_idle_dormant();
+            let observed = row
+                .try_acquire_lifecycle_reservation(
+                    LifecycleOperation::Stop,
+                    Instance::LIFECYCLE_RESERVATION_TTL,
+                    chrono::Utc::now(),
+                )
+                .unwrap();
+            crate::server::test_support::seed_instances_on_disk_for_test(
+                "default",
+                vec![row.clone()],
+            );
+            let state = crate::server::test_support::build_test_app_state(vec![row.clone()]);
+            crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+            let _submission = state.session_service.prompt_submission(&row.id).await;
+            let reservation = state
+                .acp_supervisor
+                .reserve_spawn(
+                    &row.id,
+                    crate::acp::supervisor::ResumeKind::SpawnFirst,
+                    crate::process::worker_registry::ResumeAuthority::Automatic,
+                )
+                .await
+                .unwrap();
+            let lease = reservation.lease().clone();
+            let storage = Storage::open_unwatched("default").unwrap();
+            if case == "no_revive" {
+                let before = std::fs::read(storage.sessions_path()).unwrap();
+                let outcome = state
+                    .session_service
+                    .touch_and_wake_on_prompt(&row.id, true)
+                    .await;
+                assert!(matches!(outcome, PromptTouch::RevivalRefused));
+                assert!(!state.acp_supervisor.test_cancel_requested(&lease));
+                assert_eq!(std::fs::read(storage.sessions_path()).unwrap(), before);
+                drop(reservation);
+                continue;
+            }
+            let service = state.session_service.clone();
+            let id = row.id.clone();
+            let wake =
+                tokio::spawn(async move { service.touch_and_wake_on_prompt(&id, false).await });
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while !state.acp_supervisor.test_cancel_requested(&lease) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            let before_retirement = storage.load().unwrap().remove(0);
+            assert_eq!(before_retirement.status, Status::Stopped);
+            assert_eq!(before_retirement.lifecycle_generation, observed);
+            assert!(before_retirement.is_idle_dormant());
+            let newer = if case == "newer_stop" {
+                Some(
+                    storage
+                        .update(|rows, _| {
+                            let row = &mut rows[0];
+                            row.release_lifecycle_reservation_if_owned(
+                                LifecycleOperation::Stop,
+                                observed,
+                            );
+                            let newer = row.try_acquire_lifecycle_reservation(
+                                LifecycleOperation::Stop,
+                                Instance::LIFECYCLE_RESERVATION_TTL,
+                                chrono::Utc::now(),
+                            )?;
+                            row.status = Status::Stopped;
+                            row.mark_idle_dormant();
+                            Ok(newer)
+                        })
+                        .unwrap(),
+                )
+            } else {
+                None
+            };
+            drop(reservation);
+            state.acp_supervisor.retry_pending_teardowns().await;
+            let outcome = wake.await.unwrap();
+            let stored = storage.load().unwrap().remove(0);
+            if let Some(newer) = newer {
+                assert!(matches!(outcome, PromptTouch::WorkerNotReady));
+                assert_eq!(stored.lifecycle_generation, newer);
+                assert_eq!(stored.status, Status::Stopped);
+                assert!(stored.is_idle_dormant());
+            } else {
+                assert!(matches!(
+                    outcome,
+                    PromptTouch::Touched { idle_dormant: true }
+                ));
+                assert!(stored.lifecycle_generation > observed);
+                assert_eq!(stored.status, Status::Idle);
+                assert!(!stored.is_idle_dormant());
+                let admission = crate::acp::supervisor::LaunchAdmission {
+                    store: Arc::new(Storage::open_unwatched("default").unwrap()),
+                    generation: stored.lifecycle_generation,
+                    namespace: None,
+                };
+                let mut child = crate::acp::supervisor::with_durable_launch(
+                    Some(admission),
+                    row.id.clone(),
+                    || {
+                        std::process::Command::new("true").spawn().map_err(|error| {
+                            crate::acp::acp_client::AcpError::Spawn(error.to_string())
+                        })
+                    },
+                )
+                .await
+                .unwrap();
+                assert!(child.wait().unwrap().success());
+            }
         }
     }
 

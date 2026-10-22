@@ -180,8 +180,24 @@
       "id": "terminal.live-split-composite",
       "kind": "vitest",
       "risk": "high",
-      "specs": ["src/components/__tests__/MobileLiveTerminal.forward.test.tsx", "src/hooks/useLiveTerminal.test.ts"],
-      "components": ["web/src/hooks/useLiveTerminal.ts", "web/src/components/MobileLiveTerminal.tsx"]
+      "specs": [
+        "src/components/__tests__/MobileLiveTerminal.forward.test.tsx",
+        "src/hooks/useLiveTerminal.test.ts",
+        "src/components/__tests__/LiveTerminalView.restart.test.tsx",
+        "src/lib/api.test.ts"
+      ],
+      "components": [
+        "web/src/hooks/useLiveTerminal.ts",
+        "web/src/components/MobileLiveTerminal.tsx",
+        "web/src/components/LiveTerminalView.tsx",
+        "web/src/components/TerminalView.tsx",
+        "web/src/components/PairedTerminal.tsx",
+        "web/src/components/MobileTerminalToolbar.tsx",
+        "web/src/components/live-terminal/useTerminalInput.ts",
+        "web/src/components/TerminalComposeSheet.tsx",
+        "web/src/components/TerminalConnectionBanners.tsx"
+      ],
+      "notes": "Deterministic real WebSocket and terminal consumers cover read-only agent, host and container observation, suppressed ensure/claim/resize/input/mouse/restart writes, late open and reconnect after revocation, retained callbacks and proxy refusal, no unsent replay, preserved compose drafts, accepted in-flight ensure results, and fresh writable takeover/paste. Real consumer cases revoke and restore policy while image decoding, dispatched upload responses and toolbar clipboard reads are pending; only fresh gesture admission permits later upload/paste, while dispatched upload receipts remain accepted. API tests also gate decoding before HTTP dispatch. Backend ownership heartbeat fences require the live read-only recheck; these unit cases do not claim physical tmux-lock coverage."
     },
     {
       "id": "terminal.live-grid-transport",
@@ -1602,12 +1618,13 @@
         "src/hooks/__tests__/useSessionsPolling.test.tsx",
         "src/lib/api.test.ts"
       ],
-      "description": "Accepted color and notification resets survive visual unmount; true epoch, target birth, profile and removal invalidation stop unsent work.",
+      "description": "Accepted color and notification resets survive visual unmount and temporary polling failure. Dispatched receipts survive read-only changes; revoked unsent work and true identity invalidation never replay.",
       "components": [
         "web/src/components/WorkspaceSidebar.tsx",
         "web/src/components/sidebar/SessionActionProvider.tsx",
         "web/src/components/sidebar/usePendingSetting.ts",
         "web/src/components/sidebar/SessionRow.tsx",
+        "web/src/components/sidebar/useSessionRowModel.ts",
         "web/src/hooks/useSessions.ts",
         "web/src/lib/api.ts"
       ]
@@ -1672,7 +1689,8 @@
         "web/src/components/WorkspaceSidebar.tsx",
         "web/src/components/sidebar/usePendingSetting.ts",
         "web/src/components/sidebar/SessionActionProvider.tsx",
-        "web/src/components/sidebar/rowModel.ts"
+        "web/src/components/sidebar/rowModel.ts",
+        "web/src/components/sidebar/useSessionRowModel.ts"
       ]
     },
     {
@@ -3478,7 +3496,8 @@
       "kind": "live-playwright",
       "risk": "high",
       "specs": ["tests/live/read-only-mode.spec.ts"],
-      "components": ["web/src/components/MobileTerminalToolbar.tsx"]
+      "components": ["web/src/components/Dashboard.tsx"],
+      "notes": "Live coverage checks authoritative /api/about policy, pre-extraction mutation refusal and dashboard shortcut suppression. Terminal policy transitions and passive consumers are exercised by terminal.live-split-composite; this live spec does not open an existing terminal."
     },
     {
       "id": "ensure-session-restart",
@@ -4851,6 +4870,7 @@
         "web/src/components/WorkspaceSidebar.tsx",
         "web/src/components/sidebar/SessionActionProvider.tsx",
         "web/src/components/sidebar/SessionRow.tsx",
+        "web/src/components/sidebar/useSessionRowModel.ts",
         "web/src/components/sidebar/usePendingSetting.ts",
         "web/src/hooks/useSessions.ts",
         "web/src/lib/api.ts"
@@ -4866,6 +4886,7 @@
         "web/src/components/WorkspaceSidebar.tsx",
         "web/src/components/sidebar/SessionActionProvider.tsx",
         "web/src/components/sidebar/SessionRow.tsx",
+        "web/src/components/sidebar/useSessionRowModel.ts",
         "web/src/components/sidebar/usePendingSetting.ts",
         "web/src/hooks/useSessions.ts",
         "web/src/lib/api.ts"
@@ -4881,6 +4902,8 @@
         "web/src/App.tsx",
         "web/src/components/WorkspaceSidebar.tsx",
         "web/src/components/sidebar/SessionRow.tsx",
+        "web/src/components/sidebar/SessionActionProvider.tsx",
+        "web/src/components/sidebar/useSessionRowModel.ts",
         "web/src/components/sidebar/usePendingSetting.ts",
         "web/src/hooks/useSessions.ts",
         "web/src/lib/api.ts"

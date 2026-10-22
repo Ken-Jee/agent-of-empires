@@ -1121,47 +1121,70 @@ mod tests {
         assert!(!sidecar.exists());
     }
 
-    /// The ancillary sessions (web terminal, container terminal, tool
-    /// sub-sessions) hold their own processes, so a failed agent kill must
-    /// still reap them: short-circuiting on that error leaks a shell per
-    /// failed kill. The agent failure is still what the caller is told.
+    /// Agent failure must not prevent independent ancillary cleanup.
     #[test]
     #[serial_test::serial]
     #[cfg(unix)]
     fn a_failed_agent_kill_still_reaps_ancillary_sessions() {
         use std::os::unix::fs::PermissionsExt;
+        let Ok(real_tmux) = which::which("tmux") else {
+            return;
+        };
         let _env_read = crate::session::test_support::EnvGuard::read_lock();
         let temp = tempfile::tempdir().unwrap();
         let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let _socket = crate::session::test_support::EnvGuard::set(&[(
+            "AOE_TMUX_SOCKET",
+            temp.path().join("tmux.sock").display().to_string(),
+        )]);
         crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
         let inst = Instance::new("Ancillary teardown", temp.path().to_str().unwrap());
+        let agent = crate::tmux::Session::generate_name(&inst.id, &inst.title);
         let terminal = crate::tmux::TerminalSession::generate_name(&inst.id, "web terminal");
-        let reaped = temp.path().join("ancillary-reaped");
-        let reaped_marker = reaped.display().to_string();
-        // A tmux that reports the web terminal as live, refuses the agent
-        // session with a real (not "absent") failure, and reaps the terminal.
+        let _agent = crate::tmux::test_helpers::TmuxTestSession::from_name(agent.clone());
+        let _terminal = crate::tmux::test_helpers::TmuxTestSession::from_name(terminal.clone());
+        for name in [&agent, &terminal] {
+            let output = crate::tmux::tmux_command()
+                .args([
+                    "-f",
+                    "/dev/null",
+                    "new-session",
+                    "-d",
+                    "-s",
+                    name,
+                    "sleep 60",
+                ])
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
         let shim = temp.path().join("tmux");
         std::fs::write(
             &shim,
             format!(
-                "#!/bin/sh\ncase \" $* \" in\n  *\" list-sessions \"*) printf '%s\\n' '{terminal}'; exit 0 ;;\nesac\ncase \" $* \" in\n  *\" kill-session \"*)\n    case \"$*\" in\n      *'={terminal}'*) : > '{reaped_marker}'; exit 0 ;;\n    esac\n    echo 'permission denied' >&2\n    exit 1\n    ;;\nesac\nexit 0\n"
+                "#!/bin/sh\nblocked={}\ncase \" $* \" in\n  *\" kill-session \"*|*\" if-shell \"*)\n    case \"$*\" in\n      *\"$blocked\"*) echo 'permission denied' >&2; exit 1 ;;\n    esac\n    ;;\nesac\nexec {} \"$@\"\n",
+                crate::session::environment::shell_escape(&agent),
+                crate::session::environment::shell_escape(&real_tmux.to_string_lossy()),
             ),
-        )
-        .unwrap();
+        ).unwrap();
         std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let path = format!(
-            "{}:{}",
-            temp.path().display(),
-            std::env::var("PATH").unwrap_or_default()
-        );
-        let _guard = crate::session::test_support::EnvGuard::set(&[("PATH", path)]);
+        let path = crate::session::test_support::path_prepended(temp.path());
 
         inst.kill_all_tmux_sessions_locked()
             .expect_err("the refused agent kill is reported to the caller");
+        let remaining = crate::tmux::tmux_query_command()
+            .args(["has-session", "-t", &format!("={terminal}")])
+            .output()
+            .unwrap();
         assert!(
-            reaped.exists(),
-            "the ancillary session must be reaped even when the agent kill fails"
+            !remaining.status.success(),
+            "the ancillary tmux session survived"
         );
+        drop(path);
     }
 
     /// A takeover relaunch can replace the row's pane while its old poller keeps the same agent and

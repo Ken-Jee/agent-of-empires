@@ -30,30 +30,16 @@
 //! cargo test --test e2e -- fork_structured
 //! ```
 
-use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use serial_test::parallel;
 
-use crate::harness::{
-    app_dir_in, pick_free_port, require_node, require_tmux, wait_for_port, TuiTestHarness,
-};
-
-fn sessions_path(h: &TuiTestHarness) -> PathBuf {
-    app_dir_in(h.home_path()).join("profiles/default/sessions.json")
-}
-
-fn read_sessions(h: &TuiTestHarness) -> serde_json::Value {
-    let path = sessions_path(h);
-    let content = std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("failed to read {}: {}", path.display(), e));
-    serde_json::from_str(&content).expect("invalid sessions JSON")
-}
+use crate::harness::{pick_free_port, require_node, require_tmux, wait_for_port, TuiTestHarness};
 
 /// The `acp_session_id` of the session titled `title`, if it is present and
 /// non-empty on disk right now.
 fn acp_id_by_title(h: &TuiTestHarness, title: &str) -> Option<String> {
-    read_sessions(h)
+    h.read_sessions()
         .as_array()?
         .iter()
         .find(|s| s["title"].as_str() == Some(title))
@@ -87,7 +73,7 @@ fn wait_for_acp_id(h: &TuiTestHarness, title: &str, timeout: Duration) -> String
             panic!(
                 "session '{title}' never captured an acp_session_id within {timeout:?}.\n\
                  sessions.json: {}\n ps --acp: {}",
-                read_sessions(h),
+                h.read_sessions(),
                 String::from_utf8_lossy(&ps.stdout),
             );
         }
@@ -97,7 +83,7 @@ fn wait_for_acp_id(h: &TuiTestHarness, title: &str, timeout: Duration) -> String
 
 /// Read the raw session object titled `title`, if present.
 fn session_by_title(h: &TuiTestHarness, title: &str) -> Option<serde_json::Value> {
-    read_sessions(h)
+    h.read_sessions()
         .as_array()?
         .iter()
         .find(|s| s["title"].as_str() == Some(title))
@@ -293,7 +279,7 @@ fn structured_fork_mints_distinct_child_id_and_preserves_parent() {
 
     // 3. The fork's one-shot fork_pending marker is consumed once the child id
     //    lands, so a reattach resumes the child rather than re-forking.
-    let sessions = read_sessions(&h);
+    let sessions = h.read_sessions();
     let child = sessions
         .as_array()
         .and_then(|arr| {
@@ -419,7 +405,7 @@ fn structured_fork_failure_clears_fork_pending_and_fails_cleanly() {
             panic!(
                 "FailChild.fork_pending never cleared after a failed session/fork (retry-loop \
                  regression). sessions.json: {}",
-                read_sessions(&h)
+                h.read_sessions()
             );
         }
         std::thread::sleep(Duration::from_millis(250));

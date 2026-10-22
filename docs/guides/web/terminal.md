@@ -52,7 +52,9 @@ When the browser fails to reach a working terminal, the disconnect banner shows 
 
 ## Read-only mode
 
-When the server runs with `aoe serve --read-only`, the terminal renders the live stream but drops keystrokes: you can watch sessions but not type into them. The session-row Delete and triage actions are hidden too.
+With `aoe serve --read-only`, existing agent and paired terminals keep streaming output. The dashboard does not create or restart panes, claim ownership, renew ownership heartbeats, resize panes, or send keyboard, paste, or mouse input. Delete and triage actions are hidden too.
+
+Compose drafts remain editable, but Send is disabled. Unsent input and unfinished clipboard gestures do not replay when writing becomes available again. An upload or terminal creation accepted before the policy changed remains accepted.
 
 ## On mobile
 

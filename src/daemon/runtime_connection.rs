@@ -17,7 +17,7 @@ use crate::acp::client::DaemonEndpoint;
 pub enum RuntimeConnectionError {
     #[error(transparent)]
     WebSocket(#[from] WsError),
-    #[error("daemon runtime protocol is incompatible")]
+    #[error("daemon runtime protocol is incompatible; run `aoe serve --restart`")]
     Protocol,
     #[error("daemon runtime identity does not match the selected endpoint")]
     Identity,
@@ -40,6 +40,7 @@ pub struct RuntimeConnection {
 pub enum RuntimeEvent {
     Snapshot(Arc<RuntimeSnapshot>),
     Progress(Vec<CreationProgress>),
+    OwnerDiagnostics(Vec<super::OwnerLoadDiagnostic>),
 }
 
 impl RuntimeConnection {
@@ -69,11 +70,12 @@ impl RuntimeConnection {
             return Err(RuntimeConnectionError::Identity);
         }
         let selected = requested_profile.unwrap_or(&snapshot.contents.default_profile);
-        if !snapshot
-            .contents
-            .profiles
-            .iter()
-            .any(|profile| profile.name == selected)
+        if snapshot.contents.health == super::RuntimeHealth::Healthy
+            && !snapshot
+                .contents
+                .profiles
+                .iter()
+                .any(|profile| profile.name == selected)
         {
             return Err(RuntimeConnectionError::ProfileUnavailable);
         }
@@ -156,7 +158,7 @@ impl RuntimeConnection {
         loop {
             match self.next_event().await? {
                 RuntimeEvent::Snapshot(snapshot) => return Ok(snapshot),
-                RuntimeEvent::Progress(_) => {}
+                RuntimeEvent::Progress(_) | RuntimeEvent::OwnerDiagnostics(_) => {}
             }
         }
     }
@@ -179,6 +181,13 @@ impl RuntimeConnection {
                 RuntimeFrame::Creation(progress) => {
                     self.creation_progress = progress;
                     return Ok(RuntimeEvent::Progress(self.creation_progress.clone()));
+                }
+                RuntimeFrame::OwnerDiagnostics { epoch, diagnostics } => {
+                    if !self.info.local_owner || epoch != self.info.epoch {
+                        return Err(RuntimeConnectionError::Protocol);
+                    }
+                    self.info.owner_diagnostics.clone_from(&diagnostics);
+                    return Ok(RuntimeEvent::OwnerDiagnostics(diagnostics));
                 }
                 RuntimeFrame::Hello(_) => return Err(RuntimeConnectionError::Protocol),
             }

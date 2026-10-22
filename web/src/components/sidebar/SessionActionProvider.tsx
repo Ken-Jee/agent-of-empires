@@ -7,6 +7,7 @@ import {
   type RuntimeCursor,
   type SessionMutation,
   type SessionReceipt,
+  type SessionSettingOutcome,
 } from "../../lib/api";
 import type { SessionResponse } from "../../lib/types";
 import { reportError } from "../../lib/toastBus";
@@ -84,12 +85,10 @@ export function SessionActionProvider({
     invalidated: boolean;
     finished: boolean;
   } | null>(null);
-  const valid = (target: SessionActionTarget) => {
+  const sameIdentity = (target: SessionActionTarget) => {
     const current = authority.current;
     return (
       alive.current &&
-      current.available &&
-      !current.readOnly &&
       target.epoch !== "" &&
       current.runtimeEpoch === target.epoch &&
       current.sessions.some(
@@ -97,13 +96,15 @@ export function SessionActionProvider({
       )
     );
   };
+  const canSubmit = (target: SessionActionTarget) =>
+    authority.current.available && !authority.current.readOnly && sameIdentity(target);
   useLayoutEffect(() => {
     authority.current = { sessions, runtimeEpoch, observedById, onSessionMutation, readOnly, available };
     for (const record of accepted.current) {
-      if (!record.targets.every(valid)) record.invalidated = true;
+      if (!record.targets.every(sameIdentity)) record.invalidated = true;
     }
     const attachment = attachWork.current;
-    if (attachment && !attachment.finished && !valid(attachment.target)) attachment.invalidated = true;
+    if (attachment && !attachment.finished && !sameIdentity(attachment.target)) attachment.invalidated = true;
     let removed = false;
     for (const [key, record] of pending.current) {
       if (!record.surrendered && record.receipts === null) {
@@ -148,7 +149,7 @@ export function SessionActionProvider({
   const owner: SessionActionsOwner = {
     openAttach: (session) => {
       const target = sessionActionTarget(session, authority.current.runtimeEpoch);
-      if (!valid(target)) return reportError("That session changed or is unavailable. Please try again.");
+      if (!canSubmit(target)) return reportError("That session changed or is unavailable. Please try again.");
       attachWork.current = { target, invalidated: false, finished: false };
       setAttach({ target, title: session.title });
     },
@@ -157,7 +158,7 @@ export function SessionActionProvider({
       return (record ? record.value : server) as typeof server;
     },
     set: (kind, selected, next, server) => {
-      if (selected.length === 0 || !selected.every(valid)) {
+      if (selected.length === 0 || !selected.every(canSubmit)) {
         reportError("That session changed or is unavailable. No setting was submitted.");
         return;
       }
@@ -185,34 +186,43 @@ export function SessionActionProvider({
       const task = Promise.all(before)
         .then(async () => {
           const results = await Promise.all(
-            targets.map(async (target) => {
-              if (record.invalidated || !valid(target)) return null;
-              const mutation =
+            targets.map(async (target): Promise<SessionSettingOutcome> => {
+              if (record.invalidated || !sameIdentity(target)) return { outcome: "uncertain" };
+              if (authority.current.readOnly) return { outcome: "rejected" };
+              const result =
                 kind === "color"
                   ? await setSessionColor(target.id, next as SettingValues["color"], target.epoch)
                   : await setSessionNotifications(target.id, next as SettingValues["notifications"], target.epoch);
-              if (!mutation || record.invalidated || !valid(target)) return null;
-              authority.current.onSessionMutation(mutation);
-              return { id: target.id, cursor: mutation.cursor };
+              if (record.invalidated || !sameIdentity(target)) return { outcome: "uncertain" };
+              if (result.outcome === "committed") authority.current.onSessionMutation(result.mutation);
+              return result;
             }),
           );
           if (!alive.current || pending.current.get(key) !== record) return;
-          if (results.some((result) => result === null)) {
+          if (
+            results.every(
+              (result): result is Extract<SessionSettingOutcome, { outcome: "committed" }> =>
+                result.outcome === "committed",
+            )
+          ) {
+            record.receipts = results.map((result) => ({
+              id: result.mutation.session.id,
+              cursor: result.mutation.cursor,
+            }));
+          } else {
             pending.current.delete(key);
             reportError(
-              !record.invalidated && targets.every(valid)
-                ? `Could not change ${kind === "color" ? "the session color" : "notifications"}. Please try again.`
-                : "Session identity or runtime changed. The setting outcome is unconfirmed; queued work was not replayed.",
+              results.some((result) => result.outcome === "uncertain")
+                ? "The setting outcome is unconfirmed. Check canonical state before retrying."
+                : `Could not change ${kind === "color" ? "the session color" : "notifications"}. Please try again.`,
             );
-          } else {
-            record.receipts = results as SessionReceipt[];
           }
           changed();
         })
         .catch(() => {
           if (alive.current && pending.current.get(key) === record) {
             pending.current.delete(key);
-            reportError("Could not change the session setting. Please try again.");
+            reportError("The setting outcome is unconfirmed. Check canonical state before retrying.");
             changed();
           }
         });
@@ -236,13 +246,13 @@ export function SessionActionProvider({
             onSubmit={async (project, attachExistingBranch) => {
               const target = attach.target;
               const operation = attachWork.current;
-              if (!operation || operation.target !== target || operation.invalidated || !valid(target))
+              if (!operation || operation.target !== target || operation.invalidated || !canSubmit(target))
                 return { ok: false, message: "Session identity or runtime changed. Nothing was submitted." };
               const result = await attachSessionProject(target.id, project, {
                 attachExistingBranch,
                 epoch: target.epoch,
               });
-              if (operation.invalidated || !valid(target))
+              if (operation.invalidated || !sameIdentity(target))
                 return {
                   ok: false,
                   message: "Session identity or runtime changed. Attachment outcome is unconfirmed.",

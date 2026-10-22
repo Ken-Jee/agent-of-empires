@@ -93,15 +93,19 @@ pub use instance::{
     is_valid_session_color, AuxiliaryObservation, AuxiliaryTarget, ConversationBinding,
     ConversationProvenance, DetectionState, EnsureReadyError, EnsureReadyOutcome, ExecutionBinding,
     ExecutionLocation, Instance, LaunchSidOutcome, LegacyToolAdoption, LegacyToolIdentity,
-    LifecycleOperation, LifecycleReservation, LifecycleReservationError, PaneObservation,
-    PanePresence, PendingInitialTurn, PluginCreateIdempotency, PollerStart, SandboxInfo,
-    SessionBucket, SessionGone, StartBlocked, StartOutcome, Status, TerminalInfo, View,
-    WorkspaceInfo, WorkspaceRepo, WorktreeInfo, SESSION_COLORS, TMUX_SERVER_UNREACHABLE_ERROR,
-    TMUX_SESSION_GONE_ERROR,
+    LegacyToolObservation, LifecycleOperation, LifecycleReservation, LifecycleReservationError,
+    PaneObservation, PanePresence, PendingInitialTurn, PluginCreateIdempotency, PollerStart,
+    SandboxInfo, SessionBucket, SessionGone, StartBlocked, StartOutcome, Status, TerminalInfo,
+    TmuxServerIdentity, View, WorkspaceInfo, WorkspaceRepo, WorktreeInfo, SESSION_COLORS,
+    TMUX_SERVER_UNREACHABLE_ERROR, TMUX_SESSION_GONE_ERROR,
 };
 pub(crate) use instance::{
     ConversationState, LaunchReservation, ResumeAttemptPolicy, ResumeLaunchOptions,
     TerminalContextResume,
+};
+pub(crate) use instance::{
+    TerminalHandoffContext, TerminalHandoffIntent, TerminalHandoffKey, TerminalHandoffStage,
+    TerminalHandoffUnbornFence,
 };
 #[cfg(test)]
 pub(crate) use move_journal::{
@@ -113,6 +117,7 @@ pub(crate) use storage::observe_lock_contention_for_test;
 pub(crate) use storage::{
     duplicate_reports, reconcile_profile_duplicates, DuplicateIdReport, ProfileMovePlan,
 };
+pub(crate) use storage::{try_acquire_terminal_handoff_driver, TerminalHandoffDriver};
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -189,7 +194,8 @@ pub use scope::SessionScope;
 #[cfg(test)]
 pub(crate) use storage::migration_backups;
 pub(crate) use storage::{
-    acquire_open_storage_flock, acquire_session_title_lock, acquire_storage_flock,
+    acquire_migration_lifecycle_lock, acquire_open_storage_flock, acquire_recovery_identity_lock,
+    acquire_recovery_storage_flock, acquire_session_title_lock, acquire_storage_flock,
     acquire_storage_shared_flock, atomic_write, backup_before_migration, read_file_no_follow,
     replace_file_no_follow, resolve_symlink_chain, try_acquire_storage_flock, CaptureStorage,
     GroupMovePlan, LaunchConfig, LockedDataFile, NativeStoreUnavailable, ProfileMoveRejected,
@@ -205,6 +211,44 @@ use anyhow::{Context, Result};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+#[derive(Debug)]
+pub(crate) struct LoadSource(pub std::path::PathBuf);
+
+impl std::fmt::Display for LoadSource {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "Unable to load {}",
+            safe_load_label(&self.0.to_string_lossy())
+        )
+    }
+}
+
+pub(crate) fn safe_load_label(value: &str) -> String {
+    use std::fmt::Write as _;
+    let mut safe = String::with_capacity(value.len());
+    for character in value.chars() {
+        if character.is_control() {
+            let _ = write!(safe, "{}", character.escape_default());
+        } else {
+            safe.push(character);
+        }
+    }
+    safe
+}
+
+pub(crate) fn sanitized_load_failure(error: &anyhow::Error) -> String {
+    if matches!(
+        error.downcast_ref::<crate::daemon::RuntimeConnectionError>(),
+        Some(crate::daemon::RuntimeConnectionError::Protocol)
+    ) {
+        return "Daemon runtime protocol is incompatible. Run `aoe serve --restart`, then reconnect.".to_owned();
+    }
+    match error.downcast_ref::<LoadSource>() {
+        Some(source) => format!("Unable to load {}. Repair this file, then wait for a fresh runtime snapshot.", safe_load_label(&source.0.to_string_lossy())),
+        None => "Native metadata is unavailable. Last complete state retained. Check daemon diagnostics; no file has been reset.".to_owned(),
+    }
+}
 
 /// App dir name under the XDG config base (`$XDG_CONFIG_HOME`, default
 /// `~/.config`). Always used on Linux; used on macOS when the user opts into
@@ -794,6 +838,14 @@ impl ProfileCatalogueTransaction {
         })
     }
 
+    fn ensure_no_terminal_handoff(&self, profile: &str) -> Result<()> {
+        crate::migrations::ensure_schema_supported()?;
+        let storage = Storage::open_unwatched(profile)?;
+        anyhow::ensure!(storage.load_complete_with_groups()?.0.iter().all(|row|
+        row.terminal_handoff.is_none()),
+        "Profile '{}' has a pending terminal handoff; finish or explicitly recover it before renaming or deleting the profile", profile);
+        Ok(())
+    }
     pub(crate) fn create(&self, name: &str) -> Result<()> {
         validate_new_profile_name(name)?;
         let profiles = self.root.join("profiles");
@@ -827,6 +879,7 @@ impl ProfileCatalogueTransaction {
         } else {
             remaining[0].clone()
         };
+        self.ensure_no_terminal_handoff(name)?;
         purge_owners::ensure_profile_has_no_pending_purges(&self.root, name)?;
         let launches =
             crate::cli::serve::LaunchProfileUpdates::prepare(&self.lifecycle, name, &replacement)?;
@@ -849,6 +902,7 @@ impl ProfileCatalogueTransaction {
                 "Profile '{}' already exists",
                 new_name
             );
+            self.ensure_no_terminal_handoff(old_name)?;
             purge_owners::ensure_profile_has_no_pending_purges(&self.root, old_name)?;
             Config::load()?;
             let launches = crate::cli::serve::LaunchProfileUpdates::prepare(

@@ -652,6 +652,45 @@ selection. `drop_failed` removes the row only after a forced failure for the sam
 selection; it retains worktree files. Restore or a new lifecycle generation
 invalidates the failure marker.
 
+## Explicit structured worker stop
+
+`DELETE /api/sessions/:id/acp` is a durable user stop, not a daemon detach. It commits the native stopped/dormant generation before retiring the captured original worker and returns `204` only after retirement is proven. Generic `POST /api/sessions/:id/stop` uses the same structured-worker stop boundary.
+
+Admitted stop work survives HTTP cancellation; its committed native fence survives daemon reconstruction. Automatic reconciliation does not resume a committed stop. A later explicit spawn, start, restart, backend/provider switch or accepted prompt proves original retirement before consuming only its observed stop generation and token; a newer stop wins. A `no_revive` prompt cannot clear the stop.
+
+If a write commits but canonical publication fails, the stop remains durable and the response reports an unconfirmed outcome. Unproven retirement remains pending rather than reporting success. Daemon detach, idle shutdown and internal provider teardown do not independently create user-stop intent. Reversible stop preserves native transcript history.
+
+## DELETE /api/workspaces
+
+Permanently purge an explicit `session_ids` selection. Capture the IDs and trash consent when opening confirmation; do not rebuild the selection from a later list. Duplicate IDs are processed once. The server identifies the managed worktree owner and removes selected siblings before it.
+
+For a trash-only selection, send `expected_trash: true` and one original consent per selected ID:
+
+```json
+{
+  "session_ids": ["example-session"],
+  "expected_trash": true,
+  "trash_consents": {
+    "example-session": {
+      "expected_trashed_at": "2026-10-11T00:00:00Z",
+      "expected_trash_lifecycle_id": "11111111-1111-4111-8111-111111111111",
+      "expected_generation": 7
+    }
+  }
+}
+```
+
+Use values from the confirmed rows, not the illustrative values above. Consent keys must belong to `session_ids`; a trash-only request must cover every selected ID. Malformed UUIDs, extra keys or incomplete coverage return `400 invalid_trash_consent` before reservation or teardown. Restore, retrash or a changed generation invalidates that row's original consent.
+
+For mixed live/trash selections, omit `expected_trash` or set it to `false`, and include consent for each selected trashed row. A consent still makes that row trash-specific; it does not authorize deleting a restored row.
+
+Optional cleanup flags are `delete_worktree`, `delete_branch`, `delete_sandbox`, `force_delete` and `keep_scratch`, all defaulting to `false`. Worktree and branch cleanup apply to the selected owner; resources still referenced by unselected sessions remain protected. A dirty shared worktree returns `409 dirty_worktree` unless forced.
+
+A successful HTTP response reports `status` (`deleted`, `kept` or `partial`), `deleted` and `kept` ID arrays, `failed` entries containing `id` and `error`, and `messages`. Processing can stop at the first retained or failed row, leaving later IDs unprocessed and absent from these arrays. A response with no confirmed deletion and a failure returns `500 deletion_failed`; publication uncertainty can return `503`.
+
+Only IDs explicitly reported in `deleted` authorize removing local drafts, cached settings, selection or navigation state. Preserve `kept`, failed and omitted IDs. A 2xx response alone does not confirm the entire selection; a missing `deleted` array or transport failure requires reconciliation, not a replay of the old confirmation.
+
+
 ## Driving a session as a subagent
 
 Together, `send` and `output` are the minimum primitive needed to run

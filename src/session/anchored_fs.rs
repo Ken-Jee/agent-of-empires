@@ -118,6 +118,37 @@ impl ResolvedDataFile {
         self.parent.open_lock(&name)
     }
 
+    pub(crate) fn read_recovery_bytes(&self) -> Result<Option<Vec<u8>>> {
+        let fd = match openat(
+            &self.parent.fd,
+            self.leaf.as_os_str(),
+            OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW | OFlag::O_NONBLOCK,
+            Mode::empty(),
+        ) {
+            Ok(fd) => fd,
+            Err(Errno::ENOENT) => return Ok(None),
+            Err(error) => return Err(error).context("opening recovery evidence"),
+        };
+        let mut file = File::from(fd);
+        crate::process::validate_recovery_file(&file)?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        Ok(Some(bytes))
+    }
+
+    pub(crate) fn quarantine_recovery_bytes(&self, bytes: &[u8]) -> Result<PathBuf> {
+        use std::io::Write;
+        let mut name = self.leaf.clone();
+        name.push(format!(".quarantine-{}", uuid::Uuid::new_v4()));
+        let mut copy = self
+            .parent
+            .create_new_regular(Path::new(&name))?
+            .context("Recovery quarantine already exists")?;
+        copy.write_all(bytes)?;
+        copy.sync_all()?;
+        self.parent.sync()?;
+        Ok(self.parent.root.join(name))
+    }
     pub(crate) fn read(&self) -> Result<Option<String>> {
         let fd = match openat(
             &self.parent.fd,

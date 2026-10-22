@@ -1,31 +1,12 @@
 # Tool Sessions
 
-Tool sessions let you keep dev tools like `lazygit`, `yazi`, `tig`, or
-`gitui` running alongside each agent session, scoped to that session's
-working directory. By default each tool runs in its own persistent tmux
-session, so re-attaching is instant and state (cursor position, staged
-hunks, browsed path) survives across detaches.
+Tool sessions keep tools such as `lazygit`, `yazi`, `tig` and `gitui` running beside an agent session in its working directory. Each persistent tool has its own tmux session, preserving state across detaches.
 
-Press a hotkey to preview the tool in the home view. `Enter` follows your
-default attach mode, including [live mode](live-mode.md); `Tab` opens a
-full tmux client. Leaving the preview does not stop the tool.
-
-A targeted stop durably records the original process births before removing
-the verified live tmux target. Retries settle only that original cohort.
-See [Lifecycle and cleanup](#lifecycle-and-cleanup) for ownership fences,
-interrupted-stop recovery, and fail-closed cases.
+A hotkey previews the tool. `Enter` uses the default attach mode, including [live mode](live-mode.md); `Tab` opens a full tmux client. Leaving the preview does not stop it. Targeted Stop retires only that tool's verified original process cohort; see [Lifecycle and cleanup](#lifecycle-and-cleanup).
 
 ## Configuring tools
 
-Tool sessions are defined in your global `config.toml` under
-`[tools.<name>]`. The path follows the usual config conventions:
-
-- **Linux**: `$XDG_CONFIG_HOME/agent-of-empires/config.toml`
-  (defaults to `~/.config/agent-of-empires/config.toml`)
-- **macOS / Windows**: `~/.agent-of-empires/config.toml`
-
-Each entry has a required `command`, an optional `hotkey`, and an
-optional `background` mode for fire-and-forget commands:
+Define tools in global `config.toml` under `[tools.<name>]`; see [File Locations](configuration.md#file-locations). Edit the file and reload from settings, or restart AoE. Tools are not editable in the settings TUI.
 
 ```toml
 [tools.lazygit]
@@ -37,8 +18,7 @@ command = "yazi"
 hotkey = "Alt+f"
 
 [tools.tig]
-command = "tig --all"
-# no hotkey, reachable from the picker and palette only
+command = "tig --all"     # no hotkey: picker and palette only
 
 [tools.github]
 command = "gh repo view --web"
@@ -46,74 +26,25 @@ hotkey = "Alt+o"
 background = true
 ```
 
-### Field reference
-
 | Field | Required | Description |
-| --- | --- | --- |
-| `command` | yes | Shell command to run. Persistent tools pass it to `tmux new-session`; background tools pass it to the user's shell. Pipes and `&&` work in both modes. |
-| `hotkey` | no | Hotkey binding in `Alt+<single-char>` format (case-insensitive on the modifier, normalized to lowercase on the letter). Examples: `"Alt+g"`, `"Alt+1"`, `"Alt+/"`. |
-| `background` | no | When `true`, run the command fire-and-forget in the selected session's working directory instead of opening a persistent tmux tool session. Defaults to `false`. |
+|---|---|---|
+| `command` | yes | Shell command. Persistent tools use `tmux new-session`, background tools use your shell; pipes and `&&` work in both. |
+| `hotkey` | no | `Alt+<single-char>`. Modifier matching is case-insensitive; ASCII letters become lowercase. Multi-character keys and other modifiers are rejected. |
+| `background` | no | Run fire-and-forget in the selected session's directory instead of creating a tmux session. Defaults to `false`. |
 
-Tool sessions are intentionally a config-file feature today; they are
-not editable from the settings TUI. Edit `config.toml` and reload from
-the settings dialog (or restart `aoe`) to pick up changes.
-
-### Hotkey rules
-
-Tool hotkeys are limited to `Alt+<single-char>`:
-
-- Modifier is case-insensitive: `Alt+g`, `ALT+g`, and `alt+g` all work.
-- ASCII letter is normalized to lowercase: `Alt+G` becomes `Alt+g`.
-  Non-ASCII characters are matched as-is (case-sensitive) and depend on
-  your terminal sending them with the Alt modifier; ASCII bindings are
-  recommended for portability.
-- Multi-character keys (`Alt+gg`, `Alt+F1`) are rejected.
-- Other modifiers (`Ctrl+g`, `Shift+g`) are not supported.
-
-If a hotkey fails to parse, AoE shows an info dialog on startup (and on
-settings reload) listing each invalid entry. The corresponding tool is
-still reachable from the picker and command palette; only the dead
-binding is dropped.
-
-If two tools claim the same hotkey, the alphabetically-first tool name
-wins. Tool hotkeys are checked before built-in home-screen keybindings,
-so they shadow any built-in binding using the same combination.
+Non-ASCII hotkeys are case-sensitive and depend on terminal Alt support; ASCII is more portable. Invalid bindings appear in a startup or reload dialog; the tool remains in the picker and palette. When bindings collide, the alphabetically-first tool name wins. Tool hotkeys precede built-in home bindings.
 
 ## Using tools
 
-Three ways to open or run a tool, in roughly the order you'll grow into them:
+Open a tool through its hotkey, the `;` picker (arrows or `j`/`k`, then `Enter`), or `Ctrl+K` **Open tool: <name>**. Background entries use **Run: <name>**. `;` or `Esc` closes the picker.
 
-1. **Hotkey**. Select an agent session, press the configured hotkey
-   (e.g. `Alt+g`). The daemon prepares its pane, then the home view shows
-   its output. Rendering alone never launches a tool. Pressing `Enter`
-   during preparation continues that same request instead of launching twice.
-2. **Picker**. Press `;` on the home view. A modal lists every
-   configured tool with its command and hotkey. Pick one with arrow
-   keys (or `j`/`k`) and `Enter`. `;` or `Esc` closes the picker.
-3. **Command palette**. Press `Ctrl+K`. Tool sessions appear as
-   "Open tool: \<name\>" entries you can fuzzy-search. Background
-   tools appear as "Run: \<name\>".
+The Daemon prepares exactly one pane for an open request; rendering never launches a tool. Pressing `Enter` during preparation continues that same request.
 
-Tools with `background = true` skip tool preview mode and do not create a
-tmux session. They run with stdin, stdout, and stderr detached; redirect
-output in the command if you need a log. Non-zero exits are written to
-the debug log, not shown as an interactive dialog.
+Background tools skip preview and tmux. Their standard streams are detached; redirect output if needed. Non-zero exits go to the debug log, not an interactive dialog.
 
-Once you're in tool preview mode:
+In preview, `Enter` uses the default attach mode and `Tab` opens full-screen tmux. The hotkey toggles preview; `Esc`, `;` or `t` returns to structured view. `x` opens Stop for the visible tool, not its agent; press `x` again to confirm or `Esc` to cancel. Strict hotkeys use `X`. Terminal preview uses the same gesture.
 
-- `Enter` uses your default attach mode; `Tab` attaches full-screen.
-- The hotkey **toggles** preview off and back to the structured view.
-- `Esc`, `;`, or `t` returns to the structured view.
-- `x` opens the Stop confirmation for the visible tool, not its agent.
-  Press `x` again to confirm or `Esc` to cancel. Strict hotkeys use `X`.
-  Terminal preview uses the same Stop gesture.
-
-Once you're attached:
-
-- The tool's own keybindings apply (it owns the screen).
-- To detach: use the tool's quit/detach behavior. Most quit on `q`. For
-  long-running tools, detach the underlying tmux session
-  (`Ctrl+B d` by default) to keep state across reattaches.
+Once attached, the tool owns the screen. Use its quit behavior, or detach tmux with `Ctrl+B d` to preserve the tool for next time.
 
 ## Lifecycle and cleanup
 
@@ -151,19 +82,9 @@ command acknowledgement and apply its matching runtime snapshot.
 
 If a TUI runtime change loses its acknowledgement, its session stays blocked because the outcome is unknown. Check the current daemon state before choosing **Unlock**; resolution does not replay the lost change. **Keep Blocked** leaves the quarantine intact. Reopen the prompt with `Ctrl+K`, then **Resolve unknown runtime change**, even if the session has disappeared from the list. A failed resolution remains blocked until a healthy, current daemon snapshot has been applied.
 
-New tool panes record their full session ID and raw configured tool name in
-tmux. Older unmarked panes are never adopted by name alone. The TUI offers an
-ownership confirmation before attaching, entering live-send mode, sending,
-or stopping one. It identifies the full row ID, profile, lifecycle generation,
-and exact tmux session and pane IDs. Confirm only if that pane belongs to that
-tool and row. Stop confirms adoption and then stops only that tool.
+New tool panes record the full session ID and raw configured tool key. Older unmarked panes require explicit ownership consent before attach, live-send, send or Stop; name alone never proves ownership. The TUI shows the selected tool, row title, full row ID, profile, lifecycle generation, and exact tmux session and pane IDs, with the original pane leader PID when available. The request also carries the configured socket and original server PID and process birth. Confirm only if that exact target belongs to that row and tool. Stop adopts it before stopping only that tool.
 
-The daemon stamps ownership only while that exact pane is still unmarked.
-Changing owners, replacing or respawning the pane, or changing its name while
-the confirmation is open makes the request fail visibly without affecting a
-replacement or agent pane. Invalid owners and ambiguous names across profiles
-or configured raw tool names are refused, not overwritten. Session retitles
-alone do not transfer ownership to another tool.
+The Daemon revalidates the captured server, session and pane identity and stamps only the same still-unmarked pane. Changed ownership, a replaced server or tmux target, or a respawned pane makes consent fail without affecting a replacement or agent. Ambiguous rows across profiles or raw tool keys are refused. The row title is context, not ownership authority; retitling alone never transfers a tool. A dead pane may lack its leader PID, but still requires the captured configured socket and live original server PID/birth proof.
 
 Targeted tool Stop retains the title and lifecycle flocks and atomically advances
 the row's durable generation, invalidating older continuations without installing
@@ -198,91 +119,22 @@ or attach; use Stop to finish its recorded cleanup without adopting any current
 replacement. A missing, unreadable, unsupported, or malformed journal is an
 error, not an empty inventory.
 
-A dead tmux 3.8 pane without a prior authorized retirement may no longer expose
-its original PID. That case remains fail-closed. Older tmux-only pending stop
-receipts are retained and refused, never discarded or replaced by a newly
-captured cohort.
+A dead pane without a leader PID can be removed only with its captured server/socket proof and unchanged owner and immutable tmux target. Missing or unprovable original server evidence stays fail-closed. Older tmux-only pending stop receipts remain retained and refused; they are never discarded or replaced by a new process cohort.
 
 
-Tool sessions are automatically killed when their parent agent session
-is removed (`aoe remove <id>`, "Remove session" in the TUI, or delete
-in the web dashboard). Cleanup sweeps all of the agent's tool sessions
-even if you renamed or deleted the `[tools.*]` entry, so nothing is left
-orphaned.
+Removing a parent session attempts cleanup of every owned tool, including renamed or deleted `[tools.*]` entries. Unsettled original debt remains a cleanup fence, not proof that an absent pane is complete.
 
-Background tools are not tmux sessions and are not managed by this
-cleanup path. Use them for short launch commands; if a command starts a
-daemon, its lifecycle is up to that command.
+Background tools are not tmux sessions and use no managed cleanup path. If a command starts a daemon, that command owns its lifecycle.
 
 ## Where the tool runs
 
-Tools always run on the **host**, in the working directory of the agent
-session. For a sandboxed (Docker) agent session, the tool does not run
-inside the container; it runs on the host against the worktree path
-that the container has mounted. For most tools (lazygit, yazi, tig,
-gitui) that is the right default: they read files via the same
-worktree path the container sees, so file state stays consistent, and
-host launches avoid `docker exec` overhead on every attach.
-
-If your dev environment lives entirely inside the container (your
-`$PATH`, `git config`, or tool binaries differ host vs. container),
-keep that in mind: tool sessions reflect the host environment. A
-config-only workaround is to define the tool's `command` as a
-`docker exec` wrapper that runs the binary inside the container, e.g.
-`command = "docker exec -it my-container lazygit"`.
-
-## Examples
-
-### lazygit per worktree
+Tools run on the **host** in the agent session's working directory, including for sandboxed agents. They share the mounted worktree's files, not the container's `$PATH`, git config or installed binaries. If a tool must run inside a container, wrap it explicitly:
 
 ```toml
 [tools.lazygit]
-command = "lazygit"
-hotkey = "Alt+g"
+command = "docker exec -it my-container lazygit"
 ```
 
-Now `Alt+g` on any agent session previews lazygit running against that
-session's worktree; pressing `Alt+g` a second time toggles back to the
-structured view. Each worktree has its own staged hunks.
-
-### File browser with a custom config
-
-```toml
-[tools.yazi]
-command = "yazi --config-dir ~/.config/yazi"
-hotkey = "Alt+f"
-```
-
-### Composite commands
-
-The `command` is shelled out, so multi-step launches work:
-
-```toml
-[tools.dbshell]
-command = "psql $DATABASE_URL || sleep 5"
-hotkey = "Alt+d"
-```
-
-### Hotkey-less tool
-
-```toml
-[tools.bench]
-command = "btm"
-# Reachable via `;` or `Ctrl+K`. No global hotkey.
-```
-
-### Background launcher
-
-```toml
-[tools.github]
-command = "gh repo view --web"
-hotkey = "Alt+o"
-background = true
-```
-
-Now `Alt+o`, the picker, or the `Run: github` command palette entry opens
-the selected session's repository in the browser without switching to a
-tool preview.
 
 ## tmux session naming
 

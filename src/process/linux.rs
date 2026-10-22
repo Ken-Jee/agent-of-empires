@@ -1,4 +1,4 @@
-//! Linux-specific process utilities
+//! Linux-specific process utilities.
 
 pub(crate) const HAS_CODEX_MANAGED_PREFERENCES: bool = false;
 use anyhow::Context as _;
@@ -11,6 +11,148 @@ pub(super) use super::unix::{
     close_frozen_payload, configure_process_group, exec_command, kill_process_group,
     restore_environment_value, terminate_process_group, try_wait_status_hook,
 };
+pub(super) fn legacy_scope_inventory_clear(
+    prefix: &str,
+    known: &[crate::process::worker_registry::ScopeOwnership],
+) -> anyhow::Result<bool> {
+    use crate::process::worker_registry::ScopeOwnership;
+    use std::collections::HashSet;
+    use std::time::Duration;
+    let retained: HashSet<&str> = known
+        .iter()
+        .filter_map(|scope| match scope {
+            ScopeOwnership::Owned { unit } => Some(unit.as_str()),
+            _ => None,
+        })
+        .collect();
+    let current_namespace = fs::read_link("/proc/self/ns/cgroup")
+        .context("Reading /proc/self/ns/cgroup for complete scope inventory")?;
+    let init_namespace = fs::read_link("/proc/1/ns/cgroup")
+        .context("Reading /proc/1/ns/cgroup for complete scope inventory")?;
+    anyhow::ensure!(
+        current_namespace == init_namespace,
+        "Cannot prove full cgroup inventory in a nested cgroup namespace"
+    );
+    let mountinfo = fs::read_to_string("/proc/self/mountinfo")?;
+    anyhow::ensure!(
+        mountinfo.lines().any(|line| {
+            let Some((mount, filesystem)) = line.split_once(" - ") else {
+                return false;
+            };
+            mount.split_whitespace().nth(4) == Some("/sys/fs/cgroup")
+                && filesystem.split_whitespace().next() == Some("cgroup2")
+        }),
+        "A complete unified cgroup hierarchy is unavailable"
+    );
+    let mut command = Command::new(which::which("systemctl")?);
+    command.args([
+        "--user",
+        "list-units",
+        "--all",
+        "--plain",
+        "--no-legend",
+        "--no-pager",
+        "--full",
+        &format!("{prefix}*.scope"),
+    ]);
+    command.env("LC_ALL", "C").env("SYSTEMD_COLORS", "0");
+    let output = super::run_with_timeout(&mut command, Duration::from_secs(3))?
+        .context("Legacy scope inventory timed out")?;
+    anyhow::ensure!(
+        output.status.success(),
+        "Legacy scope inventory rejected: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let mut listed = HashSet::new();
+    for line in std::str::from_utf8(&output.stdout)?.lines() {
+        let mut fields = line.split_whitespace();
+        let unit = fields.next().context("Missing legacy scope unit")?;
+        fields.next().context("Missing legacy scope load state")?;
+        let active = fields.next().context("Missing legacy scope active state")?;
+        fields.next().context("Missing legacy scope substate")?;
+        anyhow::ensure!(
+            unit.starts_with(prefix) && unit.ends_with(".scope") && listed.insert(unit),
+            "Invalid or duplicate legacy scope inventory unit"
+        );
+        if !retained.contains(unit) {
+            // Inventory can prove absence, not transfer kill authority.
+            if !matches!(active, "inactive" | "failed") {
+                return Ok(false);
+            }
+            let mut show = Command::new(which::which("systemctl")?);
+            show.args([
+                "--user",
+                "show",
+                "--property=LoadState",
+                "--property=ActiveState",
+                "--property=ControlGroup",
+                unit,
+            ]);
+            let show = super::run_with_timeout(&mut show, Duration::from_secs(3))?
+                .context("Legacy scope status timed out")?;
+            anyhow::ensure!(show.status.success(), "Legacy scope status rejected");
+            let mut properties = std::collections::HashMap::new();
+            for line in std::str::from_utf8(&show.stdout)?.lines() {
+                let (key, value) = line
+                    .split_once('=')
+                    .context("Malformed legacy scope property")?;
+                anyhow::ensure!(
+                    properties.insert(key, value).is_none(),
+                    "Duplicate legacy scope property"
+                );
+            }
+            anyhow::ensure!(
+                properties.contains_key("LoadState"),
+                "Missing legacy scope load state"
+            );
+            if !properties
+                .get("ActiveState")
+                .is_some_and(|state| matches!(*state, "inactive" | "failed"))
+                || properties.get("ControlGroup") != Some(&"")
+            {
+                return Ok(false);
+            }
+        }
+    }
+    let mut pending = vec![std::path::PathBuf::from("/sys/fs/cgroup")];
+    while let Some(path) = pending.pop() {
+        for entry in fs::read_dir(&path)? {
+            let entry = entry?;
+            let kind = entry.file_type()?;
+            anyhow::ensure!(!kind.is_symlink(), "Cgroup inventory contains a link");
+            if !kind.is_dir() {
+                continue;
+            }
+            let child = entry.path();
+            let name = entry.file_name();
+            let name = name.to_str().context("Non-UTF8 cgroup name")?;
+            if name.starts_with(prefix) && name.ends_with(".scope") && !retained.contains(name) {
+                let events = fs::read_to_string(child.join("cgroup.events"))?;
+                let mut populated = None;
+                for line in events.lines() {
+                    let mut fields = line.split_whitespace();
+                    if fields.next() == Some("populated") {
+                        let value = fields.next().context("Missing cgroup population")?;
+                        anyhow::ensure!(
+                            populated.is_none()
+                                && fields.next().is_none()
+                                && matches!(value, "0" | "1"),
+                            "Invalid cgroup population"
+                        );
+                        populated = Some(value == "1");
+                    }
+                }
+                match populated {
+                    Some(false) => {}
+                    Some(true) => return Ok(false),
+                    None => anyhow::bail!("Cgroup population unavailable"),
+                }
+            }
+            pending.push(child);
+        }
+    }
+    Ok(true)
+}
 pub(super) fn open_read_nonblocking(path: &std::path::Path) -> std::io::Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
 
@@ -85,9 +227,6 @@ pub(crate) fn unix_peer_uid(stream: &tokio::net::UnixStream) -> std::io::Result<
     Ok(stream.peer_cred()?.uid())
 }
 
-/// Collect `pid` and every descendant by walking `/proc` once to build a
-/// parent -> children map, then descending it. One `/proc` scan regardless of
-/// tree depth.
 pub(super) fn collect_pid_tree(pid: u32) -> Vec<u32> {
     let children_map = build_children_map();
     let mut pids = vec![pid];
@@ -95,7 +234,6 @@ pub(super) fn collect_pid_tree(pid: u32) -> Vec<u32> {
     pids
 }
 
-/// Scan `/proc` once and group every live PID by its parent.
 pub(super) fn build_children_map() -> HashMap<u32, Vec<u32>> {
     let mut children_map: HashMap<u32, Vec<u32>> = HashMap::new();
     let proc_dir = Path::new("/proc");
@@ -663,9 +801,6 @@ fn kib_to_bytes(kib: u64) -> u64 {
     kib.saturating_mul(1024)
 }
 
-/// Parse a `/proc/meminfo` line like `MemAvailable:   12345 kB` into its kB
-/// value. All meminfo size fields are in kB. Returns `None` if the key is
-/// absent or the value is not a number.
 fn parse_meminfo_field(meminfo: &str, key: &str) -> Option<u64> {
     for line in meminfo.lines() {
         let Some((name, rest)) = line.split_once(':') else {
@@ -674,15 +809,12 @@ fn parse_meminfo_field(meminfo: &str, key: &str) -> Option<u64> {
         if name.trim() != key {
             continue;
         }
-        // `rest` is like "   12345 kB"; the first whitespace token is the value.
         return rest.split_whitespace().next()?.parse().ok();
     }
     None
 }
 
-/// Parse the `some avg10` stall percentage from a `/proc/pressure/*` file. The
-/// `some` line looks like `some avg10=0.00 avg60=0.00 avg300=0.00 total=12345`.
-/// `None` if absent (e.g. PSI not compiled into the kernel), never a false 0.0.
+/// `None` when PSI is unavailable, never a false 0.0.
 fn parse_psi_some_avg10(psi: &str) -> Option<f32> {
     for line in psi.lines() {
         let mut fields = line.split_whitespace();
@@ -703,10 +835,7 @@ pub(super) fn boot_id() -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-/// Get the foreground process group leader for a shell PID
-/// Walks the process tree to find the actual foreground process
 pub fn get_foreground_pid(shell_pid: u32) -> Option<u32> {
-    // Read the shell's stat to get its controlling terminal
     let stat_path = format!("/proc/{}/stat", shell_pid);
     let stat_content = fs::read_to_string(&stat_path).ok()?;
 
@@ -718,12 +847,9 @@ pub fn get_foreground_pid(shell_pid: u32) -> Option<u32> {
         return Some(shell_pid);
     }
 
-    // Find a process in the foreground process group
-    // The tpgid is a process group ID, we need to find a process in that group
     find_process_in_group(tpgid as u32).or(Some(shell_pid))
 }
 
-/// Find a process that belongs to the given process group
 fn find_process_in_group(pgrp: u32) -> Option<u32> {
     let proc_dir = Path::new("/proc");
     if !proc_dir.exists() {
@@ -807,9 +933,8 @@ pub(super) fn parent_and_argv0(pid: u32) -> Option<(u32, String)> {
     Some((ppid, String::from_utf8_lossy(argv0).into_owned()))
 }
 
-/// Parse a field from `/proc/[pid]/stat`; `comm` (field 2) may contain spaces.
+/// `comm` (field 2) may contain spaces.
 fn parse_stat_field(content: &str, field_idx: usize) -> Option<i64> {
-    // Find the closing paren of comm field, then parse from there
     let close_paren = content.rfind(')')?;
     let after_comm = &content[close_paren + 2..]; // Skip ") "
 
@@ -1095,7 +1220,6 @@ mod tests {
 
     #[test]
     fn test_parse_stat_field() {
-        // Example stat line (simplified)
         let stat = "1234 (bash) S 1233 1234 1234 34816 1234 4194304 1234 0 0 0";
         // Fields: pid(0) comm(1) state(2) ppid(3) pgrp(4) session(5) tty(6) tpgid(7) ...
 
@@ -1118,7 +1242,6 @@ Cached:          5678901 kB
             ("MemAvailable", Some(9876543)),
             ("MemFree", Some(1234567)),
             ("Nonexistent", None),
-            // Substring of a real key must not match (split on ':' + trim).
             ("Mem", None),
         ];
         for (key, expected) in cases {
@@ -1133,9 +1256,7 @@ some avg10=1.23 avg60=4.56 avg300=7.89 total=123456789
 full avg10=0.10 avg60=0.20 avg300=0.30 total=42
 ";
         assert_eq!(parse_psi_some_avg10(psi), Some(1.23));
-        // PSI not compiled in / empty file -> None (not a false 0.0).
         assert_eq!(parse_psi_some_avg10(""), None);
-        // Only a `full` line, no `some` -> None.
         assert_eq!(parse_psi_some_avg10("full avg10=5.0 total=9"), None);
     }
 }
@@ -1160,6 +1281,7 @@ pub(crate) mod runtime_io {
     pub(crate) const DIRECTORY: u32 = libc::S_IFDIR;
     pub(crate) const SOCKET: u32 = libc::S_IFSOCK;
     pub(crate) const KIND_MASK: u32 = libc::S_IFMT;
+    #[cfg(test)]
     pub(crate) const STICKY: u32 = libc::S_ISVTX;
     pub(crate) enum DirectoryOpenFailure {
         Symlink,
@@ -1183,6 +1305,7 @@ pub(crate) mod runtime_io {
     pub(crate) struct Stat {
         pub st_mode: u32,
         pub st_uid: u32,
+        pub st_gid: u32,
         pub st_dev: u64,
         pub st_ino: u64,
         pub st_nlink: libc::nlink_t,
@@ -1191,6 +1314,7 @@ pub(crate) mod runtime_io {
         Stat {
             st_mode: stat.st_mode,
             st_uid: stat.st_uid,
+            st_gid: stat.st_gid,
             st_dev: stat.st_dev,
             st_ino: stat.st_ino,
             st_nlink: stat.st_nlink,

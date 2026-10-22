@@ -51,7 +51,8 @@ pub fn is_recovery_candidate(inst: &Instance) -> bool {
         .agent_session_id
         .as_deref()
         .is_some_and(super::is_valid_session_id);
-    !inst.is_structured()
+    inst.terminal_handoff.is_none()
+        && !inst.is_structured()
         && !inst.is_archived()
         && !inst.is_snoozed()
         && !inst.is_trashed()

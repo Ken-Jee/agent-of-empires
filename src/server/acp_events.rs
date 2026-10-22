@@ -858,7 +858,11 @@ pub(super) fn apply_acp_session_change(
     session_id: &str,
     change: Option<&AcpSessionChange>,
 ) -> Option<String> {
-    if !inst.is_structured() {
+    if !inst.is_structured()
+        || inst.terminal_handoff.as_ref().is_some_and(|intent| {
+            intent.stage != crate::session::TerminalHandoffStage::RetirementPending
+        })
+    {
         return None;
     }
     match change? {

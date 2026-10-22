@@ -354,10 +354,7 @@ fn restart_selected_session_debounces_via_cooldown_map() {
 
 #[test]
 #[serial]
-fn restart_tool_swap_refuses_a_foreign_pending_fork() {
-    if crate::tmux::tmux_command().arg("-V").output().is_err() {
-        return;
-    }
+fn restart_refusal_preserves_pending_fork_without_local_launch() {
     let temp = TempDir::new().unwrap();
     let _guard = setup_test_home(&temp);
     crate::session::config::update_app_state(|state| state.has_acknowledged_agent_hooks = true)
@@ -394,14 +391,17 @@ fn restart_tool_swap_refuses_a_foreign_pending_fork() {
         transcript_path: None,
     });
     let id = inst.id.clone();
-    let name = crate::tmux::Session::generate_name(&id, &inst.title);
+    let _pane = crate::tmux::test_helpers::TmuxTestSession::from_name(
+        crate::tmux::Session::generate_name(&id, &inst.title),
+    );
     storage
         .update(|instances, _| {
             *instances = vec![inst.clone()];
             Ok(())
         })
         .unwrap();
-    let mut view = HomeView::new(
+    let before = std::fs::read(storage.sessions_path()).unwrap();
+    let mut view = HomeView::new_for_test(
         Some(profile.into()),
         AvailableTools::with_tools(&["claude", "codex"]),
         crate::file_watch::FileWatchService::noop(),
@@ -412,19 +412,12 @@ fn restart_tool_swap_refuses_a_foreign_pending_fork() {
     view.selected_session = Some(id.clone());
     view.restart_selected_session(None, Some("codex"), None, None)
         .unwrap();
-    let mut applied = false;
-    for _ in 0..120 {
-        let _ = respond(Err("restart refused before launch".to_string()));
-        if view.apply_restart_results() {
-            applied = true;
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
-    let _ = crate::tmux::tmux_command()
-        .args(["kill-session", "-t", &name])
-        .output();
-    assert!(applied, "restart worker did not complete");
+    respond(Err("restart refused before launch".to_string()))
+        .expect("the restart reached the authoritative runtime lane");
+    assert!(view.apply_restart_results());
+    assert!(!view.restart_in_flight.contains(&id));
+    assert!(view.info_dialog.is_some(), "the refusal remains visible");
+    assert_eq!(std::fs::read(storage.sessions_path()).unwrap(), before);
     assert!(
         !launched.exists(),
         "a pending fork was dispatched as a fresh foreign session"

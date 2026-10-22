@@ -2,11 +2,11 @@ use anyhow::{Context, Result};
 use std::path::Path;
 
 pub fn run() -> Result<()> {
+    super::recovery::reconcile_repaired_components()
+}
+
+pub(super) fn reconcile_sidebar_settings() -> Result<()> {
     let app = crate::session::get_app_dir()?;
-    super::v038_prime_native_runtime::run()?;
-    super::v039_prime_control_path::run()?;
-    super::v040_worker_ownership::run()?;
-    super::v045_runner_scope_ownership::run()?;
     migrate_config_file(&app.join("config.toml"))?;
     let profiles = app.join("profiles");
     if profiles.exists() {
@@ -56,7 +56,7 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
-    async fn quarantined_components_keep_bytes_and_explicit_migrate_retries_missing_scope_retyping(
+    async fn quarantined_components_keep_bytes_and_named_retyping_retries_repaired_fields(
     ) -> Result<()> {
         use crate::process::worker_registry::{self, ScopeOwnership, WorkerRecord};
         let home = tempfile::tempdir()?;
@@ -139,7 +139,7 @@ mod tests {
         ] {
             assert!(worker_registry::admit_resume("deferred", authority, &None).is_err());
         }
-        crate::migrations::run_migrations_announced(None)?;
+        crate::migrations::recovery::reconcile_repaired_components()?;
         let worker = worker_registry::load_strict("deferred")?.unwrap();
         assert_eq!(worker.scope, ScopeOwnership::Unresolved);
         assert!(worker.runner_identity.is_none());
@@ -151,7 +151,7 @@ mod tests {
             .iter()
             .any(|(_, path)| std::fs::read(path).is_ok_and(|bytes| bytes == repaired_worker)));
         let bytes = std::fs::read(&worker_path)?;
-        crate::migrations::run_migrations_announced(None)?;
+        crate::migrations::recovery::reconcile_repaired_components()?;
         assert_eq!(std::fs::read(worker_path)?, bytes);
         Ok(())
     }
@@ -320,12 +320,22 @@ mod tests {
             assert!(!crate::session::migration_backups(&config)?.is_empty());
             let journal = app.join(crate::session::purge_owners::FILE_NAME);
             assert_eq!(journal.exists(), version < 41);
+            let journal_before = if journal.exists() {
+                Some(std::fs::read(&journal)?)
+            } else {
+                None
+            };
             let paths = [&sessions, &record_path, &native_path, &proof, &config];
             let bytes = paths
                 .iter()
                 .map(std::fs::read)
                 .collect::<std::io::Result<Vec<_>>>()?;
-            crate::migrations::run_migrations_announced(None)?;
+            crate::migrations::recovery::reconcile_repaired_components()?;
+            if journal_before.is_some() {
+                crate::migrations::run_migrations_announced(None)?;
+            } else {
+                assert!(crate::migrations::run_migrations_announced(None).is_err());
+            }
             for (path, expected) in paths.into_iter().zip(bytes) {
                 assert_eq!(
                     std::fs::read(path)?,
@@ -334,6 +344,9 @@ mod tests {
                 );
             }
             assert_eq!(journal.exists(), version < 41);
+            if let Some(before) = journal_before {
+                assert_eq!(std::fs::read(journal)?, before);
+            }
         }
         Ok(())
     }

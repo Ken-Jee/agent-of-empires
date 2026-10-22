@@ -7,10 +7,11 @@ pub(crate) mod lifecycle;
 mod runtime;
 mod runtime_connection;
 pub use runtime::{
-    CreationPhase, CreationProgress, MutationReceipt, ProfileMutation, ProfileSnapshot,
-    ProjectMutation, ProjectResponse, ProjectTarget, ReloadFailureCode, RuntimeCapabilities,
-    RuntimeContents, RuntimeCursor, RuntimeFrame, RuntimeHealth, RuntimeInfo, RuntimeSnapshot,
-    SessionMutation, RUNTIME_EPOCH_HEADER, RUNTIME_PROTOCOL_VERSION, RUNTIME_REVISION_HEADER,
+    CreationPhase, CreationProgress, MutationReceipt, OwnerLoadDiagnostic, ProfileMutation,
+    ProfileSnapshot, ProjectMutation, ProjectResponse, ProjectTarget, ReloadFailureCode,
+    RuntimeCapabilities, RuntimeContents, RuntimeCursor, RuntimeFrame, RuntimeHealth, RuntimeInfo,
+    RuntimeSnapshot, SessionMutation, RUNTIME_EPOCH_HEADER, RUNTIME_PROTOCOL_VERSION,
+    RUNTIME_REVISION_HEADER,
 };
 pub(crate) use runtime::{NamespaceMutation, NamespaceOutcome};
 pub use runtime_connection::{RuntimeConnection, RuntimeConnectionError, RuntimeEvent};
@@ -126,6 +127,18 @@ pub enum DaemonClientError {
     InvalidMutationReceipt,
 }
 
+#[derive(Debug, Error)]
+pub(crate) enum LocalRuntimeError {
+    #[error(transparent)]
+    Client(#[from] DaemonClientError),
+    #[error("Local daemon protocol {actual} does not match {expected}; run `aoe serve --restart`")]
+    Protocol { expected: u16, actual: u16 },
+    #[error("Local daemon owner or namespace does not match")]
+    Identity,
+    #[error("Local daemon profile '{0}' is unavailable")]
+    ProfileUnavailable(String),
+}
+
 fn committed_failure_message(code: ApiErrorCode) -> &'static str {
     match code {
         ApiErrorCode::PurgeFailed => "Purge failed; apply its committed state before retrying",
@@ -232,12 +245,26 @@ impl DaemonClient {
     pub(crate) async fn local_runtime_ready(
         &self,
         profile: Option<&str>,
-    ) -> Result<bool, DaemonClientError> {
+    ) -> Result<RuntimeInfo, LocalRuntimeError> {
         let info = self.runtime_info().await?;
-        Ok(self.matches_local_runtime(&info)
-            && info.health == RuntimeHealth::Healthy
-            && !info.profiles.is_empty()
-            && profile.is_none_or(|profile| info.profiles.iter().any(|name| name == profile)))
+        if info.protocol_version != RUNTIME_PROTOCOL_VERSION {
+            return Err(LocalRuntimeError::Protocol {
+                expected: RUNTIME_PROTOCOL_VERSION,
+                actual: info.protocol_version,
+            });
+        }
+        if !self.matches_local_identity(&info) {
+            return Err(LocalRuntimeError::Identity);
+        }
+        if info.health == RuntimeHealth::Healthy
+            && (info.profiles.is_empty()
+                || profile.is_some_and(|profile| !info.profiles.iter().any(|name| name == profile)))
+        {
+            return Err(LocalRuntimeError::ProfileUnavailable(
+                profile.unwrap_or("default").into(),
+            ));
+        }
+        Ok(info)
     }
 
     pub(crate) async fn local_daemon_ready(&self, pid: u32) -> Result<bool, DaemonClientError> {
@@ -248,18 +275,17 @@ impl DaemonClient {
         let info: RuntimeInfo = self
             .request_json_with_peer(self.http.get(url), Some(pid))
             .await?;
-        Ok(self.matches_local_runtime(&info))
+        Ok(info.protocol_version == RUNTIME_PROTOCOL_VERSION && self.matches_local_identity(&info))
     }
 
-    fn matches_local_runtime(&self, info: &RuntimeInfo) -> bool {
+    fn matches_local_identity(&self, info: &RuntimeInfo) -> bool {
         let namespace = self
             .unix_path
             .as_deref()
             .and_then(std::path::Path::parent)
             .and_then(std::path::Path::parent)
             .and_then(std::path::Path::to_str);
-        info.protocol_version == RUNTIME_PROTOCOL_VERSION
-            && !info.epoch.is_empty()
+        !info.epoch.is_empty()
             && info.local_owner
             && namespace.is_some_and(|expected| expected == info.namespace)
     }
@@ -1154,13 +1180,15 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn daemon_start_accepts_degraded_native_health_but_pins_peer_and_preserves_tui_refusal() {
+    async fn native_admission_preserves_degraded_reads_without_relaxing_identity() {
         let root = tempfile::tempdir().unwrap();
         let daemon = root.path().join("daemon");
         std::fs::create_dir(&daemon).unwrap();
         let path = daemon.join("api.sock");
         let listener = tokio::net::UnixListener::bind(&path).unwrap();
-        let info = RuntimeInfo {
+        let info = std::sync::Arc::new(tokio::sync::RwLock::new(RuntimeInfo {
+            owner_diagnostics: Vec::new(),
+            owner_instance_id: None,
             protocol_version: RUNTIME_PROTOCOL_VERSION,
             epoch: "native-epoch".into(),
             namespace: root.path().to_str().unwrap().into(),
@@ -1177,21 +1205,45 @@ mod tests {
                 mutations: false,
                 native_interaction: false,
             },
-        };
+        }));
+        let served_info = info.clone();
         let router = axum::Router::new().route(
             "/api/runtime",
             axum::routing::get(move || {
-                let info = info.clone();
-                async move { axum::Json(info) }
+                let info = served_info.clone();
+                async move { axum::Json(info.read().await.clone()) }
             }),
         );
         let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
         let client = DaemonClient::new_unix(path).unwrap();
         assert!(client.local_daemon_ready(std::process::id()).await.unwrap());
-        assert!(!client.local_runtime_ready(Some("healthy")).await.unwrap());
+        for profile in ["healthy", "damaged"] {
+            let admitted = client.local_runtime_ready(Some(profile)).await.unwrap();
+            assert!(matches!(admitted.health, RuntimeHealth::Degraded { .. }));
+            assert!(!admitted.interaction_capabilities.mutations);
+            assert!(!admitted.interaction_capabilities.native_interaction);
+        }
         assert!(matches!(
             client.local_daemon_ready(std::process::id() + 1).await,
             Err(DaemonClientError::PeerIdentity)
+        ));
+        info.write().await.protocol_version = RUNTIME_PROTOCOL_VERSION + 1;
+        assert!(matches!(
+            client.local_runtime_ready(None).await,
+            Err(LocalRuntimeError::Protocol { expected, actual })
+                if expected == RUNTIME_PROTOCOL_VERSION && actual == RUNTIME_PROTOCOL_VERSION + 1
+        ));
+        info.write().await.protocol_version = RUNTIME_PROTOCOL_VERSION;
+        info.write().await.namespace = "different-namespace".into();
+        assert!(matches!(
+            client.local_runtime_ready(None).await,
+            Err(LocalRuntimeError::Identity)
+        ));
+        info.write().await.namespace = root.path().to_str().unwrap().into();
+        info.write().await.health = RuntimeHealth::Healthy;
+        assert!(matches!(
+            client.local_runtime_ready(Some("missing")).await,
+            Err(LocalRuntimeError::ProfileUnavailable(profile)) if profile == "missing"
         ));
         server.abort();
         let _ = server.await;

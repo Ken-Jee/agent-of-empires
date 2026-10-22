@@ -58,10 +58,13 @@ fn validate(journal: &Journal) -> Result<()> {
                 }),
             "Invalid or duplicate tool retirement ownership"
         );
-        owner
-            .receipt
-            .tree
-            .validate(owner.receipt.identity.pane_pid)?;
+        owner.receipt.tree.validate(
+            owner
+                .receipt
+                .identity
+                .pane_pid
+                .context("Retirement lacks its original live process identity")?,
+        )?;
     }
     Ok(())
 }
@@ -97,12 +100,13 @@ impl LockedJournal {
             .find(|owner| owner.token == token)
     }
 
-    pub fn first_token_for_instance(&self, id: &str) -> Option<uuid::Uuid> {
+    pub fn retirements_for_instance(&self, id: &str) -> Vec<(uuid::Uuid, String)> {
         self.journal
             .owners
             .iter()
-            .find(|owner| owner.instance_id == id)
-            .map(|owner| owner.token)
+            .filter(|owner| owner.instance_id == id)
+            .map(|owner| (owner.token, owner.tool_name.clone()))
+            .collect()
     }
 
     pub fn targets(&self) -> Vec<(String, String)> {
@@ -162,6 +166,48 @@ impl LockedJournal {
     }
 }
 
+pub(crate) fn restore_from_complete_backup(
+    source: &std::path::Path,
+    _transaction: &crate::daemon::lifecycle::Transaction,
+    _serve: &crate::cli::serve::ServeLock,
+) -> Result<()> {
+    let parent = source.parent().context("Backup needs a parent directory")?;
+    let parent = if parent.as_os_str().is_empty() {
+        std::path::Path::new(".")
+    } else {
+        parent
+    };
+    let source = AnchoredDir::open(parent)?
+        .bind_file(source.file_name().context("Backup needs a file name")?)?;
+    let original = source
+        .read_recovery_bytes()?
+        .context("Tool retirement backup is missing")?;
+    let journal = decode(Some(std::str::from_utf8(&original)?))?;
+    let encoded = serde_json::to_vec(&journal)?;
+    let app = crate::session::get_app_dir()?;
+    let _identity = crate::session::acquire_recovery_identity_lock()?;
+    let _profiles = crate::migrations::recovery::profile_locks()?;
+    let target = AnchoredDir::open(&app)?.bind_file(FILE_NAME.as_ref())?;
+    let file = LockedDataFile::lock_recovery(target)?;
+    if let Some(bytes) = file.read_recovery_bytes()? {
+        if let Ok(text) = std::str::from_utf8(&bytes) {
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(text) {
+                anyhow::ensure!(
+                    value.get("version").and_then(serde_json::Value::as_u64) == Some(1),
+                    "Unsupported destination tool retirement journal version; refusing replacement"
+                );
+            }
+            anyhow::ensure!(
+                decode(Some(text)).is_err(),
+                "Destination tool retirement journal is healthy; refusing replacement"
+            );
+        }
+        file.require_writable_existing()?;
+        let quarantine = file.quarantine_recovery_bytes(&bytes)?;
+        tracing::warn!(path = %quarantine.display(), "Preserved corrupt tool retirement evidence");
+    }
+    file.replace_and_sync(&encoded)
+}
 /// Migration-only initialization. Existing malformed bytes are never replaced.
 pub(crate) fn initialize(root: &std::path::Path) -> Result<()> {
     let target = AnchoredDir::open(root)?.bind_file(FILE_NAME.as_ref())?;
@@ -238,7 +284,7 @@ mod tests {
                 identity: crate::session::LegacyToolIdentity {
                     session_id: "$1".into(),
                     pane_id: "%1".into(),
-                    pane_pid: pid,
+                    pane_pid: Some(pid),
                 },
                 owner: serde_json::to_string(&("full-instance-id", "raw/tool-name")).unwrap(),
                 tree: crate::process::CapturedProcessTree::capture(pid)
@@ -307,5 +353,55 @@ mod tests {
         assert!(journal
             .pending(&original.instance_id, &original.tool_name)
             .is_none());
+    }
+    #[test]
+    #[serial_test::serial]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn complete_restore_retains_original_births_and_never_overwrites_healthy_authority(
+    ) -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let _home = crate::session::test_support::isolate_app_dir_at(home.path());
+        let app = crate::session::get_app_dir()?;
+        let original = owner();
+        let backup = home.path().join("complete-tool-backup.json");
+        let bytes = serde_json::to_vec(&Journal {
+            version: 1,
+            owners: vec![original.clone()],
+        })?;
+        std::fs::write(&backup, &bytes)?;
+        let target = app.join(FILE_NAME);
+        let corrupt = [0xff, b'{'];
+        std::fs::write(&target, corrupt)?;
+        let transaction = crate::daemon::lifecycle::Transaction::acquire_blocking_for(
+            std::time::Duration::from_secs(1),
+        )?;
+        let serve = crate::cli::serve::try_lock_serve()?.unwrap();
+        crate::cli::serve::with_inactive_serve_state(&transaction, Some(&serve), |serve| {
+            restore_from_complete_backup(&backup, &transaction, serve)
+        })?;
+        let restored = LockedJournal::open_at(&app)?;
+        assert!(restored.pending_by_token(original.token) == Some(&original));
+        drop(restored);
+        let committed = std::fs::read(&target)?;
+        assert!(crate::cli::serve::with_inactive_serve_state(
+            &transaction,
+            Some(&serve),
+            |serve| { restore_from_complete_backup(&backup, &transaction, serve) }
+        )
+        .is_err());
+        assert_eq!(std::fs::read(&target)?, committed);
+        let quarantines: Vec<_> = std::fs::read_dir(&app)?
+            .collect::<std::io::Result<Vec<_>>>()?
+            .into_iter()
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(&format!("{FILE_NAME}.quarantine-"))
+            })
+            .collect();
+        assert_eq!(quarantines.len(), 1);
+        assert_eq!(std::fs::read(quarantines[0].path())?, corrupt);
+        Ok(())
     }
 }

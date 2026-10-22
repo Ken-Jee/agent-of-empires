@@ -969,3 +969,160 @@ async fn native_auxiliary_ensure_uses_fresh_context_and_refuses_purge() {
     container_row.sandbox_info = None;
     persist(container_row);
 }
+
+#[test]
+#[parallel]
+fn native_attach_has_one_input_reader_and_survives_peer_delete_on_detach() {
+    use crate::harness::wait_until;
+    use agent_of_empires::tmux::{Session, TerminalSession, ToolSession};
+    for kind in ["agent", "terminal", "tool"] {
+        require_tmux!();
+        let mut h = TuiTestHarness::new(&format!("attach_reader_{kind}"));
+        h.set_env("AGENT_OF_EMPIRES_PROFILE", "default");
+        h.set_env("SHELL", "/bin/sh");
+        h.stop_daemon_on_drop();
+        let receipt = h.home_path().join("child-input.receipt");
+        let bin = h.install_path_command("claude");
+        let script = format!("#!/bin/sh\nprintf 'HANDOFF_CHILD_READY\\n'\nwhile IFS= read -r line; do printf '%s\\n' \"$line\" >> {}; done\n", shell_quote_path(&receipt));
+        fs::write(bin.join("claude"), &script).unwrap();
+        let tools = h.install_path_command("handoffprobe");
+        fs::write(tools.join("handoffprobe"), &script).unwrap();
+        append_tools_config(
+            &h,
+            "[tools.handoffprobe]\ncommand = \"handoffprobe\"\nhotkey = \"Alt+t\"",
+        );
+        let project = h.project_path();
+        let peer = h.add_session(&[project.to_str().unwrap(), "-t", "DeleteWhileAttached"]);
+        let id = h.add_session(&[project.to_str().unwrap(), "-t", "ExactAttachTarget"]);
+        h.run_cli_ok(&["session", "start", &id]);
+        h.spawn_tui();
+        h.wait_for("Runtime ready");
+        h.send_keys("/");
+        h.type_text("ExactAttachTarget");
+        h.send_keys("Enter");
+        let resume = h.terminal_resume_sequence();
+        let target = match kind {
+            "agent" => {
+                h.send_keys_unfenced("Enter");
+                Session::generate_name(&id, "ExactAttachTarget")
+            }
+            "terminal" => {
+                h.send_keys_unfenced("T");
+                TerminalSession::generate_name(&id, "ExactAttachTarget")
+            }
+            "tool" => {
+                h.send_keys("M-t");
+                h.send_keys_unfenced("Enter");
+                ToolSession::generate_name(&id, "ExactAttachTarget", "handoffprobe")
+            }
+            _ => unreachable!(),
+        };
+        wait_until(Duration::from_secs(15), Duration::from_millis(20), || {
+            let output = h
+                .tmux()
+                .args(["list-clients", "-F", "#{client_session}"])
+                .output()
+                .map_err(|error| error.to_string())?;
+            let clients = String::from_utf8(output.stdout).map_err(|error| error.to_string())?;
+            clients
+                .lines()
+                .any(|name| name == target)
+                .then_some(())
+                .ok_or_else(|| format!("no native client attached to {target}: {clients}"))
+        });
+        if kind != "terminal" {
+            h.wait_for("HANDOFF_CHILD_READY");
+        }
+        let pane_rows = || -> Result<(u16, u16), String> {
+            let output = h
+                .tmux()
+                .args([
+                    "display-message",
+                    "-p",
+                    "-t",
+                    &format!("={target}:^"),
+                    "#{window_height} #{pane_height}",
+                ])
+                .output()
+                .map_err(|error| error.to_string())?;
+            if !output.status.success() {
+                return Err(String::from_utf8_lossy(&output.stderr).into_owned());
+            }
+            let text = String::from_utf8(output.stdout).map_err(|error| error.to_string())?;
+            let values = text
+                .split_whitespace()
+                .map(|value| value.parse::<u16>().map_err(|error| error.to_string()))
+                .collect::<Result<Vec<_>, _>>()?;
+            match values.as_slice() {
+                [window, pane] => Ok((*window, *pane)),
+                _ => Err(format!("invalid native geometry: {text}")),
+            }
+        };
+        if kind == "agent" {
+            let border = h
+                .tmux()
+                .args([
+                    "set-option",
+                    "-w",
+                    "-t",
+                    &format!("={target}:^"),
+                    "pane-border-status",
+                    "top",
+                ])
+                .output()
+                .unwrap();
+            assert!(border.status.success(), "{border:?}");
+            wait_until(Duration::from_secs(10), Duration::from_millis(20), || {
+                let (window, pane) = pane_rows()?;
+                (window == pane + 1)
+                    .then_some(())
+                    .ok_or_else(|| format!("expected real border chrome: {window} {pane}"))
+            });
+        }
+        if kind == "terminal" {
+            h.send_keys_unfenced(&format!(
+                "printf 'child-input-once\\n' > {}",
+                shell_quote_path(&receipt)
+            ));
+        } else {
+            h.send_keys_unfenced("child-input-once");
+        }
+        h.send_keys_unfenced("Enter");
+        wait_until(Duration::from_secs(10), Duration::from_millis(20), || {
+            let bytes = fs::read_to_string(&receipt).map_err(|error| error.to_string())?;
+            (bytes == "child-input-once\n").then_some(()).ok_or(bytes)
+        });
+        h.run_cli_ok(&["remove", &peer, "--purge", "--force"]);
+        let sessions = app_dir_in(h.home_path()).join("profiles/default/sessions.json");
+        let committed: Vec<agent_of_empires::session::Instance> =
+            serde_json::from_slice(&fs::read(&sessions).unwrap()).unwrap();
+        assert!(!committed.iter().any(|row| row.id == peer));
+        h.send_keys_unfenced("C-b");
+        h.send_keys_unfenced("d");
+        h.wait_for_terminal_resume(resume);
+        h.wait_for("Runtime ready");
+        if kind == "agent" {
+            // The harness uses a 100x30 compact viewport: two preview borders
+            // and one footer leave 27 content rows. Pane-border-status consumes
+            // one additional tmux window row, not one preview content row.
+            let content_rows = h.capture_screen().lines().count() as u16 - 3;
+            wait_until(Duration::from_secs(10), Duration::from_millis(20), || {
+                let observed = pane_rows()?;
+                (observed == (content_rows + 1, content_rows))
+                    .then_some(())
+                    .ok_or_else(|| format!("preview content {content_rows}, geometry {observed:?}"))
+            });
+        }
+        h.send_keys("Escape");
+        h.send_paste("post-attach-draft-is-owned-by-tui");
+        h.wait_for("post-attach-draft-is-owned-by-tui");
+        assert_eq!(
+            fs::read_to_string(&receipt).unwrap(),
+            "child-input-once\n",
+            "resumed paste must not leak into former native child"
+        );
+        h.send_keys("Escape");
+        h.assert_screen_contains("ExactAttachTarget");
+        h.assert_screen_not_contains("DeleteWhileAttached");
+    }
+}

@@ -31,7 +31,7 @@ impl HomeView {
     /// client-side pin: the daemon's own project mutations map to
     /// `POST /api/projects` / `PATCH /api/projects/{name}` /
     /// Project registry has an independent local-write policy; sessions/groups never write locally.
-    fn project_write_block(&self) -> Option<&'static str> {
+    pub(super) fn project_write_block(&self) -> Option<&'static str> {
         if !self.project_registry_authoritative {
             return None;
         }

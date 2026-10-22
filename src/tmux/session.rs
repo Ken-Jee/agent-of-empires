@@ -517,7 +517,12 @@ impl Session {
             }
             match mutation {
                 PaneEnvMutation::Set { key, value }
-                    if key == crate::tmux::env::AOE_OMP_LAUNCH_ID_KEY =>
+                    if matches!(
+                        key.as_str(),
+                        crate::tmux::env::AOE_OMP_LAUNCH_ID_KEY
+                            | crate::tmux::env::AOE_TERMINAL_HANDOFF_ID_KEY
+                            | crate::tmux::env::AOE_TERMINAL_HANDOFF_GENERATION_KEY
+                    ) =>
                 {
                     tmux_env.push((key.as_str(), value.as_str()));
                 }

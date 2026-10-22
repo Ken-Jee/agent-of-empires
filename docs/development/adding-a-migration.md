@@ -11,51 +11,18 @@ This exception does not cover scoped transitions, recovery/reclamation scans, gl
 To add one:
 
 1. Create `src/migrations/vNNN_description.rs` with a `pub fn run() -> anyhow::Result<()>`.
-2. In `src/migrations/mod.rs`: add `mod vNNN_description;`, bump `CURRENT_VERSION`, and append a `Migration { version: NNN, name: "description", run: vNNN_description::run }` entry to `MIGRATIONS`.
+2. In `src/migrations/mod.rs`: add `mod vNNN_description;`, bump `CURRENT_VERSION`, and append `(NNN, "description", vNNN_description::run)` to `MIGRATIONS`.
 
 Migrations must be idempotent, use `tracing::info!`, gate platform-specific ones with `#[cfg(target_os = "...")]`, and be tested by hand-crafting the old state.
 
 Do not reuse a published migration number for a different transformation. When integrating divergent schema histories, preserve the published meaning and add idempotent reconciliation steps newer than both histories. Test upgrades from each history and a second run over the migrated state.
 
-Published schemas 35, 36, and 37 retain custom-sort admission, creation-count
-seeding, and trash identity respectively. Published schemas 38, 39, and 40
-initialize native Prime runtime metadata, pin its control path, and attest
-worker process birth. Draft schema 44 reconciles launch policy; it does not
-initialize purge ownership or fabricate missing ownership proof.
+Scope and process authority must remain exact. Missing legacy proof stays unresolved until complete authoritative inventory proves absence. Preserve captured units, process births, native runtime and producer identity. An unfinished constructor prevents discharge of unknown scope debt. Never overwrite readable malformed proof or infer launch or retirement authority from a missing field. Inventory selectors never authorize retirement.
 
-Schema 45 records exact runner, terminal-launch and purge scope ownership. Older
-records are migrated to unresolved authority, never assumed unscoped or
-authorized by a SID wildcard. Unknown scope ownership retains rows, journals
-and resources. Terminal launch records exact units under its existing generation
-reservation before pane birth, including when later configuration disables scopes.
+Ordinary startup performs metadata migrations, not explicit scope-authority recovery. Unreadable components retain their bytes for repair; a current schema marker does not prove physical completion. After repair, explicit `aoe migrate` retries supported metadata reconciliation and separately requires a complete, consistent session, worker and purge-journal inventory before scope-authority writes. Malformed or ambiguous inventory, live unknown units and incomplete manager or kernel proof refuse that recovery. Follow [Ownership recovery](../installation.md#ownership-recovery) rather than clearing evidence.
 
-Experimental schema 46 reconciles published 38–40 with the earlier draft's
-38–45 history, then retries draft scope retyping and removes obsolete sidebar
-flags. Historical worker input does not require the newer scope field to attest
-process birth. Old purge captures gain unresolved native authority and no birth
-attestation; reconciliation never borrows authority from a replacement record.
-An already-upgraded installation with a missing purge journal stays missing.
+Runtime stop, launch and cleanup require their migrated ownership journals. A missing journal must not be recreated empty, and a historical receipt must not acquire manufactured process-birth or tmux-incarnation proof. Restore only complete original authority using the [operator workflow](../installation.md#ownership-recovery).
 
-Unreadable session or worker components retain their bytes for quarantine.
-After repairing those components, run `aoe migrate` to retry deferred retyping.
-Malformed ownership proofs or purge journals remain fatal without advancing the
-schema marker. Rewrites require backups and repeated reconciliation preserves
-already-migrated bytes.
-
-Schema 47 initializes the private `tool-retirements.json` journal. Runtime
-tool stop, launch, and whole-row cleanup require the migrated journal and
-never recreate a missing one. Records preserve the authorized original process
-births and exact tmux server incarnation before live target removal. Older
-tmux-only pending receipts are not silently converted or discarded: without a
-provable original live incarnation they remain unresolved evidence.
-
-Managed restart, rollback and Core promotion reconcile historical launch policy
-under their existing daemon lifecycle transaction before decoding the launch.
-Launch-only reconciliation accepts only supported historical schemas or a valid
-current policy. Unknown or malformed schemas leave both records and the live
-predecessor untouched.
-They stop the verified predecessor before full parent migrations under `serve.lock`.
-The replacement child only asserts the current schema; it never reacquires the
-parent's lifecycle transaction or migrates alongside its predecessor.
+Managed restart, rollback and dashboard promotion reconcile supported historical launch policy under their existing lifecycle transaction. The schema compatibility guard runs before stopping the verified predecessor; future or unsupported data remains untouched. Full parent migrations then run under `serve.lock`, and the replacement child only asserts the current schema. Torn inactive historical launch records may be quarantined only under serve, lifetime and state exclusion after proving daemon absence. Preserve peer launch records and credentials.
 
 A migration that retypes a persisted field must call `crate::session::backup_before_migration` before rewriting, so the build that predates the new shape still has bytes it can read. What that build does with a row it cannot decode, and what the migration backup is worth to a user who forces a downgrade, is covered under [Downgrading](../installation.md#downgrading).

@@ -345,6 +345,12 @@ async fn committed_purge_settles_only_its_live_preconfiguration_producer() -> an
                 crate::process::worker_registry::ResumeAuthority::Explicit,
             )
             .await?;
+        let producer_lease = producer.lease().clone();
+        producer_lease.set_admission(Some(crate::acp::supervisor::LaunchAdmission {
+            store: Arc::new(Storage::open_unwatched(&row.source_profile)?),
+            generation: row.lifecycle_generation,
+            namespace: Some(state.profile_namespace.clone()),
+        }));
         let retirement = state.acp_supervisor.capture_retirement(&row.id)?;
         assert!(retirement.identity.is_none());
         assert_eq!(
@@ -385,6 +391,16 @@ async fn committed_purge_settles_only_its_live_preconfiguration_producer() -> an
         };
         if replacement {
             drop(producer);
+            assert!(producer_lease.was_cancelled_before_birth());
+            assert!(producer_lease.spawned_runner().is_none());
+            let storage = Arc::new(Storage::open_unwatched("default")?);
+            let mut newer_row = row.clone();
+            newer_row.title = "replacement row".into();
+            newer_row.lifecycle_generation += 2;
+            storage.update(|rows, _| {
+                rows.push(newer_row.clone());
+                Ok(())
+            })?;
             let newer = state
                 .acp_supervisor
                 .reserve_spawn(
@@ -393,6 +409,13 @@ async fn committed_purge_settles_only_its_live_preconfiguration_producer() -> an
                     crate::process::worker_registry::ResumeAuthority::Explicit,
                 )
                 .await?;
+            newer
+                .lease()
+                .set_admission(Some(crate::acp::supervisor::LaunchAdmission {
+                    store: storage.clone(),
+                    generation: newer_row.lifecycle_generation,
+                    namespace: Some(state.profile_namespace.clone()),
+                }));
             let mut current = state.acp_supervisor.capture_retirement(&row.id)?;
             assert!(
                 committed.ensure_retirement_target(&mut current).is_err(),
@@ -407,14 +430,6 @@ async fn committed_purge_settles_only_its_live_preconfiguration_producer() -> an
                 !newer.lease().cancellation().is_cancelled(),
                 "a frozen old request cannot cancel an unborn replacement"
             );
-            let storage = Storage::open_unwatched("default")?;
-            let mut newer_row = row.clone();
-            newer_row.title = "replacement row".into();
-            newer_row.lifecycle_generation += 2;
-            storage.update(|rows, _| {
-                rows.push(newer_row.clone());
-                Ok(())
-            })?;
             committed.complete_retirement(&retirement)?;
             assert!(
                 state
@@ -450,6 +465,8 @@ async fn committed_purge_settles_only_its_live_preconfiguration_producer() -> an
         let cancellation = producer.lease().cancellation().clone();
         let producer = if window == 4 {
             drop(producer);
+            assert!(producer_lease.was_cancelled_before_birth());
+            assert!(producer_lease.spawned_runner().is_none());
             None
         } else {
             Some(producer)
@@ -460,7 +477,7 @@ async fn committed_purge_settles_only_its_live_preconfiguration_producer() -> an
         let finishing = tokio::spawn(async move {
             super::delete::finish_structured_purge(&cleanup_state, &id, &target).await
         });
-        cancellation.cancelled().await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), cancellation.cancelled()).await?;
         if window != 4 {
             assert!(
                 !finishing.is_finished(),
@@ -470,7 +487,12 @@ async fn committed_purge_settles_only_its_live_preconfiguration_producer() -> an
         let (mut committed, retirement) = if recovered {
             if window >= 2 {
                 drop(producer);
-                finishing.await??;
+                assert!(producer_lease.was_cancelled_before_birth());
+                assert!(producer_lease.spawned_runner().is_none());
+                state.acp_supervisor.retry_pending_teardowns().await;
+                let settled =
+                    tokio::time::timeout(std::time::Duration::from_secs(10), finishing).await?;
+                settled??;
                 committed.complete_retirement(&retirement)?;
                 if window == 2 {
                     use crate::acp::runner_lifecycle::{
@@ -516,6 +538,9 @@ async fn committed_purge_settles_only_its_live_preconfiguration_producer() -> an
                 drop(retirement);
                 drop(committed);
                 drop(producer);
+                assert!(producer_lease.was_cancelled_before_birth());
+                assert!(producer_lease.spawned_runner().is_none());
+                state.acp_supervisor.retry_pending_teardowns().await;
             }
             let mut committed = tokio::task::spawn_blocking(|| {
                 crate::session::deletion::recover_committed_purge(
@@ -530,11 +555,20 @@ async fn committed_purge_settles_only_its_live_preconfiguration_producer() -> an
                     .capture_retirement(id)
                     .map_err(Into::into)
             })?;
-            super::delete::finish_structured_purge(&state, &row.id, &retirement).await?;
+            tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                super::delete::finish_structured_purge(&state, &row.id, &retirement),
+            )
+            .await??;
             (committed, retirement)
         } else {
             drop(producer);
-            finishing.await??;
+            assert!(producer_lease.was_cancelled_before_birth());
+            assert!(producer_lease.spawned_runner().is_none());
+            state.acp_supervisor.retry_pending_teardowns().await;
+            let settled =
+                tokio::time::timeout(std::time::Duration::from_secs(10), finishing).await?;
+            settled??;
             (committed, retirement)
         };
         if window != 3 {
@@ -2828,6 +2862,7 @@ mod workspace_deletion {
             delete_sandbox: true,
             force_delete: false,
             keep_scratch: false,
+            ..Default::default()
         }
     }
 
@@ -9041,6 +9076,285 @@ async fn same_timestamp_retrash_rejects_stale_force_and_drop_consent() -> anyhow
             snapshot.value.contents.sessions[0].failed_purge_forced,
             Some(true)
         );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn workspace_purge_retains_changed_trash_lifecycles_and_requires_complete_consent(
+) -> anyhow::Result<()> {
+    let _home = crate::session::test_support::isolate_app_dir();
+    let app = crate::session::get_app_dir()?;
+    crate::session::purge_owners::initialize(&app)?;
+    crate::tmux::tool_retirement::initialize(&app)?;
+    let profile = "workspace-trash-consent";
+    for case in [
+        "restored",
+        "retrashed",
+        "generation",
+        "timestamp",
+        "missing",
+        "matching",
+    ] {
+        let mut selected = Instance::new("selected trash", "");
+        let root = crate::session::scratch::provision_scratch_dir(&selected.id)?;
+        selected.project_path = root.to_string_lossy().into_owned();
+        selected.scratch = true;
+        selected.source_profile = profile.into();
+        selected.view = crate::session::View::Structured;
+        selected.trash();
+        selected.lifecycle_generation = 7;
+        let mut current = selected.clone();
+        match case {
+            "restored" => current.untrash(),
+            "retrashed" => {
+                current.untrash();
+                current.trash();
+                current.trashed_at = selected.trashed_at;
+                current.lifecycle_generation = selected.lifecycle_generation;
+                assert_ne!(current.trash_lifecycle_id, selected.trash_lifecycle_id);
+            }
+            "generation" => current.lifecycle_generation += 1,
+            "timestamp" => {
+                current.trashed_at = selected
+                    .trashed_at
+                    .map(|at| at + chrono::Duration::seconds(1));
+            }
+            _ => {}
+        }
+        let payload = root.join("owned-content");
+        std::fs::write(&payload, b"selected lifecycle owns this content")?;
+        crate::server::test_support::seed_instances_on_disk_for_test(
+            profile,
+            vec![current.clone()],
+        );
+        let state = crate::server::test_support::build_test_app_state(vec![current]);
+        *state.canonical_metadata.write().await =
+            crate::server::reload::load_all_profiles(&state.file_watch)?.metadata;
+        let storage = Storage::open_unwatched(profile)?;
+        let before = std::fs::read(storage.sessions_path())?;
+        let mut body = DeleteWorkspaceBody {
+            session_ids: vec![selected.id.clone()],
+            expected_trash: true,
+            force_delete: true,
+            trash_consents: std::collections::HashMap::from([(
+                selected.id.clone(),
+                super::delete::TrashPurgeConsent {
+                    expected_trashed_at: selected.trashed_at.unwrap(),
+                    expected_trash_lifecycle_id: selected.trash_lifecycle_id.unwrap(),
+                    expected_generation: selected.lifecycle_generation,
+                },
+            )]),
+            ..Default::default()
+        };
+        if case == "missing" {
+            body.trash_consents.clear();
+        }
+        let response = delete_workspace(State(state.clone()), Some(Json(body)))
+            .await
+            .into_response();
+        assert_eq!(
+            response.status(),
+            if case == "missing" {
+                StatusCode::BAD_REQUEST
+            } else {
+                StatusCode::OK
+            },
+            "{case}"
+        );
+        if case == "matching" {
+            let bytes = axum::body::to_bytes(response.into_body(), 8192).await?;
+            let result: serde_json::Value = serde_json::from_slice(&bytes)?;
+            assert_eq!(result["deleted"], serde_json::json!([selected.id]));
+            assert!(storage.load()?.is_empty());
+            assert!(!payload.exists());
+        } else {
+            assert_eq!(std::fs::read(storage.sessions_path())?, before, "{case}");
+            assert_eq!(
+                std::fs::read(&payload)?,
+                b"selected lifecycle owns this content",
+                "{case}"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn committed_setting_reports_unconfirmed_until_canonical_recovery() -> anyhow::Result<()> {
+    let _home = crate::session::test_support::isolate_app_dir();
+    let mut row = Instance::new("setting adoption", "/tmp");
+    row.source_profile = "default".into();
+    row.view = crate::session::View::Structured;
+    crate::server::test_support::seed_instances_on_disk_for_test("default", vec![row.clone()]);
+    let state = crate::server::test_support::build_test_app_state(vec![row.clone()]);
+    crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+    let storage = Storage::open_unwatched("default")?;
+    let failing_state = state.clone();
+    let response = super::update::commit_profile_update(
+        &state,
+        "default".into(),
+        "favorite adoption",
+        move |rows| {
+            rows[0].favorited_at = Some(chrono::Utc::now());
+            failing_state
+                .canonical_metadata
+                .blocking_write()
+                .profiles
+                .clear();
+        },
+        None,
+    )
+    .await
+    .expect_err("a persisted edit without canonical adoption cannot return success");
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(!response.headers().contains_key("aoe-runtime-epoch"));
+    assert!(!response.headers().contains_key("aoe-runtime-revision"));
+    let bytes = axum::body::to_bytes(response.into_body(), 8192).await?;
+    let body: serde_json::Value = serde_json::from_slice(&bytes)?;
+    assert_eq!(body["error"], "outcome_unconfirmed");
+    assert!(storage.load()?[0].favorited_at.is_some());
+    assert!(state.instances.read().await[0].favorited_at.is_none());
+    assert!(matches!(
+        *state.canonical_health.read().await,
+        crate::daemon::RuntimeHealth::Degraded { .. }
+    ));
+
+    let loaded = crate::server::reload::load_all_profiles(&state.file_watch)?;
+    crate::server::reload::reload_state_instances_from_disk(
+        &state,
+        loaded.instances.into(),
+        Vec::new(),
+        crate::server::state::StatusSource::DiskOnly,
+        0,
+        Ok(loaded.metadata),
+        Default::default(),
+    )
+    .await;
+    assert_eq!(
+        *state.canonical_health.read().await,
+        crate::daemon::RuntimeHealth::Healthy
+    );
+    let snapshot = state.runtime.snapshot(&state).await?;
+    assert!(snapshot.value.contents.sessions[0].favorited);
+    Ok(())
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn workspace_trash_consent_follows_siblings_and_protects_the_shared_owner(
+) -> anyhow::Result<()> {
+    fn git(dir: &std::path::Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "git {args:?}: {output:?}");
+    }
+    for changed_sibling in [false, true] {
+        let tmp = tempfile::tempdir()?;
+        let _home = crate::session::test_support::isolate_app_dir_at(&tmp.path().join("home"));
+        let app = crate::session::get_app_dir()?;
+        crate::session::purge_owners::initialize(&app)?;
+        crate::tmux::tool_retirement::initialize(&app)?;
+        let repo = tmp.path().join("repo");
+        let checkout = tmp.path().join("checkout");
+        std::fs::create_dir(&repo)?;
+        git(&repo, &["init", "-b", "main"]);
+        git(&repo, &["commit", "--allow-empty", "-m", "init"]);
+        git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "selected",
+                checkout.to_str().unwrap(),
+            ],
+        );
+        let payload = checkout.join("owned-content");
+        std::fs::write(&payload, b"shared selected worktree")?;
+        let profile = "workspace-owner-consent";
+        let mut selected = Vec::new();
+        for (title, managed, generation) in [
+            ("owner", true, 11),
+            ("first", false, 22),
+            ("second", false, 33),
+        ] {
+            let mut row = Instance::new(title, checkout.to_str().unwrap());
+            row.source_profile = profile.into();
+            row.view = crate::session::View::Structured;
+            row.worktree_info = Some(crate::session::WorktreeInfo {
+                branch: "selected".into(),
+                main_repo_path: repo.to_string_lossy().into_owned(),
+                managed_by_aoe: managed,
+                created_at: chrono::Utc::now(),
+                base_branch: None,
+            });
+            row.trash();
+            row.lifecycle_generation = generation;
+            selected.push(row);
+        }
+        let mut current = selected.clone();
+        if changed_sibling {
+            current[1].untrash();
+            current[1].trash();
+            current[1].trashed_at = selected[1].trashed_at;
+            current[1].lifecycle_generation = selected[1].lifecycle_generation;
+            assert_ne!(
+                current[1].trash_lifecycle_id,
+                selected[1].trash_lifecycle_id
+            );
+        }
+        crate::server::test_support::seed_instances_on_disk_for_test(profile, current.clone());
+        let state = crate::server::test_support::build_test_app_state(current);
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+        let response = delete_workspace(
+            State(state),
+            Some(Json(DeleteWorkspaceBody {
+                session_ids: selected.iter().map(|row| row.id.clone()).collect(),
+                expected_trash: true,
+                trash_consents: selected
+                    .iter()
+                    .map(|row| {
+                        (
+                            row.id.clone(),
+                            super::delete::TrashPurgeConsent {
+                                expected_trashed_at: row.trashed_at.unwrap(),
+                                expected_trash_lifecycle_id: row
+                                    .trash_lifecycle_id
+                                    .clone()
+                                    .unwrap(),
+                                expected_generation: row.lifecycle_generation,
+                            },
+                        )
+                    })
+                    .collect(),
+                force_delete: true,
+                delete_worktree: true,
+                delete_branch: true,
+                ..Default::default()
+            })),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 8192).await?;
+        let outcome: serde_json::Value = serde_json::from_slice(&bytes)?;
+        let stored = Storage::open_unwatched(profile)?.load()?;
+        if changed_sibling {
+            assert_eq!(outcome["deleted"], serde_json::json!([]));
+            assert_eq!(stored.len(), 3);
+            assert_eq!(std::fs::read(&payload)?, b"shared selected worktree");
+            assert!(checkout.join(".git").exists());
+        } else {
+            assert!(stored.is_empty(), "{outcome}");
+            assert!(!checkout.exists(), "{outcome}");
+        }
     }
     Ok(())
 }

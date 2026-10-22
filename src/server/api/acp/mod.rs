@@ -36,6 +36,9 @@ pub use prompt::{
     resolve_approval, resolve_elicitation,
 };
 pub use view::{acp_disable, acp_enable};
+pub(crate) use view::{
+    publish_startup_error_if_current, recover_pending_terminal_handoffs, HandoffRecovery,
+};
 pub use worker::{
     get_option_catalog, list_acp_agents, shutdown_acp, spawn_acp, switch_acp_agent,
     switch_acp_provider,
@@ -518,8 +521,20 @@ mod tests {
                 }
             };
             tokio::pin!(handler);
+            tokio::time::timeout(Duration::from_secs(10), async {
+                tokio::select! {
+                    claim = claims.recv() => {
+                        assert_eq!(claim.expect("contender reached claim"), id, "{which}");
+                    }
+                    response = &mut handler => panic!(
+                        "{which} answered before claiming submission exclusion: {}",
+                        response.status(),
+                    ),
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("{which} must reach the held submission claim"));
             assert!(futures_util::poll!(&mut handler).is_pending(), "{which}");
-            assert_eq!(claims.try_recv().expect("contender reached claim"), id);
 
             drop(delivering);
             let response = tokio::time::timeout(Duration::from_secs(10), handler)
@@ -649,6 +664,13 @@ mod tests {
                         Poll::Ready(())
                     })
                     .await;
+                    tokio::time::timeout(Duration::from_secs(2), async {
+                        while lock.try_lock().is_ok() {
+                            tokio::task::yield_now().await;
+                        }
+                    })
+                    .await
+                    .expect("tracked handoff task must acquire its instance exclusion");
                     assert!(lock.try_lock().is_err());
                     if let Some(same_identity) = reload {
                         let mut fresh = durable;

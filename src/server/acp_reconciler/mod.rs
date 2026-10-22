@@ -85,7 +85,7 @@ fn park_message(project_path: &str) -> String {
 #[derive(Debug, Clone)]
 enum ResumeOutcome {
     Attached,
-    /// The orphan registry entry was swept; retry next tick unless parked.
+    /// Attachment or retirement is unfinished; retry next tick unless parked.
     RetryAfterAttachTimeout,
     /// Spawn finished with or without error; `attempted` stays set so a
     /// permanently failing spawn does not loop.
@@ -94,6 +94,8 @@ enum ResumeOutcome {
     /// once. `message` is its Display, matched by the front-end regex (#1027).
     CapacityDeferred {
         message: String,
+        source_profile: String,
+        lifecycle_generation: u64,
     },
 }
 
@@ -115,7 +117,11 @@ fn due(last: &mut Option<Instant>, interval: Duration) -> bool {
 
 /// Structured and not archived, snoozed or trashed.
 fn is_untriaged_structured(i: &Instance) -> bool {
-    i.is_structured() && !i.is_archived() && !i.is_snoozed() && !i.is_trashed()
+    i.is_structured()
+        && i.terminal_handoff.is_none()
+        && !i.is_archived()
+        && !i.is_snoozed()
+        && !i.is_trashed()
 }
 
 /// Eligible for a reconciler-driven worker.
@@ -171,6 +177,11 @@ pub async fn reconcile_acp_workers(
 ) {
     let supervisor = &state.acp_supervisor;
     supervisor.retry_pending_teardowns().await;
+    crate::server::api::recover_pending_terminal_handoffs(
+        state,
+        crate::server::api::HandoffRecovery::Maintenance,
+    )
+    .await;
 
     // Before the reaper, so this tick's reaper tears down the drained handle.
     resume::respawn_drained_stale_workers(state).await;
@@ -300,7 +311,14 @@ pub async fn reconcile_acp_workers(
                 "structured-view worker respawn budget exhausted; parking session"
             );
             if parked.insert(id.clone()) {
-                supervisor.publish_startup_error(&id, park_message(&target.project_path));
+                crate::server::api::publish_startup_error_if_current(
+                    state,
+                    &id,
+                    &target.source_profile,
+                    target.lifecycle_generation,
+                    park_message(&target.project_path),
+                )
+                .await;
             }
             attempted.insert(id);
             continue;
@@ -351,7 +369,14 @@ pub async fn reconcile_acp_workers(
                     attempted.remove(&id);
                 }
             }
-            Ok((id, ResumeOutcome::CapacityDeferred { message })) => {
+            Ok((
+                id,
+                ResumeOutcome::CapacityDeferred {
+                    message,
+                    source_profile,
+                    lifecycle_generation,
+                },
+            )) => {
                 // Refund only this tick's budget entry so prior crash history survives.
                 if let Some(entries) = respawn_history.get_mut(&id) {
                     entries.pop();
@@ -363,7 +388,14 @@ pub async fn reconcile_acp_workers(
                 attempted.remove(&id);
                 // `publish_startup_error` does not dedup, so publish once per transition.
                 if capacity_deferred.insert(id.clone()) {
-                    supervisor.publish_startup_error(&id, message);
+                    crate::server::api::publish_startup_error_if_current(
+                        state,
+                        &id,
+                        &source_profile,
+                        lifecycle_generation,
+                        message,
+                    )
+                    .await;
                 }
             }
             Ok((id, ResumeOutcome::Attached | ResumeOutcome::SpawnFinished)) => {
@@ -382,7 +414,7 @@ async fn drain_pending_initial_turns(state: &Arc<AppState>) {
         let instances = state.instances.read().await;
         instances
             .iter()
-            .filter(|i| i.pending_initial_turn.is_some() && is_untriaged_structured(i))
+            .filter(|i| i.pending_initial_turn.is_some() && is_resumable(i))
             .map(|i| i.id.clone())
             .collect()
     };
@@ -473,8 +505,17 @@ async fn sweep_orphan_workers(state: &Arc<AppState>, live: &HashSet<&String>) {
     let Ok(records) = crate::process::worker_registry::list() else {
         return;
     };
+    let pending_handoffs: HashSet<String> = state
+        .instances
+        .read()
+        .await
+        .iter()
+        .filter(|row| row.terminal_handoff.is_some())
+        .map(|row| row.id.clone())
+        .collect();
     for record in records {
-        if live.contains(&record.session_id)
+        if pending_handoffs.contains(&record.session_id)
+            || live.contains(&record.session_id)
             || state.acp_supervisor.is_owned(&record.session_id).await
         {
             continue;

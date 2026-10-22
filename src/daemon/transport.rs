@@ -80,16 +80,21 @@ fn drop_group_other_write(dir: &Path, owner: u32) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The owner's primary group when it is a user-private group: same name as
-/// the user and no listed members, as Debian and Ubuntu create by default.
-fn user_private_gid(owner: u32) -> Option<u32> {
+/// Accept only same-name user-private primary groups without extra members.
+pub(crate) fn user_private_gid(owner: u32) -> Option<u32> {
     use nix::unistd::{Group, Uid, User};
     let user = User::from_uid(Uid::from_raw(owner)).ok()??;
     let group = Group::from_gid(user.gid).ok()??;
     (group.name == user.name && group.mem.is_empty()).then(|| user.gid.as_raw())
 }
 
-fn trusted_ancestor(uid: u32, gid: u32, mode: u32, owner: u32, private_gid: Option<u32>) -> bool {
+pub(crate) fn trusted_ancestor(
+    uid: u32,
+    gid: u32,
+    mode: u32,
+    owner: u32,
+    private_gid: Option<u32>,
+) -> bool {
     let trusted_sticky = uid == 0 && mode & 0o1000 != 0;
     let private_group_write = uid == owner && mode & 0o002 == 0 && private_gid == Some(gid);
     (uid == owner || uid == 0) && (mode & 0o022 == 0 || trusted_sticky || private_group_write)

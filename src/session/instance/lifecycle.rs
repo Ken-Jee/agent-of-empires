@@ -15,9 +15,9 @@ use super::*;
 /// without a whole-session reservation; its original cohort journal owns recovery.
 /// `status` is presentation state and never proves ownership.
 ///
-/// A crashed owner loses both the flock and, after the TTL, its reservation.
-/// Recovery may then acquire a newer generation; exact-generation commits
-/// ensure a late result can never mutate or clear that replacement.
+/// Ordinary crashed reservations expire after their TTL. Explicit terminal
+/// handoff debt requires matching-intent recovery, which advances generation
+/// before taking over so late results cannot mutate or clear its replacement.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum LifecycleOperation {
@@ -76,6 +76,9 @@ impl Instance {
         ttl: chrono::Duration,
         now: DateTime<Utc>,
     ) -> Result<u64, LifecycleReservationError> {
+        if self.terminal_handoff.is_some() {
+            return Err(LifecycleReservationError::Busy(LifecycleOperation::Launch));
+        }
         if let Some(reservation) = self.lifecycle_reservation.as_ref().filter(|reservation| {
             reservation.generation == self.lifecycle_generation && (now - reservation.at) < ttl
         }) {
@@ -166,6 +169,42 @@ impl Instance {
         }
     }
 
+    /// Consume an exact native stop observation after original execution retirement.
+    /// The caller validates the structured target and compares its observed registry stop token.
+    pub(crate) fn resume_structured_after_retirement(
+        &mut self,
+        observed_generation: u64,
+    ) -> Result<u64, LifecycleReservationError> {
+        if self.lifecycle_generation != observed_generation {
+            return Err(LifecycleReservationError::Superseded);
+        }
+        let stopped =
+            if self.lifecycle_reservation_is_owned(LifecycleOperation::Stop, observed_generation) {
+                self.lifecycle_reservation.take()
+            } else {
+                None
+            };
+        let generation = match self.try_acquire_lifecycle_reservation(
+            LifecycleOperation::Launch,
+            Self::LIFECYCLE_RESERVATION_TTL,
+            Utc::now(),
+        ) {
+            Ok(generation) => generation,
+            Err(error) => {
+                if let Some(stopped) = stopped {
+                    self.lifecycle_reservation = Some(stopped);
+                }
+                return Err(error);
+            }
+        };
+        self.status = Status::Idle;
+        self.idle_dormant_since = None;
+        self.idle_entered_at = None;
+        self.last_error = None;
+        self.release_lifecycle_reservation_if_owned(LifecycleOperation::Launch, generation);
+        Ok(generation)
+    }
+
     /// Clear a crashed owner's expired reservation. The generation is
     /// deliberately retained as the monotonic cache/result revision.
     pub fn clear_expired_lifecycle_reservation(
@@ -173,6 +212,9 @@ impl Instance {
         ttl: chrono::Duration,
         now: DateTime<Utc>,
     ) -> bool {
+        if self.terminal_handoff.is_some() {
+            return false;
+        }
         if matches!(
             &self.lifecycle_reservation,
             Some(reservation)
@@ -647,6 +689,42 @@ impl Instance {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn observed_native_resume_is_generation_owned_and_preserves_failed_reservations() {
+        for case in ["resume", "superseded", "overflow", "busy"] {
+            let mut row = Instance::new(case, "/tmp/native-resume");
+            row.view = crate::session::View::Structured;
+            row.status = Status::Stopped;
+            row.mark_idle_dormant();
+            row.lifecycle_generation = if case == "overflow" { u64::MAX } else { 7 };
+            row.lifecycle_reservation = Some(LifecycleReservation {
+                op: if case == "busy" {
+                    LifecycleOperation::Capture
+                } else {
+                    LifecycleOperation::Stop
+                },
+                generation: row.lifecycle_generation,
+                at: Utc::now(),
+            });
+            let before = serde_json::to_value(&row).unwrap();
+            let observed = if case == "superseded" {
+                6
+            } else {
+                row.lifecycle_generation
+            };
+            let result = row.resume_structured_after_retirement(observed);
+            if case == "resume" {
+                assert_eq!(result.unwrap(), 8);
+                assert_eq!(row.status, Status::Idle);
+                assert!(!row.is_idle_dormant());
+                assert!(row.lifecycle_reservation.is_none());
+            } else {
+                assert!(result.is_err(), "{case}");
+                assert_eq!(serde_json::to_value(&row).unwrap(), before, "{case}");
+            }
+        }
+    }
+
     #[test]
     #[serial_test::serial]
     fn auxiliary_generation_preserves_state_and_rejects_stale_identity() {

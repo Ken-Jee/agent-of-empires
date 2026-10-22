@@ -1507,10 +1507,6 @@ fn perform_deletion_core(
     }
 }
 
-fn preclean_blocks_container_removal(outcome: Option<crate::git::cleanup::SandboxCleanup>) -> bool {
-    outcome == Some(crate::git::cleanup::SandboxCleanup::Blocked)
-}
-
 /// Container and worktree teardown, which destroys checkout contents and so must run inside the
 /// same [`PathsInUse`] check that decides what to keep. Returns whether the container is gone.
 #[expect(
@@ -1557,12 +1553,13 @@ fn stage_teardown_worktrees(
     } else {
         None
     };
-    let preclean_blocked = preclean_blocks_container_removal(preclean);
+    let preclean_blocked = matches!(
+        &preclean,
+        Some(crate::git::cleanup::SandboxCleanup::Blocked(_))
+    );
     let worktrees_removed_early = preclean_blocked && request.delete_sandbox;
     if worktrees_removed_early {
-        // A stopped container cannot run the managed cleanup entrypoint. Try
-        // host-side worktree removal first; only tear the container down after
-        // that succeeds. A permission/root-owned failure leaves both intact.
+        // Keep the stopped container until host cleanup proves its worktree removable.
         stage_remove_worktrees_and_branches(
             request,
             repos,
@@ -1573,6 +1570,11 @@ fn stage_teardown_worktrees(
             messages,
         );
         if !errors.is_empty() {
+            if let Some(crate::git::cleanup::SandboxCleanup::Blocked(reason)) = preclean {
+                if !errors.contains(&reason) {
+                    errors.push(reason);
+                }
+            }
             return false;
         }
     }
@@ -1599,6 +1601,13 @@ fn stage_teardown_worktrees(
             errors,
             messages,
         );
+    }
+    if !errors.is_empty() {
+        if let Some(crate::git::cleanup::SandboxCleanup::Blocked(reason)) = preclean {
+            if !errors.contains(&reason) {
+                errors.push(reason);
+            }
+        }
     }
     container_gone
 }
@@ -2218,19 +2227,6 @@ fn run_on_destroy_hooks(instance: &Instance, detach: bool, configured_hooks: &[S
 mod tests {
     use super::*;
 
-    #[test]
-    fn stopped_or_unreadable_sandbox_preclean_retains_container() {
-        assert!(preclean_blocks_container_removal(Some(
-            crate::git::cleanup::SandboxCleanup::Blocked
-        )));
-        assert!(!preclean_blocks_container_removal(Some(
-            crate::git::cleanup::SandboxCleanup::Cleaned
-        )));
-        assert!(!preclean_blocks_container_removal(Some(
-            crate::git::cleanup::SandboxCleanup::Absent
-        )));
-        assert!(!preclean_blocks_container_removal(None));
-    }
     fn create_test_instance() -> Instance {
         Instance::new("Test Session", "/tmp/test-project")
     }

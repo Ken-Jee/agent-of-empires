@@ -166,10 +166,43 @@ pub(crate) fn build_test_app_state_impl(
     )
         -> crate::acp::supervisor::Supervisor<crate::acp::supervisor::ChannelSink>,
 ) -> Arc<AppState> {
-    let app_dir = tempfile::tempdir().expect("tempdir");
-    let acp_db = app_dir.path().join("acp_events.db");
-    let event_store =
-        Arc::new(crate::acp::event_store::EventStore::open(&acp_db, 100).expect("event store"));
+    build_test_app_state_impl_with_event_store(
+        prior,
+        allowed_hosts,
+        allowed_origins,
+        token,
+        None,
+        |state| {
+            state.cityhall_mode = cityhall_mode;
+            configure(state);
+        },
+        customize,
+    )
+}
+
+pub(crate) fn build_test_app_state_impl_with_event_store(
+    prior: Vec<Instance>,
+    allowed_hosts: Vec<String>,
+    allowed_origins: Vec<String>,
+    token: Option<String>,
+    event_store: Option<Arc<crate::acp::event_store::EventStore>>,
+    configure: impl FnOnce(&mut AppState),
+    customize: impl FnOnce(
+        crate::acp::supervisor::Supervisor<crate::acp::supervisor::ChannelSink>,
+    )
+        -> crate::acp::supervisor::Supervisor<crate::acp::supervisor::ChannelSink>,
+) -> Arc<AppState> {
+    let app_dir = event_store
+        .is_none()
+        .then(|| tempfile::tempdir().expect("tempdir"));
+    let event_store = event_store.unwrap_or_else(|| {
+        let acp_db = app_dir
+            .as_ref()
+            .expect("default store directory")
+            .path()
+            .join("acp_events.db");
+        Arc::new(crate::acp::event_store::EventStore::open(&acp_db, 100).expect("event store"))
+    });
     let acp_events_tx = broadcast::channel::<AcpBroadcastFrame>(8).0;
     let acp_control_cache = Arc::new(crate::acp::control_cache::ControlStateCache::new());
     let sink = std::sync::Arc::new(crate::acp::supervisor::ChannelSink {
@@ -177,9 +210,10 @@ pub(crate) fn build_test_app_state_impl(
         event_store: event_store.clone(),
         control_cache: acp_control_cache.clone(),
     });
-    let supervisor = std::sync::Arc::new(customize(
-        crate::acp::supervisor::Supervisor::with_capacity(sink, 1),
-    ));
+    let supervisor = std::sync::Arc::new(
+        customize(crate::acp::supervisor::Supervisor::with_capacity(sink, 1))
+            .with_native_admission(),
+    );
     let instances = Arc::new(RwLock::new(prior));
     let instance_locks = Arc::new(RwLock::new(HashMap::new()));
     let idempotency_locks = Arc::new(RwLock::new(HashMap::new()));
@@ -203,7 +237,7 @@ pub(crate) fn build_test_app_state_impl(
         profile: "test".to_owned().into(),
         core_only: false,
         read_only: false,
-        cityhall_mode,
+        cityhall_mode: false,
         instances,
         profile_namespace: Arc::new(RwLock::new(())),
         publication: Arc::new(RwLock::new(())),
@@ -213,6 +247,7 @@ pub(crate) fn build_test_app_state_impl(
             ..Default::default()
         }),
         canonical_health: RwLock::new(crate::daemon::RuntimeHealth::Healthy),
+        canonical_diagnostics: Default::default(),
         runtime: super::runtime::NativeRuntime::new(
             "test".into(),
             None,
@@ -649,4 +684,24 @@ pub(crate) async fn archive_while_hook_waits(
     }
     std::fs::write(release, b"release").expect("release hook");
     target.is_some()
+}
+
+#[cfg(test)]
+/// Serve a fixture router through the real owner-authenticated private listener.
+pub(crate) async fn serve_owner_router_for_test(
+    socket: &std::path::Path,
+    router: axum::Router,
+) -> tokio::task::JoinHandle<()> {
+    let (listener, lease) = super::peer::bind_private(socket)
+        .await
+        .expect("fixture private listener");
+    tokio::spawn(async move {
+        let _lease = lease;
+        axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<super::peer::ConnectionPeer>(),
+        )
+        .await
+        .expect("fixture owner server");
+    })
 }

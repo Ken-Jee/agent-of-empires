@@ -123,12 +123,20 @@ impl ToolSession {
         Ok(super::tool_retirement::LockedJournal::open()?.targets())
     }
 
-    pub(crate) fn settle_pending_retirements_for(id: &str) -> Result<()> {
+    pub(crate) fn settle_pending_retirements_for(
+        id: &str,
+    ) -> Result<(std::collections::HashSet<String>, Vec<anyhow::Error>)> {
         let mut journal = super::tool_retirement::LockedJournal::open()?;
-        while let Some(token) = journal.first_token_for_instance(id) {
-            Self::finish_retirement(&mut journal, token, None)?;
+        let targets = journal.retirements_for_instance(id);
+        let mut protected = std::collections::HashSet::with_capacity(targets.len());
+        let mut errors = Vec::new();
+        for (token, tool_name) in targets {
+            protected.insert(tool_name);
+            if let Err(error) = Self::finish_retirement(&mut journal, token, None) {
+                errors.push(error);
+            }
         }
-        Ok(())
+        Ok((protected, errors))
     }
 
     /// Transport name only; lifecycle operations require verified snapshot ownership.
@@ -321,35 +329,60 @@ impl ToolSession {
         }
     }
 
-    pub(super) fn valid_identity(identity: &crate::session::LegacyToolIdentity) -> bool {
-        identity.pane_pid > 0
-            && i32::try_from(identity.pane_pid).is_ok()
-            && [(&identity.session_id, '$'), (&identity.pane_id, '%')]
-                .into_iter()
-                .all(|(id, prefix)| {
-                    id.strip_prefix(prefix).is_some_and(|digits| {
-                        !digits.is_empty() && digits.bytes().all(|ch| ch.is_ascii_digit())
-                    })
+    fn valid_pane_ids(session_id: &str, pane_id: &str) -> bool {
+        [(session_id, '$'), (pane_id, '%')]
+            .into_iter()
+            .all(|(id, prefix)| {
+                id.strip_prefix(prefix).is_some_and(|digits| {
+                    !digits.is_empty() && digits.bytes().all(|ch| ch.is_ascii_digit())
                 })
+            })
     }
 
-    fn validate_identity(metadata: &crate::tmux::PaneMetadata) -> Result<u32> {
+    pub(super) fn valid_identity(identity: &crate::session::LegacyToolIdentity) -> bool {
+        identity
+            .pane_pid
+            .is_some_and(|pid| pid > 0 && i32::try_from(pid).is_ok())
+            && Self::valid_pane_ids(&identity.session_id, &identity.pane_id)
+    }
+
+    fn validate_identity(metadata: &crate::tmux::PaneMetadata) -> Result<Option<u32>> {
         anyhow::ensure!(
-            metadata
-                .session_id
-                .strip_prefix('$')
-                .is_some_and(|id| !id.is_empty() && id.bytes().all(|ch| ch.is_ascii_digit()))
-                && metadata
-                    .pane_id
-                    .strip_prefix('%')
-                    .is_some_and(|id| !id.is_empty() && id.bytes().all(|ch| ch.is_ascii_digit())),
+            Self::valid_pane_ids(&metadata.session_id, &metadata.pane_id),
             LegacyToolUnavailable("immutable tmux IDs unavailable")
         );
+        if metadata.pane_dead {
+            return Ok(None);
+        }
         let pane_pid = metadata
             .pane_pid
-            .filter(|pid| *pid != 0)
+            .filter(|pid| *pid > 0 && i32::try_from(*pid).is_ok())
             .ok_or(LegacyToolUnavailable("pane process identity unavailable"))?;
-        Ok(pane_pid)
+        Ok(Some(pane_pid))
+    }
+
+    pub(crate) fn server_identity() -> Result<crate::session::TmuxServerIdentity> {
+        let (socket, pid) =
+            super::configured_tmux_server_identity(&super::TmuxCommandDeadline::new())?
+                .ok_or(LegacyToolUnavailable("original tmux server is absent"))?;
+        let birth = crate::process::process_birth_identity(pid)?.ok_or(LegacyToolUnavailable(
+            "original tmux server birth is unavailable",
+        ))?;
+        anyhow::ensure!(
+            crate::process::process_birth_is_live(pid, &birth)?,
+            LegacyToolUnavailable("original tmux server is not live")
+        );
+        Ok(crate::session::TmuxServerIdentity { socket, pid, birth })
+    }
+
+    fn validate_server(server: &crate::session::TmuxServerIdentity) -> Result<()> {
+        anyhow::ensure!(
+            super::configured_tmux_server_identity(&super::TmuxCommandDeadline::new())?
+                .is_some_and(|(socket, pid)| socket == server.socket && pid == server.pid)
+                && crate::process::process_birth_is_live(server.pid, &server.birth)?,
+            LegacyToolUnavailable("captured tmux server was replaced")
+        );
+        Ok(())
     }
 
     pub(crate) fn legacy_identity(
@@ -363,7 +396,7 @@ impl ToolSession {
         })
     }
 
-    fn snapshot_condition(
+    fn pane_condition(
         name: &str,
         identity: &crate::session::LegacyToolIdentity,
         owner: &str,
@@ -374,8 +407,20 @@ impl ToolSession {
         let name = literal(name);
         let kind = "#{||:#{==:#{@aoe_kind},},#{==:#{@aoe_kind},tool}}";
         let owner = literal(owner);
-        let pid = identity.pane_pid;
-        format!("#{{&&:#{{&&:#{{==:#{{session_id}},{session_id}}},#{{==:#{{pane_id}},{pane_id}}}}},#{{&&:#{{&&:#{{==:#{{session_name}},{name}}},#{{==:#{{pane_pid}},{pid}}}}},#{{&&:#{{==:#{{@aoe_tool_owner}},{owner}}},{kind}}}}}}}")
+        format!("#{{&&:#{{&&:#{{==:#{{session_id}},{session_id}}},#{{==:#{{pane_id}},{pane_id}}}}},#{{&&:#{{==:#{{session_name}},{name}}},#{{&&:#{{==:#{{@aoe_tool_owner}},{owner}}},{kind}}}}}}}")
+    }
+
+    fn snapshot_condition(
+        name: &str,
+        identity: &crate::session::LegacyToolIdentity,
+        owner: &str,
+    ) -> String {
+        let pane = Self::pane_condition(name, identity, owner);
+        let leader = match identity.pane_pid {
+            Some(pid) => format!("#{{==:#{{pane_pid}},{pid}}}"),
+            None => "#{==:#{pane_dead},1}".to_owned(),
+        };
+        format!("#{{&&:{pane},{leader}}}")
     }
 
     pub(crate) fn adopt_legacy_snapshot(
@@ -387,18 +432,23 @@ impl ToolSession {
         panes: &std::collections::HashMap<String, crate::tmux::PaneMetadata>,
         scope: &LegacyToolScope,
     ) -> Result<(Self, crate::session::LegacyToolIdentity)> {
+        Self::validate_server(&adoption.server)?;
         let (name, metadata) =
             Self::legacy_metadata_in(id, title, tool_name, profile, panes, scope)?
                 .ok_or(LegacyToolUnavailable("captured legacy pane is absent"))?;
         anyhow::ensure!(
             name == adoption.tmux_session
-                && metadata.session_id == adoption.identity.session_id
-                && metadata.pane_id == adoption.identity.pane_id
-                && metadata.pane_pid == Some(adoption.identity.pane_pid),
+                && Self::legacy_identity(metadata)? == adoption.identity
+                && metadata.server.as_ref() == Some(&adoption.server),
             LegacyToolUnavailable("captured pane was replaced")
         );
         let owner = serde_json::to_string(&(id, tool_name))?;
         let condition = Self::snapshot_condition(name, &adoption.identity, "");
+        let pid = adoption.server.pid;
+        let socket = super::Session::tmux_format_literal(&adoption.server.socket);
+        let condition = format!(
+            "#{{&&:{condition},#{{&&:#{{==:#{{pid}},{pid}}},#{{==:#{{socket_path}},{socket}}}}}}}"
+        );
         let quote = crate::tmux::Session::tmux_command_string_literal;
         let session_target = quote(&adoption.identity.session_id);
         let replacement = format!("set-option -t {session_target} @aoe_tool_owner {} ; set-option -t {session_target} @aoe_kind tool ; display-message -p aoe-tool-adopted", quote(&owner));
@@ -485,13 +535,25 @@ impl ToolSession {
         crate::process::process_birth_is_live(pending.server_pid, &pending.server_birth)
     }
 
-    /// An exact socket, server birth, and strict session census prove absence.
-    /// A live original server with an unavailable or redirected endpoint is not absent.
     fn original_session_present(pending: &super::tool_retirement::Retirement) -> Result<bool> {
-        if !Self::original_server_alive(pending)? {
+        Self::session_present_at(
+            &pending.socket,
+            pending.server_pid,
+            &pending.receipt.identity.session_id,
+            || Self::original_server_alive(pending),
+        )
+    }
+
+    fn session_present_at(
+        socket: &str,
+        server_pid: u32,
+        session_id: &str,
+        server_alive: impl Fn() -> Result<bool>,
+    ) -> Result<bool> {
+        if !server_alive()? {
             return Ok(false);
         }
-        let mut command = super::tmux_query_command_for_socket(&pending.socket);
+        let mut command = super::tmux_query_command_for_socket(socket);
         command.args([
             "display-message",
             "-p",
@@ -502,7 +564,7 @@ impl ToolSession {
             "#{pid}\t#{socket_path}\t#{session_id}",
         ]);
         let output = super::TmuxCommandDeadline::new().run(&mut command)?;
-        if !Self::original_server_alive(pending)? {
+        if !server_alive()? {
             return Ok(false);
         }
         anyhow::ensure!(
@@ -515,13 +577,13 @@ impl ToolSession {
         for line in text.lines() {
             let mut fields = line.split('\t');
             let pid = fields.next().and_then(|pid| pid.parse::<u32>().ok());
-            let socket = fields.next();
+            let observed_socket = fields.next();
             let session = fields
                 .next()
                 .ok_or(LegacyToolUnavailable("original tmux census is malformed"))?;
             anyhow::ensure!(
-                pid == Some(pending.server_pid)
-                    && socket == Some(pending.socket.as_str())
+                pid == Some(server_pid)
+                    && observed_socket == Some(socket)
                     && (session == "-"
                         || session.strip_prefix('$').is_some_and(
                             |id| !id.is_empty() && id.bytes().all(|ch| ch.is_ascii_digit())
@@ -530,7 +592,7 @@ impl ToolSession {
                 LegacyToolUnavailable("original tmux server identity changed")
             );
             server_attested |= session == "-";
-            present |= session == pending.receipt.identity.session_id;
+            present |= session == session_id;
         }
         anyhow::ensure!(
             server_attested,
@@ -554,17 +616,23 @@ impl ToolSession {
             ))?;
         if Self::original_session_present(pending)? {
             let receipt = &pending.receipt;
-            anyhow::ensure!(
-                receipt.tree.root_is_current()?,
-                LegacyToolUnavailable("original tool process birth changed before tmux effect")
-            );
+            let root_current = receipt.tree.root_is_current();
             let identity = &receipt.identity;
-            let condition = Self::snapshot_condition(&receipt.name, identity, &receipt.owner);
+            let live = Self::snapshot_condition(&receipt.name, identity, &receipt.owner);
+            let current = if matches!(&root_current, Ok(true)) {
+                "1"
+            } else {
+                "0"
+            };
+            let live = format!("#{{&&:#{{&&:{live},#{{==:#{{pane_dead}},0}}}},{current}}}");
+            let pane = Self::pane_condition(&receipt.name, identity, &receipt.owner);
+            let dead = format!("#{{&&:{pane},#{{==:#{{pane_dead}},1}}}}");
+            let condition = format!("#{{||:{live},{dead}}}");
             let token = super::Session::tmux_format_literal(&pending.token.to_string());
             let socket = super::Session::tmux_format_literal(&pending.socket);
             let condition = format!(
                 concat!(
-                    "#{{&&:#{{&&:{condition},#{{==:#{{pane_dead}},0}}}},",
+                    "#{{&&:{condition},",
                     "#{{&&:#{{==:#{{@aoe_tool_retirement}},{token}}},",
                     "#{{&&:#{{==:#{{pid}},{server_pid}}},",
                     "#{{==:#{{socket_path}},{socket}}}",
@@ -598,19 +666,23 @@ impl ToolSession {
             #[cfg(test)]
             let acknowledged = !DROP_RETIREMENT_ACK.replace(false) && acknowledged;
             if !acknowledged && Self::original_session_present(pending)? {
+                root_current?;
                 return Err(LegacyToolUnavailable(
                     "captured identity or owner changed before tmux effect",
                 )
                 .into());
             }
         }
-        // Tmux 3.8 hides pane_pid once its descriptor closes. Remove the original
-        // live session first, then settle only the already-authorized birth list.
+        // Settle only the original birth list, including when tmux hides a dead leader PID.
         let tree = match captured {
             Some(tree) => tree,
             None => crate::process::CapturedProcessTree::resume(
                 pending.receipt.tree.clone(),
-                pending.receipt.identity.pane_pid,
+                pending
+                    .receipt
+                    .identity
+                    .pane_pid
+                    .ok_or(LegacyToolUnavailable("original tool PID unavailable"))?,
             )?,
         };
         tree.settle(std::time::Duration::from_millis(200))?;
@@ -621,26 +693,102 @@ impl ToolSession {
         Ok(())
     }
 
+    fn kill_dead_pane_verified(
+        &self,
+        identity: &crate::session::LegacyToolIdentity,
+        owner: &str,
+        server: &crate::session::TmuxServerIdentity,
+    ) -> Result<()> {
+        Self::validate_server(server)?;
+        let socket = server.socket.as_str();
+        let server_pid = server.pid;
+        let birth = &server.birth;
+        let condition = Self::snapshot_condition(&self.name, identity, owner);
+        let socket_literal = super::Session::tmux_format_literal(socket);
+        let condition = format!(
+            concat!(
+                "#{{&&:{condition},",
+                "#{{&&:#{{==:#{{@aoe_tool_stop}},}},",
+                "#{{&&:#{{==:#{{@aoe_tool_retirement}},}},",
+                "#{{&&:#{{==:#{{pid}},{server_pid}}},",
+                "#{{==:#{{socket_path}},{socket}}}",
+                "}}",
+                "}}",
+                "}}",
+                "}}"
+            ),
+            condition = condition,
+            server_pid = server_pid,
+            socket = socket_literal,
+        );
+        let target = super::Session::tmux_command_string_literal(&identity.session_id);
+        let effect = format!("kill-session -t {target} ; display-message -p aoe-tool-stopped");
+        let mut command = super::tmux_query_command_for_socket(socket);
+        command.args([
+            "if-shell",
+            "-t",
+            &identity.pane_id,
+            "-F",
+            &condition,
+            &effect,
+        ]);
+        let result = super::TmuxCommandDeadline::new().run(&mut command);
+        let acknowledged = result.as_ref().is_ok_and(|output| {
+            output.status.success()
+                && String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .any(|line| line.trim() == "aoe-tool-stopped")
+        });
+        anyhow::ensure!(
+            acknowledged
+                || !Self::session_present_at(socket, server_pid, &identity.session_id, || {
+                    crate::process::process_birth_is_live(server_pid, birth)
+                },)?,
+            LegacyToolUnavailable("dead tool identity or owner changed before tmux effect")
+        );
+        refresh_session_cache();
+        Ok(())
+    }
+
     pub(crate) fn kill_verified(
         &self,
         id: &str,
         tool_name: &str,
         identity: &crate::session::LegacyToolIdentity,
+        expected_server: Option<&crate::session::TmuxServerIdentity>,
     ) -> Result<()> {
         let mut journal = super::tool_retirement::LockedJournal::open()?;
         if let Some(pending) = journal.pending(id, tool_name) {
             anyhow::ensure!(
-                pending.receipt.name == self.name && pending.receipt.identity == *identity,
+                pending.receipt.name == self.name
+                    && pending.receipt.identity.session_id == identity.session_id
+                    && pending.receipt.identity.pane_id == identity.pane_id
+                    && identity
+                        .pane_pid
+                        .is_none_or(|pid| pending.receipt.identity.pane_pid == Some(pid)),
                 LegacyToolUnavailable("pending retirement belongs to another tool incarnation")
             );
             let token = pending.token;
             return Self::finish_retirement(&mut journal, token, None);
         }
         anyhow::ensure!(
-            Self::valid_identity(identity),
+            Self::valid_pane_ids(&identity.session_id, &identity.pane_id),
             LegacyToolUnavailable("immutable tmux IDs unavailable")
         );
+        if let Some(server) = expected_server {
+            Self::validate_server(server)?;
+        }
         let owner = serde_json::to_string(&(id, tool_name))?;
+        let Some(pane_pid) = identity.pane_pid else {
+            let server = expected_server.ok_or(LegacyToolUnavailable(
+                "dead pane has no captured tmux server proof",
+            ))?;
+            return self.kill_dead_pane_verified(identity, &owner, server);
+        };
+        anyhow::ensure!(
+            Self::valid_identity(identity),
+            LegacyToolUnavailable("live pane process identity unavailable")
+        );
         let condition = Self::snapshot_condition(&self.name, identity, &owner);
         // Refuse historical tmux-only debt before even sampling a current cohort.
         // This read is not authorization: capture must precede the fresh CAS below.
@@ -659,13 +807,21 @@ impl ToolSession {
             "display-message -p aoe-tool-capture-ready",
             "aoe-tool-capture-ready",
         )?;
-        let tree = crate::process::CapturedProcessTree::capture(identity.pane_pid)?;
+        let tree = crate::process::CapturedProcessTree::capture(pane_pid)?;
         let (socket, server_pid) =
             super::configured_tmux_server_identity(&super::TmuxCommandDeadline::new())?
                 .ok_or(LegacyToolUnavailable("original tmux server is absent"))?;
         let server_birth = crate::process::process_birth_identity(server_pid)?.ok_or(
             LegacyToolUnavailable("original tmux server birth is unavailable"),
         )?;
+        if let Some(expected) = expected_server {
+            anyhow::ensure!(
+                socket == expected.socket
+                    && server_pid == expected.pid
+                    && server_birth == expected.birth,
+                LegacyToolUnavailable("captured tmux server changed before retirement")
+            );
+        }
         let token = uuid::Uuid::new_v4();
         let socket_literal = super::Session::tmux_format_literal(&socket);
         // An older tmux-only receipt remains evidence, not an alternative authority.
@@ -839,6 +995,7 @@ mod tests {
 
     fn legacy_metadata() -> crate::tmux::PaneMetadata {
         crate::tmux::PaneMetadata {
+            server: None,
             session_id: "$42".into(),
             pane_id: "%42".into(),
             session_kind: None,
@@ -1103,13 +1260,18 @@ mod tests {
             }
             let mut cleanup = Cleanup {
                 tree: Some(
-                    crate::process::CapturedProcessTree::capture(identity.pane_pid).unwrap(),
+                    crate::process::CapturedProcessTree::capture(
+                        identity.pane_pid.expect("live tool fixture"),
+                    )
+                    .unwrap(),
                 ),
                 descendant: None,
-                pid: identity.pane_pid,
-                birth: crate::process::process_birth_identity(identity.pane_pid)
-                    .unwrap()
-                    .unwrap(),
+                pid: identity.pane_pid.expect("live tool fixture"),
+                birth: crate::process::process_birth_identity(
+                    identity.pane_pid.expect("live tool fixture"),
+                )
+                .unwrap()
+                .unwrap(),
             };
             std::fs::write(&start, "start\n").unwrap();
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -1125,15 +1287,21 @@ mod tests {
                 );
                 std::thread::yield_now();
             };
-            cleanup.tree =
-                Some(crate::process::CapturedProcessTree::capture(identity.pane_pid).unwrap());
+            cleanup.tree = Some(
+                crate::process::CapturedProcessTree::capture(
+                    identity.pane_pid.expect("live tool fixture"),
+                )
+                .unwrap(),
+            );
             cleanup.descendant =
                 Some(crate::process::CapturedProcessTree::capture(descendant).unwrap());
             let descendant_proof = cleanup.descendant.as_ref().unwrap();
             let mut retired_replacement = None;
             if fail_first {
                 crate::process::FAIL_CAPTURED_TREE_AFTER_ROOT.set(true);
-                let error = tool.kill_verified(ID, "probe", &identity).unwrap_err();
+                let error = tool
+                    .kill_verified(ID, "probe", &identity, None)
+                    .unwrap_err();
                 assert!(error
                     .to_string()
                     .contains("injected retirement proof failure after root exit"));
@@ -1168,9 +1336,10 @@ mod tests {
                     ToolSession::legacy_identity(replacement.get(tool.session_name()).unwrap())
                         .unwrap();
                 assert_ne!(replacement_identity, identity);
-                let replacement_tree =
-                    crate::process::CapturedProcessTree::capture(replacement_identity.pane_pid)
-                        .unwrap();
+                let replacement_tree = crate::process::CapturedProcessTree::capture(
+                    replacement_identity.pane_pid.expect("live tool fixture"),
+                )
+                .unwrap();
                 assert!(ToolSession::settle_pending_retirement(ID, "probe", None).unwrap());
                 assert!(descendant_proof.all_exited().unwrap());
                 assert!(
@@ -1197,14 +1366,14 @@ mod tests {
                         .unwrap()
                         .success());
                 } else {
-                    tool.kill_verified(ID, "probe", &replacement_identity)
+                    tool.kill_verified(ID, "probe", &replacement_identity, None)
                         .unwrap();
                 }
                 retired_replacement = Some(replacement_identity.session_id);
             }
             if !fail_first {
                 DROP_RETIREMENT_ACK.set(true);
-                tool.kill_verified(ID, "probe", &identity).unwrap();
+                tool.kill_verified(ID, "probe", &identity, None).unwrap();
             }
             assert!(cleanup.tree.as_ref().unwrap().all_exited().unwrap());
             assert!(descendant_proof.all_exited().unwrap());
@@ -1239,10 +1408,13 @@ mod tests {
         let panes = crate::tmux::batch_pane_metadata().unwrap();
         let identity =
             ToolSession::legacy_identity(panes.get(tool.session_name()).unwrap()).unwrap();
-        let proof = crate::process::CapturedProcessTree::capture(identity.pane_pid).unwrap();
+        let proof = crate::process::CapturedProcessTree::capture(
+            identity.pane_pid.expect("live tool fixture"),
+        )
+        .unwrap();
         let _interruption = ToolSession::interrupt_retirement_after_prepare_for_test(ID);
         assert!(tool
-            .kill_verified(ID, "probe", &identity)
+            .kill_verified(ID, "probe", &identity, None)
             .unwrap_err()
             .to_string()
             .contains("after durable"));
@@ -1262,12 +1434,13 @@ mod tests {
             .status()
             .unwrap()
             .success());
-        assert!(tool.kill_verified(ID, "probe", &identity).is_err());
+        assert!(tool.kill_verified(ID, "probe", &identity, None).is_err());
         assert!(!proof.all_exited().unwrap());
         assert_eq!(std::fs::read(&path).unwrap(), evidence);
         let mut stale = crate::session::LegacyToolAdoption {
             tmux_session: tool.name.clone(),
             identity: identity.clone(),
+            server: std::sync::Arc::new(ToolSession::server_identity().unwrap()),
             profile: "default".into(),
             lifecycle_generation: 0,
         };
@@ -1309,9 +1482,12 @@ mod tests {
         let panes = crate::tmux::batch_pane_metadata().unwrap();
         let identity =
             ToolSession::legacy_identity(panes.get(tool.session_name()).unwrap()).unwrap();
-        let proof = crate::process::CapturedProcessTree::capture(identity.pane_pid).unwrap();
+        let proof = crate::process::CapturedProcessTree::capture(
+            identity.pane_pid.expect("live tool fixture"),
+        )
+        .unwrap();
         let _interruption = ToolSession::interrupt_retirement_after_prepare_for_test(ID);
-        assert!(tool.kill_verified(ID, "probe", &identity).is_err());
+        assert!(tool.kill_verified(ID, "probe", &identity, None).is_err());
         let journal = super::super::tool_retirement::LockedJournal::open().unwrap();
         let pending = journal.pending(ID, "probe").unwrap().clone();
         drop(journal);
@@ -1385,7 +1561,7 @@ mod tests {
                 identity: crate::session::LegacyToolIdentity {
                     session_id: "$1".into(),
                     pane_id: "%1".into(),
-                    pane_pid: pid,
+                    pane_pid: Some(pid),
                 },
                 owner: serde_json::to_string(&(ID, "probe")).unwrap(),
                 tree,
@@ -1399,8 +1575,15 @@ mod tests {
             identity: crate::session::LegacyToolIdentity {
                 session_id: "$2".into(),
                 pane_id: "%2".into(),
-                pane_pid: std::process::id(),
+                pane_pid: Some(std::process::id()),
             },
+            server: std::sync::Arc::new(crate::session::TmuxServerIdentity {
+                socket: "/unreachable/replacement.sock".into(),
+                pid: std::process::id(),
+                birth: crate::process::process_birth_identity(std::process::id())
+                    .unwrap()
+                    .unwrap(),
+            }),
             profile: "default".into(),
             lifecycle_generation: 0,
         };
@@ -1432,7 +1615,10 @@ mod tests {
         let panes = crate::tmux::batch_pane_metadata().unwrap();
         let identity =
             ToolSession::legacy_identity(panes.get(tool.session_name()).unwrap()).unwrap();
-        let proof = crate::process::CapturedProcessTree::capture(identity.pane_pid).unwrap();
+        let proof = crate::process::CapturedProcessTree::capture(
+            identity.pane_pid.expect("live tool fixture"),
+        )
+        .unwrap();
         let receipt = serde_json::to_string(&ToolStopReceipt {
             name: tool.name.clone(),
             identity: identity.clone(),
@@ -1451,7 +1637,7 @@ mod tests {
             .status()
             .unwrap()
             .success());
-        assert!(tool.kill_verified(ID, "probe", &identity).is_err());
+        assert!(tool.kill_verified(ID, "probe", &identity, None).is_err());
         assert!(!proof.all_exited().unwrap());
         assert_eq!(
             crate::tmux::test_helpers::pane_field(&identity.pane_id, "#{@aoe_tool_stop}"),
@@ -1508,6 +1694,7 @@ mod tests {
             let adoption = crate::session::LegacyToolAdoption {
                 tmux_session: name.clone(),
                 identity: ToolSession::legacy_identity(metadata).unwrap(),
+                server: metadata.server.clone().expect("legacy census server proof"),
                 profile: "work".into(),
                 lifecycle_generation: 0,
             };
@@ -1579,7 +1766,11 @@ mod tests {
                     wait_for_pane_command(pane, "sleep");
                     assert_ne!(
                         pane_field(pane, "#{pane_pid}"),
-                        adoption.identity.pane_pid.to_string()
+                        adoption
+                            .identity
+                            .pane_pid
+                            .expect("captured live pane PID")
+                            .to_string()
                     );
                 }
                 "replacement" => {
@@ -1635,10 +1826,13 @@ mod tests {
                         .status()
                         .unwrap()
                         .success());
-                    assert!(tool.kill_verified(&id, "probe", &verified).is_err());
+                    assert!(tool
+                        .kill_verified(&id, "probe", &verified, Some(&adoption.server))
+                        .is_err());
                     assert_eq!(pane_field(&name, "#{@aoe_tool_owner}"), "");
                 } else {
-                    tool.kill_verified(&id, "probe", &verified).unwrap();
+                    tool.kill_verified(&id, "probe", &verified, Some(&adoption.server))
+                        .unwrap();
                 }
             } else {
                 assert!(
@@ -1678,6 +1872,7 @@ mod tests {
         let mut panes = std::collections::HashMap::from([(
             sibling.clone(),
             crate::tmux::PaneMetadata {
+                server: None,
                 session_id: "$42".into(),
                 pane_id: "%42".into(),
                 session_kind: None,
@@ -1887,6 +2082,128 @@ mod tests {
             ui_owner.stdout.is_empty(),
             "creation changed the inherited session owner"
         );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn legacy_dead_pane_consent_never_adopts_recycled_ids_from_a_replacement_server(
+    ) -> anyhow::Result<()> {
+        if !tmux_available() {
+            return Ok(());
+        }
+        let home = crate::session::test_support::isolate_app_dir();
+        let socket = home.path().join("server-replacement.sock");
+        let _environment = crate::session::test_support::EnvGuard::set(&[(
+            crate::tmux::TMUX_SOCKET_ENV,
+            socket.as_os_str(),
+        )]);
+        struct PrivateServer<'a>(&'a std::path::Path);
+        impl Drop for PrivateServer<'_> {
+            fn drop(&mut self) {
+                let _ = std::process::Command::new("tmux")
+                    .arg("-S")
+                    .arg(self.0)
+                    .arg("kill-server")
+                    .output();
+            }
+        }
+        let _server = PrivateServer(&socket);
+        let name = ToolSession::generate_name(ID, "Row", "probe");
+        let create_dead =
+            || -> anyhow::Result<std::collections::HashMap<String, crate::tmux::PaneMetadata>> {
+                anyhow::ensure!(
+                    crate::tmux::tmux_command()
+                        .args([
+                            "-f",
+                            "/dev/null",
+                            "new-session",
+                            "-d",
+                            "-s",
+                            &name,
+                            "sleep 600",
+                            ";",
+                            "set-option",
+                            "-w",
+                            "-t",
+                            &name,
+                            "remain-on-exit",
+                            "on",
+                            ";",
+                            "respawn-pane",
+                            "-k",
+                            "-t",
+                            &name,
+                            "true",
+                        ])
+                        .status()?
+                        .success(),
+                    "private dead pane creation failed"
+                );
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                loop {
+                    let panes = crate::tmux::batch_pane_metadata()?;
+                    if panes.get(&name).is_some_and(|pane| pane.pane_dead) {
+                        return Ok(panes);
+                    }
+                    anyhow::ensure!(
+                        std::time::Instant::now() < deadline,
+                        "private pane did not exit"
+                    );
+                    std::thread::yield_now();
+                }
+            };
+        let original = create_dead()?;
+        let original_server =
+            crate::tmux::configured_tmux_server_identity(&crate::tmux::TmuxCommandDeadline::new())?
+                .expect("original private server");
+        let adoption = crate::session::LegacyToolAdoption {
+            tmux_session: name.clone(),
+            identity: ToolSession::legacy_identity(original.get(&name).unwrap())?,
+            server: original
+                .get(&name)
+                .unwrap()
+                .server
+                .clone()
+                .expect("original census server proof"),
+            profile: "work".into(),
+            lifecycle_generation: 0,
+        };
+        anyhow::ensure!(crate::tmux::tmux_command()
+            .arg("kill-server")
+            .status()?
+            .success());
+        let replacement = create_dead()?;
+        let replacement_server =
+            crate::tmux::configured_tmux_server_identity(&crate::tmux::TmuxCommandDeadline::new())?
+                .expect("replacement private server");
+        assert_ne!(original_server.1, replacement_server.1);
+        assert_eq!(
+            ToolSession::legacy_identity(replacement.get(&name).unwrap())?,
+            adoption.identity,
+            "the replacement server reused the same dead-pane IDs"
+        );
+        let result = ToolSession::adopt_legacy_snapshot(
+            ID,
+            "Row",
+            "probe",
+            "work",
+            &adoption,
+            &replacement,
+            &legacy_scope(ID, "probe"),
+        );
+        let after = crate::tmux::batch_pane_metadata()?;
+        assert!(
+            matches!(
+                after.get(&name).expect("replacement survives").tool_owner,
+                crate::tmux::ToolPaneOwner::Unmarked
+            ),
+            "old consent modified a replacement server"
+        );
+        assert!(
+            result.is_err(),
+            "old consent was accepted for a replacement server"
+        );
+        Ok(())
     }
 
     #[test]

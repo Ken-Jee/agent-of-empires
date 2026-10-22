@@ -19,6 +19,7 @@ export function sessionResponse({ id, title, project_path, ...rest }: SessionInp
     tool: "claude",
     status: "Idle",
     yolo_mode: false,
+    lifecycle_generation: 0,
     created_at: new Date().toISOString(),
     last_accessed_at: null,
     idle_entered_at: null,

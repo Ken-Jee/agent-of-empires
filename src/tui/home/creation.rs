@@ -414,7 +414,6 @@ impl HomeView {
         self.clear_creation_tracking(&pending.request_key);
         self.rebuild_group_trees();
         self.rebuild_flat_items();
-        self.select_and_reveal_session(&row.id);
         self.new_dialog = None;
         if pending.cancel_requested {
             self.flash_status("Creation had already committed; cancellation was too late");
@@ -429,7 +428,15 @@ impl HomeView {
                 ),
             ));
         }
-        Some(row.id.clone())
+        match self.reveal_session(&row.id, true) {
+            Ok(_) => self.take_created_attach(),
+            Err(error) => {
+                self.record_runtime_message(format!(
+                    "Session created; reveal not admitted: {error}"
+                ));
+                None
+            }
+        }
     }
 
     /// Clear the placeholder only after bounded cancellation admission at quit.
