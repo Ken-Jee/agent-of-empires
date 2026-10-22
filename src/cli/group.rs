@@ -131,15 +131,12 @@ async fn create_group(profile: &str, args: GroupCreateArgs) -> Result<()> {
     let name = args.name.trim();
     let parent = args.parent.as_deref().map(str::trim);
     let client = HttpClient::new(require_daemon().await?)?;
-    client
+    let path = client
         .create_group(name, parent, profile)
         .await
         .map_err(group_error)?;
 
-    match parent {
-        Some(parent) => println!("✓ Created group: {parent}/{name}"),
-        None => println!("✓ Created group: {name}"),
-    }
+    println!("✓ Created group: {path}");
     Ok(())
 }
 

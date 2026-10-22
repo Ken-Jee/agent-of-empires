@@ -375,19 +375,22 @@ impl HttpClient {
     }
 
     /// Register a group in `profile`, nested under `parent` when given.
+    /// Returns the path the daemon created.
     pub async fn create_group(
         &self,
         name: &str,
         parent: Option<&str>,
         profile: &str,
-    ) -> Result<(), HttpError> {
+    ) -> Result<String, HttpError> {
         let body = serde_json::json!({ "name": name, "parent": parent, "profile": profile });
-        self.send_elevated(
-            || self.request(Method::POST, "/api/groups").json(&body),
-            Scope::Global,
-        )
-        .await?;
-        Ok(())
+        let res = self
+            .send_elevated(
+                || self.request(Method::POST, "/api/groups").json(&body),
+                Scope::Global,
+            )
+            .await?;
+        let body: serde_json::Value = res.json().await?;
+        Ok(body["path"].as_str().unwrap_or(name).to_string())
     }
 
     /// Delete a group and its subtree; returns how many sessions were ungrouped.
