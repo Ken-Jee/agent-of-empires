@@ -193,6 +193,12 @@ test("enabling structured view reaps owned panes and preserves an unverified too
         "set-option",
         "-t",
         `=${name}:`,
+        "pane-base-index",
+        "0",
+        ";",
+        "set-option",
+        "-t",
+        `=${name}:`,
         "@aoe_kind",
         ["agent", "term", "tool", "tool"][index]!,
       ];

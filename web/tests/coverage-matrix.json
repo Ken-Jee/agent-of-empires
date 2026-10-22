@@ -703,6 +703,18 @@
       ]
     },
     {
+      "id": "settings.sandbox-passphrase-elevation",
+      "kind": "live-playwright",
+      "risk": "high",
+      "description": "Direct and proxied TCP sandbox image saves require real browser elevation; forwarding headers never grant Unix owner authority.",
+      "specs": ["tests/live/settings-persistence.spec.ts"],
+      "components": [
+        "web/src/components/settings/SchemaSection.tsx",
+        "web/src/components/ElevationPrompt.tsx",
+        "web/src/lib/fetchInterceptor.ts"
+      ]
+    },
+    {
       "id": "settings.custom-widgets",
       "kind": "vitest",
       "risk": "medium",
@@ -2632,6 +2644,7 @@
       "id": "devices",
       "kind": "live-playwright",
       "risk": "medium",
+      "description": "Authenticated TCP device management requires real browser elevation before revoke and sign-out-all; revoked credentials stop authenticating.",
       "specs": ["tests/live/auth.spec.ts"],
       "components": ["web/src/components/ConnectedDevices.tsx"]
     },
@@ -3003,6 +3016,7 @@
       "id": "acp.mode-switch-tmux-teardown",
       "kind": "live-playwright",
       "risk": "high",
+      "description": "Mode switches reap verified owned panes and preserve tools whose matching name lacks owner evidence.",
       "specs": ["tests/live/session-lifecycle.spec.ts"],
       "components": ["src/server/api/acp.rs"]
     },
@@ -4708,9 +4722,10 @@
       "components": ["web/src/components/settings/PluginsSettings.tsx"]
     },
     {
-      "id": "settings.plugins-passphrase-loopback",
+      "id": "settings.plugins-passphrase-elevation",
       "kind": "live-playwright",
       "risk": "high",
+      "description": "Direct TCP plugin changes require passphrase elevation, explicit retry and persisted UI/backend state.",
       "specs": ["tests/live/settings-panels.spec.ts"],
       "components": [
         "web/src/components/settings/PluginsSettings.tsx",
