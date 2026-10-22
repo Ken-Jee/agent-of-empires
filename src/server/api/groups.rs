@@ -48,6 +48,28 @@ enum DeleteOutcome {
     Retry(Vec<String>),
 }
 
+/// Locks every session in `ids` without ever waiting while holding one:
+/// workspace deletion locks its owner first, then siblings, an order unrelated
+/// to id order. On contention, release all, wait on that lock alone, return `None`.
+async fn try_lock_all(
+    state: &AppState,
+    ids: &[String],
+) -> Option<Vec<tokio::sync::OwnedMutexGuard<()>>> {
+    let mut guards = Vec::with_capacity(ids.len());
+    for id in ids {
+        let lock = state.instance_lock(id).await;
+        match lock.clone().try_lock_owned() {
+            Ok(guard) => guards.push(guard),
+            Err(_) => {
+                drop(guards);
+                drop(lock.lock().await);
+                return None;
+            }
+        }
+    }
+    Some(guards)
+}
+
 fn group_session_ids(instances: &[Instance], profile: &str, group: &str) -> Vec<String> {
     instances
         .iter()
@@ -205,10 +227,9 @@ pub async fn delete_group(
     let (moved, _guards) = loop {
         ids.sort();
         ids.dedup();
-        let mut guards = Vec::with_capacity(ids.len());
-        for id in &ids {
-            guards.push(state.instance_lock(id).await.lock_owned().await);
-        }
+        let Some(guards) = try_lock_all(&state, &ids).await else {
+            continue;
+        };
         let file_watch = state.file_watch.clone();
         let persist_path = path.clone();
         let persist_profile = profile.clone();
@@ -462,6 +483,58 @@ mod tests {
         let on_disk = Storage::new_unwatched(PROFILE).unwrap().load().unwrap();
         assert_eq!(on_disk[0].group_path, "");
         assert_eq!(f.state.instances.read().await[0].group_path, "");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn forced_delete_does_not_deadlock_with_workspace_deletion() {
+        let f = fixture(&[("sibling", "team"), ("owner", "team")]);
+        create(&f, "empty", Some("team")).await;
+        {
+            let mut live = f.state.instances.write().await;
+            live[0].id = "a".into();
+            live[1].id = "b".into();
+        }
+        Storage::new_unwatched(PROFILE)
+            .unwrap()
+            .update(|disk, _| {
+                disk[0].id = "a".into();
+                disk[1].id = "b".into();
+                Ok(())
+            })
+            .unwrap();
+
+        // Workspace deletion: owner `b` first, then sibling `a`.
+        let owner = f.state.instance_lock("b").await.lock_owned().await;
+        let task = tokio::spawn({
+            let state = f.state.clone();
+            async move {
+                delete_group(
+                    State(state),
+                    Ok(Query(DeleteGroupQuery {
+                        path: "team".into(),
+                        force: true,
+                        profile: Some(PROFILE.into()),
+                    })),
+                )
+                .await
+                .into_response()
+            }
+        });
+        let sibling = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            f.state.instance_lock("a").await.lock_owned(),
+        )
+        .await
+        .expect("group delete must not hold `a` while waiting on `b`");
+        drop(sibling);
+        drop(owner);
+
+        assert_eq!(task.await.unwrap().status(), StatusCode::OK);
+        let on_disk = Storage::new_unwatched(PROFILE).unwrap().load().unwrap();
+        assert!(on_disk.iter().all(|i| i.group_path.is_empty()));
+        let live = f.state.instances.read().await;
+        assert!(live.iter().all(|i| i.group_path.is_empty()));
     }
 
     #[tokio::test]
