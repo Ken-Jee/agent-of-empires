@@ -11,7 +11,7 @@ use serde::Deserialize;
 
 use super::{api_error, cityhall_block, read_only_block, validate_display_label};
 use super::{validate_profile_name, AppState};
-use crate::session::{GroupTree, Storage};
+use crate::session::{GroupTree, Instance, Storage};
 
 #[derive(Deserialize)]
 pub struct CreateGroupBody {
@@ -41,6 +41,19 @@ enum GroupError {
         "Group '{path}' contains {count} sessions. Use --force to move them to default group."
     )]
     NotEmpty { path: String, count: usize },
+}
+
+enum DeleteOutcome {
+    Done(Vec<String>),
+    Retry(Vec<String>),
+}
+
+fn group_session_ids(instances: &[Instance], profile: &str, group: &str) -> Vec<String> {
+    instances
+        .iter()
+        .filter(|i| i.source_profile == profile && in_group(&i.group_path, group))
+        .map(|i| i.id.clone())
+        .collect()
 }
 
 fn in_group(group_path: &str, group: &str) -> bool {
@@ -175,61 +188,81 @@ pub async fn delete_group(
         Err(resp) => return resp,
     };
 
-    let file_watch = state.file_watch.clone();
-    let persist_path = path.clone();
-    let persist_profile = profile.clone();
-    let result = tokio::task::spawn_blocking(move || {
-        Storage::new(&persist_profile, file_watch)?.update(|instances, groups| {
-            let mut tree = GroupTree::new_with_groups(instances, groups);
-            if !tree.group_exists(&persist_path) {
-                return Err(GroupError::NotFound(persist_path).into());
-            }
-            let affected = instances
-                .iter()
-                .filter(|i| in_group(&i.group_path, &persist_path))
-                .count();
-            if affected > 0 && !force {
-                return Err(GroupError::NotEmpty {
-                    path: persist_path,
-                    count: affected,
+    // Hold each affected session's lock across the disk write and the memory
+    // pass so `PATCH /api/sessions/{id}/group` cannot interleave. A session
+    // that joined the group after the snapshot shows up on disk and retries.
+    let mut ids = {
+        let instances = state.instances.read().await;
+        group_session_ids(&instances, &profile, &path)
+    };
+    let (moved, _guards) = loop {
+        ids.sort();
+        ids.dedup();
+        let mut guards = Vec::with_capacity(ids.len());
+        for id in &ids {
+            guards.push(state.instance_lock(id).await.lock_owned().await);
+        }
+        let file_watch = state.file_watch.clone();
+        let persist_path = path.clone();
+        let persist_profile = profile.clone();
+        let held = ids.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            Storage::new(&persist_profile, file_watch)?.update(|instances, groups| {
+                let mut tree = GroupTree::new_with_groups(instances, groups);
+                if !tree.group_exists(&persist_path) {
+                    return Err(GroupError::NotFound(persist_path).into());
                 }
-                .into());
-            }
-            for inst in instances
-                .iter_mut()
-                .filter(|i| in_group(&i.group_path, &persist_path))
-            {
-                inst.group_path = String::new();
-            }
-            tree.delete_group(&persist_path);
-            *groups = tree.get_all_groups();
-            Ok(affected)
-        })
-    })
-    .await;
-    match result {
-        Ok(Ok(moved)) => {
-            if moved > 0 {
-                let mut instances = state.instances.write().await;
+                let affected: Vec<String> = instances
+                    .iter()
+                    .filter(|i| in_group(&i.group_path, &persist_path))
+                    .map(|i| i.id.clone())
+                    .collect();
+                if affected.iter().any(|id| !held.contains(id)) {
+                    return Ok(DeleteOutcome::Retry(affected));
+                }
+                if !affected.is_empty() && !force {
+                    return Err(GroupError::NotEmpty {
+                        path: persist_path,
+                        count: affected.len(),
+                    }
+                    .into());
+                }
                 for inst in instances
                     .iter_mut()
-                    .filter(|i| i.source_profile == profile && in_group(&i.group_path, &path))
+                    .filter(|i| in_group(&i.group_path, &persist_path))
                 {
                     inst.group_path = String::new();
                 }
-            }
-            Json(serde_json::json!({ "path": path, "moved_sessions": moved })).into_response()
+                tree.delete_group(&persist_path);
+                *groups = tree.get_all_groups();
+                Ok(DeleteOutcome::Done(affected))
+            })
+        })
+        .await;
+        match result {
+            Ok(Ok(DeleteOutcome::Done(moved))) => break (moved, guards),
+            Ok(Ok(DeleteOutcome::Retry(affected))) => ids = affected,
+            Ok(Err(e)) => return group_error_response(e, "delete"),
+            Err(e) => return group_error_response(e.into(), "delete"),
         }
-        Ok(Err(e)) => group_error_response(e, "delete"),
-        Err(e) => group_error_response(e.into(), "delete"),
+    };
+
+    if !moved.is_empty() {
+        let mut instances = state.instances.write().await;
+        for inst in instances
+            .iter_mut()
+            .filter(|i| i.source_profile == profile && moved.contains(&i.id))
+        {
+            inst.group_path = String::new();
+        }
     }
+    Json(serde_json::json!({ "path": path, "moved_sessions": moved.len() })).into_response()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::server::test_support::build_test_app_state;
-    use crate::session::Instance;
 
     const PROFILE: &str = "group-api";
 
@@ -370,6 +403,49 @@ mod tests {
         )
         .await;
         assert_eq!(resp.into_response().status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn forced_delete_waits_for_in_flight_session_group_update() {
+        let f = fixture(&[("one", "team")]);
+        create(&f, "empty", Some("team")).await;
+        let id = f.state.instances.read().await[0].id.clone();
+
+        // Stand in for a PATCH holding the session lock mid-update.
+        let guard = f.state.instance_lock(&id).await.lock_owned().await;
+        let mut task = tokio::spawn({
+            let state = f.state.clone();
+            async move {
+                delete_group(
+                    State(state),
+                    Ok(Query(DeleteGroupQuery {
+                        path: "team".into(),
+                        force: true,
+                        profile: Some(PROFILE.into()),
+                    })),
+                )
+                .await
+                .into_response()
+            }
+        });
+        let blocked = tokio::time::timeout(std::time::Duration::from_millis(100), &mut task).await;
+        assert!(blocked.is_err(), "delete must wait for the session lock");
+
+        Storage::new_unwatched(PROFILE)
+            .unwrap()
+            .update(|disk, _| {
+                disk[0].group_path = "team/new".into();
+                Ok(())
+            })
+            .unwrap();
+        f.state.instances.write().await[0].group_path = "team/new".into();
+        drop(guard);
+
+        assert_eq!(task.await.unwrap().status(), StatusCode::OK);
+        let on_disk = Storage::new_unwatched(PROFILE).unwrap().load().unwrap();
+        assert_eq!(on_disk[0].group_path, "");
+        assert_eq!(f.state.instances.read().await[0].group_path, "");
     }
 
     #[tokio::test]
