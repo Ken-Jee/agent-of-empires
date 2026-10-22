@@ -338,9 +338,10 @@ async fn test_quit_creation_waits_for_cancellation_admission_before_exit() {
     .await
     .unwrap_or_else(|error| {
         let sessions = h.read_sessions();
-        let row = sessions
-            .as_array()
-            .and_then(|rows| rows.iter().find(|row| row["id"].as_str() == Some(id.as_str())));
+        let row = sessions.as_array().and_then(|rows| {
+            rows.iter()
+                .find(|row| row["id"].as_str() == Some(id.as_str()))
+        });
         let log = std::fs::read_to_string(app_dir_in(h.home_path()).join("debug.log"))
             .unwrap_or_else(|error| format!("<daemon log unreadable: {error}>"));
         panic!(
