@@ -312,6 +312,24 @@ pub(super) fn custom_agent_acp_capable(
         || crate::acp::inherited_acp_base(tool, &session.agent_detect_as).is_some()
 }
 
+impl SessionResponse {
+    /// The config-dependent fields `list_sessions` overlays per request, for a
+    /// response built from one instance: custom-agent ACP capability, and the
+    /// `acp.structured_view = off` gate on a terminal session's switch.
+    pub(super) fn overlay_switch_gates(&mut self, instance: &crate::session::Instance) {
+        let config = crate::session::config::repo_config::resolve_config_with_repo_or_warn(
+            &instance.source_profile,
+            std::path::Path::new(&instance.project_path),
+        );
+        if !self.acp_capable {
+            self.acp_capable = custom_agent_acp_capable(&config.session, &instance.tool);
+        }
+        self.structured_view_off = self.acp_capable
+            && !instance.is_structured()
+            && !config.acp.structured_view.is_offered();
+    }
+}
+
 /// Per-request cache for `(profile, project_path)` config resolution, shared
 /// across the `list_sessions` overlays so a repo-local override is read once per
 /// unique pair rather than once per row (#2603).

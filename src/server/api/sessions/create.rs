@@ -649,7 +649,12 @@ pub async fn create_session(
         let existing = {
             let instances = state.instances.read().await;
             find_by_idempotency_key(&instances, key).map(|inst| {
-                SessionResponse::from_instance(inst, crate::claude_settings::read_tui_fullscreen())
+                let mut resp = SessionResponse::from_instance(
+                    inst,
+                    crate::claude_settings::read_tui_fullscreen(),
+                );
+                resp.overlay_switch_gates(inst);
+                resp
             })
         };
         if let Some(resp) = existing {
@@ -1076,15 +1081,7 @@ pub async fn create_session(
                     .session
                     .tie_workdir_to_name;
             }
-            if !resp.acp_capable {
-                let session =
-                    crate::session::config::repo_config::resolve_config_with_repo_or_warn(
-                        &instance.source_profile,
-                        std::path::Path::new(&instance.project_path),
-                    )
-                    .session;
-                resp.acp_capable = custom_agent_acp_capable(&session, &instance.tool);
-            }
+            resp.overlay_switch_gates(&instance);
 
             if query.wait.as_deref() == Some("ready") && instance.status == Status::Starting {
                 if let Some(fresh) =

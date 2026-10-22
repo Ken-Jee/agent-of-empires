@@ -642,6 +642,46 @@ async fn list_sessions_flags_only_terminal_sessions_when_structured_view_is_off(
     assert_eq!(off, [("svo-terminal", true), ("svo-structured", false)]);
 }
 
+#[test]
+#[serial_test::serial]
+fn single_session_responses_resolve_the_structured_view_gate() {
+    let tmp_home = tempfile::tempdir().expect("tempdir HOME");
+    let _home = crate::session::test_support::isolate_app_dir_at(tmp_home.path());
+    let app_dir = crate::session::get_app_dir().expect("app dir");
+
+    let gate = |view: crate::session::View| {
+        let mut inst = Instance::new("test-session", "/tmp/gate-repo");
+        inst.tool = "claude".to_string();
+        inst.source_profile = "default".to_string();
+        inst.view = view;
+        let mut resp = SessionResponse::from_instance(&inst, false);
+        resp.overlay_switch_gates(&inst);
+        resp.structured_view_off
+    };
+
+    for (setting, terminal_off, structured_off) in [
+        ("off", true, false),
+        ("terminal", false, false),
+        ("structured", false, false),
+    ] {
+        std::fs::write(
+            app_dir.join("config.toml"),
+            format!("[acp]\nstructured_view = \"{setting}\"\n"),
+        )
+        .expect("global config");
+        assert_eq!(
+            gate(crate::session::View::Terminal),
+            terminal_off,
+            "{setting}"
+        );
+        assert_eq!(
+            gate(crate::session::View::Structured),
+            structured_off,
+            "{setting}"
+        );
+    }
+}
+
 #[tokio::test]
 #[serial_test::serial]
 async fn list_sessions_state_filter() {
