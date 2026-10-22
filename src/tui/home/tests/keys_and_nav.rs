@@ -1079,7 +1079,10 @@ async fn test_b_opens_project_add_flow_when_no_projects() {
     let project_dir = env._temp.path().join("plain-project");
     std::fs::create_dir_all(&project_dir).unwrap();
     let profile = env.view.config_profile();
-    let app_dir = crate::session::get_app_dir().unwrap().canonicalize().unwrap();
+    let app_dir = crate::session::get_app_dir()
+        .unwrap()
+        .canonicalize()
+        .unwrap();
     crate::session::purge_owners::initialize(&app_dir).unwrap();
     crate::tmux::tool_retirement::initialize(&app_dir).unwrap();
     let state = test_support::build_test_app_state_with_policy_configured(

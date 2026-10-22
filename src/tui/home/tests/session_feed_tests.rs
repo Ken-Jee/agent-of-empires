@@ -2751,7 +2751,10 @@ async fn degraded_stream_revokes_grants_and_project_writes_while_owner_http_is_h
     let tmux_socket = tokio::task::spawn_blocking(crate::tmux::native_socket_locator)
         .await
         .unwrap();
-    let app = crate::session::get_app_dir().unwrap().canonicalize().unwrap();
+    let app = crate::session::get_app_dir()
+        .unwrap()
+        .canonicalize()
+        .unwrap();
     let repo = app.join("admission-project");
     git2::Repository::init(&repo).unwrap();
     crate::session::projects::add(
