@@ -58,6 +58,7 @@ impl Instance {
             disk_sandbox.before_start_env = runtime_sandbox.before_start_env.clone();
             // The live container's workdir outranks a stale persisted pin (#4806).
             if disk_sandbox.container_name == runtime_sandbox.container_name
+                && disk_sandbox.container_id == runtime_sandbox.container_id
                 && runtime_sandbox.container_workdir.is_some()
             {
                 disk_sandbox.container_workdir = runtime_sandbox.container_workdir.clone();
@@ -224,7 +225,7 @@ mod tests {
     }
 
     /// A workdir adopted from the live container must survive the post-hook reload over a stale
-    /// persisted pin, but not carry onto a different container (#4806).
+    /// persisted pin, but not carry onto a different container, by name or id (#4806).
     #[test]
     #[serial]
     fn reconcile_from_disk_keeps_adopted_workdir_for_same_container() {
@@ -241,6 +242,11 @@ mod tests {
         assert_eq!(inst.container_workdir(), "/workspace/live");
 
         inst.sandbox_info.as_mut().unwrap().container_name = "recreated".to_string();
+        inst.reconcile_from_disk();
+        assert_eq!(inst.container_workdir(), "/workspace/stale/wt");
+
+        inst.adopt_container_workdir(Some("/workspace/live".to_string()));
+        inst.sandbox_info.as_mut().unwrap().container_id = Some("new-id".to_string());
         inst.reconcile_from_disk();
         assert_eq!(inst.container_workdir(), "/workspace/stale/wt");
     }
