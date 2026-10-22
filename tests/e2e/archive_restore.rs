@@ -22,6 +22,33 @@ fn kill_tmux(sock: &std::path::Path, name: &str) {
         .output();
 }
 
+fn mark_tool_owned(h: &TuiTestHarness, name: &str, session_id: &str, tool_name: &str) {
+    let target = format!("={name}:");
+    let owner = serde_json::to_string(&(session_id, tool_name)).unwrap();
+    let mark = h
+        .tmux()
+        .args([
+            "set-option",
+            "-t",
+            &target,
+            "@aoe_tool_owner",
+            &owner,
+            ";",
+            "set-option",
+            "-t",
+            &target,
+            "@aoe_kind",
+            "tool",
+        ])
+        .output()
+        .expect("mark archive tool fixture ownership");
+    assert!(
+        mark.status.success(),
+        "mark archive tool fixture failed: {}",
+        String::from_utf8_lossy(&mark.stderr)
+    );
+}
+
 fn tmux_has_session(sock: &std::path::Path, name: &str) -> bool {
     Command::new("tmux")
         .arg("-S")
@@ -270,6 +297,8 @@ fn test_cli_archive_kills_agent_and_terminal_tmux_sessions() {
         );
     }
 
+    mark_tool_owned(&h, &tool_tmux_name, &session_id, "lazygit");
+
     let archive_output = h.run_cli(&["session", "archive", &session_id]);
     assert!(
         archive_output.status.success(),
@@ -371,6 +400,8 @@ fn test_cli_archive_no_kill_preserves_all_tmux_sessions() {
             String::from_utf8_lossy(&create.stderr)
         );
     }
+
+    mark_tool_owned(&h, &tool_tmux_name, &session_id, "lazygit");
 
     let archive_output = h.run_cli(&["session", "archive", &session_id, "--no-kill"]);
     assert!(
