@@ -1382,15 +1382,12 @@ fn stop_aoe_sessions<'a>(
         .count()
 }
 
-/// Batch-fetch pane metadata for all aoe sessions in a single tmux subprocess call.
-/// Returns a map from session name to metadata for the first window's first pane.
+/// Fetch the first pane of each aoe session.
 ///
-/// Returns `Err` when the underlying `tmux list-panes` call fails to spawn or
-/// exits non-zero. Callers MUST distinguish this from `Ok(map)` where a missing
-/// key means the session is genuinely absent: `Err` means we don't know.
-/// Startup recovery and status pollers treat `Err` as "skip this pass" to
-/// avoid acting on a possibly-live pane during a transient tmux glitch. A
-/// successful empty map is authoritative and means there are no panes.
+/// An empty map proves absence. A missing server or a successful empty session
+/// inventory also proves absence when `list-panes` has no current target.
+/// Other query failures return `Err`; recovery and status pollers must retain
+/// possibly-live resources until a later successful inventory.
 pub fn batch_pane_metadata() -> anyhow::Result<HashMap<String, PaneMetadata>> {
     let start = Instant::now();
     let format = concat!(
@@ -1445,8 +1442,16 @@ pub fn batch_pane_metadata() -> anyhow::Result<HashMap<String, PaneMetadata>> {
             Ok(panes)
         }
         Ok(out) => {
-            if tmux_no_server_running(&out.stderr) {
-                tracing::trace!(target: "tmux.pane", "no tmux server running; no panes");
+            let confirmed_empty = std::str::from_utf8(&out.stderr)
+                .is_ok_and(|stderr| stderr.trim() == "no current target")
+                && run_tmux_command_with_timeout(tmux_query_command().args([
+                    "list-sessions",
+                    "-F",
+                    "#{session_name}",
+                ]))
+                .is_ok_and(|inventory| inventory.status.success() && inventory.stdout.is_empty());
+            if tmux_no_server_running(&out.stderr) || confirmed_empty {
+                tracing::trace!(target: "tmux.pane", "tmux inventory confirms no panes");
                 Ok(HashMap::new())
             } else {
                 tracing::warn!(

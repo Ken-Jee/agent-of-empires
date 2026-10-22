@@ -1219,6 +1219,10 @@ mod tests {
             kill_session_if_present("missing|proof").unwrap();
             let still_empty = inventory();
             assert!(still_empty.status.success() && still_empty.stdout.is_empty());
+            assert!(
+                crate::tmux::batch_pane_metadata().unwrap().is_empty(),
+                "a successful empty session inventory proves no panes remain"
+            );
             return;
         }
         if !tmux_available() {
