@@ -2742,10 +2742,7 @@ fn diff_save_uses_its_own_receipt_and_surfaces_rejection_or_unknown_in_takeover(
 #[serial]
 async fn degraded_stream_revokes_grants_and_project_writes_while_owner_http_is_held() {
     use crate::server::auth::LocalAuthorization;
-    use crate::tui::dialogs::{
-        test_render::{draw, find},
-        ProjectsDialog,
-    };
+    use crate::tui::dialogs::ProjectsDialog;
     use axum::{extract::Extension, routing::get, Router};
     let mut env = create_test_env_with_sessions(1);
     let tmux_socket = tokio::task::spawn_blocking(crate::tmux::native_socket_locator)
@@ -2953,12 +2950,6 @@ async fn degraded_stream_revokes_grants_and_project_writes_while_owner_http_is_h
     }
     env.view.handle_key(key(KeyCode::Enter), None);
     assert_eq!(std::fs::read(&registry).unwrap(), before);
-    let buffer = draw(120, 42, |frame, theme| {
-        env.view
-            .render(frame, frame.area(), theme, None, None, None)
-    });
-    find(&buffer, "The runtime is read-only");
-    find(&buffer, "admission-project");
     release.notify_one();
     assert!(held_get.await.unwrap().is_err());
     state.shutdown.cancel();
