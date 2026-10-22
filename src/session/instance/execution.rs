@@ -2005,13 +2005,14 @@ impl Instance {
                 let mut store = root.clone();
                 if let Some((sid, binding, explicit)) = target {
                     let binding = binding.filter(|binding| binding.session_id == sid);
-                    let file = binding.and_then(|binding| binding.transcript_path.clone()).or_else(|| {
+                    let bound = binding.and_then(|binding| binding.transcript_path.clone());
+                    let file = bound.clone().or_else(|| {
                         (!explicit && inputs.container.is_none())
                             .then(|| crate::session::capture::find_pi_transcript(&root, sid, !custom))
                             .flatten()
                     });
                     if let Some(file) = &file {
-                        anyhow::ensure!(binding.is_none_or(|binding| binding.execution.as_ref().is_some_and(|source| source.filesystem == "host")), "Pi transcript filesystem is unsupported");
+                        anyhow::ensure!(bound.is_none() || binding.is_some_and(|binding| binding.execution.as_ref().is_some_and(|source| source.filesystem == "host")), "Pi transcript filesystem is unsupported");
                         let native = inputs.native_transcript_path(file, &root)?;
                         let parent = native.parent().context("Pi transcript has no parent directory")?;
                         anyhow::ensure!(native.starts_with(&root) && (!custom || parent == root), "Pi transcript does not belong to the configured session directory");
@@ -4111,6 +4112,16 @@ mod tests {
             .namespace_arguments
             .windows(2)
             .any(|pair| pair[0] == "--session-dir" && pair[1] == store.to_str().unwrap()));
+
+        let migrated = ConversationBinding::unknown(sid);
+        let native = inst
+            .resolve_native_execution(Some((sid, Some(&migrated), false)))
+            .unwrap();
+        assert_eq!(
+            native.pi_transcript_path.as_deref(),
+            transcript.to_str(),
+            "a migrated id-only binding has no execution; the discovered host transcript still resumes"
+        );
 
         let unknown = "bbbbbbbb-1111-4111-8111-bbbbbbbbbbbb";
         let fresh = inst
