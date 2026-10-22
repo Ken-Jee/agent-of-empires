@@ -2410,14 +2410,15 @@ fn plugin_agents_available(
         if cancel.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
             return found;
         }
-        let Some(output) = output else {
-            return found;
-        };
-        let shell_found: HashSet<usize> = String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .filter_map(|line| line.strip_prefix("AOE_PLUGIN_OK "))
-            .filter_map(|index| index.parse().ok())
-            .collect();
+        let shell_found: HashSet<usize> = output
+            .map(|output| {
+                String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .filter_map(|line| line.strip_prefix("AOE_PLUGIN_OK "))
+                    .filter_map(|index| index.parse().ok())
+                    .collect()
+            })
+            .unwrap_or_default();
         for (index, (agent, _, _)) in needs_shell.into_iter().enumerate() {
             results.push((agent, shell_found.contains(&index)));
         }
@@ -3157,6 +3158,57 @@ mod tests {
         );
         assert!(!executed.exists(), "discovery must not execute the agent");
         assert!(failures.is_empty(), "{failures:?}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    #[serial_test::serial]
+    fn plugin_probe_spawn_failure_preserves_path_hits_and_caches_results() {
+        if run_probe_test_in_subprocess() {
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().unwrap();
+        let _env = probe_environment(home.path());
+        let memo = AgentAvailabilityGuard::capture();
+        memo.clear();
+        let direct_binary = home.path().join("bin/direct-agent");
+        std::fs::write(&direct_binary, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&direct_binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let shell = home.path().join("missing-login-shell");
+        let _shell = crate::session::test_support::EnvGuard::set(&[("SHELL", shell)]);
+        let batch = [
+            crate::plugin::agent_integration::PluginAgent {
+                plugin: "plugin",
+                tool: "direct-agent",
+                command: "direct-agent",
+            },
+            crate::plugin::agent_integration::PluginAgent {
+                plugin: "plugin",
+                tool: "login-agent",
+                command: "login-agent",
+            },
+        ];
+        let expected = HashSet::from(["direct-agent".to_owned()]);
+        assert_eq!(plugin_agents_available(&batch, true, None, false), expected);
+        let direct_key = plugin_cache_key(batch[0]);
+        let shell_key = plugin_cache_key(batch[1]);
+        let cached = || {
+            AGENT_AVAILABILITY
+                .read()
+                .ok()
+                .and_then(|cache| {
+                    let cache = cache.as_ref()?;
+                    Some((*cache.get(&direct_key)?, *cache.get(&shell_key)?))
+                })
+                .expect("probe results cached")
+        };
+        let first_cache = cached();
+        let (direct, shell) = first_cache;
+        assert!(direct.0, "PATH-discovered agent remains available");
+        assert!(!shell.0, "failed shell probe is cached as unavailable");
+        assert_eq!(plugin_agents_available(&batch, true, None, false), expected);
+        assert_eq!(cached(), first_cache, "failed shell probe is not repeated");
     }
 
     #[test]

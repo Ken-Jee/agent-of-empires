@@ -26,8 +26,14 @@ fn unique_candidates<'a, 'b, 'c>(
     for name in custom_names {
         candidate_counts.remove(name);
     }
-    for (_, tool, _) in &candidates {
-        if crate::agents::resolve_tool_name(tool).is_some() {
+    for (plugin, tool, _) in &candidates {
+        if let Some(builtin) = crate::agents::resolve_tool_name(tool) {
+            tracing::warn!(
+                plugin = %plugin,
+                tool = %tool,
+                builtin = %builtin,
+                "plugin agent tool name contains a built-in name or alias; preserving built-in precedence"
+            );
             candidate_counts.remove(tool);
         }
     }
@@ -115,16 +121,12 @@ mod tests {
     }
 
     #[test]
-    fn aliases_resolved_by_builtins_are_reserved_from_plugins() {
-        assert!(unique_candidates(
-            [(
-                "plugin",
-                "claude-yolo",
-                "claude --dangerously-skip-permissions"
-            )],
-            [],
-            []
-        )
-        .is_empty());
+    fn builtin_substring_aliases_are_reserved_from_plugins() {
+        for tool in ["claude-yolo", "session-agent"] {
+            assert!(
+                unique_candidates([("plugin", tool, "agent")], [], []).is_empty(),
+                "built-in alias should reserve {tool}"
+            );
+        }
     }
 }
