@@ -132,6 +132,13 @@ pub async fn create_group(
             "Group name cannot be empty",
         );
     }
+    if path.split('/').any(|seg| seg.trim().is_empty()) {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_group_path",
+            "Group path cannot contain empty segments",
+        );
+    }
     if let Err(msg) = validate_display_label(&path, "group") {
         return api_error(StatusCode::BAD_REQUEST, "invalid_group_path", msg);
     }
@@ -358,8 +365,17 @@ mod tests {
         assert_eq!(dup.status(), StatusCode::CONFLICT);
         assert_eq!(error_code(dup).await, "group_already_exists");
 
-        let empty = create(&f, "  ", None).await;
-        assert_eq!(empty.status(), StatusCode::BAD_REQUEST);
+        for (name, parent) in [
+            ("  ", None),
+            ("b", Some("a/")),
+            ("/x", None),
+            ("x", Some("/")),
+        ] {
+            let bad = create(&f, name, parent).await;
+            assert_eq!(bad.status(), StatusCode::BAD_REQUEST, "{parent:?}/{name:?}");
+        }
+        let blank_parent = create(&f, "c", Some("")).await;
+        assert_eq!(blank_parent.status(), StatusCode::CREATED);
         let unknown = create_group(
             State(f.state.clone()),
             Ok(Json(CreateGroupBody {
