@@ -3,7 +3,14 @@
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Locator, Page } from "@playwright/test";
-import { test, expect, authHeaders, bootDashboard, type ServeHandle } from "../helpers/liveTest";
+import {
+  test,
+  expect,
+  authHeaders,
+  bootDashboard,
+  confirmPassphraseElevation,
+  type ServeHandle,
+} from "../helpers/liveTest";
 import { appDirFor, loginWithPassphrase, resolveAoeBinary, spawnAoeServe } from "../helpers/aoeServe";
 
 // #1189: the theme resolver once deadlocked per request, which mocked specs cannot see.
@@ -197,52 +204,61 @@ test.describe("passphrase mode", () => {
     expect((await getJson(settingsUrl, servePreauthed))?.theme?.name).toBe("dracula");
   });
 
-  test("sandbox image change requires elevation for remote callers, not loopback", async ({
-    servePreauthed,
-    spawnServe,
-    page,
-  }) => {
-    const patchImage = (profile: string, image: string, xff?: string) =>
-      page.evaluate(
-        async ({ profile, image, xff }) =>
-          (
-            await fetch(`/api/profiles/${encodeURIComponent(profile)}/settings`, {
-              method: "PATCH",
-              headers: { "Content-Type": "application/json", ...(xff ? { "X-Forwarded-For": xff } : {}) },
-              body: JSON.stringify({ sandbox: { default_image: image } }),
-            })
-          ).status,
-        { profile, image, xff },
-      );
+  for (const ingress of ["direct TCP", "proxy-reported remote TCP"] as const) {
+    test(`sandbox image changes require browser elevation over ${ingress}`, async ({ spawnServe, page }) => {
+      const proxied = ingress === "proxy-reported remote TCP";
+      const handle = await spawnServe({
+        authMode: "passphrase",
+        preloginViaHarness: true,
+        ...(proxied ? { extraArgs: ["--behind-proxy", "--allowed-host", "127.0.0.1"] } : {}),
+      });
+      if (proxied) await page.setExtraHTTPHeaders({ "X-Forwarded-For": "203.0.113.10" });
+      const profile = await defaultProfile(handle);
+      const profileUrl = `${handle.baseUrl}/api/profiles/${encodeURIComponent(profile)}/settings`;
+      const savedImage = async () => (await getJson(profileUrl, handle))?.sandbox?.default_image;
+      const baseline = await savedImage();
+      await bootDashboard(page, handle, "/settings/sandbox");
+      const status = await page.evaluate(async () => (await fetch("/api/login/status")).json());
+      expect(status).toMatchObject({ required: true, authenticated: true, elevated: false });
+      expect(status.principal).not.toBe("local_owner");
 
-    const localProfile = await defaultProfile(servePreauthed);
-    await bootDashboard(page, servePreauthed);
-    expect(await patchImage(localProfile, "ghcr.io/example/img:local-trusted")).toBe(200);
-    await expect(confirmPassphraseDialog(page)).toHaveCount(0);
+      // Proxy address claims cannot manufacture kernel-authenticated Unix owner authority.
+      const spoofed = await fetch(profileUrl, {
+        method: "PATCH",
+        headers: {
+          ...authHeaders(handle),
+          "Content-Type": "application/json",
+          "X-Forwarded-For": "127.0.0.1",
+          "CF-Connecting-IP": "127.0.0.1",
+          "X-Real-IP": "127.0.0.1",
+          Forwarded: "for=127.0.0.1",
+        },
+        body: JSON.stringify({ sandbox: { default_image: "ghcr.io/example/img:spoofed-owner" } }),
+      });
+      expect(spoofed.status).toBe(403);
+      expect(await spoofed.json()).toMatchObject({ error: "elevation_required" });
+      expect(await savedImage()).toBe(baseline);
 
-    const proxied = await spawnServe({
-      authMode: "passphrase",
-      preloginViaHarness: true,
-      extraArgs: ["--behind-proxy", "--allowed-host", "127.0.0.1"],
+      const profilePicker = page.getByTestId("settings-profile-picker").locator("select");
+      await expect(profilePicker).toHaveValue(profile);
+      const image = page.locator('[data-settings-field="sandbox.default_image"]').locator('input[type="text"]');
+      await expect(image).toBeVisible({ timeout: 10_000 });
+      await image.fill("ghcr.io/example/img:blocked");
+      await image.blur();
+      await expect(confirmPassphraseDialog(page)).toBeVisible({ timeout: 5_000 });
+      expect(await savedImage()).toBe(baseline);
+
+      await confirmPassphraseElevation(page, handle);
+      expect(await savedImage()).toBe(baseline);
+      await image.fill("ghcr.io/example/img:elevated");
+      await image.blur();
+      await expect.poll(savedImage).toBe("ghcr.io/example/img:elevated");
+      await expect(image).toHaveValue("ghcr.io/example/img:elevated");
+      await expect(confirmPassphraseDialog(page)).toHaveCount(0);
+      await bootDashboard(page, handle, "/settings/sandbox");
+      await expect(image).toHaveValue("ghcr.io/example/img:elevated", { timeout: 10_000 });
     });
-    const proxiedProfile = await defaultProfile(proxied);
-    await bootDashboard(page, proxied);
-    const savedImage = async () =>
-      (await getJson(`${proxied.baseUrl}/api/profiles/${encodeURIComponent(proxiedProfile)}/settings`, proxied))
-        ?.sandbox?.default_image;
-
-    // The SPA sees the remote caller's 403 and opens the elevation prompt.
-    expect(await patchImage(proxiedProfile, "ghcr.io/example/img:tampered", "203.0.113.10")).toBe(403);
-    const dialog = confirmPassphraseDialog(page);
-    await expect(dialog).toBeVisible({ timeout: 5_000 });
-    expect((await savedImage()) ?? "").not.toBe("ghcr.io/example/img:tampered");
-
-    await dialog.locator('input[type="password"]').fill(proxied.passphrase!);
-    await dialog.getByRole("button", { name: /Confirm/i }).click();
-    await expect(dialog).toHaveCount(0, { timeout: 5_000 });
-    expect(await patchImage(proxiedProfile, "ghcr.io/example/img:elevated", "203.0.113.10")).toBe(200);
-    expect(await savedImage()).toBe("ghcr.io/example/img:elevated");
-  });
+  }
 });
 
 test("global settings migrate from profiles and reject stale profile writes", async ({ spawnServe, page }) => {
