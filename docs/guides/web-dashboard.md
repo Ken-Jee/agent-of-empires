@@ -91,10 +91,13 @@ Description=Agent of Empires daemon
 Type=notify
 ExecStart=/path/to/aoe serve
 Restart=on-failure
+KillMode=process
 
 [Install]
 WantedBy=default.target
 ```
+
+`KillMode=process` keeps a tmux server the daemon started, and every pane, alive across `systemctl --user stop` and `restart`, at the cost of leaving the daemon's other child processes running after a stop. Alternatively drop it and select a dedicated `tmux.socket_name` whose server starts outside the daemon; see [systemd](configuration.md#systemd).
 
 `~/Library/LaunchAgents/com.agentofempires.daemon.plist`, loaded with `launchctl bootstrap gui/$(id -u) <plist>`:
 
