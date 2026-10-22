@@ -78,6 +78,8 @@ export function useSessions() {
               ...session,
               rate_limit: session.rate_limit === undefined ? s.rate_limit : session.rate_limit,
               rate_limit_auto_resume: session.rate_limit_auto_resume ?? s.rate_limit_auto_resume,
+              // Omitted when false, and mutation responses never resolve it: keep the polled value.
+              structured_view_off: session.structured_view_off ?? s.structured_view_off,
             }
           : s,
       ),
