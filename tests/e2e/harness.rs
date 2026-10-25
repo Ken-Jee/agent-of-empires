@@ -1614,13 +1614,19 @@ fn tui_launch_sets_autostart_policy_on_a_running_tmux_server() {
         let mut harness = TuiTestHarness::new("autostart_policy");
         // The first client fixes the server's environment, as a parent shell
         // exporting the variable would.
-        let mut tmux = harness.isolated("tmux", &[], &["AOE_NO_AUTOSTART"]);
+        let mut tmux = harness.tmux();
+        tmux.env("HOME", harness.home_path())
+            .env("XDG_CONFIG_HOME", harness.home_path().join(".config"))
+            .env("PATH", harness.env_path())
+            .env_remove("AOE_NO_AUTOSTART")
+            .envs(harness.extra_env.iter().map(|(key, value)| (key, value)));
+        for key in &harness.extra_env_remove {
+            tmux.env_remove(key);
+        }
         if let Some(value) = inherited {
             tmux.env("AOE_NO_AUTOSTART", value);
         }
         let output = tmux
-            .arg("-S")
-            .arg(&harness.socket_path)
             .args(["new-session", "-d", "-s", "server", "sleep 600"])
             .output()
             .expect("start harness tmux server");
@@ -1630,12 +1636,14 @@ fn tui_launch_sets_autostart_policy_on_a_running_tmux_server() {
         }
 
         // Stands in for the TUI: reports the policy, then acknowledges startup.
+        // Drop runs the binary with arguments to stop the daemon; those calls
+        // exit at once.
         let report = harness.home_path().join("autostart-policy");
         let probe = harness.home_path().join("probe");
         write_executable(
             &probe,
             &format!(
-                "#!/bin/sh\nprintf %s \"${{AOE_NO_AUTOSTART-unset}}\" > {}\nprintf '\\033]0;aoe-e2e-0\\007'\nexec sleep 600\n",
+                "#!/bin/sh\n[ \"$#\" -eq 0 ] || exit 0\nprintf %s \"${{AOE_NO_AUTOSTART-unset}}\" > {}\nprintf '\\033]0;aoe-e2e-0\\007'\nexec sleep 600\n",
                 shell_words::quote(report.to_str().expect("report path"))
             ),
         );
